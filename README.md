@@ -9,15 +9,6 @@ SDK network prover ──mTLS──▶ fleet-scheduler ──cluster token──
 fleetctl ──admin token──▶   http     :9091  (/admin, public values)
 ```
 
-| crate / dir | what |
-|---|---|
-| `crates/fleet-proto` | `stage.v1` (a verbatim copy of the SDK's `stage.proto`) and the internal `fleet.v1` |
-| `crates/fleet-scheduler` | stage API, node registry, placement (classes, anchoring, reservations), dispatch, Postgres store, admin API |
-| `crates/fleet-node` | a prover node: the Ziren SDK as is (`ProverClient` cpu / mock, or `CudaProver` against a GPU server) |
-| `crates/fleetctl` | cluster operations and credentials |
-| `bridge/` | Ray driver: runs `ZirenGpuProver` / `ZirenCpuProver` actors from a services file |
-| `deploy/` | example configs, fixed-port Ray start, Postgres compose |
-
 ## Credentials
 
 | what | who holds it | issued by |
