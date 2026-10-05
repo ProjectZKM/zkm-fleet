@@ -1,4 +1,5 @@
-# Postgres for the scheduler. The scheduler itself runs as a binary or its image.
+# Scheduler + Postgres. Run from deploy/:  docker compose up -d --build
+# Config and secrets live in ${FLEET_ETC:-/etc/zkm-fleet} (see docs/INSTALL.md).
 services:
   postgres:
     image: postgres:16
@@ -8,10 +9,36 @@ services:
       POSTGRES_DB: fleet
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
     secrets: [pg_password]
-    ports: ["127.0.0.1:5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleet -d fleet"]
+      interval: 5s
+      retries: 20
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.scheduler
+    image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      FLEET_URL: http://127.0.0.1:9191
+      FLEET_ADMIN_TOKEN_FILE: /etc/zkm-fleet/admin.token
+    volumes:
+      - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
+      - fleet-data:/var/lib/zkm-fleet
+    ports:
+      - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (mTLS), external
+      - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
+      - "${HTTP_BIND:-0.0.0.0}:9191:9191"         # public values, /admin, /healthz
+
 secrets:
   pg_password:
-    file: ./pg_password
+    file: ${FLEET_ETC:-/etc/zkm-fleet}/pg_password
+
 volumes:
   pgdata: {}
+  fleet-data: {}

@@ -1,5 +1,5 @@
 # fleet_bridge: Ray actors to keep running.
-scheduler: http://10.0.0.1:50001
+scheduler: http://10.0.0.1:51001
 cluster_token_file: /etc/zkm-fleet/cluster.token
 node_binary: /opt/zkm-fleet/bin/fleet-node
 log_dir: /var/log/zkm-fleet

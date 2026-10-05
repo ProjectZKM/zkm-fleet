@@ -18,6 +18,9 @@ pub struct Config {
     /// Postgres; the in-memory store is used when absent (tests, local runs).
     #[serde(default)]
     pub database_url: Option<String>,
+    /// File holding the Postgres URL (keeps the password out of this file); wins over `database_url`.
+    #[serde(default)]
+    pub database_url_file: Option<PathBuf>,
     /// ELFs, job inputs and results.
     pub data_dir: PathBuf,
     /// How long `GetStatus` holds a request open waiting for the job to finish.
@@ -101,13 +104,13 @@ pub struct TlsConfig {
 }
 
 fn default_stage_addr() -> String {
-    "0.0.0.0:50000".into()
+    "0.0.0.0:51000".into()
 }
 fn default_control_addr() -> String {
-    "0.0.0.0:50001".into()
+    "0.0.0.0:51001".into()
 }
 fn default_http_addr() -> String {
-    "0.0.0.0:9091".into()
+    "0.0.0.0:9191".into()
 }
 fn default_long_poll_ms() -> u64 {
     2_000
@@ -131,7 +134,10 @@ fn default_max_queued() -> usize {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let cfg: Config = serde_yaml::from_str(&text)?;
+        let mut cfg: Config = serde_yaml::from_str(&text)?;
+        if let Some(f) = &cfg.database_url_file {
+            cfg.database_url = Some(std::fs::read_to_string(f)?.trim().to_string());
+        }
         cfg.validate()?;
         Ok(cfg)
     }

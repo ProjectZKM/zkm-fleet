@@ -23,7 +23,7 @@ import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from .actors import ZirenCpuProver, ZirenGpuProver
+from .actors import ZirenCpuProver, ZirenGpuProver, spec_hash
 
 NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
@@ -109,7 +109,7 @@ def stop(name: str):
 def reconcile_once(cfg: dict) -> dict:
     want = _replica_specs(cfg)
     have = _running()
-    report = {"started": [], "stopped": [], "healthy": [], "unhealthy": []}
+    report = {"started": [], "stopped": [], "replaced": [], "healthy": [], "unhealthy": []}
     for name in sorted(set(have) - set(want)):
         log.info("stopping %s (no longer wanted)", name)
         stop(name)
@@ -126,11 +126,23 @@ def reconcile_once(cfg: dict) -> dict:
                 report["unhealthy"].append(name)
             continue
         try:
-            ray.get(have[name].health.remote(), timeout=30)
-            report["healthy"].append(name)
+            h = ray.get(have[name].health.remote(), timeout=30)
         except Exception as e:
             log.warning("%s unhealthy (Ray restarts it): %s", name, e)
             report["unhealthy"].append(name)
+            continue
+        if h.get("spec") != spec_hash(spec):
+            log.info("replacing %s (spec changed)", name)
+            stop(name)
+            try:
+                start(spec)
+                report["replaced"].append(name)
+            except Exception as e:
+                log.error("restarting %s failed: %s", name, e)
+                stop(name)
+                report["unhealthy"].append(name)
+        else:
+            report["healthy"].append(name)
     return report
 
 
@@ -138,7 +150,7 @@ def reconcile_forever(load_cfg, period_s: float = 15):
     while True:
         try:
             r = reconcile_once(load_cfg())
-            if r["started"] or r["stopped"] or r["unhealthy"]:
+            if r["started"] or r["stopped"] or r["replaced"] or r["unhealthy"]:
                 log.info("reconcile: %s", r)
         except Exception as e:
             log.exception("reconcile failed: %s", e)

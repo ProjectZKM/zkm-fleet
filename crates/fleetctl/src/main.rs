@@ -15,7 +15,7 @@ use serde_json::Value;
 #[command(about = "Operate a zkm-fleet cluster and issue its credentials")]
 struct Cli {
     /// Scheduler HTTP base URL (admin API under /admin).
-    #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9091", global = true)]
+    #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9191", global = true)]
     url: String,
     /// File holding the admin token.
     #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE", global = true)]
@@ -61,7 +61,7 @@ enum CredentialCmd {
         /// Env file for the client (0600): ZKM_PROVER, ENDPOINT, ZKM_PRIVATE_KEY, TLS paths.
         #[arg(long)]
         out: PathBuf,
-        /// Stage API endpoint clients use, e.g. https://fleet.example:50000.
+        /// Stage API endpoint clients use, e.g. https://fleet.example:51000.
         #[arg(long)]
         endpoint: String,
         /// Directory of `fleetctl tls init`: issue a client certificate for this credential too.

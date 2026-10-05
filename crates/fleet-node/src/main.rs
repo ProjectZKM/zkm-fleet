@@ -34,7 +34,7 @@ pub struct Args {
     /// How the scheduler reaches this node, e.g. http://10.0.0.5:31000.
     #[arg(long, env = "FLEET_ADVERTISE")]
     advertise: String,
-    /// Scheduler control API, e.g. http://10.0.0.1:50001.
+    /// Scheduler control API, e.g. http://10.0.0.1:51001.
     #[arg(long, env = "FLEET_SCHEDULER")]
     scheduler: String,
     /// File holding the cluster token shared with the scheduler.

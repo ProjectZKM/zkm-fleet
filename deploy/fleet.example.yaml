@@ -1,9 +1,9 @@
-# fleet-scheduler configuration.
-stage_addr: 0.0.0.0:50000          # external, mutual TLS (the SDK only does TLS with a client cert)
-control_addr: 10.0.0.1:50001       # cluster-internal: node registration
-http_addr: 0.0.0.0:9091            # public values for the SDK, /healthz, /admin (admin token)
-public_url: https://fleet.example.com:9091
-database_url: postgres://fleet:CHANGE_ME@127.0.0.1:5432/fleet
+# fleet-scheduler configuration (inside the compose container: paths under /etc/zkm-fleet).
+stage_addr: 0.0.0.0:51000          # external, mutual TLS (the SDK only does TLS with a client cert)
+control_addr: 0.0.0.0:51001        # cluster-internal: node registration (publish on the cluster interface only)
+http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin (admin token)
+public_url: https://fleet.example.com:9191
+database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
 long_poll_ms: 2000
 heartbeat_secs: 5
@@ -11,9 +11,9 @@ node_stale_secs: 20
 job_timeout_secs: 3600
 max_attempts: 2
 require_signature: true
-cluster_token_file: /etc/zkm-fleet/cluster.token   # fleetctl token new
-admin_token_file: /etc/zkm-fleet/admin.token       # fleetctl token new
-tls:                                               # fleetctl tls init
+cluster_token_file: /etc/zkm-fleet/cluster.token
+admin_token_file: /etc/zkm-fleet/admin.token
+tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
   client_ca_path: /etc/zkm-fleet/tls/ca.pem
@@ -21,7 +21,6 @@ tenants:
   - name: ethproofs
     class: latency
     anchor: exclusive
-    zkm_version: v2.0.0
     backends: [cuda]
     max_queued: 16
   - name: goat

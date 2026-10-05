@@ -10,6 +10,8 @@ If either process dies, the actor exits and Ray restarts it (max_restarts=-1).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shlex
 import socket
@@ -18,6 +20,10 @@ import time
 import urllib.request
 
 import ray
+
+
+def spec_hash(spec: dict) -> str:
+    return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _free_port(lo: int, hi: int) -> int:
@@ -152,6 +158,7 @@ class ZirenGpuProver:
             os._exit(1)  # Ray restarts the actor
         return {
             "name": self.name,
+            "spec": spec_hash(self.spec),
             "gpus": self.gpus,
             "gpu_port": self.gpu_port,
             "node_port": self.node_port,
@@ -187,7 +194,7 @@ class ZirenCpuProver:
     def health(self) -> dict:
         if not self.node.alive():
             os._exit(1)
-        return {"name": self.name, "node_port": self.node_port, "machine": socket.gethostname()}
+        return {"name": self.name, "spec": spec_hash(self.spec), "node_port": self.node_port, "machine": socket.gethostname()}
 
     def shutdown(self):
         self.node.stop()
