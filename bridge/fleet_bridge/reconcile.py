@@ -2,13 +2,16 @@
 
     services:
       - name: ethproofs-gpu        # replica i runs as actor "<name>-<i>"
-        kind: ziren-gpu            # ziren-gpu | ziren-cpu
+        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app
         replicas: 1
         gpus: 2
         cpus: 48
         memory_gb: 256
         image: ghcr.io/projectzkm/ziren-gpu@sha256:...
         env: {VERIFY_VK: "true", ZIREN_LEAF_HOST_THREADS: "3"}
+
+An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
+server): see GpuApp and deploy/services.example.yaml.
 
 Each replica gets its own placement group with one STRICT_PACK bundle, so all
 of a GPU server's cards land on one machine.
@@ -22,12 +25,12 @@ import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from .actors import ZirenCpuProver, ZirenGpuProver, spec_hash
+from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, spec_hash
 
 NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
 
-KINDS = {"ziren-gpu": ZirenGpuProver, "ziren-cpu": ZirenCpuProver}
+KINDS = {"ziren-gpu": ZirenGpuProver, "ziren-cpu": ZirenCpuProver, "app": GpuApp}
 
 
 def _replica_specs(cfg: dict) -> dict[str, dict]:
@@ -44,13 +47,15 @@ def _replica_specs(cfg: dict) -> dict[str, dict]:
         for i in range(int(svc.get("replicas", 1))):
             name = f"{svc['name']}-{i}"
             out[name] = {**common, **svc, "name": name, "kind": kind}
+            if kind == "app":
+                out[name]["index"] = i
     return out
 
 
 def _bundle(spec: dict) -> dict:
     b = {"CPU": float(spec.get("cpus", 1))}
-    if spec["kind"] == "ziren-gpu":
-        b["GPU"] = float(spec["gpus"])
+    if spec["kind"] in ("ziren-gpu", "app"):
+        b["GPU"] = float(spec.get("gpus", 1))
     if spec.get("memory_gb"):
         b["memory"] = float(spec["memory_gb"]) * 2**30
     return b

@@ -49,6 +49,7 @@ fleetctl status                                       # queue, nodes, anchors
 | task | how |
 |---|---|
 | add / change provers | edit `/etc/zkm-fleet/services.yaml` (see `deploy/services.example.yaml`), then `/opt/zkm-fleet/deploy/apply.sh`; a changed spec (e.g. a new image digest) replaces that actor |
+| a GPU app (ComfyUI, an inference server) | a `kind: app` service: a container on one card, serving on `port_base` + replica index, its data mounted at the same paths; `python -m fleet_bridge render --services … --actor <name>-0 --gpus <card>` prints the `docker run` to try it by hand |
 | tenants | `/etc/zkm-fleet/fleet.yaml` (class, anchoring, allowed backends, queue cap), then `docker compose -p zkm-fleet restart scheduler` |
 | a client | `fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 --tls-dir /etc/zkm-fleet/tls --out ethproofs.env`; the client runs `set -a; . ./ethproofs.env; set +a` and calls the SDK as before |
 | revoke | `fleetctl credential revoke <address>` |
@@ -79,5 +80,6 @@ What the SDK's scheme leaves open: the request signature covers `proof_id&seg_si
 | 51001 control (gRPC) | cluster interface | nodes (cluster token) |
 | 31000-31099 fleet-node | cluster | the scheduler (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
+| app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |
 | 172.28.250.0/24 | docker network on the control machine | scheduler (fixed at .10), Postgres, gateway; `install.sh --subnet` if it collides |

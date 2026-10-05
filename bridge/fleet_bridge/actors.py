@@ -1,4 +1,4 @@
-"""Ray actors that run prover nodes.
+"""Ray actors that run prover nodes, and GPU apps that serve on their own port.
 
 A ZirenGpuProver owns one GPU server: the container on exactly the cards Ray
 granted the actor (all on one machine: the server's per-card workers share
@@ -176,6 +176,101 @@ class ZirenGpuProver:
 
     def shutdown(self):
         self.node.stop()
+        subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+
+
+def app_command(spec: dict, gpus: list[str], index: int) -> tuple[list[str], int]:
+    """`docker run` for one replica of an app service, and the port it serves on.
+
+    Volumes are mounted at the same path inside, so absolute paths baked into the app's
+    tree (a venv's interpreter, model links, database URLs) keep working; `:ro` and
+    `:rslave` (an NFS mount remounted later still shows up inside) pass through.
+    `{port}`, `{index}` and `{gpus}` in the command and env are filled in per replica.
+    """
+    port = int(spec["port_base"]) + index
+    fill = {"port": port, "index": index, "gpus": ",".join(str(i) for i in range(len(gpus)))}
+    cmd = [
+        "docker", "run", "-d", "--name", f"fleet-app-{spec['name']}",
+        "--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"',
+        "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
+        "--network", "host",
+        f"--shm-size={spec.get('shm_gb', 16)}g",
+        "--label", "zkm-fleet=app", "--label", f"zkm-fleet.node={spec['name']}",
+    ]
+    if spec.get("user"):
+        cmd += ["--user", str(spec["user"])]
+    if spec.get("workdir"):
+        cmd += ["-w", spec["workdir"]]
+    for v in spec.get("volumes", []):
+        path, _, opts = v.partition(":")
+        cmd += ["-v", f"{path}:{path}" + (f":{opts}" if opts else "")]
+    for k, v in spec.get("env", {}).items():
+        cmd += ["-e", f"{k}={str(v).format(**fill)}"]
+    cmd.append(spec["image"])
+    cmd += [str(a).format(**fill) for a in spec["command"]]
+    return cmd, port
+
+
+def _http_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+@ray.remote(max_restarts=-1, max_task_retries=0)
+class GpuApp:
+    """A GPU container that serves on its own port (ComfyUI, an inference server).
+
+    It does not register with the scheduler: its clients address it by port, which is
+    fixed per replica (`port_base` + replica index), on the machine Ray placed it on.
+    """
+
+    def __init__(self, spec: dict):
+        self.spec = spec
+        self.name = spec["name"]
+        self.container = f"fleet-app-{self.name}"
+        gpus = [str(int(g)) for g in ray.get_gpu_ids()]
+        if not gpus:
+            raise RuntimeError("actor was granted no GPU")
+        self.gpus = gpus
+        cmd, self.port = app_command(spec, gpus, int(spec.get("index", 0)))
+        self.health_url = f"http://127.0.0.1:{self.port}{spec.get('health_path', '/')}"
+        subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+        out = subprocess.run(cmd, capture_output=True, text=True)
+        if out.returncode != 0:
+            raise RuntimeError(f"docker run failed: {out.stderr.strip()} ({shlex.join(cmd)})")
+        deadline = time.time() + spec.get("ready_timeout_s", 600)
+        while not _http_ok(self.health_url):
+            if time.time() > deadline or not self._container_running():
+                logs = subprocess.run(["docker", "logs", "--tail", "40", self.container], capture_output=True, text=True)
+                self.shutdown()
+                raise RuntimeError(f"{self.name} did not answer {self.health_url}:\n{logs.stdout}{logs.stderr}")
+            time.sleep(2)
+        _watch(self._container_running, self.shutdown)
+
+    def _container_running(self) -> bool:
+        out = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", self.container], capture_output=True, text=True
+        )
+        return out.stdout.strip() == "true"
+
+    def health(self) -> dict:
+        if not self._container_running():
+            self.shutdown()
+            os._exit(1)
+        return {
+            "name": self.name,
+            "spec": spec_hash(self.spec),
+            "gpus": self.gpus,
+            "port": self.port,
+            "ready": _http_ok(self.health_url),
+            "machine": socket.gethostname(),
+        }
+
+    def shutdown(self):
+        subprocess.run(["docker", "stop", "-t", str(self.spec.get("stop_timeout_s", 30)), self.container], capture_output=True)
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
 
 

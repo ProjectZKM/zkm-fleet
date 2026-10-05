@@ -27,3 +27,25 @@ services:
     replicas: 1
     cpus: 16
     memory_gb: 64
+  # A GPU app on its own port: ComfyUI from a tree on the host. Replica i serves on
+  # port_base + i; volumes are mounted at the same path inside, so the tree's venv,
+  # model links and database URLs work unchanged (`:ro`, `:rslave` for NFS).
+  # Image: deploy/images/comfyui (Ubuntu 22.04 userland matching the venv).
+  - name: comfyui
+    kind: app
+    replicas: 2
+    gpus: 1
+    cpus: 8
+    image: zkm-fleet-comfyui:22.04
+    user: "1000:1000"
+    port_base: 50000
+    health_path: /system_stats
+    workdir: /srv/comfyui
+    volumes:
+      - /srv/comfyui
+      - /mnt/models:rslave
+      - /opt/blender:ro
+    env:
+      PATH: /opt/blender:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    command: [/srv/comfyui/venv/bin/python, main.py, --port, "{port}", --cuda-device, "0",
+              --disable-auto-launch, --database-url, "sqlite:///user/comfyui_w{index}.db"]
