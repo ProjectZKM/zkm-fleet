@@ -65,6 +65,7 @@ Copy `cluster.token` to every GPU / CPU machine (`/etc/zkm-fleet/cluster.token`,
 ```bash
 sudo cp deploy/fleet.example.yaml /etc/zkm-fleet/fleet.yaml     # edit public_url and tenants
 cd deploy
+export FLEET_UID=$(id -u fleet) FLEET_GID=$(id -g fleet)       # the owner of /etc/zkm-fleet
 CONTROL_BIND=10.0.0.1 docker compose up -d --build              # CONTROL_BIND = the cluster interface
 curl -sf http://127.0.0.1:9191/healthz                          # ok
 ```

@@ -21,6 +21,8 @@ services:
       dockerfile: deploy/Dockerfile.scheduler
     image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
     restart: unless-stopped
+    # The user that owns ${FLEET_ETC}: the secrets there are mode 600.
+    user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
     depends_on:
       postgres: { condition: service_healthy }
     environment:
@@ -29,7 +31,7 @@ services:
       FLEET_ADMIN_TOKEN_FILE: /etc/zkm-fleet/admin.token
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
-      - fleet-data:/var/lib/zkm-fleet
+      - ${FLEET_DATA:-fleet-data}:/var/lib/zkm-fleet    # a host path works too (owned by FLEET_UID)
     ports:
       - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (mTLS), external
       - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
