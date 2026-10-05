@@ -191,7 +191,7 @@ class ZirenCpuProver:
         backend = spec.get("backend", "cpu")
         env = _node_env(
             spec, self.name, backend,
-            {"FLEET_CPUS": spec.get("cpus", 0), "RAYON_NUM_THREADS": spec.get("cpus", 0) or ""},
+            {"FLEET_CPUS": spec.get("cpus", 0), "RAYON_NUM_THREADS": spec.get("cpus", 0) or "", **spec.get("env", {})},
         )
         if not env.get("RAYON_NUM_THREADS"):
             env.pop("RAYON_NUM_THREADS")

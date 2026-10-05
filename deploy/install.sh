@@ -20,13 +20,14 @@
 #   --no-tls              no TLS on the stage API: only when it is bound to loopback (control)
 #   --bind-stage IP       interface for the stage API (control; default 0.0.0.0)
 #   --bind-http IP        interface for public values and /admin (control; default 0.0.0.0)
+#   --no-cron             do not install the cron watchdog (containers, tests)
 #
 # Without root, pass --prefix and --etc under $HOME: Ray is kept alive by a cron watchdog.
 set -euo pipefail
 
 ROLE=${1:-}; shift || true
 PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; CUDA=""; CPUS=""; WORKDIR=""; HEAD=""; TOKEN=""; IP=""
-PUBLIC_URL=""; TLS_NAMES=""; TLS=1; BIND_STAGE=0.0.0.0; BIND_HTTP=0.0.0.0
+PUBLIC_URL=""; TLS_NAMES=""; TLS=1; BIND_STAGE=0.0.0.0; BIND_HTTP=0.0.0.0; CRON=1
 RAY_VERSION=2.59.0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +45,7 @@ while [ $# -gt 0 ]; do
     --no-tls) TLS=0; shift ;;
     --bind-stage) BIND_STAGE=$2; shift 2 ;;
     --bind-http) BIND_HTTP=$2; shift 2 ;;
+    --no-cron) CRON=0; shift ;;
     *) echo "unknown option $1"; exit 2 ;;
   esac
 done
@@ -54,8 +56,10 @@ say(){ echo "[install] $*"; }
 die(){ echo "[install] ERROR: $*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ checks
-command -v docker > /dev/null || die "docker is not installed"
-docker info > /dev/null 2>&1 || die "this user cannot talk to docker (add it to the docker group)"
+if [ "$ROLE" = control ] || [ -n "$CUDA" ]; then
+  command -v docker > /dev/null || die "docker is not installed"
+  docker info > /dev/null 2>&1 || die "this user cannot talk to docker (add it to the docker group)"
+fi
 command -v python3 > /dev/null || die "python3 is not installed"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' || die "python3 >= 3.10 is required"
 python3 -m venv --help > /dev/null 2>&1 || die "python3-venv is not installed"
@@ -170,11 +174,10 @@ CUDA_VISIBLE_DEVICES=$CUDA
 EOF
 say "starting Ray ($( [ "$ROLE" = control ] && echo head || echo "worker of $HEAD"), cards: ${CUDA:-none}, cpus: ${CPUS:-all}, workspace $WORKDIR)"
 FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh" || true
-RAY_AT=$([ "$ROLE" = control ] && echo 127.0.0.1 || echo "$HEAD")
-"$PREFIX/venv/bin/ray" status --address "$RAY_AT:6379" > /dev/null 2>&1 \
-  || die "Ray did not start: see $WORKDIR/logs/ray.log"
+pgrep -x raylet > /dev/null || die "Ray did not start on this machine: see $WORKDIR/logs/ray.log"
 LINE="* * * * * FLEET_ENV=$ETC/watchdog.env $PREFIX/deploy/fleet-watchdog.sh >> $WORKDIR/logs/watchdog.log 2>&1"
-if ! crontab -l 2>/dev/null | grep -qF "$PREFIX/deploy/fleet-watchdog.sh"; then
+if [ "$CRON" = 1 ] && ! crontab -l 2>/dev/null | grep -qF "$PREFIX/deploy/fleet-watchdog.sh"; then
+  command -v crontab > /dev/null || die "crontab not found (install cron, or pass --no-cron and keep Ray up another way)"
   (crontab -l 2>/dev/null; echo "$LINE") | crontab -
   say "cron watchdog installed (keeps Ray up after crashes and reboots)"
 fi

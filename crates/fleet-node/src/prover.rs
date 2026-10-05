@@ -126,6 +126,11 @@ impl Node {
         .await
         .map_err(|e| Status::internal(format!("prover panicked: {e}")))?
         .map_err(|e| Status::internal(format!("{e:#}")))?;
+        if self.backend == "mock" {
+            if let Some(ms) = std::env::var("FLEET_MOCK_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
         let prove_ms = server_ms.unwrap_or(t1.elapsed().as_millis() as u64);
         let proof_json = serde_json::to_vec(&proof.proof).map_err(|e| Status::internal(format!("encoding proof: {e}")))?;
         let wall_ms = t0.elapsed().as_millis() as u64;
