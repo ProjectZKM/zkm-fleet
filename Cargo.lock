@@ -2493,6 +2493,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",

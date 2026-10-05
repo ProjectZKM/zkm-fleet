@@ -4,7 +4,7 @@
 # detached and restarted by Ray itself.
 set -u
 . "${FLEET_ENV:-/etc/zkm-fleet/watchdog.env}"
-export PATH="$FLEET_HOME/venv/bin:$PATH" RAY_NODE_IP CUDA_VISIBLE_DEVICES
+export PATH="$FLEET_HOME/venv/bin:$PATH" RAY_NODE_IP CUDA_VISIBLE_DEVICES RAY_NUM_CPUS FLEET_WORKDIR
 mkdir -p "$FLEET_LOG"
 if ! ray status --address 127.0.0.1:6379 > /dev/null 2>&1 && ! ray status --address "${RAY_HEAD:-127.0.0.1}:6379" > /dev/null 2>&1; then
   echo "$(date -u +%FT%TZ) starting ray $RAY_ROLE"

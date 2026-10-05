@@ -74,4 +74,3 @@ What the SDK's scheme leaves open: the request signature covers `proof_id&seg_si
 | 31000-31099 fleet-node | cluster | the scheduler (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
 | Ray 6379, 6380, 6381, 10001, 8080, 52365, 10002-19999 | cluster | Ray |
-| Ray dashboard 8265 | 127.0.0.1 | operators (it can submit jobs) |

@@ -9,6 +9,9 @@
 #   --etc DIR             config and secrets          (default /etc/zkm-fleet)
 #   --bin DIR             where fleet-node and fleetctl were built (default ./target/release)
 #   --cuda LIST           cards Ray may hand out on this machine, e.g. 0,1,2,3 (default: none)
+#   --cpus N              CPUs Ray may hand out here (default: all; leave room on shared machines)
+#   --workdir DIR         this node's workspace: Ray session files, spilled objects, node logs
+#                         (default <prefix>/work; keep it off a root disk that must stay free)
 #   --head IP             Ray head address (node role)
 #   --cluster-token FILE  the control machine's cluster.token (node role)
 #   --ip IP               this machine's cluster address (default: first address of `hostname -I`)
@@ -22,7 +25,7 @@
 set -euo pipefail
 
 ROLE=${1:-}; shift || true
-PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; CUDA=""; HEAD=""; TOKEN=""; IP=""
+PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; CUDA=""; CPUS=""; WORKDIR=""; HEAD=""; TOKEN=""; IP=""
 PUBLIC_URL=""; TLS_NAMES=""; TLS=1; BIND_STAGE=0.0.0.0; BIND_HTTP=0.0.0.0
 RAY_VERSION=2.59.0
 while [ $# -gt 0 ]; do
@@ -31,6 +34,8 @@ while [ $# -gt 0 ]; do
     --etc) ETC=$2; shift 2 ;;
     --bin) BIN=$2; shift 2 ;;
     --cuda) CUDA=$2; shift 2 ;;
+    --cpus) CPUS=$2; shift 2 ;;
+    --workdir) WORKDIR=$2; shift 2 ;;
     --head) HEAD=$2; shift 2 ;;
     --cluster-token) TOKEN=$2; shift 2 ;;
     --ip) IP=$2; shift 2 ;;
@@ -62,19 +67,20 @@ fi
 [ "$ROLE" = node ] && { [ -n "$HEAD" ] || die "--head is required for a node"; [ -f "$TOKEN" ] || die "--cluster-token FILE is required for a node"; }
 for b in fleet-node fleetctl; do [ -x "$BIN/$b" ] || die "$BIN/$b not found: build first (cargo build --release --bins), or pass --bin"; done
 [ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
+[ -n "$WORKDIR" ] || WORKDIR="$PREFIX/work"
 mkdir -p "$PREFIX" "$ETC" 2>/dev/null || die "cannot create $PREFIX / $ETC: run as root, or pass --prefix and --etc under \$HOME"
 chmod 750 "$ETC"
 
 # ----------------------------------------------------------- files and venv
 say "installing into $PREFIX (config in $ETC)"
-mkdir -p "$PREFIX/bin" "$PREFIX/logs"
+mkdir -p "$PREFIX/bin" "$WORKDIR/logs"
 install -m 755 "$BIN/fleet-node" "$BIN/fleetctl" "$PREFIX/bin/"
 rm -rf "$PREFIX/bridge" "$PREFIX/deploy"
 cp -r "$SRC/bridge" "$SRC/deploy" "$PREFIX/"
 if ! "$PREFIX/venv/bin/python" -c "import ray, yaml, sys; sys.exit(ray.__version__ != '$RAY_VERSION')" 2>/dev/null; then
-  say "installing Ray $RAY_VERSION (this downloads ~300 MB)"
+  say "installing Ray $RAY_VERSION"
   python3 -m venv "$PREFIX/venv"
-  "$PREFIX/venv/bin/pip" install -q --timeout 120 --retries 10 "ray[default]==$RAY_VERSION" pyyaml
+  "$PREFIX/venv/bin/pip" install -q --timeout 120 --retries 10 "ray==$RAY_VERSION" pyyaml
 fi
 FLEETCTL="$PREFIX/bin/fleetctl"
 
@@ -145,15 +151,17 @@ fi
 cat > "$ETC/watchdog.env" <<EOF
 FLEET_HOME=$PREFIX
 FLEET_ETC=$ETC
-FLEET_LOG=$PREFIX/logs
+FLEET_LOG=$WORKDIR/logs
+FLEET_WORKDIR=$WORKDIR
+RAY_NUM_CPUS=$CPUS
 RAY_ROLE=$([ "$ROLE" = control ] && echo head || echo worker)
 RAY_HEAD=$HEAD
 RAY_NODE_IP=$IP
 CUDA_VISIBLE_DEVICES=$CUDA
 EOF
-say "starting Ray ($( [ "$ROLE" = control ] && echo head || echo "worker of $HEAD"), cards: ${CUDA:-none})"
+say "starting Ray ($( [ "$ROLE" = control ] && echo head || echo "worker of $HEAD"), cards: ${CUDA:-none}, cpus: ${CPUS:-all}, workspace $WORKDIR)"
 FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh"
-LINE="* * * * * FLEET_ENV=$ETC/watchdog.env $PREFIX/deploy/fleet-watchdog.sh >> $PREFIX/logs/watchdog.log 2>&1"
+LINE="* * * * * FLEET_ENV=$ETC/watchdog.env $PREFIX/deploy/fleet-watchdog.sh >> $WORKDIR/logs/watchdog.log 2>&1"
 if ! crontab -l 2>/dev/null | grep -qF "$PREFIX/deploy/fleet-watchdog.sh"; then
   (crontab -l 2>/dev/null; echo "$LINE") | crontab -
   say "cron watchdog installed (keeps Ray up after crashes and reboots)"
@@ -166,7 +174,7 @@ if [ "$ROLE" = control ]; then
       echo "scheduler: http://$IP:51001"
       echo "cluster_token_file: $ETC/cluster.token"
       echo "node_binary: $PREFIX/bin/fleet-node"
-      echo "log_dir: $PREFIX/logs"
+      echo "log_dir: $WORKDIR/logs"
       echo "services: []            # add ziren-gpu / ziren-cpu services, then: $PREFIX/deploy/apply.sh"
     } > "$ETC/services.yaml"
   fi

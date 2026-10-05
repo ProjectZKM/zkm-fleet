@@ -28,12 +28,15 @@ pub struct Args {
     /// GPU server twirp endpoint, for the cuda backend.
     #[arg(long, env = "FLEET_GPU_ENDPOINT", default_value = "http://127.0.0.1:3000/twirp/")]
     gpu_endpoint: String,
-    /// Where NodeService listens.
-    #[arg(long, env = "FLEET_LISTEN", default_value = "0.0.0.0:31000")]
-    listen: SocketAddr,
-    /// How the scheduler reaches this node, e.g. http://10.0.0.5:31000.
-    #[arg(long, env = "FLEET_ADVERTISE")]
-    advertise: String,
+    /// Interface NodeService listens on.
+    #[arg(long, env = "FLEET_LISTEN_IP", default_value = "0.0.0.0")]
+    listen_ip: std::net::IpAddr,
+    /// Ports to try, first free one wins (atomic: several nodes on one machine cannot collide).
+    #[arg(long, env = "FLEET_PORT_RANGE", default_value = "31000-31099")]
+    port_range: String,
+    /// Host the scheduler reaches this node at (the machine's cluster address).
+    #[arg(long, env = "FLEET_ADVERTISE_HOST")]
+    advertise_host: String,
     /// Scheduler control API, e.g. http://10.0.0.1:51001.
     #[arg(long, env = "FLEET_SCHEDULER")]
     scheduler: String,
@@ -70,16 +73,32 @@ async fn main() -> anyhow::Result<()> {
         .max_decoding_message_size(1 << 30)
         .max_encoding_message_size(1 << 30);
     let service = tonic::service::interceptor::InterceptedService::new(service, prover::RequireToken(Arc::new(token.clone())));
-    let server = Server::builder().add_service(service).serve(args.listen);
-    tracing::info!(listen = %args.listen, backend = %args.backend, "node service up");
+    let (listener, port) = bind_in_range(args.listen_ip, &args.port_range)?;
+    let advertise = format!("http://{}:{port}", args.advertise_host);
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+    let server = Server::builder().add_service(service).serve_with_incoming(incoming);
+    tracing::info!(port, %advertise, backend = %args.backend, "node service up");
 
-    let control = tokio::spawn(control_loop(args.clone(), token, node.clone()));
+    let control = tokio::spawn(control_loop(args.clone(), advertise, token, node.clone()));
     tokio::select! {
         r = server => r?,
         r = control => r??,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
     }
     Ok(())
+}
+
+/// Binds the first free port of `lo-hi`.
+fn bind_in_range(ip: std::net::IpAddr, range: &str) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    let (lo, hi) = range.split_once('-').ok_or_else(|| anyhow::anyhow!("port range must be lo-hi"))?;
+    let (lo, hi): (u16, u16) = (lo.trim().parse()?, hi.trim().parse()?);
+    for port in lo..=hi {
+        if let Ok(l) = std::net::TcpListener::bind(SocketAddr::new(ip, port)) {
+            l.set_nonblocking(true)?;
+            return Ok((tokio::net::TcpListener::from_std(l)?, port));
+        }
+    }
+    anyhow::bail!("no free port in {range}")
 }
 
 fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
@@ -96,11 +115,11 @@ async fn control_client(args: &Args, token: &str) -> anyhow::Result<Control> {
 }
 
 /// Registers, heartbeats, re-registers when the scheduler forgets us, deregisters on exit.
-async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> anyhow::Result<()> {
+async fn control_loop(args: Args, advertise: String, token: String, node: Arc<prover::Node>) -> anyhow::Result<()> {
     let mut client = control_client(&args, &token).await?;
     let info = NodeInfo {
         name: args.name.clone(),
-        endpoint: args.advertise.clone(),
+        endpoint: advertise,
         backend: args.backend.clone(),
         gpus: args.gpus,
         cpus: args.cpus,

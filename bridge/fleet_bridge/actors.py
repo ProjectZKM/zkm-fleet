@@ -16,6 +16,7 @@ import os
 import shlex
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -24,17 +25,6 @@ import ray
 
 def spec_hash(spec: dict) -> str:
     return hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:16]
-
-
-def _free_port(lo: int, hi: int) -> int:
-    for port in range(lo, hi + 1):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(("0.0.0.0", port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(f"no free port in {lo}-{hi}")
 
 
 def _gpu_ready(port: int) -> bool:
@@ -51,14 +41,15 @@ def _gpu_ready(port: int) -> bool:
         return False
 
 
-def _node_env(spec: dict, name: str, backend: str, node_port: int, extra: dict) -> dict:
+def _node_env(spec: dict, name: str, backend: str, extra: dict) -> dict:
     env = dict(os.environ)
+    lo, hi = spec.get("node_port_range", [31000, 31099])
     env.update(
         {
             "FLEET_NODE_NAME": name,
             "FLEET_BACKEND": backend,
-            "FLEET_LISTEN": f"0.0.0.0:{node_port}",
-            "FLEET_ADVERTISE": f"http://{ray.util.get_node_ip_address()}:{node_port}",
+            "FLEET_PORT_RANGE": f"{lo}-{hi}",
+            "FLEET_ADVERTISE_HOST": ray.util.get_node_ip_address(),
             "FLEET_SCHEDULER": spec["scheduler"],
             "FLEET_CLUSTER_TOKEN_FILE": spec["cluster_token_file"],
             "FLEET_MACHINE": socket.gethostname(),
@@ -69,6 +60,19 @@ def _node_env(spec: dict, name: str, backend: str, node_port: int, extra: dict) 
     # The node itself does not touch the GPUs; the GPU server does.
     env.pop("CUDA_VISIBLE_DEVICES", None)
     return env
+
+
+def _watch(alive, cleanup, every_s: float = 5.0):
+    """Exits the actor process when what it owns dies, so Ray restarts the actor."""
+
+    def loop():
+        while True:
+            time.sleep(every_s)
+            if not alive():
+                cleanup()
+                os._exit(1)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 class _NodeProcess:
@@ -98,10 +102,6 @@ class ZirenGpuProver:
         if not gpus:
             raise RuntimeError("actor was granted no GPU")
         self.gpus = gpus
-        lo, hi = spec.get("gpu_port_range", [30100, 30199])
-        self.gpu_port = _free_port(lo, hi)
-        lo, hi = spec.get("node_port_range", [31000, 31099])
-        self.node_port = _free_port(lo, hi)
         log_dir = spec.get("log_dir", "/tmp/zkm-fleet")
         os.makedirs(log_dir, exist_ok=True)
 
@@ -111,20 +111,28 @@ class ZirenGpuProver:
             env_args += ["-e", f"{k}={v}"]
         for k in ("CUDA_VISIBLE_DEVICES", "ZKM_GPU_DEVICES"):
             env_args += ["-e", f"{k}={','.join(str(i) for i in range(len(gpus)))}"]
-        cmd = [
-            "docker", "run", "-d", "--name", self.container,
-            "--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"',
-            f"--shm-size={spec.get('shm_gb', 64)}g",
-            "-p", f"127.0.0.1:{self.gpu_port}:3000",
-            "--label", "zkm-fleet=gpu-server", "--label", f"zkm-fleet.node={self.name}",
-            *env_args,
-        ]
-        for v in spec.get("volumes", []):
-            cmd += ["-v", v]
-        cmd.append(spec["image"])
-        out = subprocess.run(cmd, capture_output=True, text=True)
-        if out.returncode != 0:
-            raise RuntimeError(f"docker run failed: {out.stderr.strip()} ({shlex.join(cmd)})")
+        lo, hi = spec.get("gpu_port_range", [30100, 30199])
+        for port in range(lo, hi + 1):
+            cmd = [
+                "docker", "run", "-d", "--name", self.container,
+                "--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"',
+                f"--shm-size={spec.get('shm_gb', 64)}g",
+                "-p", f"127.0.0.1:{port}:3000",
+                "--label", "zkm-fleet=gpu-server", "--label", f"zkm-fleet.node={self.name}",
+                *env_args,
+            ]
+            for v in spec.get("volumes", []):
+                cmd += ["-v", v]
+            cmd.append(spec["image"])
+            out = subprocess.run(cmd, capture_output=True, text=True)
+            if out.returncode == 0:
+                self.gpu_port = port
+                break
+            subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+            if "port is already allocated" not in out.stderr and "address already in use" not in out.stderr:
+                raise RuntimeError(f"docker run failed: {out.stderr.strip()} ({shlex.join(cmd)})")
+        else:
+            raise RuntimeError(f"no free GPU server port in {lo}-{hi}")
 
         deadline = time.time() + spec.get("ready_timeout_s", 600)
         while not _gpu_ready(self.gpu_port):
@@ -134,7 +142,7 @@ class ZirenGpuProver:
             time.sleep(2)
 
         env = _node_env(
-            spec, self.name, "cuda", self.node_port,
+            spec, self.name, "cuda",
             {
                 "FLEET_GPU_ENDPOINT": f"http://127.0.0.1:{self.gpu_port}/twirp/",
                 "FLEET_GPUS": len(gpus),
@@ -143,6 +151,7 @@ class ZirenGpuProver:
             },
         )
         self.node = _NodeProcess(spec["node_binary"], env, f"{log_dir}/{self.name}.node.log")
+        _watch(lambda: self.node.alive() and self._container_running(), self.shutdown)
 
     def _container_running(self) -> bool:
         out = subprocess.run(
@@ -161,7 +170,6 @@ class ZirenGpuProver:
             "spec": spec_hash(self.spec),
             "gpus": self.gpus,
             "gpu_port": self.gpu_port,
-            "node_port": self.node_port,
             "gpu_ready": _gpu_ready(self.gpu_port),
             "machine": socket.gethostname(),
         }
@@ -178,23 +186,22 @@ class ZirenCpuProver:
     def __init__(self, spec: dict):
         self.spec = spec
         self.name = spec["name"]
-        lo, hi = spec.get("node_port_range", [31000, 31099])
-        self.node_port = _free_port(lo, hi)
         log_dir = spec.get("log_dir", "/tmp/zkm-fleet")
         os.makedirs(log_dir, exist_ok=True)
         backend = spec.get("backend", "cpu")
         env = _node_env(
-            spec, self.name, backend, self.node_port,
+            spec, self.name, backend,
             {"FLEET_CPUS": spec.get("cpus", 0), "RAYON_NUM_THREADS": spec.get("cpus", 0) or ""},
         )
         if not env.get("RAYON_NUM_THREADS"):
             env.pop("RAYON_NUM_THREADS")
         self.node = _NodeProcess(spec["node_binary"], env, f"{log_dir}/{self.name}.node.log")
+        _watch(self.node.alive, self.shutdown)
 
     def health(self) -> dict:
         if not self.node.alive():
             os._exit(1)
-        return {"name": self.name, "spec": spec_hash(self.spec), "node_port": self.node_port, "machine": socket.gethostname()}
+        return {"name": self.name, "spec": spec_hash(self.spec), "machine": socket.gethostname()}
 
     def shutdown(self):
         self.node.stop()
