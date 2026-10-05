@@ -18,6 +18,7 @@
 #   --public-url URL      how clients reach the scheduler's http port (control; default http://<ip>:9191)
 #   --tls-names LIST      names on the stage certificate (control; default stage,<hostname>)
 #   --no-tls              no TLS on the stage API: only when it is bound to loopback (control)
+#   --subnet CIDR         /24 for the control containers (control; default 172.28.250.0/24)
 #   --bind-stage IP       interface for the stage API (control; default 0.0.0.0)
 #   --bind-http IP        interface for public values and /admin (control; default 0.0.0.0)
 #   --no-cron             do not install the cron watchdog (containers, tests)
@@ -27,7 +28,7 @@ set -euo pipefail
 
 ROLE=${1:-}; shift || true
 PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; CUDA=""; CPUS=""; WORKDIR=""; HEAD=""; TOKEN=""; IP=""
-PUBLIC_URL=""; TLS_NAMES=""; TLS=1; BIND_STAGE=0.0.0.0; BIND_HTTP=0.0.0.0; CRON=1
+PUBLIC_URL=""; TLS_NAMES=""; SUBNET=172.28.250.0/24; TLS=1; BIND_STAGE=0.0.0.0; BIND_HTTP=0.0.0.0; CRON=1
 RAY_VERSION=2.59.0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
     --public-url) PUBLIC_URL=$2; shift 2 ;;
     --tls-names) TLS_NAMES=$2; shift 2 ;;
     --no-tls) TLS=0; shift ;;
+    --subnet) SUBNET=$2; shift 2 ;;
     --bind-stage) BIND_STAGE=$2; shift 2 ;;
     --bind-http) BIND_HTTP=$2; shift 2 ;;
     --no-cron) CRON=0; shift ;;
@@ -127,12 +129,6 @@ if [ "$ROLE" = control ]; then
       echo "require_signature: true"
       echo "cluster_token_file: /etc/zkm-fleet/cluster.token"
       echo "admin_token_file: /etc/zkm-fleet/admin.token"
-      if [ "$TLS" = 1 ]; then
-        echo "tls:"
-        echo "  cert_path: /etc/zkm-fleet/tls/server.pem"
-        echo "  key_path: /etc/zkm-fleet/tls/server.key"
-        echo "  client_ca_path: /etc/zkm-fleet/tls/ca.pem"
-      fi
       echo "tenants:"
       echo "  - name: ethproofs"
       echo "    class: latency"
@@ -144,6 +140,30 @@ if [ "$ROLE" = control ]; then
     } > "$ETC/fleet.yaml"
   fi
   [ "$TLS" = 0 ] && [ "$BIND_STAGE" != 127.0.0.1 ] && die "--no-tls requires --bind-stage 127.0.0.1"
+  # The gateway terminates mTLS now; an older fleet.yaml still has the scheduler do it.
+  if grep -q '^tls:' "$ETC/fleet.yaml"; then
+    say "moving stage TLS from fleet.yaml to the gateway"
+    awk '/^tls:/{skip=1; next} skip && /^[[:space:]]/{next} {skip=0; print}' "$ETC/fleet.yaml" > "$ETC/fleet.yaml.new"
+    mv "$ETC/fleet.yaml.new" "$ETC/fleet.yaml"
+  fi
+  if [ "$TLS" = 1 ]; then
+    STAGE_TLS='          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              require_client_certificate: true
+              common_tls_context:
+                alpn_protocols: [h2]
+                tls_certificates:
+                  - certificate_chain: { filename: /etc/zkm-fleet/tls/server.pem }
+                    private_key: { filename: /etc/zkm-fleet/tls/server.key }
+                validation_context: { trusted_ca: { filename: /etc/zkm-fleet/tls/ca.pem } }'
+  else
+    STAGE_TLS=""
+  fi
+  SCHED_IP="${SUBNET%.*}.10"
+  STAGE_TLS="$STAGE_TLS" awk '/# @STAGE_TLS@/{ if (ENVIRON["STAGE_TLS"] != "") print ENVIRON["STAGE_TLS"]; next } {print}' \
+    "$PREFIX/deploy/gateway.yaml.in" | sed "s/@SCHEDULER_IP@/$SCHED_IP/" > "$ETC/gateway.yaml"
   mkdir -p "$PREFIX/data"
   cat > "$PREFIX/compose.env" <<EOF
 FLEET_ETC=$ETC
@@ -153,6 +173,8 @@ FLEET_GID=$(id -g)
 STAGE_BIND=$BIND_STAGE
 CONTROL_BIND=$IP
 HTTP_BIND=$BIND_HTTP
+FLEET_SUBNET=$SUBNET
+FLEET_SCHEDULER_IP=$SCHED_IP
 EOF
   IMG=$(grep -E '^ *image: \$\{FLEET_SCHEDULER_IMAGE' "$PREFIX/deploy/docker-compose.yml" | sed -E 's/.*:-([^}]*)\}.*/\1/')
   if ! docker image inspect "${FLEET_SCHEDULER_IMAGE:-$IMG}" > /dev/null 2>&1; then
@@ -160,8 +182,9 @@ EOF
     say "building the scheduler image (first install)"
     docker build -q -f "$SRC/deploy/Dockerfile.scheduler" -t "${FLEET_SCHEDULER_IMAGE:-$IMG}" "$SRC" > /dev/null
   fi
-  say "starting the scheduler and Postgres (docker compose)"
+  say "starting the scheduler, its gateway and Postgres (docker compose)"
   docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d
+  docker network rm zkm-fleet_default > /dev/null 2>&1 || true   # left by installs before the fixed subnet
   for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:9191/healthz" > /dev/null 2>&1 && break; sleep 2; done
   curl -sf "http://127.0.0.1:9191/healthz" > /dev/null || die "scheduler did not come up: docker compose -p zkm-fleet logs scheduler"
 fi

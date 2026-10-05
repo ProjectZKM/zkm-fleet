@@ -37,7 +37,9 @@ impl JobState {
             0 => JobState::Queued,
             1 => JobState::Running,
             2 => JobState::Succeeded,
-            _ => JobState::Failed(StageStatus::try_from(status).unwrap_or(StageStatus::InternalError)),
+            _ => JobState::Failed(
+                StageStatus::try_from(status).unwrap_or(StageStatus::InternalError),
+            ),
         }
     }
 }
@@ -75,7 +77,10 @@ pub struct Credential {
 }
 
 pub fn normalize_address(a: &str) -> String {
-    a.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase()
+    a.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_lowercase()
 }
 
 #[async_trait]
@@ -109,21 +114,34 @@ impl Store for MemoryStore {
     }
 
     async fn incomplete(&self) -> anyhow::Result<Vec<Job>> {
-        let mut v: Vec<Job> =
-            self.jobs.lock().values().filter(|j| !j.state.is_terminal()).cloned().collect();
+        let mut v: Vec<Job> = self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| !j.state.is_terminal())
+            .cloned()
+            .collect();
         v.sort_by_key(|j| j.created_ms);
         Ok(v)
     }
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {
         let mut creds = self.creds.lock();
-        anyhow::ensure!(!creds.contains_key(&c.address), "address already registered");
+        anyhow::ensure!(
+            !creds.contains_key(&c.address),
+            "address already registered"
+        );
         creds.insert(c.address.clone(), c.clone());
         Ok(())
     }
 
     async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool> {
-        Ok(self.creds.lock().get_mut(&normalize_address(address)).map(|c| c.revoked_ms = Some(at_ms)).is_some())
+        Ok(self
+            .creds
+            .lock()
+            .get_mut(&normalize_address(address))
+            .map(|c| c.revoked_ms = Some(at_ms))
+            .is_some())
     }
 
     async fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
@@ -178,17 +196,26 @@ impl PgStore {
             id: row.try_get("id")?,
             tenant: row.try_get("tenant")?,
             elf_id: row.try_get("elf_id")?,
-            kind: ProofKind::try_from(row.try_get::<i32, _>("kind")?).unwrap_or(ProofKind::Unspecified),
+            kind: ProofKind::try_from(row.try_get::<i32, _>("kind")?)
+                .unwrap_or(ProofKind::Unspecified),
             state: JobState::from_db(row.try_get("state")?, row.try_get("status")?),
             error: row.try_get("error")?,
             node: row.try_get("node")?,
             attempts: row.try_get::<i32, _>("attempts")? as u32,
-            failed_on: failed_on.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+            failed_on: failed_on
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
             cycles: row.try_get::<i64, _>("cycles")? as u64,
             prove_ms: row.try_get::<i64, _>("prove_ms")? as u64,
             created_ms: row.try_get::<i64, _>("created_ms")? as u64,
-            started_ms: row.try_get::<Option<i64>, _>("started_ms")?.map(|v| v as u64),
-            finished_ms: row.try_get::<Option<i64>, _>("finished_ms")?.map(|v| v as u64),
+            started_ms: row
+                .try_get::<Option<i64>, _>("started_ms")?
+                .map(|v| v as u64),
+            finished_ms: row
+                .try_get::<Option<i64>, _>("finished_ms")?
+                .map(|v| v as u64),
         })
     }
 }
@@ -260,7 +287,9 @@ impl Store for PgStore {
     }
 
     async fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
-        let rows = sqlx::query("SELECT * FROM fleet_credentials ORDER BY created_ms").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT * FROM fleet_credentials ORDER BY created_ms")
+            .fetch_all(&self.pool)
+            .await?;
         rows.iter()
             .map(|r| {
                 Ok(Credential {

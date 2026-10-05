@@ -17,7 +17,11 @@ pub const PUBLIC_VALUES: &str = "public_values.bin";
 /// Ids are used as path components; accept only what the SDK produces
 /// (uuids, hex digests) so a request cannot escape the data directory.
 pub fn is_safe_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 pub fn elf_id_of(elf: &[u8]) -> String {
@@ -28,7 +32,9 @@ impl Blobs {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(root.join("elf"))?;
         std::fs::create_dir_all(root.join("jobs"))?;
-        Ok(Self { root: root.to_path_buf() })
+        Ok(Self {
+            root: root.to_path_buf(),
+        })
     }
 
     pub fn put_elf(&self, elf: &[u8]) -> anyhow::Result<String> {

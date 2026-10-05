@@ -27,12 +27,18 @@ pub fn router(state: HttpState) -> Router {
     let admin = Router::new()
         .route("/status", get(status))
         .route("/credentials", get(list_credentials).post(add_credential))
-        .route("/credentials/:address", axum::routing::delete(revoke_credential))
+        .route(
+            "/credentials/:address",
+            axum::routing::delete(revoke_credential),
+        )
         .route("/elfs", post(put_elf))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
         .layer(DefaultBodyLimit::max(512 << 20))
-        .route_layer(axum::middleware::from_fn_with_state(state.clone(), require_admin));
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/:proof_id/wrap/public_values.bin", get(public_values))
@@ -86,7 +92,11 @@ struct NewCredential {
 }
 
 async fn add_credential(State(s): State<HttpState>, Json(c): Json<NewCredential>) -> Response {
-    match s.fleet.add_credential(&c.tenant, &c.address, &c.label).await {
+    match s
+        .fleet
+        .add_credential(&c.tenant, &c.address, &c.label)
+        .await
+    {
         Ok(cred) => {
             tracing::info!(tenant = %cred.tenant, address = %cred.address, label = %cred.label, "credential added");
             (StatusCode::CREATED, Json(cred)).into_response()
@@ -134,7 +144,11 @@ async fn drain(State(s): State<HttpState>, Path(name): Path<String>) -> Response
     if s.fleet.set_drain(&name, true) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        (StatusCode::NOT_FOUND, "no such node (the drain is kept for when it registers)").into_response()
+        (
+            StatusCode::NOT_FOUND,
+            "no such node (the drain is kept for when it registers)",
+        )
+            .into_response()
     }
 }
 

@@ -53,7 +53,11 @@ impl tonic::service::Interceptor for Attach {
 /// Reads a token from a file (trimmed); refuses an empty one.
 pub fn load(path: &std::path::Path) -> anyhow::Result<String> {
     let t = std::fs::read_to_string(path)?.trim().to_string();
-    anyhow::ensure!(t.len() >= 32, "token in {} is shorter than 32 characters", path.display());
+    anyhow::ensure!(
+        t.len() >= 32,
+        "token in {} is shorter than 32 characters",
+        path.display()
+    );
     Ok(t)
 }
 

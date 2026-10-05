@@ -12,16 +12,24 @@ use tonic::{Request, Response, Status};
 use fleet_proto::fleet::v1::{
     control_service_client::ControlServiceClient,
     node_service_server::{NodeService, NodeServiceServer},
-    HealthRequest, HealthResponse, HeartbeatRequest, NodeInfo, ProveRequest, ProveResponse, RegisterRequest,
+    HealthRequest, HealthResponse, HeartbeatRequest, NodeInfo, ProveRequest, ProveResponse,
+    RegisterRequest,
 };
-use fleet_proto::stage::v1::{stage_service_client::StageServiceClient, GenerateProofRequest, GetStatusRequest, Status as S, Step};
+use fleet_proto::stage::v1::{
+    stage_service_client::StageServiceClient, GenerateProofRequest, GetStatusRequest, Status as S,
+    Step,
+};
 use fleet_scheduler::config::Config;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef-cluster";
 const ADMIN: &str = "0123456789abcdef0123456789abcdef-admin!";
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 struct FakeNode {
@@ -34,7 +42,12 @@ struct FakeNode {
 #[tonic::async_trait]
 impl NodeService for FakeNode {
     async fn prove(&self, req: Request<ProveRequest>) -> Result<Response<ProveResponse>, Status> {
-        let auth = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        let auth = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         if auth != format!("Bearer {TOKEN}") {
             return Err(Status::unauthenticated("bad token"));
         }
@@ -46,7 +59,12 @@ impl NodeService for FakeNode {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
         Ok(Response::new(ProveResponse {
-            proof_json: format!("{{\"node\":\"{}\",\"stdin\":{}}}", self.name, r.stdin_buffer.len()).into_bytes(),
+            proof_json: format!(
+                "{{\"node\":\"{}\",\"stdin\":{}}}",
+                self.name,
+                r.stdin_buffer.len()
+            )
+            .into_bytes(),
             public_values: vec![7, 7, 7],
             cycles: 1234,
             prove_ms: 100,
@@ -56,7 +74,11 @@ impl NodeService for FakeNode {
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse { ready: true, cached_elf_ids: vec![], busy: false }))
+        Ok(Response::new(HealthResponse {
+            ready: true,
+            cached_elf_ids: vec![],
+            busy: false,
+        }))
     }
 }
 
@@ -104,18 +126,42 @@ tenants:
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    Harness { stage, http: format!("http://127.0.0.1:{hp}"), control_port: cp, _dir: dir }
+    Harness {
+        stage,
+        http: format!("http://127.0.0.1:{hp}"),
+        control_port: cp,
+        _dir: dir,
+    }
 }
 
-async fn add_node(h: &Harness, name: &str, gpus: u32, fail_first: bool) -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+async fn add_node(
+    h: &Harness,
+    name: &str,
+    gpus: u32,
+    fail_first: bool,
+) -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let port = free_port();
     let calls = Arc::new(AtomicUsize::new(0));
     let jobs = Arc::new(Mutex::new(vec![]));
-    let svc = FakeNode { name: name.into(), calls: calls.clone(), jobs: jobs.clone(), fail_first };
-    tokio::spawn(Server::builder().add_service(NodeServiceServer::new(svc)).serve(format!("127.0.0.1:{port}").parse().unwrap()));
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port)).unwrap().connect().await.unwrap();
+    let svc = FakeNode {
+        name: name.into(),
+        calls: calls.clone(),
+        jobs: jobs.clone(),
+        fail_first,
+    };
+    tokio::spawn(
+        Server::builder()
+            .add_service(NodeServiceServer::new(svc))
+            .serve(format!("127.0.0.1:{port}").parse().unwrap()),
+    );
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
     let mut ctl = ControlServiceClient::with_interceptor(channel, |mut r: Request<()>| {
-        r.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        r.metadata_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
         Ok(r)
     });
     let id = ctl
@@ -137,7 +183,13 @@ async fn add_node(h: &Harness, name: &str, gpus: u32, fail_first: bool) -> (Arc<
         .node_id;
     tokio::spawn(async move {
         loop {
-            let _ = ctl.heartbeat(HeartbeatRequest { node_id: id.clone(), ready: true, cached_elf_ids: vec![] }).await;
+            let _ = ctl
+                .heartbeat(HeartbeatRequest {
+                    node_id: id.clone(),
+                    ready: true,
+                    ..Default::default()
+                })
+                .await;
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
@@ -157,7 +209,14 @@ fn request(id: &str, elf: &[u8]) -> GenerateProofRequest {
 
 async fn wait_done(h: &mut Harness, id: &str) -> fleet_proto::stage::v1::GetStatusResponse {
     for _ in 0..40 {
-        let r = h.stage.get_status(GetStatusRequest { proof_id: id.into() }).await.unwrap().into_inner();
+        let r = h
+            .stage
+            .get_status(GetStatusRequest {
+                proof_id: id.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
         if r.status != S::Computing as i32 {
             return r;
         }
@@ -169,17 +228,37 @@ async fn wait_done(h: &mut Harness, id: &str) -> fleet_proto::stage::v1::GetStat
 async fn a_job_runs_end_to_end_and_its_public_values_are_served() {
     let mut h = start().await;
     add_node(&h, "gpu-a", 2, false).await;
-    let r = h.stage.generate_proof(request("job-1", b"elf-one")).await.unwrap().into_inner();
+    let r = h
+        .stage
+        .generate_proof(request("job-1", b"elf-one"))
+        .await
+        .unwrap()
+        .into_inner();
     assert_eq!(r.status, S::Computing as i32);
     let s = wait_done(&mut h, "job-1").await;
     assert_eq!(s.status, S::Success as i32);
-    assert_eq!(String::from_utf8(s.proof_with_public_inputs).unwrap(), r#"{"node":"gpu-a","stdin":2}"#);
+    assert_eq!(
+        String::from_utf8(s.proof_with_public_inputs).unwrap(),
+        r#"{"node":"gpu-a","stdin":2}"#
+    );
     assert_eq!(s.total_steps, 1234);
     assert_eq!(s.proving_time, 100);
-    let pv = std::process::Command::new("curl").args(["-sf", &s.public_values_url]).output().unwrap();
+    let pv = std::process::Command::new("curl")
+        .args(["-sf", &s.public_values_url])
+        .output()
+        .unwrap();
     assert_eq!(pv.stdout, vec![7, 7, 7]);
-    let again = h.stage.generate_proof(request("job-1", b"something else")).await.unwrap().into_inner();
-    assert_eq!(again.status, S::Computing as i32, "a known proof id is idempotent");
+    let again = h
+        .stage
+        .generate_proof(request("job-1", b"something else"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        again.status,
+        S::Computing as i32,
+        "a known proof id is idempotent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -193,7 +272,10 @@ async fn rejections_surface_through_get_status() {
     let mut bad = request("job-y", b"elf");
     bad.target_step = Some(Step::InSplit as i32);
     h.stage.generate_proof(bad).await.unwrap();
-    assert_eq!(wait_done(&mut h, "job-y").await.status, S::InvalidParameter as i32);
+    assert_eq!(
+        wait_done(&mut h, "job-y").await.status,
+        S::InvalidParameter as i32
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -201,10 +283,15 @@ async fn a_failed_attempt_moves_to_another_node() {
     let mut h = start().await;
     let (a_calls, _) = add_node(&h, "gpu-a", 4, true).await;
     let (b_calls, _) = add_node(&h, "gpu-b", 1, false).await;
-    h.stage.generate_proof(request("job-r", b"elf-r")).await.unwrap();
+    h.stage
+        .generate_proof(request("job-r", b"elf-r"))
+        .await
+        .unwrap();
     let s = wait_done(&mut h, "job-r").await;
     assert_eq!(s.status, S::Success as i32);
-    assert!(String::from_utf8(s.proof_with_public_inputs).unwrap().contains("gpu-b"));
+    assert!(String::from_utf8(s.proof_with_public_inputs)
+        .unwrap()
+        .contains("gpu-b"));
     assert_eq!(a_calls.load(Ordering::SeqCst), 1);
     assert_eq!(b_calls.load(Ordering::SeqCst), 1);
 }
@@ -216,19 +303,44 @@ async fn an_exclusive_anchor_keeps_the_program_and_keeps_others_off_the_node() {
     let (_, b_jobs) = add_node(&h, "gpu-b", 1, false).await;
     for i in 0..3 {
         let id = format!("eth-{i}");
-        h.stage.generate_proof(request(&id, b"eth-guest")).await.unwrap();
+        h.stage
+            .generate_proof(request(&id, b"eth-guest"))
+            .await
+            .unwrap();
         assert_eq!(wait_done(&mut h, &id).await.status, S::Success as i32);
     }
-    assert_eq!(a_jobs.lock().len(), 3, "latency tenant anchored on the larger node");
+    assert_eq!(
+        a_jobs.lock().len(),
+        3,
+        "latency tenant anchored on the larger node"
+    );
     let st = std::process::Command::new("curl")
-        .args(["-sf", "-H", &format!("authorization: Bearer {ADMIN}"), &format!("{}/admin/status", h.http)])
+        .args([
+            "-sf",
+            "-H",
+            &format!("authorization: Bearer {ADMIN}"),
+            &format!("{}/admin/status", h.http),
+        ])
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
-    let a = v["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "gpu-a").unwrap().clone();
+    let a = v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "gpu-a")
+        .unwrap()
+        .clone();
     assert_eq!(a["reserved_for"], "eth");
     let unauth = std::process::Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/status", h.http)])
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("{}/admin/status", h.http),
+        ])
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(unauth.stdout).unwrap(), "401");
@@ -238,7 +350,17 @@ async fn an_exclusive_anchor_keeps_the_program_and_keeps_others_off_the_node() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_control_api_refuses_a_node_without_the_cluster_token() {
     let h = start().await;
-    let mut ctl = ControlServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port)).await.unwrap();
-    let err = ctl.register(RegisterRequest { node: Some(NodeInfo { name: "rogue".into(), ..Default::default() }) }).await.unwrap_err();
+    let mut ctl = ControlServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port))
+        .await
+        .unwrap();
+    let err = ctl
+        .register(RegisterRequest {
+            node: Some(NodeInfo {
+                name: "rogue".into(),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }

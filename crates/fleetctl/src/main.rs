@@ -15,7 +15,12 @@ use serde_json::Value;
 #[command(about = "Operate a zkm-fleet cluster and issue its credentials")]
 struct Cli {
     /// Scheduler HTTP base URL (admin API under /admin).
-    #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9191", global = true)]
+    #[arg(
+        long,
+        env = "FLEET_URL",
+        default_value = "http://127.0.0.1:9191",
+        global = true
+    )]
     url: String,
     /// File holding the admin token (default: admin.token in FLEET_ETC, ~/.config/zkm-fleet or /etc/zkm-fleet).
     #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE", global = true)]
@@ -74,7 +79,9 @@ enum CredentialCmd {
         domain_name: Option<String>,
     },
     List,
-    Revoke { address: String },
+    Revoke {
+        address: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -114,8 +121,12 @@ enum ElfCmd {
 #[derive(Subcommand)]
 enum NodeCmd {
     /// Stop placing new jobs on a node (it finishes the current one).
-    Drain { name: String },
-    Undrain { name: String },
+    Drain {
+        name: String,
+    },
+    Undrain {
+        name: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -130,7 +141,11 @@ fn main() -> anyhow::Result<()> {
         Cmd::Tls(TlsCmd::Init { dir, names }) => tls_init(dir, names)?,
         Cmd::Tls(TlsCmd::Client { dir, name }) => {
             let (c, k) = tls_client(dir, name)?;
-            println!("client certificate: SSL_CERT_PATH={} SSL_KEY_PATH={}", c.display(), k.display());
+            println!(
+                "client certificate: SSL_CERT_PATH={} SSL_KEY_PATH={}",
+                c.display(),
+                k.display()
+            );
         }
         _ => admin(&cli)?,
     }
@@ -147,14 +162,24 @@ impl Admin {
     fn new(cli: &Cli) -> anyhow::Result<Self> {
         let path = match &cli.admin_token_file {
             Some(p) => p.clone(),
-            None => default_admin_token().context("no admin token: pass --admin-token-file or set FLEET_ADMIN_TOKEN_FILE")?,
+            None => default_admin_token()
+                .context("no admin token: pass --admin-token-file or set FLEET_ADMIN_TOKEN_FILE")?,
         };
-        let token = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?.trim().to_string();
-        Ok(Self { url: cli.url.trim_end_matches('/').to_string(), token, http: reqwest::blocking::Client::new() })
+        let token = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?
+            .trim()
+            .to_string();
+        Ok(Self {
+            url: cli.url.trim_end_matches('/').to_string(),
+            token,
+            http: reqwest::blocking::Client::new(),
+        })
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
-        self.http.request(method, format!("{}/admin{path}", self.url)).bearer_auth(&self.token)
+        self.http
+            .request(method, format!("{}/admin{path}", self.url))
+            .bearer_auth(&self.token)
     }
 
     fn send(&self, rb: reqwest::blocking::RequestBuilder) -> anyhow::Result<Option<Value>> {
@@ -164,7 +189,11 @@ impl Admin {
         if !status.is_success() {
             bail!("{status}: {body}");
         }
-        Ok(if body.is_empty() { None } else { Some(serde_json::from_str(&body).unwrap_or(Value::String(body))) })
+        Ok(if body.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&body).unwrap_or(Value::String(body)))
+        })
     }
 }
 
@@ -180,9 +209,19 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
                 print_status(&v);
             }
         }
-        Cmd::Credential(CredentialCmd::Issue { tenant, label, out, endpoint, tls_dir, domain_name }) => {
+        Cmd::Credential(CredentialCmd::Issue {
+            tenant,
+            label,
+            out,
+            endpoint,
+            tls_dir,
+            domain_name,
+        }) => {
             if out.exists() {
-                bail!("{} exists; refusing to overwrite a credential", out.display());
+                bail!(
+                    "{} exists; refusing to overwrite a credential",
+                    out.display()
+                );
             }
             let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
             let address = alloy_primitives::Address::from_private_key(&key);
@@ -198,7 +237,11 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
                 let name = format!("{tenant}-{}", &format!("{address:x}")[..8]);
                 let (cert, key_path) = tls_client(dir, &name)?;
                 env += &format!("CA_CERT_PATH={}\n", abs(&dir.join("ca.pem"))?);
-                env += &format!("SSL_CERT_PATH={}\nSSL_KEY_PATH={}\n", abs(&cert)?, abs(&key_path)?);
+                env += &format!(
+                    "SSL_CERT_PATH={}\nSSL_KEY_PATH={}\n",
+                    abs(&cert)?,
+                    abs(&key_path)?
+                );
                 if let Some(d) = domain_name {
                     env += &format!("DOMAIN_NAME={d}\n");
                 }
@@ -206,16 +249,26 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
                 bail!("an https endpoint needs --tls-dir: the SDK only speaks TLS with a client certificate");
             }
             write_secret(out, env.as_bytes())?;
-            println!("issued {address:#x} for tenant {tenant}; client env in {} (0600)", out.display());
+            println!(
+                "issued {address:#x} for tenant {tenant}; client env in {} (0600)",
+                out.display()
+            );
             if let Some(v) = v {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             }
         }
         Cmd::Credential(CredentialCmd::List) => {
             let v = a.send(a.req(M::GET, "/credentials"))?.unwrap_or_default();
-            println!("{:<44} {:<14} {:<20} {}", "ADDRESS", "TENANT", "LABEL", "STATE");
+            println!(
+                "{:<44} {:<14} {:<20} {}",
+                "ADDRESS", "TENANT", "LABEL", "STATE"
+            );
             for c in v.as_array().into_iter().flatten() {
-                let state = if c["revoked_ms"].is_null() { "active" } else { "revoked" };
+                let state = if c["revoked_ms"].is_null() {
+                    "active"
+                } else {
+                    "revoked"
+                };
                 println!(
                     "0x{:<42} {:<14} {:<20} {}",
                     c["address"].as_str().unwrap_or(""),
@@ -226,7 +279,10 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
             }
         }
         Cmd::Credential(CredentialCmd::Revoke { address }) => {
-            a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
+            a.send(a.req(
+                M::DELETE,
+                &format!("/credentials/{}", address.trim_start_matches("0x")),
+            ))?;
             println!("revoked {address}");
         }
         Cmd::Elf(ElfCmd::Put { file }) => {
@@ -261,7 +317,9 @@ fn default_admin_token() -> Option<PathBuf> {
         dirs.push(PathBuf::from(h).join(".config/zkm-fleet"));
     }
     dirs.push("/etc/zkm-fleet".into());
-    dirs.into_iter().map(|d| d.join("admin.token")).find(|p| p.exists())
+    dirs.into_iter()
+        .map(|d| d.join("admin.token"))
+        .find(|p| p.exists())
 }
 
 fn print_status(v: &Value) {
@@ -294,13 +352,21 @@ fn print_status(v: &Value) {
         println!("anchors:");
         for a in anchors {
             let elf = a[1].as_str().unwrap_or("");
-            println!("  {} / {}… -> {}", a[0].as_str().unwrap_or(""), &elf[..12.min(elf.len())], a[2].as_str().unwrap_or(""));
+            println!(
+                "  {} / {}… -> {}",
+                a[0].as_str().unwrap_or(""),
+                &elf[..12.min(elf.len())],
+                a[2].as_str().unwrap_or("")
+            );
         }
     }
 }
 
 fn abs(p: &Path) -> anyhow::Result<String> {
-    Ok(std::fs::canonicalize(p).with_context(|| format!("{} not found", p.display()))?.display().to_string())
+    Ok(std::fs::canonicalize(p)
+        .with_context(|| format!("{} not found", p.display()))?
+        .display()
+        .to_string())
 }
 
 fn write_secret(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -333,15 +399,22 @@ fn tls_init(dir: &Path, names: &[String]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir)?;
     let ca_key = rcgen::KeyPair::generate()?;
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new())?;
-    ca.distinguished_name.push(rcgen::DnType::CommonName, "zkm-fleet CA");
+    ca.distinguished_name
+        .push(rcgen::DnType::CommonName, "zkm-fleet CA");
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
+    ca.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
     validity(&mut ca, 3650);
     let ca_cert = ca.self_signed(&ca_key)?;
 
     let srv_key = rcgen::KeyPair::generate()?;
     let mut srv = rcgen::CertificateParams::new(names.to_vec())?;
-    srv.distinguished_name.push(rcgen::DnType::CommonName, names.first().cloned().unwrap_or_else(|| "stage".into()));
+    srv.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        names.first().cloned().unwrap_or_else(|| "stage".into()),
+    );
     srv.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     validity(&mut srv, 825);
     let srv_cert = srv.signed_by(&srv_key, &ca_cert, &ca_key)?;
@@ -350,15 +423,24 @@ fn tls_init(dir: &Path, names: &[String]) -> anyhow::Result<()> {
     write_secret(&dir.join("ca.key"), ca_key.serialize_pem().as_bytes())?;
     write_public(&dir.join("server.pem"), srv_cert.pem().as_bytes())?;
     write_secret(&dir.join("server.key"), srv_key.serialize_pem().as_bytes())?;
-    println!("CA and server certificate for {:?} in {}", names, dir.display());
+    println!(
+        "CA and server certificate for {:?} in {}",
+        names,
+        dir.display()
+    );
     println!("scheduler: tls.cert_path={0}/server.pem tls.key_path={0}/server.key tls.client_ca_path={0}/ca.pem", dir.display());
-    println!("clients:   CA_CERT_PATH={}/ca.pem (and DOMAIN_NAME={} if not \"stage\")", dir.display(), names[0]);
+    println!(
+        "clients:   CA_CERT_PATH={}/ca.pem (and DOMAIN_NAME={} if not \"stage\")",
+        dir.display(),
+        names[0]
+    );
     Ok(())
 }
 
 fn tls_client(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
     let ca_key = rcgen::KeyPair::from_pem(&std::fs::read_to_string(dir.join("ca.key"))?)?;
-    let ca_params = rcgen::CertificateParams::from_ca_cert_pem(&std::fs::read_to_string(dir.join("ca.pem"))?)?;
+    let ca_params =
+        rcgen::CertificateParams::from_ca_cert_pem(&std::fs::read_to_string(dir.join("ca.pem"))?)?;
     let ca_cert = ca_params.self_signed(&ca_key)?;
     let key = rcgen::KeyPair::generate()?;
     let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
@@ -366,7 +448,10 @@ fn tls_client(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
     p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     validity(&mut p, 825);
     let cert = p.signed_by(&key, &ca_cert, &ca_key)?;
-    let (c, k) = (dir.join(format!("client-{name}.pem")), dir.join(format!("client-{name}.key")));
+    let (c, k) = (
+        dir.join(format!("client-{name}.pem")),
+        dir.join(format!("client-{name}.key")),
+    );
     write_public(&c, cert.pem().as_bytes())?;
     write_secret(&k, key.serialize_pem().as_bytes())?;
     Ok((c, k))

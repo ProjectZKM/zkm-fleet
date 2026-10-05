@@ -12,8 +12,8 @@ use clap::Parser;
 use tonic::transport::{Channel, Endpoint, Server};
 
 use fleet_proto::fleet::v1::{
-    control_service_client::ControlServiceClient, node_service_server::NodeServiceServer, DeregisterRequest,
-    HeartbeatRequest, NodeInfo, RegisterRequest,
+    control_service_client::ControlServiceClient, node_service_server::NodeServiceServer,
+    DeregisterRequest, HeartbeatRequest, NodeInfo, RegisterRequest,
 };
 
 #[derive(Parser, Clone)]
@@ -26,7 +26,11 @@ pub struct Args {
     #[arg(long, env = "FLEET_BACKEND", default_value = "cuda")]
     backend: String,
     /// GPU server twirp endpoint, for the cuda backend.
-    #[arg(long, env = "FLEET_GPU_ENDPOINT", default_value = "http://127.0.0.1:3000/twirp/")]
+    #[arg(
+        long,
+        env = "FLEET_GPU_ENDPOINT",
+        default_value = "http://127.0.0.1:3000/twirp/"
+    )]
     gpu_endpoint: String,
     /// Interface NodeService listens on.
     #[arg(long, env = "FLEET_LISTEN_IP", default_value = "0.0.0.0")]
@@ -63,7 +67,9 @@ pub struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .init();
     let args = Args::parse();
     let token = load_token(&args.cluster_token_file)?;
@@ -72,11 +78,16 @@ async fn main() -> anyhow::Result<()> {
     let service = NodeServiceServer::new(prover::NodeApi { node: node.clone() })
         .max_decoding_message_size(1 << 30)
         .max_encoding_message_size(1 << 30);
-    let service = tonic::service::interceptor::InterceptedService::new(service, prover::RequireToken(Arc::new(token.clone())));
+    let service = tonic::service::interceptor::InterceptedService::new(
+        service,
+        prover::RequireToken(Arc::new(token.clone())),
+    );
     let (listener, port) = bind_in_range(args.listen_ip, &args.port_range)?;
     let advertise = format!("http://{}:{port}", args.advertise_host);
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let server = Server::builder().add_service(service).serve_with_incoming(incoming);
+    let server = Server::builder()
+        .add_service(service)
+        .serve_with_incoming(incoming);
     tracing::info!(port, %advertise, backend = %args.backend, "node service up");
 
     let control = tokio::spawn(control_loop(args.clone(), advertise, token, node.clone()));
@@ -89,8 +100,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Binds the first free port of `lo-hi`.
-fn bind_in_range(ip: std::net::IpAddr, range: &str) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
-    let (lo, hi) = range.split_once('-').ok_or_else(|| anyhow::anyhow!("port range must be lo-hi"))?;
+fn bind_in_range(
+    ip: std::net::IpAddr,
+    range: &str,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    let (lo, hi) = range
+        .split_once('-')
+        .ok_or_else(|| anyhow::anyhow!("port range must be lo-hi"))?;
     let (lo, hi): (u16, u16) = (lo.trim().parse()?, hi.trim().parse()?);
     for port in lo..=hi {
         if let Ok(l) = std::net::TcpListener::bind(SocketAddr::new(ip, port)) {
@@ -106,19 +122,34 @@ fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("reading the cluster token {}: {e}", path.display()))?
         .trim()
         .to_string();
-    anyhow::ensure!(t.len() >= 32, "cluster token in {} is shorter than 32 characters", path.display());
+    anyhow::ensure!(
+        t.len() >= 32,
+        "cluster token in {} is shorter than 32 characters",
+        path.display()
+    );
     Ok(t)
 }
 
-type Control = ControlServiceClient<tonic::codegen::InterceptedService<Channel, prover::AttachToken>>;
+type Control =
+    ControlServiceClient<tonic::codegen::InterceptedService<Channel, prover::AttachToken>>;
 
 async fn control_client(args: &Args, token: &str) -> anyhow::Result<Control> {
-    let channel = Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5)).connect_lazy();
-    Ok(ControlServiceClient::with_interceptor(channel, prover::AttachToken::new(token)?))
+    let channel = Endpoint::from_shared(args.scheduler.clone())?
+        .connect_timeout(Duration::from_secs(5))
+        .connect_lazy();
+    Ok(ControlServiceClient::with_interceptor(
+        channel,
+        prover::AttachToken::new(token)?,
+    ))
 }
 
 /// Registers, heartbeats, re-registers when the scheduler forgets us, deregisters on exit.
-async fn control_loop(args: Args, advertise: String, token: String, node: Arc<prover::Node>) -> anyhow::Result<()> {
+async fn control_loop(
+    args: Args,
+    advertise: String,
+    token: String,
+    node: Arc<prover::Node>,
+) -> anyhow::Result<()> {
     let mut client = control_client(&args, &token).await?;
     let info = NodeInfo {
         name: args.name.clone(),
@@ -134,7 +165,12 @@ async fn control_loop(args: Args, advertise: String, token: String, node: Arc<pr
     let mut period = Duration::from_secs(5);
     loop {
         match &node_id {
-            None => match client.register(RegisterRequest { node: Some(info.clone()) }).await {
+            None => match client
+                .register(RegisterRequest {
+                    node: Some(info.clone()),
+                })
+                .await
+            {
                 Ok(r) => {
                     let r = r.into_inner();
                     tracing::info!(node_id = %r.node_id, "registered");
@@ -145,7 +181,14 @@ async fn control_loop(args: Args, advertise: String, token: String, node: Arc<pr
                 Err(e) => tracing::warn!("register failed: {e}"),
             },
             Some(id) => {
-                let hb = HeartbeatRequest { node_id: id.clone(), ready: node.ready().await, cached_elf_ids: node.cached() };
+                let running_job = node.running_job();
+                let hb = HeartbeatRequest {
+                    node_id: id.clone(),
+                    ready: node.ready().await,
+                    cached_elf_ids: node.cached(),
+                    busy: running_job.is_some(),
+                    running_job: running_job.unwrap_or_default(),
+                };
                 match client.heartbeat(hb).await {
                     Ok(r) => {
                         if !r.into_inner().known {

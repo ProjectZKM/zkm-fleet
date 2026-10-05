@@ -1,4 +1,4 @@
-# Scheduler + Postgres. Started by deploy/install.sh control; config and secrets in ${FLEET_ETC:-/etc/zkm-fleet}.
+# Scheduler + Postgres + gateway. Started by deploy/install.sh control; config and secrets in ${FLEET_ETC:-/etc/zkm-fleet}.
 services:
   postgres:
     image: postgres:16
@@ -8,6 +8,7 @@ services:
       POSTGRES_DB: fleet
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
     secrets: [pg_password]
+    networks: [fleet]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U fleet -d fleet"]
@@ -24,6 +25,8 @@ services:
     user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
     depends_on:
       postgres: { condition: service_healthy }
+    networks:
+      fleet: { ipv4_address: "${FLEET_SCHEDULER_IP:-172.28.250.10}" }
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       FLEET_URL: http://127.0.0.1:9191
@@ -31,10 +34,28 @@ services:
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
       - ${FLEET_DATA:-fleet-data}:/var/lib/zkm-fleet    # a host path works too (owned by FLEET_UID)
+    # Stage API and HTTP are reached through the gateway; only node control is published.
+    ports:
+      - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
+
+  # Terminates mTLS and holds client calls across scheduler restarts (deploy/gateway.yaml.in).
+  gateway:
+    image: ${FLEET_GATEWAY_IMAGE:-envoyproxy/envoy:v1.35.3}
+    restart: unless-stopped
+    user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
+    command: ["-c", "/etc/zkm-fleet/gateway.yaml", "--log-level", "warn"]
+    networks: [fleet]
+    volumes:
+      - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
     ports:
       - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (mTLS), external
-      - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
       - "${HTTP_BIND:-0.0.0.0}:9191:9191"         # public values, /admin, /healthz
+
+# The scheduler's address is fixed so the gateway can reach it without DNS.
+networks:
+  fleet:
+    ipam:
+      config: [{ subnet: "${FLEET_SUBNET:-172.28.250.0/24}" }]
 
 secrets:
   pg_password:

@@ -9,7 +9,10 @@ use zkm_sdk::{NetworkProver, ZKMProofKind, ZKMStdin};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    anyhow::ensure!(args.len() >= 3, "usage: sdk_submit <elf> <u32 input> [compressed|groth16] [--elf-id]");
+    anyhow::ensure!(
+        args.len() >= 3,
+        "usage: sdk_submit <elf> <u32 input> [compressed|groth16] [--elf-id]"
+    );
     let elf = std::fs::read(&args[1])?;
     let n: u32 = args[2].parse()?;
     let kind = match args.get(3).map(String::as_str) {
@@ -25,7 +28,9 @@ async fn main() -> anyhow::Result<()> {
     stdin.write(&n);
     let prover = NetworkProver::from_env()?;
     let t = Instant::now();
-    let (proof, cycles) = prover.prove_with_cycles(&elf, stdin, kind, elf_id, Some(Duration::from_secs(3600))).await?;
+    let (proof, cycles) = prover
+        .prove_with_cycles(&elf, stdin, kind, elf_id, Some(Duration::from_secs(3600)))
+        .await?;
     println!(
         "PROOF_RECEIVED kind={kind:?} cycles={cycles} public_values={} bytes, elapsed={:.2}s, variant={:?}",
         proof.public_values.as_slice().len(),

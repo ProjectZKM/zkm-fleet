@@ -29,9 +29,15 @@ pub enum Choice {
 pub fn eligible(node: &NodeView, tenant: &TenantConfig, failed_on: &[String]) -> bool {
     node.ready
         && !failed_on.iter().any(|f| f == &node.name)
-        && tenant.zkm_version.as_ref().map_or(true, |v| v == &node.zkm_version)
+        && tenant
+            .zkm_version
+            .as_ref()
+            .map_or(true, |v| v == &node.zkm_version)
         && (tenant.backends.is_empty() || tenant.backends.iter().any(|b| b == &node.backend))
-        && node.reserved_for.as_ref().map_or(true, |r| r == &tenant.name)
+        && node
+            .reserved_for
+            .as_ref()
+            .map_or(true, |r| r == &tenant.name)
 }
 
 /// `anchor` is the name of the node this (tenant, program) is anchored to.
@@ -106,15 +112,24 @@ mod tests {
     #[test]
     fn latency_prefers_the_largest_free_node_and_batch_the_smallest() {
         let nodes = vec![node("a", 1), node("b", 4), node("c", 2)];
-        assert_eq!(choose(&tenant(Class::Latency, Anchor::None), &[], None, &nodes), Choice::Run(1));
-        assert_eq!(choose(&tenant(Class::Batch, Anchor::None), &[], None, &nodes), Choice::Run(0));
+        assert_eq!(
+            choose(&tenant(Class::Latency, Anchor::None), &[], None, &nodes),
+            Choice::Run(1)
+        );
+        assert_eq!(
+            choose(&tenant(Class::Batch, Anchor::None), &[], None, &nodes),
+            Choice::Run(0)
+        );
     }
 
     #[test]
     fn a_node_with_the_program_hot_wins() {
         let mut nodes = vec![node("a", 4), node("b", 1)];
         nodes[1].has_elf = true;
-        assert_eq!(choose(&tenant(Class::Latency, Anchor::None), &[], None, &nodes), Choice::Run(1));
+        assert_eq!(
+            choose(&tenant(Class::Latency, Anchor::None), &[], None, &nodes),
+            Choice::Run(1)
+        );
     }
 
     #[test]

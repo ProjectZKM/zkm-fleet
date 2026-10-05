@@ -2,7 +2,9 @@ syntax = "proto3";
 
 package fleet.v1;
 
-// Scheduler -> prover node. One proof at a time per node.
+// Scheduler -> prover node. One proof at a time per node. A proof outlives the
+// call that started it: Prove with the job_id of the running or a recently
+// finished proof returns that proof's result instead of proving again.
 service NodeService {
   rpc Prove(ProveRequest) returns (ProveResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -89,6 +91,9 @@ message HeartbeatRequest {
   string node_id = 1;
   bool ready = 2;
   repeated string cached_elf_ids = 3;
+  // A proof is running; after a scheduler restart this is how it finds the job again.
+  bool busy = 4;
+  string running_job = 5;
 }
 
 message HeartbeatResponse {

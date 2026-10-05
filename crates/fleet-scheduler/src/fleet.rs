@@ -2,6 +2,7 @@
 //! anchoring, and the dispatcher that runs jobs on nodes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +31,15 @@ enum Failure {
     Lost,
     /// The node answered with an error.
     Prover,
+    /// The node is proving something this scheduler did not send it. Not counted.
+    Busy,
+}
+
+/// `Node::busy` for a proof the node reported itself rather than one dispatched here.
+const REPORTED: char = '~';
+
+fn reported(job_id: &str) -> String {
+    format!("{REPORTED}{job_id}")
 }
 
 /// Nodes tried per job, whatever the reason, before it fails.
@@ -39,6 +49,7 @@ fn classify(status: &tonic::Status) -> Failure {
     let m = status.message();
     match status.code() {
         tonic::Code::Unavailable => Failure::NotStarted,
+        tonic::Code::ResourceExhausted => Failure::Busy,
         tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::Aborted
             if m.contains("transport") || m.contains("connection") || m.contains("broken pipe") =>
         {
@@ -49,7 +60,10 @@ fn classify(status: &tonic::Status) -> Failure {
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 struct JobEntry {
@@ -64,7 +78,10 @@ pub struct Node {
     client: NodeClient,
     pub last_heartbeat: Instant,
     pub ready: bool,
+    /// The job running there: dispatched by this scheduler, or `~job` as the node reported it.
     pub busy: Option<String>,
+    /// The last job released here; a heartbeat sent before the release still names it.
+    last_released: Option<String>,
     pub cached: HashSet<String>,
 }
 
@@ -89,6 +106,8 @@ pub struct Fleet {
     /// address -> credential, mirrored from the store.
     creds: Mutex<HashMap<String, Credential>>,
     wake: Notify,
+    started: Instant,
+    stopping: AtomicBool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -117,7 +136,12 @@ pub struct FleetStatus {
 }
 
 impl Fleet {
-    pub fn new(cfg: Config, store: Arc<dyn Store>, blobs: Blobs, cluster_token: String) -> Arc<Self> {
+    pub fn new(
+        cfg: Config,
+        store: Arc<dyn Store>,
+        blobs: Blobs,
+        cluster_token: String,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cfg,
             store,
@@ -126,6 +150,8 @@ impl Fleet {
             inner: Mutex::new(Inner::default()),
             creds: Mutex::new(HashMap::new()),
             wake: Notify::new(),
+            started: Instant::now(),
+            stopping: AtomicBool::new(false),
         })
     }
 
@@ -140,16 +166,34 @@ impl Fleet {
     pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
         let a = normalize_address(address);
         if let Some(c) = self.creds.lock().get(&a) {
-            return if c.revoked_ms.is_none() { Some(c.tenant.clone()) } else { None };
+            return if c.revoked_ms.is_none() {
+                Some(c.tenant.clone())
+            } else {
+                None
+            };
         }
         self.cfg.tenant_for_address(&a).map(|t| t.name.clone())
     }
 
-    pub async fn add_credential(&self, tenant: &str, address: &str, label: &str) -> anyhow::Result<Credential> {
+    pub async fn add_credential(
+        &self,
+        tenant: &str,
+        address: &str,
+        label: &str,
+    ) -> anyhow::Result<Credential> {
         anyhow::ensure!(self.cfg.tenant(tenant).is_some(), "unknown tenant {tenant}");
         let address = normalize_address(address);
-        anyhow::ensure!(address.len() == 40 && address.bytes().all(|b| b.is_ascii_hexdigit()), "not an address");
-        let c = Credential { address: address.clone(), tenant: tenant.into(), label: label.into(), created_ms: now_ms(), revoked_ms: None };
+        anyhow::ensure!(
+            address.len() == 40 && address.bytes().all(|b| b.is_ascii_hexdigit()),
+            "not an address"
+        );
+        let c = Credential {
+            address: address.clone(),
+            tenant: tenant.into(),
+            label: label.into(),
+            created_ms: now_ms(),
+            revoked_ms: None,
+        };
         self.store.add_credential(&c).await?;
         self.creds.lock().insert(address, c.clone());
         Ok(c)
@@ -189,8 +233,10 @@ impl Fleet {
         let mut jobs = self.store.incomplete().await?;
         for j in &mut jobs {
             if j.state == JobState::Running {
+                // `node` stays as a hint: that node may still be proving the job and
+                // hands the result over when asked again (see `assign`).
                 j.state = JobState::Queued;
-                j.node = None;
+                j.attempts = j.attempts.saturating_sub(1);
                 self.store.upsert(j).await?;
             }
         }
@@ -198,7 +244,13 @@ impl Fleet {
         let mut inner = self.inner.lock();
         for j in jobs {
             let (tx, _) = watch::channel(0);
-            inner.jobs.insert(j.id.clone(), JobEntry { job: j, changed: tx });
+            inner.jobs.insert(
+                j.id.clone(),
+                JobEntry {
+                    job: j,
+                    changed: tx,
+                },
+            );
         }
         drop(inner);
         self.wake.notify_one();
@@ -227,7 +279,10 @@ impl Fleet {
         }
         self.store.upsert(&job).await?;
         let (tx, _) = watch::channel(0);
-        self.inner.lock().jobs.insert(job.id.clone(), JobEntry { job, changed: tx });
+        self.inner
+            .lock()
+            .jobs
+            .insert(job.id.clone(), JobEntry { job, changed: tx });
         self.wake.notify_one();
         Ok(true)
     }
@@ -253,7 +308,13 @@ impl Fleet {
         loop {
             match tokio::time::timeout_at(deadline, rx.changed()).await {
                 Ok(Ok(())) => {
-                    if self.inner.lock().jobs.get(id).map_or(true, |e| e.job.state.is_terminal()) {
+                    if self
+                        .inner
+                        .lock()
+                        .jobs
+                        .get(id)
+                        .map_or(true, |e| e.job.state.is_terminal())
+                    {
                         return;
                     }
                 }
@@ -286,31 +347,60 @@ impl Fleet {
             .connect_timeout(Duration::from_secs(5))
             .tcp_keepalive(Some(Duration::from_secs(30)));
         let channel = endpoint.connect_lazy();
-        let client = NodeServiceClient::with_interceptor(channel, token::Attach::new(&self.cluster_token)?)
-            .max_decoding_message_size(1 << 30)
-            .max_encoding_message_size(1 << 30);
+        let client =
+            NodeServiceClient::with_interceptor(channel, token::Attach::new(&self.cluster_token)?)
+                .max_decoding_message_size(1 << 30)
+                .max_encoding_message_size(1 << 30);
         let id = uuid::Uuid::new_v4().to_string();
         let mut inner = self.inner.lock();
         inner.nodes.retain(|_, n| n.info.name != info.name);
         tracing::info!(node = %info.name, endpoint = %info.endpoint, backend = %info.backend, gpus = info.gpus, "node registered");
         inner.nodes.insert(
             id.clone(),
-            Node { id: id.clone(), info, client, last_heartbeat: Instant::now(), ready: false, busy: None, cached: HashSet::new() },
+            Node {
+                id: id.clone(),
+                info,
+                client,
+                last_heartbeat: Instant::now(),
+                ready: false,
+                busy: None,
+                last_released: None,
+                cached: HashSet::new(),
+            },
         );
         drop(inner);
         self.wake.notify_one();
         Ok(id)
     }
 
-    pub fn heartbeat(&self, id: &str, ready: bool, cached: Vec<String>) -> bool {
+    pub fn heartbeat(
+        &self,
+        id: &str,
+        ready: bool,
+        cached: Vec<String>,
+        busy: bool,
+        running_job: &str,
+    ) -> bool {
         let mut inner = self.inner.lock();
-        let Some(n) = inner.nodes.get_mut(id) else { return false };
-        let became_ready = ready && !n.ready;
+        let Some(n) = inner.nodes.get_mut(id) else {
+            return false;
+        };
+        let mut wake = ready && !n.ready;
         n.last_heartbeat = Instant::now();
         n.ready = ready;
         n.cached = cached.into_iter().collect();
+        // The node's own word fills in proofs this scheduler did not dispatch: one from
+        // before a restart, or the one behind a "node busy" answer.
+        let ours = n.busy.as_ref().is_some_and(|b| !b.starts_with(REPORTED));
+        if !ours {
+            if busy && n.last_released.as_deref() != Some(running_job) {
+                n.busy = Some(reported(running_job));
+            } else if n.busy.take().is_some() {
+                wake = true;
+            }
+        }
         drop(inner);
-        if became_ready {
+        if wake {
             self.wake.notify_one();
         }
         true
@@ -370,14 +460,24 @@ impl Fleet {
             })
             .collect();
         nodes.sort_by(|a, b| a.name.cmp(&b.name));
-        let anchors = inner.anchors.iter().map(|((t, e), n)| (t.clone(), e.clone(), n.clone())).collect();
-        FleetStatus { queued, running, nodes, anchors }
+        let anchors = inner
+            .anchors
+            .iter()
+            .map(|((t, e), n)| (t.clone(), e.clone(), n.clone()))
+            .collect();
+        FleetStatus {
+            queued,
+            running,
+            nodes,
+            anchors,
+        }
     }
 
     // ------------------------------------------------------------- dispatch
 
     pub async fn run_dispatcher(self: Arc<Self>) {
-        let mut sweep = tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_secs.max(1) as u64));
+        let mut sweep =
+            tokio::time::interval(Duration::from_secs(self.cfg.heartbeat_secs.max(1) as u64));
         loop {
             for (job_id, node_id) in self.assign() {
                 let me = self.clone();
@@ -390,23 +490,75 @@ impl Fleet {
         }
     }
 
+    /// No new placements: the process is stopping. Jobs left queued are recovered on restart.
+    pub fn stop_dispatching(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
     /// One placement pass: latency jobs first, then oldest first.
     fn assign(&self) -> Vec<(String, String)> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
         let mut inner = self.inner.lock();
         let mut queued: Vec<(u8, u64, String)> = inner
             .jobs
             .values()
             .filter(|e| e.job.state == JobState::Queued)
             .map(|e| {
-                let class = self.cfg.tenant(&e.job.tenant).map(|t| t.class).unwrap_or_default();
-                (if class == Class::Latency { 0 } else { 1 }, e.job.created_ms, e.job.id.clone())
+                let class = self
+                    .cfg
+                    .tenant(&e.job.tenant)
+                    .map(|t| t.class)
+                    .unwrap_or_default();
+                (
+                    if class == Class::Latency { 0 } else { 1 },
+                    e.job.created_ms,
+                    e.job.id.clone(),
+                )
             })
             .collect();
         queued.sort();
         let mut out = Vec::new();
         for (_, _, job_id) in queued {
             let job = inner.jobs[&job_id].job.clone();
-            let Some(tenant) = self.cfg.tenant(&job.tenant) else { continue };
+            let Some(tenant) = self.cfg.tenant(&job.tenant) else {
+                continue;
+            };
+            // A recovered job goes back to the node it was running on (or that says it is
+            // proving it), which joins the proof if it is still going. Nodes re-register
+            // within a heartbeat or two.
+            let mine = reported(&job_id);
+            let hint = job.node.clone().or_else(|| {
+                inner
+                    .nodes
+                    .values()
+                    .find(|n| n.busy.as_deref() == Some(mine.as_str()))
+                    .map(|n| n.info.name.clone())
+            });
+            if let Some(hint) = &hint {
+                let at = inner
+                    .nodes
+                    .values()
+                    .find(|n| &n.info.name == hint)
+                    .map(|n| (n.id.clone(), n.ready, n.busy.clone()));
+                let free_or_ours =
+                    |b: &Option<String>| b.is_none() || b.as_deref() == Some(mine.as_str());
+                match at {
+                    Some((node_id, true, b)) if free_or_ours(&b) => {
+                        tracing::info!(job = %job_id, node = %hint, "resuming on the node that was running it");
+                        self.commit(&mut inner, tenant, &job_id, &node_id);
+                        out.push((job_id, node_id));
+                        continue;
+                    }
+                    Some((_, true, _)) => {}
+                    _ if self.started.elapsed() < Duration::from_secs(self.cfg.node_stale_secs) => {
+                        continue
+                    }
+                    _ => {}
+                }
+                inner.jobs.get_mut(&job_id).unwrap().job.node = None;
+            }
             let ids: Vec<String> = inner.nodes.keys().cloned().collect();
             let views: Vec<NodeView> = ids
                 .iter()
@@ -429,26 +581,7 @@ impl Fleet {
             match placement::choose(tenant, &job.failed_on, anchor.as_deref(), &views) {
                 Choice::Run(i) => {
                     let node_id = ids[i].clone();
-                    let name = views[i].name.clone();
-                    if tenant.anchor != Anchor::None && anchor.as_deref() != Some(name.as_str()) {
-                        if let Some(old) = anchor {
-                            if inner.reserved.get(&old) == Some(&tenant.name) {
-                                inner.reserved.remove(&old);
-                            }
-                        }
-                        inner.anchors.insert(anchor_key, name.clone());
-                        if tenant.anchor == Anchor::Exclusive {
-                            inner.reserved.insert(name.clone(), tenant.name.clone());
-                        }
-                        tracing::info!(tenant = %tenant.name, elf = %&job.elf_id[..12.min(job.elf_id.len())], node = %name, "anchored");
-                    }
-                    inner.nodes.get_mut(&node_id).unwrap().busy = Some(job_id.clone());
-                    let e = inner.jobs.get_mut(&job_id).unwrap();
-                    e.job.state = JobState::Running;
-                    e.job.node = Some(name);
-                    e.job.attempts += 1;
-                    e.job.started_ms = Some(now_ms());
-                    e.changed.send_modify(|v| *v += 1);
+                    self.commit(&mut inner, tenant, &job_id, &node_id);
                     out.push((job_id, node_id));
                 }
                 Choice::WaitForAnchor | Choice::NoNode => {}
@@ -457,10 +590,43 @@ impl Fleet {
         out
     }
 
+    /// Marks `job_id` running on `node_id`, moving the tenant's anchor there if it has one.
+    fn commit(
+        &self,
+        inner: &mut Inner,
+        tenant: &crate::config::TenantConfig,
+        job_id: &str,
+        node_id: &str,
+    ) {
+        let name = inner.nodes[node_id].info.name.clone();
+        let elf_id = inner.jobs[job_id].job.elf_id.clone();
+        let anchor_key = (tenant.name.clone(), elf_id.clone());
+        let anchor = inner.anchors.get(&anchor_key).cloned();
+        if tenant.anchor != Anchor::None && anchor.as_deref() != Some(name.as_str()) {
+            if let Some(old) = anchor {
+                if inner.reserved.get(&old) == Some(&tenant.name) {
+                    inner.reserved.remove(&old);
+                }
+            }
+            inner.anchors.insert(anchor_key, name.clone());
+            if tenant.anchor == Anchor::Exclusive {
+                inner.reserved.insert(name.clone(), tenant.name.clone());
+            }
+            tracing::info!(tenant = %tenant.name, elf = %&elf_id[..12.min(elf_id.len())], node = %name, "anchored");
+        }
+        inner.nodes.get_mut(node_id).unwrap().busy = Some(job_id.to_string());
+        let e = inner.jobs.get_mut(job_id).unwrap();
+        e.job.state = JobState::Running;
+        e.job.node = Some(name);
+        e.job.attempts += 1;
+        e.job.started_ms = Some(now_ms());
+        e.changed.send_modify(|v| *v += 1);
+    }
+
     fn release(&self, node_id: &str, elf_id: Option<&str>) {
         let mut inner = self.inner.lock();
         if let Some(n) = inner.nodes.get_mut(node_id) {
-            n.busy = None;
+            n.last_released = n.busy.take();
             if let Some(e) = elf_id {
                 n.cached.insert(e.to_string());
             }
@@ -470,7 +636,9 @@ impl Fleet {
     }
 
     async fn run(self: Arc<Self>, job_id: String, node_id: String) {
-        let Some(job) = self.inner.lock().jobs.get(&job_id).map(|e| e.job.clone()) else { return };
+        let Some(job) = self.inner.lock().jobs.get(&job_id).map(|e| e.job.clone()) else {
+            return;
+        };
         self.persist(Some(job.clone())).await;
         let found = self
             .inner
@@ -479,7 +647,13 @@ impl Fleet {
             .get(&node_id)
             .map(|n| (n.client.clone(), n.cached.contains(&job.elf_id)));
         let Some((client, has_elf)) = found else {
-            self.fail_attempt(&job_id, &node_id, "node left before the job started", Failure::NotStarted).await;
+            self.fail_attempt(
+                &job_id,
+                &node_id,
+                "node left before the job started",
+                Failure::NotStarted,
+            )
+            .await;
             return;
         };
         let request = match self.build_request(&job, !has_elf) {
@@ -498,7 +672,9 @@ impl Fleet {
         let timeout = Duration::from_secs(self.cfg.job_timeout_secs);
         let mut result = tokio::time::timeout(timeout, client.clone().prove(request.clone())).await;
         if let Ok(Err(status)) = &result {
-            if status.code() == tonic::Code::FailedPrecondition && status.message().contains("elf_missing") {
+            if status.code() == tonic::Code::FailedPrecondition
+                && status.message().contains("elf_missing")
+            {
                 let mut retry = request.clone();
                 match self.blobs.elf(&job.elf_id) {
                     Ok(elf) => {
@@ -515,7 +691,10 @@ impl Fleet {
                 let written = self
                     .blobs
                     .put(&job_id, blobs::PROOF, &resp.proof_json)
-                    .and_then(|_| self.blobs.put(&job_id, blobs::PUBLIC_VALUES, &resp.public_values));
+                    .and_then(|_| {
+                        self.blobs
+                            .put(&job_id, blobs::PUBLIC_VALUES, &resp.public_values)
+                    });
                 self.release(&node_id, Some(&job.elf_id));
                 let j = self.update_job(&job_id, |j| {
                     match &written {
@@ -539,19 +718,28 @@ impl Fleet {
             }
             Ok(Err(status)) => {
                 let msg = format!("{}: {}", status.code(), status.message());
-                self.fail_attempt(&job_id, &node_id, &msg, classify(&status)).await;
+                self.fail_attempt(&job_id, &node_id, &msg, classify(&status))
+                    .await;
             }
-            Err(_) => self.fail_attempt(&job_id, &node_id, "timed out", Failure::Lost).await,
+            Err(_) => {
+                self.fail_attempt(&job_id, &node_id, "timed out", Failure::Lost)
+                    .await
+            }
         }
     }
 
     fn build_request(&self, job: &Job, with_elf: bool) -> anyhow::Result<ProveRequest> {
         let stdin: Vec<Vec<u8>> = bincode::deserialize(&self.blobs.get(&job.id, blobs::STDIN)?)?;
-        let receipts: Vec<Vec<u8>> = bincode::deserialize(&self.blobs.get(&job.id, blobs::RECEIPTS)?)?;
+        let receipts: Vec<Vec<u8>> =
+            bincode::deserialize(&self.blobs.get(&job.id, blobs::RECEIPTS)?)?;
         Ok(ProveRequest {
             job_id: job.id.clone(),
             elf_id: job.elf_id.clone(),
-            elf: if with_elf { self.blobs.elf(&job.elf_id)? } else { Vec::new() },
+            elf: if with_elf {
+                self.blobs.elf(&job.elf_id)?
+            } else {
+                Vec::new()
+            },
             stdin_buffer: stdin,
             receipts,
             kind: job.kind as i32,
@@ -563,9 +751,28 @@ impl Fleet {
     /// connection, is marked not ready together with the other nodes on its machine (the
     /// machine is likely gone); the next heartbeat of a live node marks it ready again.
     async fn fail_attempt(&self, job_id: &str, node_id: &str, msg: &str, failure: Failure) {
+        if failure == Failure::Busy {
+            // Busy with a proof from before a restart: keep the node out until its heartbeat
+            // says it is free, and place the job again as if it had not been tried.
+            if let Some(n) = self.inner.lock().nodes.get_mut(node_id) {
+                n.busy = Some(reported(""));
+            }
+            let j = self.update_job(job_id, |j| {
+                j.attempts = j.attempts.saturating_sub(1);
+                j.state = JobState::Queued;
+                j.node = None;
+            });
+            tracing::info!(job = job_id, "node was busy; placing the job again");
+            self.persist(j).await;
+            self.wake.notify_one();
+            return;
+        }
         let node_name = {
             let mut inner = self.inner.lock();
-            let info = inner.nodes.get(node_id).map(|n| (n.info.name.clone(), n.info.machine.clone()));
+            let info = inner
+                .nodes
+                .get(node_id)
+                .map(|n| (n.info.name.clone(), n.info.machine.clone()));
             if failure != Failure::Prover {
                 if let Some((_, machine)) = &info {
                     for n in inner.nodes.values_mut() {
@@ -599,5 +806,27 @@ impl Fleet {
             tracing::warn!(job = %j.id, attempt = j.attempts, ?failure, error = %msg, retrying = !j.state.is_terminal(), "job attempt failed");
         }
         self.persist(j).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failures_are_classified_by_what_they_say_about_the_node() {
+        let c = |code, msg: &str| classify(&tonic::Status::new(code, msg));
+        assert_eq!(
+            c(tonic::Code::Unavailable, "tcp connect error"),
+            Failure::NotStarted
+        );
+        assert_eq!(c(tonic::Code::Unknown, "transport error"), Failure::Lost);
+        assert_eq!(c(tonic::Code::Cancelled, "connection reset"), Failure::Lost);
+        assert_eq!(
+            c(tonic::Code::ResourceExhausted, "node busy"),
+            Failure::Busy
+        );
+        assert_eq!(c(tonic::Code::Internal, "gpu fell over"), Failure::Prover);
+        assert_eq!(c(tonic::Code::Unknown, "panicked"), Failure::Prover);
     }
 }

@@ -14,8 +14,18 @@ use std::time::{Duration, Instant};
 use zkm_sdk::{NetworkProver, ZKMProofKind, ZKMStdin};
 
 const SDK_VARS: &[&str] = &[
-    "ZKM_PROVER", "ENDPOINT", "ZKM_PRIVATE_KEY", "CA_CERT_PATH", "SSL_CERT_PATH", "SSL_KEY_PATH", "DOMAIN_NAME",
-    "ZKM_PROOF_POLL_INTERVAL", "SHARD_SIZE", "MAX_PROVER_NUM", "SINGLE_NODE", "ZKM_ALLOW_INSECURE_TEST_CA",
+    "ZKM_PROVER",
+    "ENDPOINT",
+    "ZKM_PRIVATE_KEY",
+    "CA_CERT_PATH",
+    "SSL_CERT_PATH",
+    "SSL_KEY_PATH",
+    "DOMAIN_NAME",
+    "ZKM_PROOF_POLL_INTERVAL",
+    "SHARD_SIZE",
+    "MAX_PROVER_NUM",
+    "SINGLE_NODE",
+    "ZKM_ALLOW_INSECURE_TEST_CA",
 ];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -64,55 +74,192 @@ fn case(name: &'static str, base: &'static str, expect: Expect) -> Case {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let a: Vec<String> = std::env::args().collect();
-    anyhow::ensure!(a.len() == 5, "usage: client_matrix <elf> <plain-endpoint> <tls-endpoint> <env-dir>");
+    anyhow::ensure!(
+        a.len() == 5,
+        "usage: client_matrix <elf> <plain-endpoint> <tls-endpoint> <env-dir>"
+    );
     let elf = std::fs::read(&a[1])?;
     let (plain, tls, dir) = (a[2].clone(), a[3].clone(), PathBuf::from(&a[4]));
     let elf_id = {
         use sha2::Digest;
         hex::encode(sha2::Sha256::digest(&elf))
     };
-    let unknown_key = std::fs::read_to_string(dir.join("unknown.key"))?.trim().to_string();
+    let unknown_key = std::fs::read_to_string(dir.join("unknown.key"))?
+        .trim()
+        .to_string();
     let kinds_only = std::env::var("MATRIX_ONLY").ok();
 
     let mut cases = vec![
         // authentication
         case("auth: issued key", "valid", Expect::Proof),
-        { let mut c = case("auth: revoked key", "revoked", Expect::Fail); c.set.push(("ENDPOINT", plain.clone())); c },
-        { let mut c = case("auth: unregistered key", "valid", Expect::Fail); c.set.push(("ZKM_PRIVATE_KEY", unknown_key.clone())); c },
-        { let mut c = case("auth: no ZKM_PRIVATE_KEY", "valid", Expect::Fail); c.unset.push("ZKM_PRIVATE_KEY"); c },
-        { let mut c = case("auth: malformed key", "valid", Expect::Fail); c.set.push(("ZKM_PRIVATE_KEY", "not-a-key".into())); c },
+        {
+            let mut c = case("auth: revoked key", "revoked", Expect::Fail);
+            c.set.push(("ENDPOINT", plain.clone()));
+            c
+        },
+        {
+            let mut c = case("auth: unregistered key", "valid", Expect::Fail);
+            c.set.push(("ZKM_PRIVATE_KEY", unknown_key.clone()));
+            c
+        },
+        {
+            let mut c = case("auth: no ZKM_PRIVATE_KEY", "valid", Expect::Fail);
+            c.unset.push("ZKM_PRIVATE_KEY");
+            c
+        },
+        {
+            let mut c = case("auth: malformed key", "valid", Expect::Fail);
+            c.set.push(("ZKM_PRIVATE_KEY", "not-a-key".into()));
+            c
+        },
         // transport
-        { let mut c = case("tls: mTLS with the issued cert", "valid-tls", Expect::Proof); c.set.push(("ENDPOINT", tls.clone())); c },
-        { let mut c = case("tls: client cert from another CA", "other-ca", Expect::Fail); c.set.push(("ENDPOINT", tls.clone())); c },
-        { let mut c = case("tls: wrong DOMAIN_NAME", "valid-tls", Expect::Fail); c.set.push(("ENDPOINT", tls.clone())); c.set.push(("DOMAIN_NAME", "not-the-server".into())); c },
-        { let mut c = case("tls: CA only, no client cert (SDK speaks plaintext)", "valid-tls", Expect::Fail); c.set.push(("ENDPOINT", tls.clone())); c.unset.push("SSL_CERT_PATH"); c.unset.push("SSL_KEY_PATH"); c },
-        { let mut c = case("tls: plaintext client to the mTLS port", "valid", Expect::Fail); c.set.push(("ENDPOINT", tls.clone())); c },
-        { let mut c = case("tls: TLS client to the plaintext port", "valid-tls", Expect::Fail); c.set.push(("ENDPOINT", plain.replace("http://", "https://"))); c },
-        { let mut c = case("endpoint: unreachable", "valid", Expect::Fail); c.set.push(("ENDPOINT", "http://127.0.0.1:1".into())); c },
+        {
+            let mut c = case("tls: mTLS with the issued cert", "valid-tls", Expect::Proof);
+            c.set.push(("ENDPOINT", tls.clone()));
+            c
+        },
+        {
+            let mut c = case("tls: client cert from another CA", "other-ca", Expect::Fail);
+            c.set.push(("ENDPOINT", tls.clone()));
+            c
+        },
+        {
+            let mut c = case("tls: wrong DOMAIN_NAME", "valid-tls", Expect::Fail);
+            c.set.push(("ENDPOINT", tls.clone()));
+            c.set.push(("DOMAIN_NAME", "not-the-server".into()));
+            c
+        },
+        {
+            let mut c = case(
+                "tls: CA only, no client cert (SDK speaks plaintext)",
+                "valid-tls",
+                Expect::Fail,
+            );
+            c.set.push(("ENDPOINT", tls.clone()));
+            c.unset.push("SSL_CERT_PATH");
+            c.unset.push("SSL_KEY_PATH");
+            c
+        },
+        {
+            let mut c = case(
+                "tls: plaintext client to the mTLS port",
+                "valid",
+                Expect::Fail,
+            );
+            c.set.push(("ENDPOINT", tls.clone()));
+            c
+        },
+        {
+            let mut c = case(
+                "tls: TLS client to the plaintext port",
+                "valid-tls",
+                Expect::Fail,
+            );
+            c.set
+                .push(("ENDPOINT", plain.replace("http://", "https://")));
+            c
+        },
+        {
+            let mut c = case("endpoint: unreachable", "valid", Expect::Fail);
+            c.set.push(("ENDPOINT", "http://127.0.0.1:1".into()));
+            c
+        },
         // programs
-        { let mut c = case("elf: by known elf_id", "valid", Expect::Proof); c.by_elf_id = Some(elf_id.clone()); c },
-        { let mut c = case("elf: by unknown elf_id", "valid", Expect::Fail); c.by_elf_id = Some("ab".repeat(32)); c },
+        {
+            let mut c = case("elf: by known elf_id", "valid", Expect::Proof);
+            c.by_elf_id = Some(elf_id.clone());
+            c
+        },
+        {
+            let mut c = case("elf: by unknown elf_id", "valid", Expect::Fail);
+            c.by_elf_id = Some("ab".repeat(32));
+            c
+        },
         // proof kinds
-        { let mut c = case("kind: Groth16", "valid", Expect::Proof); c.kind = ZKMProofKind::Groth16; c },
-        { let mut c = case("kind: Core (the network does not produce it)", "valid", Expect::Fail); c.kind = ZKMProofKind::Core; c },
-        { let mut c = case("kind: Plonk (the network does not produce it)", "valid", Expect::Fail); c.kind = ZKMProofKind::Plonk; c },
+        {
+            let mut c = case("kind: Groth16", "valid", Expect::Proof);
+            c.kind = ZKMProofKind::Groth16;
+            c
+        },
+        {
+            let mut c = case(
+                "kind: Core (the network does not produce it)",
+                "valid",
+                Expect::Fail,
+            );
+            c.kind = ZKMProofKind::Core;
+            c
+        },
+        {
+            let mut c = case(
+                "kind: Plonk (the network does not produce it)",
+                "valid",
+                Expect::Fail,
+            );
+            c.kind = ZKMProofKind::Plonk;
+            c
+        },
         // SDK knobs
-        { let mut c = case("poll: ZKM_PROOF_POLL_INTERVAL=100", "valid", Expect::Proof); c.set.push(("ZKM_PROOF_POLL_INTERVAL", "100".into())); c },
-        { let mut c = case("poll: ZKM_PROOF_POLL_INTERVAL=3000", "valid", Expect::Proof); c.set.push(("ZKM_PROOF_POLL_INTERVAL", "3000".into())); c },
-        { let mut c = case("poll: ZKM_PROOF_POLL_INTERVAL=10 (clamped to 100)", "valid", Expect::Proof); c.set.push(("ZKM_PROOF_POLL_INTERVAL", "10".into())); c },
-        { let mut c = case("SHARD_SIZE=4194304 (signed into the request)", "valid", Expect::Proof); c.set.push(("SHARD_SIZE", "4194304".into())); c },
-        { let mut c = case("MAX_PROVER_NUM=1", "valid", Expect::Proof); c.set.push(("MAX_PROVER_NUM", "1".into())); c },
-        { let mut c = case("SINGLE_NODE=true", "valid", Expect::Proof); c.set.push(("SINGLE_NODE", "true".into())); c },
+        {
+            let mut c = case("poll: ZKM_PROOF_POLL_INTERVAL=100", "valid", Expect::Proof);
+            c.set.push(("ZKM_PROOF_POLL_INTERVAL", "100".into()));
+            c
+        },
+        {
+            let mut c = case("poll: ZKM_PROOF_POLL_INTERVAL=3000", "valid", Expect::Proof);
+            c.set.push(("ZKM_PROOF_POLL_INTERVAL", "3000".into()));
+            c
+        },
+        {
+            let mut c = case(
+                "poll: ZKM_PROOF_POLL_INTERVAL=10 (clamped to 100)",
+                "valid",
+                Expect::Proof,
+            );
+            c.set.push(("ZKM_PROOF_POLL_INTERVAL", "10".into()));
+            c
+        },
+        {
+            let mut c = case(
+                "SHARD_SIZE=4194304 (signed into the request)",
+                "valid",
+                Expect::Proof,
+            );
+            c.set.push(("SHARD_SIZE", "4194304".into()));
+            c
+        },
+        {
+            let mut c = case("MAX_PROVER_NUM=1", "valid", Expect::Proof);
+            c.set.push(("MAX_PROVER_NUM", "1".into()));
+            c
+        },
+        {
+            let mut c = case("SINGLE_NODE=true", "valid", Expect::Proof);
+            c.set.push(("SINGLE_NODE", "true".into()));
+            c
+        },
         // inputs
-        { let mut c = case("stdin: 24 MB input", "valid", Expect::Proof); c.big_stdin = 24 << 20; c },
-        { let mut c = case("timeout: 1 ms client deadline", "valid", Expect::Fail); c.timeout = Duration::from_millis(1); c.input = 300_000; c },
+        {
+            let mut c = case("stdin: 24 MB input", "valid", Expect::Proof);
+            c.big_stdin = 24 << 20;
+            c
+        },
+        {
+            let mut c = case("timeout: 1 ms client deadline", "valid", Expect::Fail);
+            c.timeout = Duration::from_millis(1);
+            c.input = 300_000;
+            c
+        },
     ];
     if let Some(only) = &kinds_only {
         cases.retain(|c| c.name.contains(only.as_str()));
     }
 
     let mut failures = 0;
-    println!("{:<58} {:<6} {:<6} {:>8}  detail", "CASE", "EXPECT", "GOT", "SECS");
+    println!(
+        "{:<58} {:<6} {:<6} {:>8}  detail",
+        "CASE", "EXPECT", "GOT", "SECS"
+    );
     for c in &cases {
         for v in SDK_VARS {
             std::env::remove_var(v);
@@ -138,13 +285,26 @@ async fn main() -> anyhow::Result<()> {
             if c.big_stdin > 0 {
                 stdin.write_vec(vec![7u8; c.big_stdin]);
             }
-            let (proof, cycles) = prover.prove_with_cycles(&elf, stdin, c.kind, c.by_elf_id.clone(), Some(c.timeout)).await?;
-            Ok(format!("cycles={cycles} pv={}B {:?}", proof.public_values.as_slice().len(), std::mem::discriminant(&proof.proof)))
+            let (proof, cycles) = prover
+                .prove_with_cycles(&elf, stdin, c.kind, c.by_elf_id.clone(), Some(c.timeout))
+                .await?;
+            Ok(format!(
+                "cycles={cycles} pv={}B {:?}",
+                proof.public_values.as_slice().len(),
+                std::mem::discriminant(&proof.proof)
+            ))
         }
         .await;
         let (got, detail) = match outcome {
             Ok(d) => (Expect::Proof, d),
-            Err(e) => (Expect::Fail, format!("{e:#}").replace('\n', " ").chars().take(110).collect()),
+            Err(e) => (
+                Expect::Fail,
+                format!("{e:#}")
+                    .replace('\n', " ")
+                    .chars()
+                    .take(110)
+                    .collect(),
+            ),
         };
         let ok = got == c.expect;
         if !ok {

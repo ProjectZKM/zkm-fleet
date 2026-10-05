@@ -46,7 +46,10 @@ mod tests {
         for (block_no, msg) in [(None, "p-1&0"), (Some(42), "p-1&42&0")] {
             let sig = sign(&key, msg);
             assert_eq!(recover_signer(&sig, "p-1", block_no, 0).unwrap(), expected);
-            assert_eq!(recover_signer(&format!("0x{sig}"), "p-1", block_no, 0).unwrap(), expected);
+            assert_eq!(
+                recover_signer(&format!("0x{sig}"), "p-1", block_no, 0).unwrap(),
+                expected
+            );
         }
     }
 

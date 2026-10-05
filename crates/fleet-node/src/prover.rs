@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::watch;
 use tonic::{metadata::MetadataValue, Request, Response, Status};
 
 use fleet_proto::fleet::v1::{
-    node_service_server::NodeService, HealthRequest, HealthResponse, ProofKind, ProveRequest, ProveResponse,
+    node_service_server::NodeService, HealthRequest, HealthResponse, ProofKind, ProveRequest,
+    ProveResponse,
 };
 use zkm_cuda::ZKMGpuServer;
 use zkm_prover::ZKMProver;
@@ -20,6 +21,15 @@ use zkm_sdk::{ProverClient, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingK
 use crate::Args;
 
 type Keys = Arc<(ZKMProvingKey, ZKMVerifyingKey)>;
+type Outcome = Result<ProveResponse, (tonic::Code, String)>;
+
+/// Results kept for jobs whose caller went away (a scheduler restart): it asks again.
+const FINISHED_KEPT: usize = 4;
+
+struct Running {
+    job_id: String,
+    done: watch::Receiver<Option<Outcome>>,
+}
 
 pub struct Node {
     client: Arc<ProverClient>,
@@ -27,25 +37,36 @@ pub struct Node {
     gpu_endpoint: String,
     keys: Mutex<LruCache<String, Keys>>,
     /// One proof at a time: the GPU server serialises anyway, and the CPU prover takes every core.
-    slot: Arc<Semaphore>,
+    /// Lock order: `running` before `finished`.
+    running: Mutex<Option<Running>>,
+    finished: Mutex<LruCache<String, Outcome>>,
     http: reqwest::Client,
 }
 
 impl Node {
     pub async fn start(args: &Args) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
         let client = match args.backend.as_str() {
             "cpu" => tokio::task::spawn_blocking(ProverClient::cpu).await?,
             "mock" => ProverClient::mock(),
             "cuda" => {
                 let deadline = Instant::now() + Duration::from_secs(args.ready_timeout);
                 while !gpu_ready(&http, &args.gpu_endpoint).await {
-                    anyhow::ensure!(Instant::now() < deadline, "GPU server at {} never became ready", args.gpu_endpoint);
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "GPU server at {} never became ready",
+                        args.gpu_endpoint
+                    );
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
                 let endpoint = args.gpu_endpoint.clone();
                 tokio::task::spawn_blocking(move || ProverClient {
-                    prover: Box::new(CudaProver::new(ZKMProver::new(), ZKMGpuServer::External { endpoint })),
+                    prover: Box::new(CudaProver::new(
+                        ZKMProver::new(),
+                        ZKMGpuServer::External { endpoint },
+                    )),
                 })
                 .await?
             }
@@ -55,8 +76,11 @@ impl Node {
             client: Arc::new(client),
             backend: args.backend.clone(),
             gpu_endpoint: args.gpu_endpoint.clone(),
-            keys: Mutex::new(LruCache::new(NonZeroUsize::new(args.pk_cache.max(1)).unwrap())),
-            slot: Arc::new(Semaphore::new(1)),
+            keys: Mutex::new(LruCache::new(
+                NonZeroUsize::new(args.pk_cache.max(1)).unwrap(),
+            )),
+            running: Mutex::new(None),
+            finished: Mutex::new(LruCache::new(NonZeroUsize::new(FINISHED_KEPT).unwrap())),
             http,
         })
     }
@@ -73,6 +97,11 @@ impl Node {
         self.keys.lock().iter().map(|(k, _)| k.clone()).collect()
     }
 
+    /// The job being proved, if any.
+    pub fn running_job(&self) -> Option<String> {
+        self.running.lock().as_ref().map(|r| r.job_id.clone())
+    }
+
     async fn keys_for(&self, elf_id: &str, elf: Vec<u8>) -> Result<Keys, Status> {
         if let Some(k) = self.keys.lock().get(elf_id) {
             return Ok(k.clone());
@@ -82,21 +111,74 @@ impl Node {
         }
         let got = zkm_elf_id(&elf);
         if got != elf_id {
-            return Err(Status::invalid_argument(format!("elf does not hash to {elf_id} (got {got})")));
+            return Err(Status::invalid_argument(format!(
+                "elf does not hash to {elf_id} (got {got})"
+            )));
         }
         let client = self.client.clone();
         let t = Instant::now();
         let keys = tokio::task::spawn_blocking(move || client.setup(&elf))
             .await
             .map_err(|e| Status::internal(format!("setup panicked: {e}")))?;
-        tracing::info!(elf_id, setup_ms = t.elapsed().as_millis() as u64, "program set up");
+        tracing::info!(
+            elf_id,
+            setup_ms = t.elapsed().as_millis() as u64,
+            "program set up"
+        );
         let keys = Arc::new(keys);
         self.keys.lock().put(elf_id.to_string(), keys.clone());
         Ok(keys)
     }
 
-    pub async fn prove(&self, req: ProveRequest) -> Result<ProveResponse, Status> {
-        let _permit = self.slot.clone().try_acquire_owned().map_err(|_| Status::resource_exhausted("node busy"))?;
+    /// Starts the proof in its own task, so it finishes even when the caller goes away, or
+    /// joins the running or a finished proof of the same job.
+    pub async fn prove(self: &Arc<Self>, req: ProveRequest) -> Result<ProveResponse, Status> {
+        let mut done = {
+            let mut running = self.running.lock();
+            if let Some(out) = self.finished.lock().get(&req.job_id) {
+                tracing::info!(job = %req.job_id, "returning the result of a finished proof");
+                return out.clone().map_err(|(code, msg)| Status::new(code, msg));
+            }
+            match &*running {
+                Some(r) if r.job_id == req.job_id => {
+                    tracing::info!(job = %req.job_id, "joining the running proof");
+                    r.done.clone()
+                }
+                Some(_) => return Err(Status::resource_exhausted("node busy")),
+                None => {
+                    let (tx, rx) = watch::channel(None);
+                    *running = Some(Running {
+                        job_id: req.job_id.clone(),
+                        done: rx.clone(),
+                    });
+                    let me = self.clone();
+                    tokio::spawn(async move {
+                        let job_id = req.job_id.clone();
+                        let out = me
+                            .run(req)
+                            .await
+                            .map_err(|s| (s.code(), s.message().to_string()));
+                        {
+                            let mut running = me.running.lock();
+                            me.finished.lock().put(job_id, out.clone());
+                            *running = None;
+                        }
+                        let _ = tx.send(Some(out));
+                    });
+                    rx
+                }
+            }
+        };
+        let out = done
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| Status::internal("the proof task ended"))?
+            .clone();
+        out.expect("waited for Some")
+            .map_err(|(code, msg)| Status::new(code, msg))
+    }
+
+    async fn run(&self, req: ProveRequest) -> Result<ProveResponse, Status> {
         let t0 = Instant::now();
         let keys = self.keys_for(&req.elf_id, req.elf).await?;
         let kind = match ProofKind::try_from(req.kind).unwrap_or(ProofKind::Unspecified) {
@@ -105,7 +187,9 @@ impl Node {
             ProofKind::Groth16 => ZKMProofKind::Groth16,
             ProofKind::Plonk => ZKMProofKind::Plonk,
             ProofKind::CompressToGroth16 => ZKMProofKind::CompressToGroth16,
-            ProofKind::Unspecified => return Err(Status::invalid_argument("proof kind unspecified")),
+            ProofKind::Unspecified => {
+                return Err(Status::invalid_argument("proof kind unspecified"))
+            }
         };
         let proofs = req
             .receipts
@@ -113,13 +197,19 @@ impl Node {
             .map(|r| bincode::deserialize(r))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Status::invalid_argument(format!("receipt: {e}")))?;
-        let stdin = ZKMStdin { buffer: req.stdin_buffer, ptr: 0, proofs };
+        let stdin = ZKMStdin {
+            buffer: req.stdin_buffer,
+            ptr: 0,
+            proofs,
+        };
         let client = self.client.clone();
         let elf_id = req.elf_id.clone();
         let job_id = req.job_id.clone();
         let t1 = Instant::now();
         let (proof, cycles, server_ms) = tokio::task::spawn_blocking(move || {
-            let r = client.prover.prove_with_cycles(&keys.0, &stdin, kind, Some(elf_id));
+            let r = client
+                .prover
+                .prove_with_cycles(&keys.0, &stdin, kind, Some(elf_id));
             let server_ms = client.prover.take_prove_ms();
             r.map(|(p, c)| (p, c, server_ms))
         })
@@ -127,12 +217,16 @@ impl Node {
         .map_err(|e| Status::internal(format!("prover panicked: {e}")))?
         .map_err(|e| Status::internal(format!("{e:#}")))?;
         if self.backend == "mock" {
-            if let Some(ms) = std::env::var("FLEET_MOCK_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            if let Some(ms) = std::env::var("FLEET_MOCK_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
         }
         let prove_ms = server_ms.unwrap_or(t1.elapsed().as_millis() as u64);
-        let proof_json = serde_json::to_vec(&proof.proof).map_err(|e| Status::internal(format!("encoding proof: {e}")))?;
+        let proof_json = serde_json::to_vec(&proof.proof)
+            .map_err(|e| Status::internal(format!("encoding proof: {e}")))?;
         let wall_ms = t0.elapsed().as_millis() as u64;
         tracing::info!(job = %job_id, cycles, prove_ms, wall_ms, proof_bytes = proof_json.len(), "proved");
         Ok(ProveResponse {
@@ -167,8 +261,18 @@ mod sha2_digest {
 /// `{ready: true}` answers as the two bytes `08 01`.
 async fn gpu_ready(http: &reqwest::Client, endpoint: &str) -> bool {
     let url = format!("{}/api.ProverService/Ready", endpoint.trim_end_matches('/'));
-    match http.post(&url).header("content-type", "application/protobuf").body(Vec::<u8>::new()).send().await {
-        Ok(r) if r.status().is_success() => r.bytes().await.map(|b| b.as_ref() == [0x08, 0x01]).unwrap_or(false),
+    match http
+        .post(&url)
+        .header("content-type", "application/protobuf")
+        .body(Vec::<u8>::new())
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r
+            .bytes()
+            .await
+            .map(|b| b.as_ref() == [0x08, 0x01])
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -179,25 +283,40 @@ pub struct NodeApi {
 
 #[tonic::async_trait]
 impl NodeService for NodeApi {
-    async fn prove(&self, request: Request<ProveRequest>) -> Result<Response<ProveResponse>, Status> {
-        self.node.prove(request.into_inner()).await.map(Response::new)
+    async fn prove(
+        &self,
+        request: Request<ProveRequest>,
+    ) -> Result<Response<ProveResponse>, Status> {
+        self.node
+            .prove(request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             ready: self.node.ready().await,
             cached_elf_ids: self.node.cached(),
-            busy: self.node.slot.available_permits() == 0,
+            busy: self.node.running_job().is_some(),
         }))
     }
 }
 
 fn bearer_ok(req: &Request<()>, token: &str) -> bool {
-    let Some(got) = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))
+    let Some(got) = req
+        .metadata()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
     else {
         return false;
     };
-    got.len() == token.len() && got.bytes().zip(token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
+    got.len() == token.len()
+        && got
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |a, (x, y)| a | (x ^ y))
+            == 0
 }
 
 /// Only the scheduler (holding the cluster token) may send work: the node receives witnesses.

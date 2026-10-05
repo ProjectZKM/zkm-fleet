@@ -145,10 +145,17 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut seen = std::collections::HashSet::new();
         for t in &self.tenants {
-            anyhow::ensure!(seen.insert(t.name.as_str()), "tenant {} declared twice", t.name);
+            anyhow::ensure!(
+                seen.insert(t.name.as_str()),
+                "tenant {} declared twice",
+                t.name
+            );
         }
         if let Some(d) = &self.default_tenant {
-            anyhow::ensure!(self.tenant(d).is_some(), "default_tenant {d} is not declared");
+            anyhow::ensure!(
+                self.tenant(d).is_some(),
+                "default_tenant {d} is not declared"
+            );
         }
         anyhow::ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
         Ok(())
@@ -168,5 +175,8 @@ impl Config {
 }
 
 fn normalize_address(a: &str) -> String {
-    a.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase()
+    a.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_ascii_lowercase()
 }

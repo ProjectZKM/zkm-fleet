@@ -3,13 +3,18 @@
 One scheduler for the GPU / CPU workloads on our machines. Phase 1 runs Ziren proofs: EthProofs and GOAT submit through the Ziren SDK's network prover (`ZKM_PROVER=network`, unchanged), the scheduler places each job on a prover node, and the nodes run as Ray actors next to the GPU servers. Design and discussion: ProjectZKM/Projects#5.
 
 ```
-SDK network prover ──mTLS──▶ fleet-scheduler ──cluster token──▶ fleet-node ──loopback──▶ GPU server container
-  (EthProofs, GOAT)         stage API :51000                     (Ray actor)              (ziren-gpu image)
-                            control  :51001 ◀──register/heartbeat──┘
-fleetctl ──admin token──▶   http     :9191  (/admin, public values)
+SDK network prover ──mTLS──▶ gateway ──▶ fleet-scheduler ──cluster token──▶ fleet-node ──loopback──▶ GPU server container
+  (EthProofs, GOAT)         :51000 stage                                     (Ray actor)              (ziren-gpu image)
+                                         control :51001 ◀──register/heartbeat──┘
+fleetctl ──admin token──▶   :9191 http (/admin, public values)
 ```
 
-The scheduler and its Postgres run under docker compose. Every machine runs a Ray node; the prover actors are detached, so Ray restarts them on failure, and `apply` reconciles them with `services.yaml` when it changes.
+The scheduler, its Postgres and the gateway run under docker compose. Every machine runs a Ray node; the prover actors are detached, so Ray restarts them on failure, and `apply` reconciles them with `services.yaml` when it changes.
+
+Restarting or upgrading the scheduler does not fail the proofs in flight:
+- **gateway:** the SDK gives up on the first broken call, so the gateway (Envoy) terminates mTLS and retries calls until the scheduler is back. A resubmitted `proof_id` is never queued twice.
+- **jobs:** the scheduler keeps them in Postgres.
+- **nodes:** a proof keeps running on its node; the restarted scheduler sends the job back to that node, which hands over the result.
 
 ## Install
 
@@ -51,7 +56,7 @@ fleetctl status                                       # queue, nodes, anchors
 | take a node out | `fleetctl node drain <name>` (finishes its job), later `undrain` |
 | one job | `fleetctl job <proof_id>` |
 | logs | `docker compose -p zkm-fleet logs scheduler`; node logs in `/opt/zkm-fleet/logs`; GPU servers: `docker logs fleet-gpu-<name>` |
-| upgrade the scheduler | `git pull`, rebuild, `docker compose -p zkm-fleet up -d --build` |
+| upgrade the scheduler | `git pull`, rebuild, `docker compose -p zkm-fleet up -d --build scheduler`; clients and running proofs ride through it |
 
 ## Credentials
 
@@ -59,7 +64,7 @@ fleetctl status                                       # queue, nodes, anchors
 |---|---|---|
 | tenant signing key (`ZKM_PRIVATE_KEY`) | the client | `fleetctl credential issue`: generated on the operator's machine, only the address is registered, revocable |
 | client certificate (`SSL_CERT_PATH` / `SSL_KEY_PATH`) | the client | the same command with `--tls-dir`. The SDK only enables TLS when it has a client certificate, so the stage API runs mutual TLS |
-| stage server certificate + CA | scheduler; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl tls init`) |
+| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl tls init`) |
 | cluster token | scheduler and every node, both directions | `install.sh` (`fleetctl token new`) |
 | admin token | operators | `install.sh` (`fleetctl token new`) |
 
@@ -69,9 +74,10 @@ What the SDK's scheme leaves open: the request signature covers `proof_id&seg_si
 
 | port | bind | who |
 |---|---|---|
-| 51000 stage (gRPC) | external, mTLS | SDK clients |
-| 9191 http | external | public values (SDK), `/admin` (admin token), `/healthz` |
+| 51000 stage (gRPC) | external, mTLS, on the gateway | SDK clients |
+| 9191 http | external, on the gateway | public values (SDK), `/admin` (admin token), `/healthz` |
 | 51001 control (gRPC) | cluster interface | nodes (cluster token) |
 | 31000-31099 fleet-node | cluster | the scheduler (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |
+| 172.28.250.0/24 | docker network on the control machine | scheduler (fixed at .10), Postgres, gateway; `install.sh --subnet` if it collides |
