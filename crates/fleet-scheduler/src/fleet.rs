@@ -21,6 +21,33 @@ use crate::token;
 
 pub type NodeClient = NodeServiceClient<InterceptedService<Channel, token::Attach>>;
 
+/// How an attempt failed, which decides whether it counts and what it says about the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The node could not be reached: the job never started. Not counted as an attempt.
+    NotStarted,
+    /// The connection broke or timed out mid-proof: the node or its machine is suspect.
+    Lost,
+    /// The node answered with an error.
+    Prover,
+}
+
+/// Nodes tried per job, whatever the reason, before it fails.
+const MAX_NODES_TRIED: usize = 8;
+
+fn classify(status: &tonic::Status) -> Failure {
+    let m = status.message();
+    match status.code() {
+        tonic::Code::Unavailable => Failure::NotStarted,
+        tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::Aborted
+            if m.contains("transport") || m.contains("connection") || m.contains("broken pipe") =>
+        {
+            Failure::Lost
+        }
+        _ => Failure::Prover,
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
@@ -452,7 +479,7 @@ impl Fleet {
             .get(&node_id)
             .map(|n| (n.client.clone(), n.cached.contains(&job.elf_id)));
         let Some((client, has_elf)) = found else {
-            self.fail_attempt(&job_id, &node_id, "node left before the job started").await;
+            self.fail_attempt(&job_id, &node_id, "node left before the job started", Failure::NotStarted).await;
             return;
         };
         let request = match self.build_request(&job, !has_elf) {
@@ -512,9 +539,9 @@ impl Fleet {
             }
             Ok(Err(status)) => {
                 let msg = format!("{}: {}", status.code(), status.message());
-                self.fail_attempt(&job_id, &node_id, &msg).await;
+                self.fail_attempt(&job_id, &node_id, &msg, classify(&status)).await;
             }
-            Err(_) => self.fail_attempt(&job_id, &node_id, "timed out").await,
+            Err(_) => self.fail_attempt(&job_id, &node_id, "timed out", Failure::Lost).await,
         }
     }
 
@@ -531,11 +558,24 @@ impl Fleet {
         })
     }
 
-    /// Requeues the job on another node, or fails it after `max_attempts`.
-    async fn fail_attempt(&self, job_id: &str, node_id: &str, msg: &str) {
+    /// Requeues the job on another node, or fails it after `max_attempts` counted attempts
+    /// (or `MAX_NODES_TRIED` nodes). A node that could not be reached, or dropped the
+    /// connection, is marked not ready together with the other nodes on its machine (the
+    /// machine is likely gone); the next heartbeat of a live node marks it ready again.
+    async fn fail_attempt(&self, job_id: &str, node_id: &str, msg: &str, failure: Failure) {
         let node_name = {
-            let inner = self.inner.lock();
-            inner.nodes.get(node_id).map(|n| n.info.name.clone())
+            let mut inner = self.inner.lock();
+            let info = inner.nodes.get(node_id).map(|n| (n.info.name.clone(), n.info.machine.clone()));
+            if failure != Failure::Prover {
+                if let Some((_, machine)) = &info {
+                    for n in inner.nodes.values_mut() {
+                        if n.info.machine == *machine || n.id == node_id {
+                            n.ready = false;
+                        }
+                    }
+                }
+            }
+            info.map(|(name, _)| name)
         };
         self.release(node_id, None);
         let max = self.cfg.max_attempts;
@@ -543,8 +583,11 @@ impl Fleet {
             if let Some(n) = node_name.clone().or_else(|| j.node.clone()) {
                 j.failed_on.push(n);
             }
+            if failure == Failure::NotStarted {
+                j.attempts = j.attempts.saturating_sub(1);
+            }
             j.error = msg.to_string();
-            if j.attempts >= max {
+            if j.attempts >= max || j.failed_on.len() >= MAX_NODES_TRIED {
                 j.state = JobState::Failed(StageStatus::ProveError);
                 j.finished_ms = Some(now_ms());
             } else {
@@ -553,7 +596,7 @@ impl Fleet {
             }
         });
         if let Some(j) = &j {
-            tracing::warn!(job = %j.id, attempt = j.attempts, error = %msg, retrying = !j.state.is_terminal(), "job attempt failed");
+            tracing::warn!(job = %j.id, attempt = j.attempts, ?failure, error = %msg, retrying = !j.state.is_terminal(), "job attempt failed");
         }
         self.persist(j).await;
     }

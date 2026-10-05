@@ -102,7 +102,10 @@ fn bind_in_range(ip: std::net::IpAddr, range: &str) -> anyhow::Result<(tokio::ne
 }
 
 fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
-    let t = std::fs::read_to_string(path)?.trim().to_string();
+    let t = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading the cluster token {}: {e}", path.display()))?
+        .trim()
+        .to_string();
     anyhow::ensure!(t.len() >= 32, "cluster token in {} is shorter than 32 characters", path.display());
     Ok(t)
 }

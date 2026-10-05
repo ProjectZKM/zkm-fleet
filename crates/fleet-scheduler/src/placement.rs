@@ -45,7 +45,14 @@ pub fn choose(
         if let Some(name) = anchor {
             if let Some((i, n)) = nodes.iter().enumerate().find(|(_, n)| n.name == name) {
                 if eligible(n, tenant, failed_on) {
-                    return if n.busy { Choice::WaitForAnchor } else { Choice::Run(i) };
+                    if !n.busy {
+                        return Choice::Run(i);
+                    }
+                    // Exclusive: the reserved node is the tenant's; wait for it.
+                    // Shared: prefer the anchor, but a free node beats waiting.
+                    if tenant.anchor == Anchor::Exclusive {
+                        return Choice::WaitForAnchor;
+                    }
                 }
             }
         }
@@ -122,8 +129,18 @@ mod tests {
     }
 
     #[test]
-    fn an_anchored_program_waits_for_its_busy_node_and_moves_when_it_is_gone() {
+    fn a_shared_anchor_spills_to_a_free_node_when_busy() {
         let t = tenant(Class::Latency, Anchor::Shared);
+        let mut nodes = vec![node("a", 4), node("b", 4)];
+        nodes[0].busy = true;
+        assert_eq!(choose(&t, &[], Some("a"), &nodes), Choice::Run(1));
+        nodes[1].busy = true;
+        assert_eq!(choose(&t, &[], Some("a"), &nodes), Choice::NoNode);
+    }
+
+    #[test]
+    fn an_exclusive_anchor_waits_for_its_busy_node_and_moves_when_it_is_gone() {
+        let t = tenant(Class::Latency, Anchor::Exclusive);
         let mut nodes = vec![node("a", 4), node("b", 4)];
         nodes[0].busy = true;
         assert_eq!(choose(&t, &[], Some("a"), &nodes), Choice::WaitForAnchor);

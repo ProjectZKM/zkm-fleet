@@ -154,6 +154,12 @@ STAGE_BIND=$BIND_STAGE
 CONTROL_BIND=$IP
 HTTP_BIND=$BIND_HTTP
 EOF
+  IMG=$(grep -E '^ *image: \$\{FLEET_SCHEDULER_IMAGE' "$PREFIX/deploy/docker-compose.yml" | sed -E 's/.*:-([^}]*)\}.*/\1/')
+  if ! docker image inspect "${FLEET_SCHEDULER_IMAGE:-$IMG}" > /dev/null 2>&1; then
+    [ -d "$SRC/crates" ] || die "no scheduler image ${FLEET_SCHEDULER_IMAGE:-$IMG}: run from a full checkout, or load / pull the image first"
+    say "building the scheduler image (first install)"
+    docker build -q -f "$SRC/deploy/Dockerfile.scheduler" -t "${FLEET_SCHEDULER_IMAGE:-$IMG}" "$SRC" > /dev/null
+  fi
   say "starting the scheduler and Postgres (docker compose)"
   docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d
   for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:9191/healthz" > /dev/null 2>&1 && break; sleep 2; done
