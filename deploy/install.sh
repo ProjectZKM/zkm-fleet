@@ -169,7 +169,10 @@ RAY_NODE_IP=$IP
 CUDA_VISIBLE_DEVICES=$CUDA
 EOF
 say "starting Ray ($( [ "$ROLE" = control ] && echo head || echo "worker of $HEAD"), cards: ${CUDA:-none}, cpus: ${CPUS:-all}, workspace $WORKDIR)"
-FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh"
+FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh" || true
+RAY_AT=$([ "$ROLE" = control ] && echo 127.0.0.1 || echo "$HEAD")
+"$PREFIX/venv/bin/ray" status --address "$RAY_AT:6379" > /dev/null 2>&1 \
+  || die "Ray did not start: see $WORKDIR/logs/ray.log"
 LINE="* * * * * FLEET_ENV=$ETC/watchdog.env $PREFIX/deploy/fleet-watchdog.sh >> $WORKDIR/logs/watchdog.log 2>&1"
 if ! crontab -l 2>/dev/null | grep -qF "$PREFIX/deploy/fleet-watchdog.sh"; then
   (crontab -l 2>/dev/null; echo "$LINE") | crontab -

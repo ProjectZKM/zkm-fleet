@@ -74,4 +74,4 @@ What the SDK's scheme leaves open: the request signature covers `proof_id&seg_si
 | 51001 control (gRPC) | cluster interface | nodes (cluster token) |
 | 31000-31099 fleet-node | cluster | the scheduler (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
-| Ray 6379, 6380, 6381, 10001, 8080, 52365, 10002-19999 | cluster | Ray |
+| Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |

@@ -24,7 +24,7 @@ else
   COMMON+=(--num-gpus=0)
 fi
 case "${1:-}" in
-  head)   ray start --head --port=6379 --ray-client-server-port=10001 --include-dashboard=false "${COMMON[@]}" ;;
+  head)   ray start --head --port=6379 --include-dashboard=false "${COMMON[@]}" ;;
   worker) ray start --address="${2:?head ip}:6379" "${COMMON[@]}" ;;
   *) echo "usage: $0 head | worker <head-ip>"; exit 2 ;;
 esac
