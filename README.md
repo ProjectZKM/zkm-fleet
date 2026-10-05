@@ -35,8 +35,9 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ## Operate
 
+`install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL` and `FLEET_ADMIN_TOKEN_FILE`).
+
 ```bash
-export FLEET_URL=http://127.0.0.1:9191 FLEET_ADMIN_TOKEN_FILE=/etc/zkm-fleet/admin.token
 fleetctl status                                       # queue, nodes, anchors
 ```
 

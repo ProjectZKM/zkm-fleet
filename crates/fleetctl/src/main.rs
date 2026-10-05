@@ -17,7 +17,7 @@ struct Cli {
     /// Scheduler HTTP base URL (admin API under /admin).
     #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9191", global = true)]
     url: String,
-    /// File holding the admin token.
+    /// File holding the admin token (default: admin.token in FLEET_ETC, ~/.config/zkm-fleet or /etc/zkm-fleet).
     #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE", global = true)]
     admin_token_file: Option<PathBuf>,
     #[command(subcommand)]
@@ -145,8 +145,11 @@ struct Admin {
 
 impl Admin {
     fn new(cli: &Cli) -> anyhow::Result<Self> {
-        let path = cli.admin_token_file.as_ref().context("--admin-token-file or FLEET_ADMIN_TOKEN_FILE is required")?;
-        let token = std::fs::read_to_string(path)?.trim().to_string();
+        let path = match &cli.admin_token_file {
+            Some(p) => p.clone(),
+            None => default_admin_token().context("no admin token: pass --admin-token-file or set FLEET_ADMIN_TOKEN_FILE")?,
+        };
+        let token = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?.trim().to_string();
         Ok(Self { url: cli.url.trim_end_matches('/').to_string(), token, http: reqwest::blocking::Client::new() })
     }
 
@@ -246,6 +249,19 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
         Cmd::Token(_) | Cmd::Tls(_) => unreachable!(),
     }
     Ok(())
+}
+
+/// admin.token in $FLEET_ETC, then ~/.config/zkm-fleet (written by install.sh without root), then /etc/zkm-fleet.
+fn default_admin_token() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(e) = std::env::var("FLEET_ETC") {
+        dirs.push(e.into());
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        dirs.push(PathBuf::from(h).join(".config/zkm-fleet"));
+    }
+    dirs.push("/etc/zkm-fleet".into());
+    dirs.into_iter().map(|d| d.join("admin.token")).find(|p| p.exists())
 }
 
 fn print_status(v: &Value) {

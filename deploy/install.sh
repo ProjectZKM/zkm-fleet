@@ -83,6 +83,9 @@ if ! "$PREFIX/venv/bin/python" -c "import ray, yaml, sys; sys.exit(ray.__version
   "$PREFIX/venv/bin/pip" install -q --timeout 120 --retries 10 "ray==$RAY_VERSION" pyyaml
 fi
 FLEETCTL="$PREFIX/bin/fleetctl"
+# fleetctl on PATH: /usr/local/bin with root, ~/.local/bin without.
+if [ -w /usr/local/bin ]; then LINKDIR=/usr/local/bin; else LINKDIR="$HOME/.local/bin"; mkdir -p "$LINKDIR"; fi
+ln -sf "$FLEETCTL" "$LINKDIR/fleetctl"
 
 # ------------------------------------------------------------------ secrets
 if [ "$ROLE" = control ]; then
@@ -97,6 +100,12 @@ if [ "$ROLE" = control ]; then
   fi
 else
   install -m 600 "$TOKEN" "$ETC/cluster.token"
+fi
+
+# With a non-default config directory, let fleetctl find the admin token without flags.
+if [ "$ROLE" = control ] && [ "$ETC" != /etc/zkm-fleet ]; then
+  mkdir -p "$HOME/.config/zkm-fleet"
+  ln -sf "$ETC/admin.token" "$HOME/.config/zkm-fleet/admin.token"
 fi
 
 # ---------------------------------------------------------------- scheduler
@@ -191,9 +200,9 @@ say "done"
 if [ "$ROLE" = control ]; then
   cat <<EOF
 
-  status:      FLEET_URL=http://127.0.0.1:9191 FLEET_ADMIN_TOKEN_FILE=$ETC/admin.token $FLEETCTL status
+  status:      fleetctl status          (fleetctl is in $LINKDIR)
   provers:     edit $ETC/services.yaml, then $PREFIX/deploy/apply.sh
-  a client:    $FLEETCTL credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 \\
+  a client:    fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 \\
                  --tls-dir $ETC/tls --out ethproofs.env
   a new node:  copy $ETC/cluster.token to it, then
                deploy/install.sh node --head $IP --cluster-token cluster.token --cuda 0,1,2,3
