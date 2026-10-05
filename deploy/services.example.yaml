@@ -1,0 +1,29 @@
+# fleet_bridge: Ray actors to keep running.
+scheduler: http://10.0.0.1:50001
+cluster_token_file: /etc/zkm-fleet/cluster.token
+node_binary: /opt/zkm-fleet/bin/fleet-node
+log_dir: /var/log/zkm-fleet
+gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
+node_port_range: [31000, 31099]    # fleet-node, cluster network
+services:
+  - name: ethproofs-gpu
+    kind: ziren-gpu
+    replicas: 1
+    gpus: 2
+    cpus: 48
+    memory_gb: 256
+    shm_gb: 64
+    image: ghcr.io/projectzkm/ziren-gpu@sha256:REPLACE
+    env:
+      VERIFY_VK: "true"
+      SHARD_SIZE: "16777216"
+      ZIREN_LEAF_HOST_THREADS: "3"
+      ZIREN_PROCESS_PER_GPU: "1"
+      ZIREN_FUSE_LEAVES: "1"
+      ZIREN_REDUCE_OVERLAP: "1"
+      TMPDIR: /dev/shm
+  - name: cpu-wrap
+    kind: ziren-cpu
+    replicas: 1
+    cpus: 16
+    memory_gb: 64

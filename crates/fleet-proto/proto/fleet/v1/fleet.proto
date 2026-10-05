@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package fleet.v1;
+
+// Scheduler -> prover node. One proof at a time per node.
+service NodeService {
+  rpc Prove(ProveRequest) returns (ProveResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+enum ProofKind {
+  PROOF_KIND_UNSPECIFIED = 0;
+  PROOF_KIND_CORE = 1;
+  PROOF_KIND_COMPRESSED = 2;
+  PROOF_KIND_GROTH16 = 3;
+  PROOF_KIND_PLONK = 4;
+  PROOF_KIND_COMPRESS_TO_GROTH16 = 5;
+}
+
+message ProveRequest {
+  string job_id = 1;
+  // Hex SHA-256 of the guest ELF, without 0x.
+  string elf_id = 2;
+  // Empty when the node reported this ELF as cached; the node answers
+  // FAILED_PRECONDITION "elf_missing" if it was evicted meanwhile.
+  bytes elf = 3;
+  // ZKMStdin.buffer, one entry per guest read.
+  repeated bytes stdin_buffer = 4;
+  // ZKMStdin.proofs, each a bincode (ZKMReduceProof, StarkVerifyingKey) pair,
+  // exactly as the SDK's network prover sends them.
+  repeated bytes receipts = 5;
+  ProofKind kind = 6;
+}
+
+message ProveResponse {
+  // serde_json of zkm_sdk::ZKMProof: what the SDK's network prover parses.
+  bytes proof_json = 1;
+  // Raw public-values bytes (ZKMPublicValues::to_vec).
+  bytes public_values = 2;
+  uint64 cycles = 3;
+  // Time the prover itself spent (the GPU server's own figure when it has one).
+  uint64 prove_ms = 4;
+  // Wall time of the whole call on the node, setup included.
+  uint64 wall_ms = 5;
+  string zkm_version = 6;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  repeated string cached_elf_ids = 2;
+  bool busy = 3;
+}
+
+// Prover node -> scheduler. Cluster-internal port only.
+service ControlService {
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+}
+
+message NodeInfo {
+  // Unique and stable across restarts of the same node (e.g. the Ray actor name).
+  string name = 1;
+  // Where the scheduler reaches this node's NodeService, e.g. http://10.0.0.5:31000.
+  string endpoint = 2;
+  // "cuda", "cpu" or "mock".
+  string backend = 3;
+  uint32 gpus = 4;
+  uint32 cpus = 5;
+  // Proof-system version the node proves with (the SDK's circuit version).
+  string zkm_version = 6;
+  // GPU server image digest, for cuda nodes.
+  string image = 7;
+  string machine = 8;
+}
+
+message RegisterRequest {
+  NodeInfo node = 1;
+}
+
+message RegisterResponse {
+  string node_id = 1;
+  uint32 heartbeat_secs = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  bool ready = 2;
+  repeated string cached_elf_ids = 3;
+}
+
+message HeartbeatResponse {
+  // False when the scheduler does not know this node id (it restarted): register again.
+  bool known = 1;
+}
+
+message DeregisterRequest {
+  string node_id = 1;
+}
+
+message DeregisterResponse {}

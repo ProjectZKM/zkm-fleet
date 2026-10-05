@@ -1,0 +1,13 @@
+[project]
+name = "fleet-bridge"
+version = "0.1.0"
+description = "Ray bridge for zkm-fleet: runs prover nodes as Ray actors"
+requires-python = ">=3.10"
+dependencies = ["ray[default]==2.59.0", "pyyaml>=6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fleet_bridge"]

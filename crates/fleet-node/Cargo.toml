@@ -1,0 +1,32 @@
+[package]
+name = "fleet-node"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fleet-node"
+path = "src/main.rs"
+
+[dependencies]
+fleet-proto.workspace = true
+anyhow.workspace = true
+bincode.workspace = true
+clap.workspace = true
+lru.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+
+zkm-sdk.workspace = true
+zkm-prover.workspace = true
+zkm-cuda.workspace = true
+zkm-core-machine.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
