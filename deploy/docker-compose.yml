@@ -1,5 +1,4 @@
-# Scheduler + Postgres. Run from deploy/:  docker compose up -d --build
-# Config and secrets live in ${FLEET_ETC:-/etc/zkm-fleet} (see docs/INSTALL.md).
+# Scheduler + Postgres. Started by deploy/install.sh control; config and secrets in ${FLEET_ETC:-/etc/zkm-fleet}.
 services:
   postgres:
     image: postgres:16

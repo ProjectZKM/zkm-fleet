@@ -17,7 +17,6 @@ of a GPU server's cards land on one machine.
 from __future__ import annotations
 
 import logging
-import time
 
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
@@ -144,14 +143,3 @@ def reconcile_once(cfg: dict) -> dict:
         else:
             report["healthy"].append(name)
     return report
-
-
-def reconcile_forever(load_cfg, period_s: float = 15):
-    while True:
-        try:
-            r = reconcile_once(load_cfg())
-            if r["started"] or r["stopped"] or r["replaced"] or r["unhealthy"]:
-                log.info("reconcile: %s", r)
-        except Exception as e:
-            log.exception("reconcile failed: %s", e)
-        time.sleep(period_s)

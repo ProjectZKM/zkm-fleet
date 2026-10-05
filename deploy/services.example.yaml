@@ -1,4 +1,4 @@
-# fleet_bridge: Ray actors to keep running.
+# Prover actors: edit, then deploy/apply.sh (written by install.sh).
 scheduler: http://10.0.0.1:51001
 cluster_token_file: /etc/zkm-fleet/cluster.token
 node_binary: /opt/zkm-fleet/bin/fleet-node
