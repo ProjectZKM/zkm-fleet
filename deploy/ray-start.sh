@@ -27,6 +27,16 @@ else
   unset CUDA_VISIBLE_DEVICES
   COMMON+=(--num-gpus=0)
 fi
+# `ray stop` can leave a gcs_server holding the head port; the next head start then fails
+# ("Session name ... does not match persisted value") every minute until it is killed. This
+# script only runs when this machine has no raylet, so any gcs_server / raylet from this
+# venv, of this user, is such a leftover.
+VENV=$(dirname "$(dirname "$(readlink -f "$(command -v ray)")")")
+for n in gcs_server raylet; do
+  for p in $(pgrep -x -u "$(id -u)" "$n"); do
+    case "$(readlink "/proc/$p/exe")" in "$VENV"/*) echo "killing a leftover $n ($p)"; kill -9 "$p" ;; esac
+  done
+done
 case "${1:-}" in
   head)   ray start --head --port=6379 --include-dashboard=false "${COMMON[@]}" ;;
   worker) ray start --address="${2:?head ip}:6379" "${COMMON[@]}" ;;
