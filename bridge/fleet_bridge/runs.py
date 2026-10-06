@@ -1,7 +1,8 @@
 """One-shot GPU jobs ("runs"): a command in a container, on cards Ray grants, until it exits.
 
     python -m fleet_bridge run submit --profiles runs.yaml --runs-dir DIR --profile NAME \\
-        [--name NAME] [--gpus N] [--cpus N] [--mount PATH[:ro]]... [--env K=V]...
+        [--name NAME] [--gpus N] [--cpus N] [--gpu-mem GiB] [--vram-wait S]
+        [--mount PATH[:ro]]... [--env K=V]...
         [--log FILE] [--workdir DIR] -- CMD ARG...
     python -m fleet_bridge run status|cancel ID      python -m fleet_bridge run list
 
@@ -16,8 +17,14 @@ detached actor in it; while no card is free the group waits, and the run is
 at the run's CPUs, appends its output to the log file, records the exit code,
 and then removes its placement group, which frees the cards and ends the actor.
 
+Ray's grant is logical: a process started outside the fleet can hold memory on
+a granted card. Before starting, the actor checks the cards' real free memory
+(nvidia-smi) against --gpu-mem (default: the whole card) and waits
+("waiting_vram", naming who holds the card) up to --vram-wait, then fails.
+
 State lives in RUNS_DIR/<id>/status.json, written by the submitter (queued)
-and the actor (running, then succeeded / failed); cancel writes "cancelled".
+and the actor (waiting_vram, running, then succeeded / failed); cancel writes
+"cancelled".
 """
 
 from __future__ import annotations
@@ -40,6 +47,44 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 NAMESPACE = "zkm-fleet"
 TERMINAL = ("succeeded", "failed", "cancelled")
+
+
+def card_memory(cards: list[str]) -> dict[str, dict]:
+    """Physical state of host cards: free / total MiB and the processes holding memory
+    (pid, MiB, command). Ray's grant is logical; this is what is really on the card."""
+    if not cards:
+        return {}
+    q = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.total",
+                        "--format=csv,noheader,nounits", "-i", ",".join(cards)], capture_output=True, text=True)
+    out, by_uuid = {}, {}
+    for line in q.stdout.strip().splitlines():
+        idx, uuid_, free, total = [x.strip() for x in line.split(",")]
+        out[idx] = {"free_mib": int(free), "total_mib": int(total), "holders": []}
+        by_uuid[uuid_] = idx
+    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
+                           "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    for line in apps.stdout.strip().splitlines():
+        uuid_, pid, used = [x.strip() for x in line.split(",")]
+        if uuid_ in by_uuid:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()[:80]
+            except OSError:
+                cmd = "?"
+            out[by_uuid[uuid_]]["holders"].append({"pid": int(pid), "mib": int(used), "cmd": cmd})
+    return out
+
+
+def vram_shortfall(cards: list[str], need_mib: int | None) -> list[str]:
+    """Why the granted cards cannot take the job yet ([] when they can). Without a
+    stated need the job wants the whole card (95% free)."""
+    short = []
+    for idx, c in card_memory(cards).items():
+        need = need_mib if need_mib else int(c["total_mib"] * 0.95)
+        if c["free_mib"] < need:
+            who = ", ".join(f"pid {h['pid']} {h['mib']} MiB ({h['cmd']})" for h in c["holders"]) or "no listed process"
+            short.append(f"card {idx}: {c['free_mib']} MiB free, needs {need} MiB; held by {who}")
+    return short
 
 
 def _write_status(run_dir: str, **fields):
@@ -124,6 +169,20 @@ class GpuRun:
         code = None
         try:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            # Ray's grant is logical: anything started outside the fleet can be on the
+            # card. Start only when the card has the memory the job needs.
+            need = int(self.spec.get("gpu_mem_gb") or 0) * 1024 or None
+            deadline = time.time() + int(self.spec.get("vram_wait_s", 1800))
+            while self.gpus:
+                short = vram_shortfall(self.gpus, need)
+                if not short:
+                    break
+                if time.time() > deadline:
+                    _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
+                                  error="cards not free in time: " + "; ".join(short))
+                    return
+                _write_status(self.run_dir, state="waiting_vram", gpus=self.gpus, detail="; ".join(short))
+                time.sleep(15)
             missing = missing_mounts(self.spec)
             if missing:
                 _write_status(self.run_dir, state="failed", error=f"mounts missing on {socket.gethostname()}: {missing}",
@@ -194,7 +253,8 @@ def submit(a, cmd: list[str]) -> dict:
     run_dir = os.path.join(a.runs_dir, run_id)
     os.makedirs(run_dir)
     spec = {"id": run_id, "profile_name": a.profile, "profile": profile, "command": cmd, "gpus": a.gpus,
-            "cpus": a.cpus, "mounts": mounts, "env": env, "log": a.log, "workdir": a.workdir}
+            "cpus": a.cpus, "mounts": mounts, "env": env, "log": a.log, "workdir": a.workdir,
+            "gpu_mem_gb": a.gpu_mem, "vram_wait_s": a.vram_wait}
     with open(os.path.join(run_dir, "spec.json"), "w") as f:
         json.dump(spec, f, indent=2)
     _write_status(run_dir, id=run_id, state="queued", submitted_at=time.time(), gpus_requested=a.gpus, cpus=a.cpus)
@@ -271,6 +331,10 @@ def main(argv: list[str]):
     p.add_argument("--name")
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--cpus", type=int, default=8)
+    p.add_argument("--gpu-mem", type=int, default=0,
+                   help="GiB of free memory each granted card must have before the job starts (default: the whole card)")
+    p.add_argument("--vram-wait", type=int, default=1800,
+                   help="seconds to wait for that memory before failing (the run shows waiting_vram meanwhile)")
     p.add_argument("--mount", action="append", default=[], help="PATH[:ro], mounted at its own path; repeat")
     p.add_argument("--env", action="append", default=[], help="K=V for the job; repeat")
     p.add_argument("--log", help="file the job's output is appended to (default RUNS_DIR/<id>/log)")

@@ -62,6 +62,18 @@ def _node_env(spec: dict, name: str, backend: str, extra: dict) -> dict:
     return env
 
 
+def _warn_foreign(name: str, gpus: list[str]):
+    """Ray's grant is logical: say so in the actor log when something outside the fleet
+    already holds memory on the granted cards (a service still starts; a one-shot run
+    waits for the memory instead, see runs.py)."""
+    from .runs import card_memory
+
+    for idx, c in card_memory(gpus).items():
+        if c["holders"]:
+            held = ", ".join(f"pid {h['pid']} {h['mib']} MiB ({h['cmd']})" for h in c["holders"])
+            print(f"WARNING {name}: card {idx} granted by Ray already holds {held}", flush=True)
+
+
 def _watch(alive, cleanup, every_s: float = 5.0):
     """Exits the actor process when what it owns dies, so Ray restarts the actor."""
 
@@ -134,6 +146,7 @@ class ZirenGpuProver:
         os.makedirs(log_dir, exist_ok=True)
 
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+        _warn_foreign(self.name, gpus)
         env_args = []
         for k, v in {"ZIREN_SERVER_PORT": "3000", **spec.get("env", {})}.items():
             env_args += ["-e", f"{k}={v}"]
@@ -266,6 +279,7 @@ class GpuApp:
         cmd, self.port = app_command(spec, gpus, int(spec.get("index", 0)))
         self.health_url = f"http://127.0.0.1:{self.port}{spec.get('health_path', '/')}"
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+        _warn_foreign(self.name, gpus)
         out = subprocess.run(cmd, capture_output=True, text=True)
         if out.returncode != 0:
             raise RuntimeError(f"docker run failed: {out.stderr.strip()} ({shlex.join(cmd)})")
