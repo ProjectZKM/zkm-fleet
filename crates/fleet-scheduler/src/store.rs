@@ -72,6 +72,20 @@ fn by_debug_name<T: std::fmt::Debug, S: serde::Serializer>(v: &T, s: S) -> Resul
     s.serialize_str(&format!("{v:?}"))
 }
 
+/// A proof app: one tenant's program, and how its jobs (instances) went.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProofApp {
+    pub tenant: String,
+    pub elf_id: String,
+    pub jobs: u64,
+    pub active: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub last_created_ms: u64,
+    /// Mean proving time of its succeeded jobs.
+    pub mean_prove_ms: Option<f64>,
+}
+
 /// A signing key registered for a tenant: the SDK's `ZKM_PRIVATE_KEY` maps to its address.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Credential {
@@ -98,6 +112,8 @@ pub trait Store: Send + Sync {
     async fn incomplete(&self) -> anyhow::Result<Vec<Job>>;
     /// The newest jobs, of one tenant or all.
     async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>>;
+    /// Every (tenant, program) that has had a job, most recently used first.
+    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>>;
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
     /// Marks the credential revoked; returns false when the address is unknown.
@@ -144,6 +160,35 @@ impl Store for MemoryStore {
             .collect();
         v.sort_by_key(|j| std::cmp::Reverse(j.created_ms));
         v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
+        let mut apps: HashMap<(String, String), (ProofApp, f64)> = HashMap::new();
+        for j in self.jobs.lock().values() {
+            let (a, prove_sum) = apps.entry((j.tenant.clone(), j.elf_id.clone())).or_insert_with(|| {
+                (ProofApp { tenant: j.tenant.clone(), elf_id: j.elf_id.clone(), jobs: 0, active: 0, succeeded: 0,
+                            failed: 0, last_created_ms: 0, mean_prove_ms: None }, 0.0)
+            });
+            a.jobs += 1;
+            a.last_created_ms = a.last_created_ms.max(j.created_ms);
+            match j.state {
+                JobState::Queued | JobState::Running => a.active += 1,
+                JobState::Succeeded => {
+                    a.succeeded += 1;
+                    *prove_sum += j.prove_ms as f64;
+                }
+                JobState::Failed(_) => a.failed += 1,
+            }
+        }
+        let mut v: Vec<ProofApp> = apps
+            .into_values()
+            .map(|(mut a, sum)| {
+                a.mean_prove_ms = (a.succeeded > 0).then(|| sum / a.succeeded as f64);
+                a
+            })
+            .collect();
+        v.sort_by_key(|a| std::cmp::Reverse(a.last_created_ms));
         Ok(v)
     }
 
@@ -297,6 +342,31 @@ impl Store for PgStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(Self::row_to_job).collect()
+    }
+
+    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
+        let rows = sqlx::query(
+            "SELECT tenant, elf_id, count(*) AS jobs, count(*) FILTER (WHERE state < 2) AS active,
+                    count(*) FILTER (WHERE state = 2) AS succeeded, count(*) FILTER (WHERE state = 3) AS failed,
+                    max(created_ms) AS last_created_ms, avg(prove_ms) FILTER (WHERE state = 2)::float8 AS mean_prove_ms
+             FROM fleet_jobs GROUP BY tenant, elf_id ORDER BY last_created_ms DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(ProofApp {
+                    tenant: r.try_get("tenant")?,
+                    elf_id: r.try_get("elf_id")?,
+                    jobs: r.try_get::<i64, _>("jobs")? as u64,
+                    active: r.try_get::<i64, _>("active")? as u64,
+                    succeeded: r.try_get::<i64, _>("succeeded")? as u64,
+                    failed: r.try_get::<i64, _>("failed")? as u64,
+                    last_created_ms: r.try_get::<i64, _>("last_created_ms")? as u64,
+                    mean_prove_ms: r.try_get("mean_prove_ms")?,
+                })
+            })
+            .collect()
     }
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {

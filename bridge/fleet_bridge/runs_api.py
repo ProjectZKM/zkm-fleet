@@ -3,6 +3,7 @@ the admin token, so runs can be submitted from any machine that reaches the port
 
     POST   /runs                     submit (JSON: the RunArgs fields marked `remote`, plus "command")
     GET    /runs?n=N                 the newest runs
+    GET    /apps                     the run apps (runs.yaml profiles) and their runs
     GET    /runs/{id}                status
     GET    /runs/{id}/logs           ?rank=K&lines=N (the tail) or &offset=O (what came after O)
     POST   /runs/{id}/cancel
@@ -159,6 +160,8 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
             head, n = (parts[0] if parts else ""), len(parts)
             if (method, head, n) == ("POST", "runs", 1):
                 return self._json(201, api.submit(self._json_body()))
+            if (method, head, n) == ("GET", "apps", 1):
+                return self._json(200, runs.apps(api.args(), runs.load_config(api.profiles)))
             if (method, head, n) == ("GET", "runs", 1):
                 return self._json(200, runs.list_runs(api.args(), _int(q, "n", 20) or 20))
             if (method, head, n) == ("DELETE", "runs", 1) and "older_than" in q:

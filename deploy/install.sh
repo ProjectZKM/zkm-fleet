@@ -263,7 +263,7 @@ if [ "$ROLE" = control ]; then
   cat <<EOF
 
   status:      fleetctl status          (fleetctl is in $LINKDIR; --json for JSON)
-  jobs:        fleetctl job (proofs and runs); fleetctl job submit --profile P --gpus 1 -- CMD   (profiles in $ETC/runs.yaml)
+  jobs:        fleetctl job (proofs and runs); fleetctl job submit --app P --gpus 1 -- CMD   (profiles in $ETC/runs.yaml)
   provers:     edit $ETC/services.yaml, then $PREFIX/deploy/apply.sh
   a client:    fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 \\
                  --tls-dir $ETC/tls --out ethproofs.env

@@ -30,6 +30,7 @@ pub fn router(state: HttpState) -> Router {
             "/credentials/:address",
             axum::routing::delete(revoke_credential),
         )
+        .route("/apps", get(apps))
         .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
@@ -133,6 +134,13 @@ struct JobsQuery {
 
 fn default_jobs_limit() -> usize {
     20
+}
+
+async fn apps(State(s): State<HttpState>) -> Response {
+    match s.fleet.apps().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 async fn jobs(State(s): State<HttpState>, axum::extract::Query(q): axum::extract::Query<JobsQuery>) -> Response {

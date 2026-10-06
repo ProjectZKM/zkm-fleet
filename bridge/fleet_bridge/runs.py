@@ -871,6 +871,7 @@ class RunSummary(Record):
 
     id: str
     state: RunState
+    profile: str | None = None  # its app
     gpus: list[str] = field(default_factory=list)
     exit_code: int | None = None
     cause: Cause | None = None
@@ -888,10 +889,52 @@ def list_runs(a: RunArgs, n: int = 20) -> list[RunSummary]:
     out = []
     for i in ids[:n]:
         try:
-            out.append(from_dict(RunSummary, RunDir(a.runs_dir, i).status().dump()))
+            run = RunDir(a.runs_dir, i)
+            out.append(from_dict(RunSummary, {**run.status().dump(), "profile": run.spec().profile_name}))
         except (SystemExit, OSError, ValueError):
             pass
     return out
+
+
+@dataclass(kw_only=True)
+class RunApp(Record):
+    """A run app: a runs.yaml profile (what a run may be), and how its jobs (runs) went."""
+
+    name: str
+    image: str
+    user: str | None
+    max_gpus: int
+    default_gpu_mem_gb: int
+    allow: list[str]
+    jobs: int = 0
+    active: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    last_submitted_at: float | None = None
+
+
+def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
+    """Every profile, with the runs submitted under it (the runs dir is scanned once)."""
+    by_name = {name: RunApp(name=name, image=p.image, user=p.user, max_gpus=p.max_gpus,
+                            default_gpu_mem_gb=p.default_gpu_mem_gb, allow=p.allow)
+               for name, p in config.profiles.items()}
+    for d in os.listdir(a.runs_dir) if os.path.isdir(a.runs_dir) else []:
+        if d.startswith("."):
+            continue
+        try:
+            run = RunDir(a.runs_dir, d)
+            spec, st = run.spec(), run.status()
+        except (SystemExit, OSError, ValueError):
+            continue
+        app = by_name.get(spec.profile_name)
+        if app is None:  # a profile since removed from runs.yaml
+            continue
+        app.jobs += 1
+        app.active += 0 if st.state.terminal else 1
+        app.succeeded += st.state is RunState.SUCCEEDED
+        app.failed += st.state is RunState.FAILED
+        app.last_submitted_at = max(app.last_submitted_at or 0, st.submitted_at)
+    return sorted(by_name.values(), key=lambda x: x.last_submitted_at or 0, reverse=True)
 
 
 def stage_model(a: RunArgs, config: RunsConfig) -> Submitted:

@@ -51,8 +51,10 @@ enum Cmd {
         #[command(flatten)]
         conn: Conn,
     },
-    /// Proof jobs and one-shot runs: the list (by default), one by its id, or submit /
-    /// logs / cancel / purge / fetch a run.
+    /// Apps: proof programs (a tenant's ELF) and run profiles (runs.yaml), with their jobs.
+    App(AppArgs),
+    /// Jobs, the instances of apps (proof jobs and runs): the list (by default), one by
+    /// its id, or submit / logs / cancel / purge / fetch a run.
     Job(JobArgs),
     /// Prover nodes: the list (by default), or drain / undrain one.
     Node(NodeArgs),
@@ -63,6 +65,15 @@ enum Cmd {
     /// certificates (install.sh runs these; no scheduler is needed).
     #[command(subcommand)]
     Init(InitCmd),
+}
+
+#[derive(Args)]
+struct AppArgs {
+    /// Only proof apps, or only run apps.
+    #[arg(long = "type", value_enum)]
+    kind: Option<Kind>,
+    #[command(flatten)]
+    conn: Conn,
 }
 
 /// Which proof jobs and runs a list shows.
@@ -80,6 +91,9 @@ struct ListArgs {
     /// Only this tenant's proof jobs (runs belong to no tenant).
     #[arg(long)]
     tenant: Option<String>,
+    /// Only the jobs of this app (as `fleetctl app` names it).
+    #[arg(long)]
+    app: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -162,8 +176,8 @@ enum CredentialCmd {
 /// take the server's defaults.
 #[derive(Args, Serialize)]
 struct Submit {
-    /// Profile in the server's runs.yaml (image, user, GPU cap, allowed mount roots).
-    #[arg(long)]
+    /// The run app: a profile in the server's runs.yaml (image, user, GPU cap, allowed mount roots).
+    #[arg(long = "app", alias = "profile")]
     profile: String,
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,7 +244,7 @@ struct Submit {
 /// What can be done to a run (a proof job is the scheduler's and its client's).
 #[derive(Subcommand)]
 enum JobCmd {
-    /// Queue a run: fleetctl job submit --profile P --gpus 1 --mount /data:ro -- python3 train.py
+    /// Queue a run: fleetctl job submit --app film-gpu --gpus 1 --mount /data:ro -- python3 train.py
     Submit {
         #[command(flatten)]
         submit: Submit,
@@ -296,6 +310,7 @@ fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Cmd::Init(i) => init(i, &out),
         Cmd::Job(j) => job(j, &out),
+        Cmd::App(a) => app(a, &out),
         other => admin(other, &out),
     }
 }
@@ -309,7 +324,7 @@ impl Cmd {
             Cmd::Credential(
                 CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
             ) => conn,
-            Cmd::Init(_) | Cmd::Job(_) => unreachable!("not the scheduler's admin API alone"),
+            Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
         }
     }
 }
@@ -477,7 +492,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
             out.done(&format!("revoked {address}"), json!({ "revoked": address }));
         }
-        Cmd::Init(_) | Cmd::Job(_) => unreachable!("not the scheduler's admin API alone"),
+        Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
     }
     Ok(())
 }
@@ -492,7 +507,7 @@ const NODE_COLS: &[out::Col] = &[
     col("BUSY WITH", "busy"),
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
-const ANCHOR_COLS: &[out::Col] = &[col("TENANT", "tenant"), col("PROGRAM", "program"), col("ANCHORED ON", "node"), col("NODE GPUS", "gpus")];
+const ANCHOR_COLS: &[out::Col] = &[col("APP", "app"), col("ANCHORED ON", "node"), col("NODE GPUS", "gpus")];
 const CREDENTIAL_COLS: &[out::Col] =
     &[col("ADDRESS", "address"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
 const PURGE_COLS: &[out::Col] =
@@ -534,17 +549,16 @@ fn anchor_rows(status: &Value) -> Vec<Value> {
         .into_iter()
         .flatten()
         .map(|a| {
-            let elf = a[1].as_str().unwrap_or("");
             let node = a[2].as_str().unwrap_or("");
-            json!({ "tenant": a[0], "program": format!("{}…", &elf[..12.min(elf.len())]), "node": node, "gpus": gpus(node) })
+            json!({ "app": proof_app(&a[0], &a[1]), "node": node, "gpus": gpus(node) })
         })
         .collect()
 }
 
 const PS_COLS: &[out::Col] = &[
     col("TYPE", "type"),
+    col("APP", "app"),
     col("ID", "id"),
-    col("OWNER", "owner"),
     col("STATE", "state"),
     col("WHERE", "where"),
     col("CREATED", "created_at"),
@@ -570,12 +584,22 @@ fn took_ms(started_s: Option<f64>, finished_s: Option<f64>) -> Value {
     }
 }
 
-/// A proof job as a `ps` row (times from milliseconds to seconds, the state in lower case).
+/// A proof app's name: its tenant and the start of its program's id (as the scheduler names it).
+fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
+    let (tenant, elf) = (tenant.as_str().unwrap_or(""), elf_id.as_str().unwrap_or(""));
+    if tenant.is_empty() && elf.is_empty() {
+        return json!("(rejected)");
+    }
+    json!(format!("{}/{}", if tenant.is_empty() { "?" } else { tenant }, &elf[..8.min(elf.len())]))
+}
+
+/// A proof job as a list row (times from milliseconds to seconds, the state in lower case).
 fn proof_row(j: &Value) -> Value {
     let secs = |k: &str| j[k].as_f64().map(|ms| ms / 1000.0);
     let state = j["state"].as_str().unwrap_or("").split('(').next().unwrap_or("").to_ascii_lowercase();
     json!({
-        "type": "proof", "id": j["id"], "owner": j["tenant"], "state": state, "where": j["node"],
+        "type": "proof", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "owner": j["tenant"],
+        "state": state, "where": j["node"],
         "created_at": secs("created_ms"), "started_at": secs("started_ms"), "finished_at": secs("finished_ms"),
         "took_ms": took_ms(secs("started_ms"), secs("finished_ms")), "record": j,
     })
@@ -585,7 +609,7 @@ fn proof_row(j: &Value) -> Value {
 fn run_row(r: &Value) -> Value {
     let cards = r["gpus"].as_array().map(|g| g.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","));
     json!({
-        "type": "run", "id": r["id"], "owner": Value::Null, "state": r["state"],
+        "type": "run", "app": r["profile"], "id": r["id"], "owner": Value::Null, "state": r["state"],
         "where": cards.filter(|c| !c.is_empty()).map(|c| format!("cards {c}")),
         "created_at": r["submitted_at"], "started_at": r["started_at"], "finished_at": r["finished_at"],
         "took_ms": took_ms(r["started_at"].as_f64(), r["finished_at"].as_f64()), "record": r,
@@ -615,8 +639,8 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
         (None, Some(_)) => vec![Kind::Proof],
         (None, None) => vec![Kind::Proof, Kind::Run],
     };
-    // --active looks further back, so a long run is not pushed out by many short proofs
-    let fetch = if p.active { 1000 } else { p.limit };
+    // --active and --app look further back, so a long run is not pushed out by many short proofs
+    let fetch = if p.active || p.app.is_some() { 1000 } else { p.limit };
     let mut rows = Vec::new();
     let mut reached = 0;
     for k in &kinds {
@@ -634,10 +658,69 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     if reached == 0 {
         bail!("neither the scheduler nor the runs API answered");
     }
-    rows.retain(|r| !p.active || is_active(r));
+    rows.retain(|r| (!p.active || is_active(r)) && p.app.as_ref().is_none_or(|a| r["app"].as_str() == Some(a)));
     rows.sort_by(|a, b| b["created_at"].as_f64().unwrap_or(0.0).total_cmp(&a["created_at"].as_f64().unwrap_or(0.0)));
     rows.truncate(p.limit);
     out.table(&rows, PS_COLS, None);
+    Ok(())
+}
+
+const APP_COLS: &[out::Col] = &[
+    col("TYPE", "type"),
+    col("APP", "name"),
+    col("ACTIVE", "active"),
+    col("JOBS", "jobs"),
+    col("OK", "succeeded"),
+    col("FAILED", "failed"),
+    col("LAST JOB", "last_at"),
+    col("DETAIL", "detail"),
+];
+
+/// Proof apps from the scheduler and run apps from the runs API, most recently used first.
+fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
+    let mut rows: Vec<Value> = Vec::new();
+    let mut raw = serde_json::Map::new();
+    let mut reached = 0;
+    if p.kind != Some(Kind::Run) {
+        match Admin::new(&p.conn).and_then(|a| a.get("/apps")) {
+            Ok(v) => {
+                reached += 1;
+                for a in v.as_array().into_iter().flatten() {
+                    let mean = a["mean_prove_ms"].as_f64().map(|m| format!("mean prove {:.1} s", m / 1000.0));
+                    let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
+                    let detail: Vec<String> = [anchored, mean].into_iter().flatten().collect();
+                    rows.push(json!({
+                        "type": "proof", "name": a["name"], "active": a["active"], "jobs": a["jobs"],
+                        "succeeded": a["succeeded"], "failed": a["failed"],
+                        "last_at": a["last_created_ms"].as_f64().map(|ms| ms / 1000.0), "detail": detail.join(", "),
+                    }));
+                }
+                raw.insert("proof".into(), v);
+            }
+            Err(e) => eprintln!("the scheduler: not reachable ({e:#}); listing the rest"),
+        }
+    }
+    if p.kind != Some(Kind::Proof) {
+        match Admin::runs(&p.conn).and_then(|a| a.get("/apps")) {
+            Ok(v) => {
+                reached += 1;
+                for a in v.as_array().into_iter().flatten() {
+                    rows.push(json!({
+                        "type": "run", "name": a["name"], "active": a["active"], "jobs": a["jobs"],
+                        "succeeded": a["succeeded"], "failed": a["failed"], "last_at": a["last_submitted_at"],
+                        "detail": format!("image {}, up to {} GPUs", a["image"].as_str().unwrap_or("?"), a["max_gpus"]),
+                    }));
+                }
+                raw.insert("run".into(), v);
+            }
+            Err(e) => eprintln!("the runs API: not reachable ({e:#}); listing the rest"),
+        }
+    }
+    if reached == 0 {
+        bail!("neither the scheduler nor the runs API answered");
+    }
+    rows.sort_by(|a, b| b["last_at"].as_f64().unwrap_or(0.0).total_cmp(&a["last_at"].as_f64().unwrap_or(0.0)));
+    out.table(&rows, APP_COLS, Some(&Value::Object(raw)));
     Ok(())
 }
 

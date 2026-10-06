@@ -65,6 +65,15 @@ fn classify(status: &tonic::Status) -> Failure {
     }
 }
 
+/// A proof app's name: its tenant and the start of its program's id; `(rejected)` for
+/// requests refused before either was known.
+pub fn app_name(tenant: &str, elf_id: &str) -> String {
+    if tenant.is_empty() && elf_id.is_empty() {
+        return "(rejected)".into();
+    }
+    format!("{}/{}", if tenant.is_empty() { "?" } else { tenant }, &elf_id[..8.min(elf_id.len())])
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -321,6 +330,25 @@ impl Fleet {
             return Ok(Some(e.job.clone()));
         }
         self.store.get(id).await
+    }
+
+    /// The proof apps (a tenant's program) with their job counts, and the node each is
+    /// anchored on now.
+    pub async fn apps(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        let anchors = self.inner.lock().anchors.clone();
+        Ok(self
+            .store
+            .apps()
+            .await?
+            .into_iter()
+            .map(|a| {
+                let node = anchors.get(&(a.tenant.clone(), a.elf_id.clone())).cloned();
+                let mut v = serde_json::to_value(&a).unwrap_or_default();
+                v["name"] = serde_json::json!(app_name(&a.tenant, &a.elf_id));
+                v["anchored_on"] = serde_json::json!(node);
+                v
+            })
+            .collect())
     }
 
     /// The newest jobs (the store has every one), of one tenant or all.
