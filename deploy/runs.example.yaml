@@ -2,11 +2,21 @@
 # The paths a job touches come with each request (`--mount PATH[:ro]`, repeated);
 # a profile only bounds them: the roots a request may mount below, plus the
 # image, the user and a GPU cap. A requested mount must already exist.
+#
+# Every run also gets its own RUNS_DIR/<id>/out, mounted read-write as $FLEET_OUT
+# (`{out}` in the command); fetch it with `run.sh fetch ID`, drop it with `purge ID`.
+
+# Optional: where `run.sh stage-model REPO` puts Hugging Face repos (mount it :ro
+# in jobs), and a token file for gated repos (read by the fleet, never by a job).
+# model_store: /srv/models
+# hf_token_file: /etc/zkm-fleet/hf.token
+
 profiles:
   trainer:
     image: zkm-fleet-comfyui:22.04      # the userland the tree's venv was built against
     user: "1000:1000"                   # owner of the mounted paths
     max_gpus: 2
+    default_gpu_mem_gb: 8               # free VRAM a run needs on its card unless it passes --gpu-mem
     shm_gb: 16
     allow:                              # requests may mount these or paths below them
       - /srv/trainer
