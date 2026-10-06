@@ -173,6 +173,12 @@ class GpuRun:
             # card. Start only when the card has the memory the job needs.
             need = int(self.spec.get("gpu_mem_gb") or 0) * 1024 or None
             deadline = time.time() + int(self.spec.get("vram_wait_s", 1800))
+            too_big = [f"card {i}: {c['total_mib']} MiB in all, the job asks {need} MiB"
+                       for i, c in card_memory(self.gpus).items() if need and need > c["total_mib"]]
+            if too_big:
+                _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
+                              error="--gpu-mem exceeds the card: " + "; ".join(too_big))
+                return
             while self.gpus:
                 short = vram_shortfall(self.gpus, need)
                 if not short:
