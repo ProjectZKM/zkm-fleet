@@ -23,6 +23,9 @@ use crate::Args;
 type Keys = Arc<(ZKMProvingKey, ZKMVerifyingKey)>;
 type Outcome = Result<ProveResponse, (tonic::Code, String)>;
 
+/// How long a node stays ready after its GPU server last answered Ready.
+const READY_GRACE: Duration = Duration::from_secs(15);
+
 /// Results kept for jobs whose caller went away (a scheduler restart): it asks again.
 const FINISHED_KEPT: usize = 4;
 
@@ -41,6 +44,8 @@ pub struct Node {
     running: Mutex<Option<Running>>,
     finished: Mutex<LruCache<String, Outcome>>,
     http: reqwest::Client,
+    /// Last time the GPU server answered Ready.
+    last_ready: Mutex<Option<Instant>>,
 }
 
 impl Node {
@@ -82,6 +87,7 @@ impl Node {
             running: Mutex::new(None),
             finished: Mutex::new(LruCache::new(NonZeroUsize::new(FINISHED_KEPT).unwrap())),
             http,
+            last_ready: Mutex::new(None),
         })
     }
 
@@ -89,8 +95,21 @@ impl Node {
         zkm_sdk::ZKM_CIRCUIT_VERSION
     }
 
+    /// A GPU server busy with a proof can answer Ready late; reporting the node not
+    /// ready then keeps the scheduler from sending the next job for a heartbeat. So a
+    /// node that is proving is ready, and one failed probe soon after a good one is a
+    /// slow answer, not an outage (an unreachable server fails jobs as unavailable).
     pub async fn ready(&self) -> bool {
-        self.backend != "cuda" || gpu_ready(&self.http, &self.gpu_endpoint).await
+        if self.backend != "cuda" || self.running_job().is_some() {
+            return true;
+        }
+        if gpu_ready(&self.http, &self.gpu_endpoint).await {
+            *self.last_ready.lock() = Some(Instant::now());
+            return true;
+        }
+        self.last_ready
+            .lock()
+            .is_some_and(|t| t.elapsed() < READY_GRACE)
     }
 
     pub fn cached(&self) -> Vec<String> {
@@ -180,7 +199,8 @@ impl Node {
 
     async fn run(&self, req: ProveRequest) -> Result<ProveResponse, Status> {
         let t0 = Instant::now();
-        if !self.ready().await {
+        // A direct probe: ready() is true while this very job counts as running.
+        if self.backend == "cuda" && !gpu_ready(&self.http, &self.gpu_endpoint).await {
             return Err(Status::unavailable("GPU server not ready"));
         }
         let keys = self.keys_for(&req.elf_id, req.elf).await?;

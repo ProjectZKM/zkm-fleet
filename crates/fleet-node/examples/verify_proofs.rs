@@ -18,7 +18,11 @@ fn main() -> anyhow::Result<()> {
         let p = Path::new(dir);
         let proof: ZKMProof = serde_json::from_slice(&std::fs::read(p.join("proof.json"))?)?;
         let public_values = ZKMPublicValues::from(&std::fs::read(p.join("public_values.bin"))?);
-        let proof = ZKMProofWithPublicValues { proof, public_values, zkm_version: client.version() };
+        let proof = ZKMProofWithPublicValues {
+            proof,
+            public_values,
+            zkm_version: client.version(),
+        };
         match client.verify(&proof, &vk) {
             Ok(()) => {
                 ok += 1;
