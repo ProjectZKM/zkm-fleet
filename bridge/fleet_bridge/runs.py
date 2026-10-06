@@ -1,11 +1,15 @@
 """One-shot GPU jobs ("runs"): a command in a container, on cards Ray grants, until it exits.
 
     python -m fleet_bridge run submit --profiles runs.yaml --runs-dir DIR --profile NAME \\
-        [--name NAME] [--gpus N] [--cpus N] [--log FILE] -- CMD ARG...
+        [--name NAME] [--gpus N] [--cpus N] [--mount PATH[:ro]]... [--env K=V]...
+        [--log FILE] [--workdir DIR] -- CMD ARG...
     python -m fleet_bridge run status|cancel ID      python -m fleet_bridge run list
 
-A profile (runs.yaml) fixes what a run may touch: the image, the user, and the
-volumes, mounted at their own paths so absolute paths in the job keep working.
+Every path a run touches is in its request: `--mount PATH[:ro]`, repeated, each
+mounted at its own path (absolute paths in the job keep working). A mount must
+exist (docker would create a missing one, owned by root) and lie under one of
+the profile's `allow` roots. The profile (runs.yaml) fixes the rest: image,
+user, a GPU cap, base env. The log file must lie in a writable mount, the workdir in a mount.
 Submitting creates a placement group for the run's cards and CPUs and a
 detached actor in it; while no card is free the group waits, and the run is
 "queued". The actor runs the container with exactly the granted cards, capped
@@ -77,26 +81,30 @@ def docker_command(spec: dict, gpus: list[str]) -> list[str]:
         cmd += ["--user", str(p["user"])]
     if spec.get("workdir"):
         cmd += ["-w", spec["workdir"]]
-    for path, opts in mounts(p):
-        if os.path.exists(path):
-            cmd += ["-v", f"{path}:{path}" + (f":{opts}" if opts else "")]
-    for k, v in p.get("env", {}).items():
+    for path, mode in spec.get("mounts", []):
+        cmd += ["-v", f"{path}:{path}" + (":ro" if mode == "ro" else "")]
+    for k, v in {**p.get("env", {}), **spec.get("env", {})}.items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(p["image"])
     cmd += spec["command"]
     return cmd
 
 
-def mounts(profile: dict) -> list[tuple[str, str]]:
-    """(path, options) per volume; a leading `?` marks a volume that may be absent."""
-    return [(v.lstrip("?").partition(":")[0], v.partition(":")[2]) for v in profile.get("volumes", [])]
+def parse_mount(text: str) -> tuple[str, str]:
+    """`PATH` or `PATH:ro` / `PATH:rw` -> (normalised absolute path, mode)."""
+    path, _, mode = text.partition(":")
+    mode = mode or "rw"
+    if mode not in ("ro", "rw"):
+        raise SystemExit(f"--mount {text}: mode must be ro or rw")
+    if not path.startswith("/") or ".." in path.split("/"):
+        raise SystemExit(f"--mount {text}: needs an absolute path without '..'")
+    return os.path.normpath(path), mode
 
 
-def missing_volumes(profile: dict) -> list[str]:
-    """Required volumes that do not exist here. Docker would create them, owned by root,
-    in someone's tree; a run fails instead."""
-    return [v.lstrip("?").partition(":")[0] for v in profile.get("volumes", [])
-            if not v.startswith("?") and not os.path.exists(v.partition(":")[0])]
+def missing_mounts(spec: dict) -> list[str]:
+    """Mounts that do not exist where the run landed; the run fails instead of docker
+    creating them, owned by root, in someone's tree."""
+    return [path for path, _ in spec.get("mounts", []) if not os.path.exists(path)]
 
 
 @ray.remote(max_restarts=0, max_task_retries=0)
@@ -116,9 +124,9 @@ class GpuRun:
         code = None
         try:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-            missing = missing_volumes(self.spec["profile"])
+            missing = missing_mounts(self.spec)
             if missing:
-                _write_status(self.run_dir, state="failed", error=f"volumes missing on {socket.gethostname()}: {missing}",
+                _write_status(self.run_dir, state="failed", error=f"mounts missing on {socket.gethostname()}: {missing}",
                               finished_at=time.time())
                 return
             cmd = docker_command(self.spec, self.gpus)
@@ -154,9 +162,9 @@ def _load_profiles(path: str) -> dict:
         return (yaml.safe_load(f) or {}).get("profiles", {})
 
 
-def _inside(path: str, volumes: list[str]) -> bool:
-    roots = [v.lstrip("?").partition(":")[0].rstrip("/") for v in volumes]
-    return any(path == r or path.startswith(r + "/") for r in roots)
+def _inside(path: str, roots: list[str]) -> bool:
+    path = os.path.normpath(path)
+    return any(path == r.rstrip("/") or path.startswith(r.rstrip("/") + "/") for r in roots)
 
 
 def submit(a, cmd: list[str]) -> dict:
@@ -169,14 +177,24 @@ def submit(a, cmd: list[str]) -> dict:
     max_gpus = int(profile.get("max_gpus", 8))
     if a.gpus > max_gpus:
         raise SystemExit(f"profile {a.profile} allows at most {max_gpus} GPUs")
-    if a.log and not _inside(a.log, profile.get("volumes", [])):
-        raise SystemExit(f"--log {a.log} is outside the profile's volumes")
+    mounts = [parse_mount(m) for m in a.mount]
+    allow = profile.get("allow", [])
+    for path, _ in mounts:
+        if not _inside(path, allow):
+            raise SystemExit(f"--mount {path} is outside what profile {a.profile} allows ({', '.join(allow) or 'nothing'})")
+        if not os.path.exists(path):
+            raise SystemExit(f"--mount {path} does not exist (create it before submitting)")
+    if a.log and not _inside(a.log, [p for p, mode in mounts if mode == "rw"]):
+        raise SystemExit(f"--log {a.log} is outside the run's writable mounts")
+    if a.workdir and not _inside(a.workdir, [p for p, _ in mounts]):
+        raise SystemExit(f"--workdir {a.workdir} is outside the run's mounts")
+    env = dict(e.split("=", 1) for e in a.env if "=" in e)
     base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40]
     run_id = f"{base}-{uuid.uuid4().hex[:8]}"
     run_dir = os.path.join(a.runs_dir, run_id)
     os.makedirs(run_dir)
     spec = {"id": run_id, "profile_name": a.profile, "profile": profile, "command": cmd, "gpus": a.gpus,
-            "cpus": a.cpus, "log": a.log, "workdir": a.workdir}
+            "cpus": a.cpus, "mounts": mounts, "env": env, "log": a.log, "workdir": a.workdir}
     with open(os.path.join(run_dir, "spec.json"), "w") as f:
         json.dump(spec, f, indent=2)
     _write_status(run_dir, id=run_id, state="queued", submitted_at=time.time(), gpus_requested=a.gpus, cpus=a.cpus)
@@ -253,6 +271,8 @@ def main(argv: list[str]):
     p.add_argument("--name")
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--cpus", type=int, default=8)
+    p.add_argument("--mount", action="append", default=[], help="PATH[:ro], mounted at its own path; repeat")
+    p.add_argument("--env", action="append", default=[], help="K=V for the job; repeat")
     p.add_argument("--log", help="file the job's output is appended to (default RUNS_DIR/<id>/log)")
     p.add_argument("--workdir")
     p.add_argument("--host-gpus", default="0", help="render: host cards to show in the command")
@@ -260,7 +280,8 @@ def main(argv: list[str]):
     os.makedirs(a.runs_dir, exist_ok=True)
     if a.action == "render":
         profile = _load_profiles(a.profiles)[a.profile]
-        spec = {"id": a.name or "render", "profile": profile, "command": cmd, "cpus": a.cpus, "workdir": a.workdir}
+        spec = {"id": a.name or "render", "profile": profile, "command": cmd, "cpus": a.cpus, "workdir": a.workdir,
+                "mounts": [parse_mount(m) for m in a.mount], "env": dict(e.split("=", 1) for e in a.env if "=" in e)}
         print(shlex.join(docker_command(spec, a.host_gpus.split(",") if a.gpus else [])))
         return
     if a.action == "list":

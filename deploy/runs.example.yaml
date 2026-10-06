@@ -1,20 +1,18 @@
 # One-shot job profiles for deploy/run.sh (installed as ${FLEET_ETC}/runs.yaml).
-# A profile is what a job may touch: its image, its user, and the volumes, which are
-# mounted at their own paths (a host tree with a venv, models, a job directory).
-# The job's command and its --log file must live inside these volumes.
+# The paths a job touches come with each request (`--mount PATH[:ro]`, repeated);
+# a profile only bounds them: the roots a request may mount below, plus the
+# image, the user and a GPU cap. A requested mount must already exist.
 profiles:
   trainer:
     image: zkm-fleet-comfyui:22.04      # the userland the tree's venv was built against
-    user: "1000:1000"                   # owner of the volumes
+    user: "1000:1000"                   # owner of the mounted paths
     max_gpus: 2
     shm_gb: 16
-    volumes:
-      - /srv/trainer                    # code + venv
-      - /srv/datasets:ro
-      - ?/srv/output                    # `?`: optional, mounted only if it exists (a required
-                                        #   volume that is missing fails the run: docker would
-                                        #   create it, owned by root)
-      - /mnt/models:rslave              # NFS: a remount reaches running jobs
-      - /tmp/train_jobs                 # per-job scripts, caches, logs
+    allow:                              # requests may mount these or paths below them
+      - /srv/trainer
+      - /srv/datasets
+      - /srv/output
+      - /mnt/models
+      - /tmp/train_jobs
     env:
       HOME: /home/ubuntu
