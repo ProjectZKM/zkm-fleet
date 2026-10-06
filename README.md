@@ -47,6 +47,31 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 `--cuda` lists the cards Ray may hand out on that machine; leave out cards other systems use. Without root, add `--prefix ~/zkm-fleet --etc ~/zkm-fleet/etc`. The installer is idempotent: it keeps existing secrets and configs, installs a cron watchdog that keeps Ray up, and prints the next steps.
 
+## Add a machine
+
+Every machine runs one Ray node; the control machine's Ray head places work on whichever machine has the cards. A machine joins with one command, and nothing on the control machine changes until something is placed on it.
+
+On the new machine:
+
+1. **Prerequisites:** for a machine with cards, Docker with `nvidia-container-toolkit` and the NVIDIA driver ≥ 570 (the GPU server image is pulled from ghcr.io on first use, no login); Python ≥ 3.10 with `venv`; `cron`. The two binaries, `fleet-ziren-node` and `fleetctl`, built for its OS (one `ubuntu:22.04` build serves every machine of that OS), in `./target/release` or wherever `--bin DIR` points.
+2. **The cluster token:** copy the control machine's `/etc/zkm-fleet/cluster.token` over (0600). It is what lets the machine's prover nodes talk to the scheduler.
+3. **Install:**
+   ```bash
+   deploy/install.sh node --head <control machine's cluster IP> --cluster-token cluster.token --cuda 0,1,2,3 [--cpus N] [--ip <this machine's cluster address>]
+   ```
+   `--cuda` is the cards Ray may hand out here (leave out any used by something else), `--cpus` how many CPUs (default: all). Use the same `--prefix` and `--etc` as on the control machine: `services.yaml` names `node_binary` and `cluster_token_file` by path, and every machine must find them there. The installer puts the binaries, the bridge and a venv with the pinned Ray version in place, starts Ray as a worker of the head (`deploy/ray-start.sh worker`, with fixed ports) and installs the cron watchdog that brings it back after a crash or a reboot.
+4. **Network:** the machine must reach the head on 6379 and the scheduler's control port 51001 (the control machine binds it to its cluster IP, the one given to `install.sh control --ip`); the other machines must reach it on 6380, 6381, 8080, 52365 and 10002-19999 (Ray) and 31000-31099 (its prover nodes). GPU servers and apps bind 127.0.0.1 on their own machine and need nothing.
+5. **Shared storage, for one-shot runs:** the runs dir (`install.sh --runs-dir`, default `<prefix>/work/runs`) must be the same shared path on every machine that runs them, and so must the roots a run app allows: a run's mounts are paths on the machine it lands on.
+
+Check it: on the control machine `/opt/zkm-fleet/venv/bin/ray status` lists the new node with its GPUs and CPUs; `fleetctl node <name>` shows a prover's `machine` once one runs there.
+
+Place work on it:
+
+- **a prover or a GPU app:** a service in `services.yaml` with `machine: <host name or IP>`, then `deploy/apply.sh`. Without `machine:` Ray picks any machine with the cards free; a replica's cards are always on one machine (a GPU server never spans two).
+- **a run:** `fleetctl job submit --machine <host> …`, or `--nodes N` for one run over N machines (`--machine` repeated N times pins them).
+
+Remove a machine: `fleetctl node drain <name>` for each prover on it (it finishes its job), take its services out of `services.yaml` (or their `machine:` pin) and run `deploy/apply.sh`; then on the machine drop the watchdog line from `crontab -e` and run `<prefix>/venv/bin/ray stop`.
+
 ## Operate
 
 `install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL` and `FLEET_ADMIN_TOKEN_FILE`).
