@@ -13,6 +13,7 @@ alloy-primitives.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 hex.workspace = true
+sha2.workspace = true
 k256 = { version = "0.13", features = ["ecdsa"] }
 rand = "0.8"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }

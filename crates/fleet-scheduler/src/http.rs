@@ -31,7 +31,7 @@ pub fn router(state: HttpState) -> Router {
             "/credentials/:address",
             axum::routing::delete(revoke_credential),
         )
-        .route("/apps", get(apps).delete(delete_app))
+        .route("/apps", get(apps).post(add_app).delete(delete_app))
         .route("/apps/disabled", put(disable_app).delete(enable_app))
         .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
@@ -178,6 +178,13 @@ fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
 async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
     match k.parts() {
         Ok((t, e)) => app_outcome(s.fleet.delete_app(&t, &e).await),
+        Err(r) => r,
+    }
+}
+
+async fn add_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+    match k.parts() {
+        Ok((t, e)) => app_outcome(s.fleet.add_app(&t, &e).await),
         Err(r) => r,
     }
 }

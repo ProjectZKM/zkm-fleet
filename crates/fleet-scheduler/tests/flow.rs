@@ -132,12 +132,37 @@ tenants:
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    Harness {
+    let h = Harness {
         stage,
         http: format!("http://127.0.0.1:{hp}"),
         control_port: cp,
         _dir: dir,
+    };
+    // a job runs only for a registered app: the tests' programs, for the default tenant
+    // (a program registered for another tenant too would keep its ELF when eth's app goes)
+    for elf in TEST_ELFS {
+        register(&h, "eth", elf);
     }
+    h
+}
+
+/// The programs the tests submit (registered for tenant eth by `start_with`).
+const TEST_ELFS: &[&[u8]] =
+    &[b"elf-one", b"something else", b"elf", b"elf-r", b"eth-guest", b"elf-c", b"elf-m", b"elf-f", b"elf-d", b"elf-e"];
+
+/// Registers the tenant's program as an app (the admin API, as fleetctl does).
+fn register(h: &Harness, tenant: &str, elf: &[u8]) -> String {
+    let id = fleet_scheduler::blobs::elf_id_of(elf);
+    let url = format!("{}/admin/apps?tenant={tenant}&elf_id={id}", h.http);
+    for _ in 0..100 {
+        let code = admin_curl(h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", &url]);
+        if code != "000" {
+            assert_eq!(code, "200", "registering {tenant}/{id}");
+            return id;
+        }
+        std::thread::sleep(Duration::from_millis(50)); // the http port is not up yet
+    }
+    panic!("the admin API never answered");
 }
 
 async fn add_node(
@@ -491,6 +516,27 @@ fn admin_curl(h: &Harness, args: &[&str]) -> String {
 fn proof_app(h: &Harness, tenant: &str) -> serde_json::Value {
     let apps: serde_json::Value = serde_json::from_str(&admin_curl(h, &[&format!("{}/admin/apps", h.http)])).unwrap();
     apps.as_array().unwrap().iter().find(|a| a["tenant"] == tenant).unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_runs_only_for_a_registered_app() {
+    let mut h = start().await;
+    add_node(&h, "gpu-a", 2, false).await;
+    let id = fleet_scheduler::blobs::elf_id_of(b"unregistered");
+    h.stage.generate_proof(request("job-u1", b"unregistered")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-u1").await.status, S::InvalidParameter as i32, "refused: not an app");
+    let apps = admin_curl(&h, &[&format!("{}/admin/apps", h.http)]);
+    assert!(!apps.contains(&id), "the refusal registered nothing");
+    assert_eq!(register(&h, "eth", b"unregistered"), id);
+    let app: serde_json::Value = serde_json::from_str(&admin_curl(&h, &[&format!("{}/admin/apps", h.http)])).unwrap();
+    let app = app.as_array().unwrap().iter().find(|a| a["elf_id"] == id.as_str()).unwrap().clone();
+    assert_eq!((app["tenant"].as_str(), app["jobs"].as_u64(), app["disabled"].as_bool()), (Some("eth"), Some(0), Some(false)), "listed before its first job");
+    h.stage.generate_proof(request("job-u2", b"unregistered")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-u2").await.status, S::Success as i32, "runs once registered");
+    let code = |args: &[&str]| admin_curl(&h, &[&["-o", "/dev/null", "-w", "%{http_code}", "-X", "POST"][..], args].concat());
+    assert_eq!(code(&[&format!("{}/admin/apps?tenant=eth&elf_id={id}", h.http)]), "409", "registered twice");
+    assert_eq!(code(&[&format!("{}/admin/apps?tenant=nobody&elf_id={id}", h.http)]), "404", "no such tenant");
+    assert_eq!(code(&[&format!("{}/admin/apps?tenant=eth&elf_id=abc", h.http)]), "400", "not a program id");
 }
 
 #[tokio::test(flavor = "multi_thread")]

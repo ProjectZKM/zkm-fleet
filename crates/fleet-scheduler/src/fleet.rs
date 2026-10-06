@@ -120,8 +120,9 @@ pub struct Fleet {
     inner: Mutex<Inner>,
     /// address -> credential, mirrored from the store.
     creds: Mutex<HashMap<String, Credential>>,
-    /// (tenant, elf_id) of the apps refusing new jobs, mirrored from the store.
-    disabled: Mutex<HashSet<(String, String)>>,
+    /// The registered proof apps, (tenant, elf_id) -> disabled, mirrored from the store.
+    /// A job runs only for one of them.
+    apps: Mutex<HashMap<(String, String), bool>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -188,7 +189,7 @@ impl Fleet {
             cluster_token,
             inner: Mutex::new(Inner::default()),
             creds: Mutex::new(HashMap::new()),
-            disabled: Mutex::new(HashSet::new()),
+            apps: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -196,34 +197,55 @@ impl Fleet {
         })
     }
 
-    /// Which apps are disabled, from the store; the number of them.
+    /// The registered apps, from the store; how many there are.
     pub async fn load_apps(&self) -> anyhow::Result<usize> {
-        let set: HashSet<_> = self.store.disabled_apps().await?.into_iter().collect();
-        let n = set.len();
-        *self.disabled.lock() = set;
+        let map: HashMap<_, _> = self.store.registered_apps().await?.into_iter().map(|(t, e, d)| ((t, e), d)).collect();
+        let n = map.len();
+        *self.apps.lock() = map;
         Ok(n)
+    }
+
+    /// Whether the program is a registered app of the tenant.
+    pub fn app_known(&self, tenant: &str, elf_id: &str) -> bool {
+        self.apps.lock().contains_key(&(tenant.to_string(), elf_id.to_string()))
     }
 
     /// Whether the app refuses new jobs.
     pub fn app_disabled(&self, tenant: &str, elf_id: &str) -> bool {
-        self.disabled.lock().contains(&(tenant.to_string(), elf_id.to_string()))
+        self.apps.lock().get(&(tenant.to_string(), elf_id.to_string())).copied().unwrap_or(false)
+    }
+
+    /// Registers a tenant's program as an app: from then on its jobs are accepted (the
+    /// ELF itself arrives with the first one).
+    pub async fn add_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
+        let _ops = self.app_ops.write().await;
+        if self.cfg.tenant(tenant).is_none() {
+            return Err(refuse(404, format!("unknown tenant {tenant:?}: tenants are configured in fleet.yaml")));
+        }
+        let elf_id = elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
+        if elf_id.len() != 64 || !elf_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into()));
+        }
+        if !self.store.add_app(tenant, &elf_id, now_ms()).await? {
+            return Err(refuse(409, format!("app {} exists", app_name(tenant, &elf_id))));
+        }
+        self.apps.lock().insert((tenant.to_string(), elf_id.clone()), false);
+        tracing::info!(app = %app_name(tenant, &elf_id), "app registered");
+        Ok(serde_json::json!({
+            "app": app_name(tenant, &elf_id), "tenant": tenant, "elf_id": elf_id, "elf_stored": self.blobs.has_elf(&elf_id),
+        }))
     }
 
     /// Disables an app (its new jobs are refused; queued and running ones finish) or
-    /// enables it again. The app must exist (have had a job).
+    /// enables it again.
     pub async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
-        let apps = self.store.apps().await?;
-        if !apps.iter().any(|a| a.tenant == tenant && a.elf_id == elf_id) {
+        let key = (tenant.to_string(), elf_id.to_string());
+        if !self.apps.lock().contains_key(&key) {
             return Err(refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id))));
         }
         self.store.set_app_disabled(tenant, elf_id, disabled, now_ms()).await?;
-        let key = (tenant.to_string(), elf_id.to_string());
-        if disabled {
-            self.disabled.lock().insert(key);
-        } else {
-            self.disabled.lock().remove(&key);
-        }
+        self.apps.lock().insert(key, disabled);
         tracing::info!(app = %app_name(tenant, elf_id), disabled, "app setting changed");
         Ok(serde_json::json!({ "app": app_name(tenant, elf_id), "disabled": disabled }))
     }
@@ -408,8 +430,8 @@ impl Fleet {
             .collect())
     }
 
-    /// Deletes a proof app: its jobs' records and files, its anchor, and its ELF when no
-    /// other app uses it. Refused while any of its jobs is queued or running.
+    /// Deletes a proof app: its registration, its jobs' records and files, its anchor, and
+    /// its ELF when no other app uses it. Refused while any of its jobs is queued or running.
     pub async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         let apps = self.store.apps().await?;
@@ -432,8 +454,7 @@ impl Fleet {
             )));
         }
         let ids = self.store.delete_app(tenant, elf_id).await?;
-        self.store.set_app_disabled(tenant, elf_id, false, now_ms()).await?;
-        self.disabled.lock().remove(&(tenant.to_string(), elf_id.to_string()));
+        self.apps.lock().remove(&(tenant.to_string(), elf_id.to_string()));
         {
             let mut inner = self.inner.lock();
             for id in &ids {

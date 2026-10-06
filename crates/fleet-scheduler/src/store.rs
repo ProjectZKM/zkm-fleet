@@ -124,11 +124,14 @@ impl serde::Serialize for Job {
     }
 }
 
-/// A proof app: one tenant's program, and how its jobs (instances) went.
+/// A proof app: one tenant's program, and how its jobs (instances) went. Registered
+/// before its first job (`created_ms`); a request refused before its app was known is
+/// counted under the unregistered (tenant "", elf_id "") entry.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProofApp {
     pub tenant: String,
     pub elf_id: String,
+    pub created_ms: u64,
     pub jobs: u64,
     pub active: u64,
     pub succeeded: u64,
@@ -168,10 +171,12 @@ pub trait Store: Send + Sync {
     async fn recent(&self, f: &JobFilter, limit: usize) -> anyhow::Result<Vec<Job>>;
     /// Every (tenant, program) that has had a job, most recently used first.
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>>;
-    /// Deletes an app's finished jobs; returns their ids.
+    /// Deletes an app and its finished jobs; returns the jobs' ids.
     async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>>;
-    /// The apps whose new jobs are refused.
-    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>>;
+    /// Every registered app: (tenant, elf_id, disabled).
+    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, bool)>>;
+    /// Registers an app; false when it already was.
+    async fn add_app(&self, tenant: &str, elf_id: &str, at_ms: u64) -> anyhow::Result<bool>;
     async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()>;
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
@@ -203,7 +208,8 @@ impl JobFilter {
 pub struct MemoryStore {
     jobs: Mutex<HashMap<String, Job>>,
     creds: Mutex<HashMap<String, Credential>>,
-    disabled: Mutex<std::collections::HashSet<(String, String)>>,
+    /// (tenant, elf_id) -> (created_ms, disabled_ms).
+    apps: Mutex<HashMap<(String, String), (u64, Option<u64>)>>,
 }
 
 #[async_trait]
@@ -237,14 +243,22 @@ impl Store for MemoryStore {
     }
 
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
-        let mut apps: HashMap<(String, String), (ProofApp, f64)> = HashMap::new();
+        let blank = |tenant: &str, elf_id: &str, created_ms, disabled| ProofApp {
+            tenant: tenant.into(), elf_id: elf_id.into(), created_ms, jobs: 0, active: 0, succeeded: 0, failed: 0,
+            last_created_ms: 0, mean_prove_ms: None, disabled,
+        };
+        let mut apps: HashMap<(String, String), (ProofApp, f64)> = self
+            .apps
+            .lock()
+            .iter()
+            .map(|((t, e), (created, disabled))| ((t.clone(), e.clone()), (blank(t, e, *created, disabled.is_some()), 0.0)))
+            .collect();
         for j in self.jobs.lock().values() {
-            let (a, prove_sum) = apps.entry((j.tenant.clone(), j.elf_id.clone())).or_insert_with(|| {
-                (ProofApp { tenant: j.tenant.clone(), elf_id: j.elf_id.clone(), jobs: 0, active: 0, succeeded: 0,
-                            failed: 0, last_created_ms: 0, mean_prove_ms: None,
-                            disabled: self.disabled.lock().contains(&(j.tenant.clone(), j.elf_id.clone())) }, 0.0)
-            });
+            let (a, prove_sum) = apps
+                .entry((j.tenant.clone(), j.elf_id.clone()))
+                .or_insert_with(|| (blank(&j.tenant, &j.elf_id, j.created_ms, false), 0.0));
             a.jobs += 1;
+            a.created_ms = a.created_ms.min(j.created_ms);
             a.last_created_ms = a.last_created_ms.max(j.created_ms);
             match j.state {
                 JobState::Queued | JobState::Running => a.active += 1,
@@ -258,11 +272,13 @@ impl Store for MemoryStore {
         let mut v: Vec<ProofApp> = apps
             .into_values()
             .map(|(mut a, sum)| {
-                a.mean_prove_ms = (a.succeeded > 0).then(|| sum / a.succeeded as f64);
+                if a.succeeded > 0 {
+                    a.mean_prove_ms = Some(sum / a.succeeded as f64);
+                }
                 a
             })
             .collect();
-        v.sort_by_key(|a| std::cmp::Reverse(a.last_created_ms));
+        v.sort_by_key(|a| std::cmp::Reverse((a.last_created_ms, a.created_ms)));
         Ok(v)
     }
 
@@ -276,22 +292,29 @@ impl Store for MemoryStore {
         for id in &ids {
             jobs.remove(id);
         }
+        self.apps.lock().remove(&(tenant.to_string(), elf_id.to_string()));
         Ok(ids)
     }
 
-    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let mut v: Vec<_> = self.disabled.lock().iter().cloned().collect();
+    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, bool)>> {
+        let mut v: Vec<_> = self.apps.lock().iter().map(|((t, e), (_, d))| (t.clone(), e.clone(), d.is_some())).collect();
         v.sort();
         Ok(v)
     }
 
-    async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, _at_ms: u64) -> anyhow::Result<()> {
+    async fn add_app(&self, tenant: &str, elf_id: &str, at_ms: u64) -> anyhow::Result<bool> {
+        let mut apps = self.apps.lock();
         let key = (tenant.to_string(), elf_id.to_string());
-        let mut set = self.disabled.lock();
-        if disabled {
-            set.insert(key);
-        } else {
-            set.remove(&key);
+        if apps.contains_key(&key) {
+            return Ok(false);
+        }
+        apps.insert(key, (at_ms, None));
+        Ok(true)
+    }
+
+    async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()> {
+        if let Some((_, d)) = self.apps.lock().get_mut(&(tenant.to_string(), elf_id.to_string())) {
+            *d = disabled.then_some(at_ms);
         }
         Ok(())
     }
@@ -327,7 +350,7 @@ pub struct PgStore {
 }
 
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
     names.into_iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
@@ -391,8 +414,24 @@ COMMENT ON COLUMN fleet_credentials.address IS 'Lower-case hex address without 0
     )
 }
 
-/// What a proof app carries beyond its jobs (schema 2): a row while it is disabled.
+/// The proof apps (schema 3): a tenant's registered programs. A job runs only for one
+/// of them; `disabled_ms` is set while the app takes no new jobs.
 fn apps() -> String {
+    r#"
+CREATE TABLE fleet_apps (
+    tenant      TEXT   NOT NULL CONSTRAINT fleet_apps_tenant_named CHECK (tenant <> ''),
+    elf_id      TEXT   NOT NULL CONSTRAINT fleet_apps_elf_id_hex CHECK (elf_id ~ '^[0-9a-f]{64}$'),
+    created_ms  BIGINT NOT NULL,
+    disabled_ms BIGINT,
+    PRIMARY KEY (tenant, elf_id)
+);
+COMMENT ON TABLE fleet_apps IS 'Proof apps: a tenant''s registered programs (sha256 of the ELF). A job runs only for one of them; disabled_ms is set while the app takes no new jobs.';
+"#
+    .to_string()
+}
+
+/// Schema 2's table: a row only while an app was disabled (kept for the 1 -> 2 step).
+fn apps_v2() -> String {
     r#"
 CREATE TABLE fleet_apps (
     tenant      TEXT   NOT NULL,
@@ -400,9 +439,27 @@ CREATE TABLE fleet_apps (
     disabled_ms BIGINT NOT NULL,
     PRIMARY KEY (tenant, elf_id)
 );
-COMMENT ON TABLE fleet_apps IS 'Proof apps that are disabled (new jobs refused): a row while that holds, with when it was set.';
 "#
     .to_string()
+}
+
+/// Schema 2 into 3: the apps table rebuilt; every program that has had a job is
+/// registered (from its first job), a disabled one stays disabled.
+fn migrate_2_to_3() -> String {
+    format!(
+        r#"
+ALTER TABLE fleet_apps RENAME TO fleet_apps_v2;
+ALTER INDEX fleet_apps_pkey RENAME TO fleet_apps_v2_pkey;
+{apps}
+INSERT INTO fleet_apps (tenant, elf_id, created_ms, disabled_ms)
+SELECT j.tenant, j.elf_id, min(j.created_ms), max(v.disabled_ms)
+FROM fleet_jobs j LEFT JOIN fleet_apps_v2 v ON v.tenant = j.tenant AND v.elf_id = j.elf_id
+WHERE j.tenant <> '' AND j.elf_id ~ '^[0-9a-f]{{64}}$'
+GROUP BY j.tenant, j.elf_id;
+DROP TABLE fleet_apps_v2;
+"#,
+        apps = apps()
+    )
 }
 
 /// A script that ends by recording the version it brought the database to.
@@ -416,8 +473,9 @@ fn applying(body: String, version: i32) -> String {
 // the scripts, made once (a query's text must outlive the connection's future)
 static CREATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(schema(), SCHEMA_VERSION));
 /// MIGRATIONS[v] takes a schema-v database to v + 1; a fresh one gets `schema()` at once.
-static MIGRATIONS: std::sync::LazyLock<Vec<String>> =
-    std::sync::LazyLock::new(|| vec![applying(migrate_0_to_1(), 1), applying(apps(), 2)]);
+static MIGRATIONS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    vec![applying(migrate_0_to_1(), 1), applying(apps_v2(), 2), applying(migrate_2_to_3(), 3)]
+});
 
 /// Schema 0 (numbers for state, stage status and kind; failed_on comma-joined) into 1:
 /// both tables rebuilt from the old ones, so a migrated database has the same tables,
@@ -582,27 +640,33 @@ impl Store for PgStore {
     }
 
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
-        let rows = sqlx::query(
-            "SELECT j.tenant, j.elf_id, count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active,
-                    count(*) FILTER (WHERE state = 'succeeded') AS succeeded,
-                    count(*) FILTER (WHERE state = 'failed') AS failed, max(created_ms) AS last_created_ms,
-                    avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms,
-                    bool_or(a.tenant IS NOT NULL) AS disabled
-             FROM fleet_jobs j LEFT JOIN fleet_apps a ON a.tenant = j.tenant AND a.elf_id = j.elf_id
-             GROUP BY j.tenant, j.elf_id ORDER BY last_created_ms DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        const COUNTS: &str = "count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active, \
+             count(*) FILTER (WHERE state = 'succeeded') AS succeeded, count(*) FILTER (WHERE state = 'failed') AS failed, \
+             max(created_ms) AS last_created_ms, avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms";
+        let sql = format!(
+            "SELECT a.tenant, a.elf_id, a.created_ms, a.disabled_ms IS NOT NULL AS disabled, coalesce(j.jobs, 0) AS jobs, \
+                    coalesce(j.active, 0) AS active, coalesce(j.succeeded, 0) AS succeeded, coalesce(j.failed, 0) AS failed, \
+                    j.last_created_ms, j.mean_prove_ms \
+             FROM fleet_apps a LEFT JOIN (SELECT tenant, elf_id, {COUNTS} FROM fleet_jobs GROUP BY tenant, elf_id) j \
+                  ON j.tenant = a.tenant AND j.elf_id = a.elf_id \
+             UNION ALL \
+             SELECT j.tenant, j.elf_id, min(created_ms), false, {COUNTS} \
+             FROM fleet_jobs j WHERE NOT EXISTS (SELECT 1 FROM fleet_apps a WHERE a.tenant = j.tenant AND a.elf_id = j.elf_id) \
+             GROUP BY j.tenant, j.elf_id \
+             ORDER BY last_created_ms DESC NULLS LAST, created_ms DESC"
+        );
+        let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|r| {
                 Ok(ProofApp {
                     tenant: r.try_get("tenant")?,
                     elf_id: r.try_get("elf_id")?,
+                    created_ms: r.try_get::<i64, _>("created_ms")? as u64,
                     jobs: r.try_get::<i64, _>("jobs")? as u64,
                     active: r.try_get::<i64, _>("active")? as u64,
                     succeeded: r.try_get::<i64, _>("succeeded")? as u64,
                     failed: r.try_get::<i64, _>("failed")? as u64,
-                    last_created_ms: r.try_get::<i64, _>("last_created_ms")? as u64,
+                    last_created_ms: r.try_get::<Option<i64>, _>("last_created_ms")?.unwrap_or(0) as u64,
                     mean_prove_ms: r.try_get("mean_prove_ms")?,
                     disabled: r.try_get("disabled")?,
                 })
@@ -611,7 +675,11 @@ impl Store for PgStore {
     }
 
     async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query("DELETE FROM fleet_jobs WHERE tenant = $1 AND elf_id = $2 AND state IN ('succeeded', 'failed') RETURNING id")
+        let rows = sqlx::query(
+            "WITH gone AS (DELETE FROM fleet_jobs WHERE tenant = $1 AND elf_id = $2 AND state IN ('succeeded', 'failed') RETURNING id), \
+                  app AS (DELETE FROM fleet_apps WHERE tenant = $1 AND elf_id = $2) \
+             SELECT id FROM gone",
+        )
             .bind(tenant)
             .bind(elf_id)
             .fetch_all(&self.pool)
@@ -619,20 +687,31 @@ impl Store for PgStore {
         rows.iter().map(|r| Ok(r.try_get("id")?)).collect()
     }
 
-    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT tenant, elf_id FROM fleet_apps ORDER BY tenant, elf_id")
+    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, bool)>> {
+        let rows = sqlx::query("SELECT tenant, elf_id, disabled_ms IS NOT NULL AS disabled FROM fleet_apps ORDER BY tenant, elf_id")
             .fetch_all(&self.pool)
             .await?;
-        rows.iter().map(|r| Ok((r.try_get("tenant")?, r.try_get("elf_id")?))).collect()
+        rows.iter().map(|r| Ok((r.try_get("tenant")?, r.try_get("elf_id")?, r.try_get("disabled")?))).collect()
+    }
+
+    async fn add_app(&self, tenant: &str, elf_id: &str, at_ms: u64) -> anyhow::Result<bool> {
+        let r = sqlx::query("INSERT INTO fleet_apps (tenant, elf_id, created_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(tenant)
+            .bind(elf_id)
+            .bind(at_ms as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
     }
 
     async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()> {
-        let sql = if disabled {
-            "INSERT INTO fleet_apps (tenant, elf_id, disabled_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
-        } else {
-            "DELETE FROM fleet_apps WHERE tenant = $1 AND elf_id = $2 AND $3 >= 0"
-        };
-        sqlx::query(sql).bind(tenant).bind(elf_id).bind(at_ms as i64).execute(&self.pool).await?;
+        sqlx::query("UPDATE fleet_apps SET disabled_ms = CASE WHEN $3 THEN $4 ELSE NULL END WHERE tenant = $1 AND elf_id = $2")
+            .bind(tenant)
+            .bind(elf_id)
+            .bind(disabled)
+            .bind(at_ms as i64)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

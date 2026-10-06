@@ -53,9 +53,9 @@ enum Cmd {
     Job(JobArgs),
     /// Prover nodes: the list (by default), or drain / undrain one.
     Node(NodeArgs),
-    /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY).
-    #[command(subcommand)]
-    Credential(CredentialCmd),
+    /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY): the list (by default), one by its
+    /// address, or issue / revoke one.
+    Credential(CredentialArgs),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
     /// certificates (install.sh runs these; no scheduler is needed).
     #[command(subcommand)]
@@ -67,6 +67,8 @@ enum Cmd {
 struct AppArgs {
     #[command(subcommand)]
     cmd: Option<AppCmd>,
+    /// An app's name: its record and newest jobs. Without one, the list.
+    name: Option<String>,
     /// Only proof apps, or only run apps.
     #[arg(long = "type", value_enum)]
     kind: Option<Kind>,
@@ -76,8 +78,9 @@ struct AppArgs {
 
 #[derive(Subcommand)]
 enum AppCmd {
-    /// Add a run app: a profile in the server's runs.yaml (a proof app is not added: it
-    /// comes into being when a tenant first submits a proof with its ELF).
+    /// Add an app. A proof app: `tenant/<elf id>` (or `tenant/ --elf FILE`, hashed here);
+    /// its jobs are accepted from then on, the ELF itself arrives with the first one. A
+    /// run app: a name with --image and --allow, a profile in the server's runs.yaml.
     Add {
         #[command(flatten)]
         add: AddApp,
@@ -138,9 +141,23 @@ struct JobArgs {
 }
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct NodeArgs {
     #[command(subcommand)]
     cmd: Option<NodeCmd>,
+    /// A node's name: its record and the apps anchored on it. Without one, the list.
+    name: Option<String>,
+    #[command(flatten)]
+    conn: Conn,
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct CredentialArgs {
+    #[command(subcommand)]
+    cmd: Option<CredentialCmd>,
+    /// A credential's address: its record. Without one, the list.
+    address: Option<String>,
     #[command(flatten)]
     conn: Conn,
 }
@@ -177,20 +194,11 @@ enum CredentialCmd {
         /// Server name in the stage certificate, when it is not the SDK's default "stage".
         #[arg(long)]
         domain_name: Option<String>,
-        #[command(flatten)]
-        conn: Conn,
     },
-    /// Every registered key: address, tenant, label, active or revoked.
-    List {
-        #[command(flatten)]
-        conn: Conn,
-    },
+    /// Every registered key: address, tenant, label, active or revoked (the default).
+    List,
     /// Refuse a key's requests from now on.
-    Revoke {
-        address: String,
-        #[command(flatten)]
-        conn: Conn,
-    },
+    Revoke { address: String },
 }
 
 /// A submit: the command line and the request body are this one struct (its field
@@ -263,15 +271,21 @@ struct Submit {
     command: Vec<String>,
 }
 
-/// A run app to add: the command line and the request body are this one struct (its
-/// field names are the profile's); unset flags take the server's defaults.
+/// An app to add. For a run app the command line and the request body are this one
+/// struct (its field names are the profile's); unset flags take the server's defaults.
 #[derive(Args, Serialize)]
 struct AddApp {
-    /// The app's name (letters, digits, _ . -): it heads its runs' ids.
+    /// A proof app: TENANT/<elf id> (64 hex), or TENANT/ with --elf. A run app: its name
+    /// (letters, digits, _ . -; it heads its runs' ids).
     name: String,
-    /// The container image its runs get.
+    /// A proof app: the ELF file, hashed here (sha256) to its id.
     #[arg(long)]
-    image: String,
+    #[serde(skip)]
+    elf: Option<PathBuf>,
+    /// A run app: the container image its runs get.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<String>,
     /// UID[:GID] the container runs as (default: the image's).
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,8 +302,9 @@ struct AddApp {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     shm_gb: Option<u32>,
-    /// A root (an absolute path on the server) a run may mount under; repeat. Nothing else can be mounted.
-    #[arg(long, required = true)]
+    /// A run app: a root (an absolute path on the server) a run may mount under; repeat. Nothing else can be mounted.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
     /// K=V every run gets; repeat.
     #[arg(long)]
@@ -376,9 +391,7 @@ impl Cmd {
     fn conn(&self) -> &Conn {
         match self {
             Cmd::Node(n) => &n.conn,
-            Cmd::Credential(
-                CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
-            ) => conn,
+            Cmd::Credential(c) => &c.conn,
             Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
         }
     }
@@ -453,6 +466,21 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
     let a = Admin::new(cmd.conn())?;
     use reqwest::Method as M;
     match cmd {
+        Cmd::Node(NodeArgs { cmd: None, name: Some(name), .. }) => {
+            let v = a.get("/status")?;
+            let Some(mut n) = node_rows(&v).into_iter().find(|n| n["name"].as_str() == Some(name.as_str())) else {
+                bail!("no node {name} (fleetctl node lists them)");
+            };
+            let anchored: Vec<Value> = v["anchors"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|x| x[2].as_str() == Some(name.as_str()))
+                .map(|x| proof_app(&x[0], &x[1]))
+                .collect();
+            n["anchored_apps"] = Value::Array(anchored);
+            out.record(&n);
+        }
         Cmd::Node(NodeArgs { cmd: None | Some(NodeCmd::List), .. }) => {
             let v = a.get("/status")?;
             out.table(&node_rows(&v), NODE_COLS, Some(&v["nodes"]));
@@ -466,7 +494,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/nodes/{name}/drain")))?;
             out.done(&format!("{name} takes jobs again"), json!({ "node": name, "draining": false }));
         }
-        Cmd::Credential(CredentialCmd::Issue { tenant, label, out: env_file, endpoint, tls_dir, domain_name, .. }) => {
+        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Issue { tenant, label, out: env_file, endpoint, tls_dir, domain_name }), .. }) => {
             if env_file.exists() {
                 bail!("{} exists; refusing to overwrite a credential", env_file.display());
             }
@@ -508,22 +536,19 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
                 println!("issued {address:#x} for tenant {tenant}; client env in {} (0600)", env_file.display());
             }
         }
-        Cmd::Credential(CredentialCmd::List { .. }) => {
+        Cmd::Credential(CredentialArgs { cmd: None, address: Some(address), .. }) => {
+            let want = format!("0x{}", address.trim_start_matches("0x").to_ascii_lowercase());
             let v = a.get("/credentials")?;
-            let rows: Vec<Value> = v
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|c| {
-                    let mut r = c.clone();
-                    r["address"] = json!(format!("0x{}", c["address"].as_str().unwrap_or("")));
-                    r["state"] = json!(if c["revoked_ms"].is_null() { "active" } else { "revoked" });
-                    r
-                })
-                .collect();
-            out.table(&rows, CREDENTIAL_COLS, Some(&v));
+            let Some(c) = credential_rows(&v).into_iter().find(|c| c["address"].as_str() == Some(want.as_str())) else {
+                bail!("no credential {address} (fleetctl credential lists them)");
+            };
+            out.record(&c);
         }
-        Cmd::Credential(CredentialCmd::Revoke { address, .. }) => {
+        Cmd::Credential(CredentialArgs { cmd: None | Some(CredentialCmd::List), .. }) => {
+            let v = a.get("/credentials")?;
+            out.table(&credential_rows(&v), CREDENTIAL_COLS, Some(&v));
+        }
+        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Revoke { address }), .. }) => {
             a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
             out.done(&format!("revoked {address}"), json!({ "revoked": address }));
         }
@@ -546,6 +571,20 @@ const CREDENTIAL_COLS: &[out::Col] =
     &[col("ADDRESS", "address"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
 const PURGE_COLS: &[out::Col] =
     &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
+
+/// Credentials as rows: the address with 0x, a STATE column (active / revoked).
+fn credential_rows(v: &Value) -> Vec<Value> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let mut r = c.clone();
+            r["address"] = json!(format!("0x{}", c["address"].as_str().unwrap_or("")));
+            r["state"] = json!(if c["revoked_ms"].is_null() { "active" } else { "revoked" });
+            r
+        })
+        .collect()
+}
 
 /// The status's nodes, with one READY column (drain / yes / no).
 fn node_rows(status: &Value) -> Vec<Value> {
@@ -805,8 +844,38 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
     Ok(())
 }
 
-/// Adds a run app.
+/// Adds an app: a tenant's program (registered with the scheduler) or a run profile.
 fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    if let AppRef::Proof { tenant, elf } = AppRef::parse(&add.name) {
+        if add.image.is_some() || !add.allow.is_empty() || !add.env.is_empty() || add.user.is_some() || add.max_gpus.is_some() {
+            bail!("{}: a proof app takes --elf at most; --image, --allow, --user, --max-gpus, --env are a run app's", add.name);
+        }
+        if tenant.is_empty() || add.name == "(rejected)" {
+            bail!("a proof app is TENANT/<elf id> (or TENANT/ with --elf FILE)");
+        }
+        let elf_id = match (&add.elf, elf.as_str()) {
+            (Some(file), "") => {
+                use sha2::Digest;
+                let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+                hex::encode(sha2::Sha256::digest(&bytes))
+            }
+            (None, id) if !id.is_empty() => id.trim_start_matches("0x").to_ascii_lowercase(),
+            (Some(_), _) => bail!("give the elf id in the name or --elf FILE, not both"),
+            (None, _) => bail!("give TENANT/<elf id>, or TENANT/ with --elf FILE"),
+        };
+        let a = Admin::new(conn)?;
+        let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str())]))?;
+        out.done(
+            &format!("added proof app {}: tenant {tenant}, program {elf_id} (its jobs are accepted from now on{})",
+                     v["app"].as_str().unwrap_or(&add.name),
+                     if v["elf_stored"].as_bool() == Some(true) { "" } else { "; the ELF itself arrives with the first one" }),
+            v,
+        );
+        return Ok(());
+    }
+    if add.image.is_none() || add.allow.is_empty() {
+        bail!("a run app needs --image and at least one --allow root");
+    }
     let mut body = serde_json::to_value(add)?;
     let mut env = serde_json::Map::new();
     for kv in &add.env {
@@ -825,6 +894,27 @@ fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
                  v["allow"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
         v,
     );
+    Ok(())
+}
+
+/// One app's record, and its newest jobs.
+fn describe_app(name: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let (kind, mut rec) = match AppRef::parse(name) {
+        AppRef::Proof { tenant, .. } => (Kind::Proof, with_type("proof", &proof_app_named(&Admin::new(conn)?, name, &tenant)?)),
+        AppRef::Run(_) => (Kind::Run, with_type("run", &run_app_named(&Admin::runs(conn)?, name)?)),
+    };
+    let full = rec["name"].as_str().unwrap_or(name).to_string();
+    let jobs = fetch_rows(kind, conn, &Want { limit: 5, active: false, tenant: None, app: Some(&full) })?;
+    if out.json {
+        rec["newest_jobs"] = Value::Array(jobs);
+        out.record(&rec);
+    } else {
+        out.record(&rec);
+        if !jobs.is_empty() {
+            println!();
+            out.table(&jobs, PS_COLS, None);
+        }
+    }
     Ok(())
 }
 
@@ -880,6 +970,9 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
         Some(AppCmd::Enable { name }) => return set_app_disabled(name, false, &p.conn, out),
         Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
         None => {}
+    }
+    if let Some(name) = &p.name {
+        return describe_app(name, &p.conn, out);
     }
     let mut rows: Vec<Value> = Vec::new();
     let mut raw = serde_json::Map::new();

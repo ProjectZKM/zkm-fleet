@@ -21,10 +21,10 @@ CREATE TABLE fleet_credentials (
 );
 INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, status, error, node, attempts, failed_on, cycles, prove_ms,
                         created_ms, started_ms, finished_ms) VALUES
-  ('q', 'eth', 'aa', 2, 0, 0, '', NULL, 0, '', 0, 0, 1000, NULL, NULL),
-  ('r', 'eth', 'aa', 2, 1, 0, '', 'n1', 1, '', 0, 0, 1001, 1100, NULL),
-  ('s', 'eth', 'aa', 2, 2, 0, '', 'n1', 1, '', 7, 50, 1002, 1100, 1200),
-  ('f', 'eth', 'aa', 2, 3, 6, 'boom', 'n2', 2, 'n1,n2', 0, 0, 1003, 1100, 1300),
+  ('q', 'eth', repeat('a', 64), 2, 0, 0, '', NULL, 0, '', 0, 0, 1000, NULL, NULL),
+  ('r', 'eth', repeat('a', 64), 2, 1, 0, '', 'n1', 1, '', 0, 0, 1001, 1100, NULL),
+  ('s', 'eth', repeat('a', 64), 2, 2, 0, '', 'n1', 1, '', 7, 50, 1002, 1100, 1200),
+  ('f', 'eth', repeat('a', 64), 2, 3, 6, 'boom', 'n2', 2, 'n1,n2', 0, 0, 1003, 1100, 1300),
   ('x', '', '', 0, 3, 3, 'bad request', NULL, 0, '', 0, 0, 1004, NULL, 1004);
 INSERT INTO fleet_credentials VALUES ('8468000000000000000000000000000000000000', 'eth', 'poller', 5, NULL);
 "#;
@@ -70,7 +70,7 @@ fn job(id: &str, state: JobState) -> Job {
     Job {
         id: id.into(),
         tenant: "goat".into(),
-        elf_id: "bb".into(),
+        elf_id: "b".repeat(64),
         kind: ProofKind::Groth16,
         state,
         error: String::new(),
@@ -103,7 +103,14 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
     // a second start finds schema 1 and leaves it
     PgStore::connect(&in_schema(&url, "migrated")).await.unwrap();
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM migrated.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![1, 2], "every step is recorded");
+    assert_eq!(versions, vec![1, 2, 3], "every step is recorded");
+    // 2 -> 3 registered the program that had jobs, from its first one; the refused request's entry is no app
+    assert_eq!(migrated.registered_apps().await.unwrap(), vec![("eth".to_string(), "a".repeat(64), false)]);
+    let listed = migrated.apps().await.unwrap();
+    let eth = listed.iter().find(|a| a.tenant == "eth").unwrap();
+    assert_eq!((eth.created_ms, eth.jobs, eth.active, eth.succeeded, eth.failed), (1000, 4, 2, 1, 1));
+    let rejected = listed.iter().find(|a| a.tenant.is_empty()).unwrap();
+    assert_eq!((rejected.jobs, rejected.failed, rejected.created_ms), (1, 1, 1004));
 
     let get = |id: &'static str| {
         let m = &migrated;
@@ -125,7 +132,12 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
     assert_eq!(names, ("failed".into(), Some("prove_error".into()), "compressed".into()));
     assert_eq!(migrated.credentials().await.unwrap().len(), 1);
 
+    let bb = "b".repeat(64);
     for store in [&fresh, &migrated] {
+        assert!(store.add_app("goat", &bb, 1999).await.unwrap());
+        assert!(!store.add_app("goat", &bb, 2000).await.unwrap(), "registered once");
+        let fresh_app = store.apps().await.unwrap().into_iter().find(|a| a.elf_id == bb).unwrap();
+        assert_eq!((fresh_app.jobs, fresh_app.created_ms, fresh_app.last_created_ms), (0, 1999, 0), "listed with no job yet");
         store.upsert(&job("g1", JobState::Running)).await.unwrap();
         store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();
         store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();
@@ -137,13 +149,13 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
         let apps = store.apps().await.unwrap();
         let goat = apps.iter().find(|a| a.tenant == "goat").unwrap();
         assert_eq!((goat.jobs, goat.active, goat.failed), (2, 1, 1));
-        store.set_app_disabled("goat", "bb", true, 5).await.unwrap();
-        store.set_app_disabled("goat", "bb", true, 6).await.unwrap(); // again: still one row
-        assert_eq!(store.disabled_apps().await.unwrap(), vec![("goat".to_string(), "bb".to_string())]);
+        store.set_app_disabled("goat", &bb, true, 5).await.unwrap();
+        assert!(store.registered_apps().await.unwrap().contains(&("goat".to_string(), bb.clone(), true)));
         assert!(store.apps().await.unwrap().iter().find(|a| a.tenant == "goat").unwrap().disabled);
-        store.set_app_disabled("goat", "bb", false, 7).await.unwrap();
-        assert!(store.disabled_apps().await.unwrap().is_empty());
-        assert_eq!(store.delete_app("goat", "bb").await.unwrap(), vec!["g2".to_string()], "the running one stays");
+        store.set_app_disabled("goat", &bb, false, 7).await.unwrap();
+        assert!(store.registered_apps().await.unwrap().contains(&("goat".to_string(), bb.clone(), false)));
+        assert_eq!(store.delete_app("goat", &bb).await.unwrap(), vec!["g2".to_string()], "the running one stays");
+        assert!(!store.registered_apps().await.unwrap().iter().any(|(t, _, _)| t == "goat"), "the app is gone");
         assert_eq!(store.incomplete().await.unwrap().iter().filter(|j| j.id == "g1").count(), 1);
     }
     // what the constraints refuse
@@ -152,6 +164,8 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
         "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, finished_ms) VALUES ('b2', 't', 'e', 'core', 'failed', 1, 2)",
         "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms) VALUES ('b3', 't', 'e', 'core', 'succeeded', 1)",
         "INSERT INTO fresh.fleet_credentials (address, tenant, created_ms) VALUES ('0xABC', 't', 1)",
+        "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms) VALUES ('', repeat('a', 64), 1)",
+        "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms) VALUES ('t', 'abc', 1)",
     ];
     for sql in bad {
         assert!(sqlx::query(sql).execute(&admin).await.is_err(), "accepted: {sql}");

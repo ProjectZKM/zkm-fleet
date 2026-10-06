@@ -148,14 +148,25 @@ impl StageApi {
             }
             let kind = kind_for(req.from_step, req.target_step)
                 .map_err(|m| fail(StageStatus::InvalidParameter, m))?;
+            // a job runs only for a registered app: the program is checked before it is stored
+            let elf_id = if !req.elf_data.is_empty() {
+                blobs::elf_id_of(&req.elf_data)
+            } else {
+                req.elf_id.clone().unwrap_or_default().trim_start_matches("0x").to_ascii_lowercase()
+            };
+            if !self.fleet.app_known(&tenant, &elf_id) {
+                return Err(fail(
+                    StageStatus::InvalidParameter,
+                    &format!("program {elf_id} is not an app of tenant {tenant}: register it first (fleetctl app add {tenant}/{elf_id})"),
+                ));
+            }
             let elf_id = if !req.elf_data.is_empty() {
                 self.fleet
                     .blobs
                     .put_elf(&req.elf_data)
                     .map_err(|e| fail(StageStatus::InternalError, &format!("{e:#}")))?
             } else {
-                let given = req.elf_id.clone().unwrap_or_default();
-                let given = given.trim_start_matches("0x").to_ascii_lowercase();
+                let given = elf_id;
                 if !self.fleet.blobs.has_elf(&given) {
                     return Err(fail(
                         StageStatus::InvalidParameter,

@@ -966,6 +966,8 @@ class RunApp(Record):
     max_gpus: int
     default_gpu_mem_gb: int
     allow: list[str]
+    shm_gb: int = 16
+    env: dict[str, str] = field(default_factory=dict)
     jobs: int = 0
     active: int = 0
     succeeded: int = 0
@@ -1124,7 +1126,7 @@ def _edit_profiles(a: RunArgs, edit: Callable[[str], str], expect: Callable[[dic
 
 def _run_app(name: str, p: Profile, **counts: Any) -> RunApp:
     return RunApp(name=name, image=p.image, user=p.user, max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
-                  allow=p.allow, disabled=p.disabled, **counts)
+                  allow=p.allow, shm_gb=p.shm_gb, env=p.env, disabled=p.disabled, **counts)
 
 
 def add_app(a: RunArgs, name: str, body: dict[str, Any]) -> RunApp:
