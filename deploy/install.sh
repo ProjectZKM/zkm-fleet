@@ -134,6 +134,7 @@ if [ "$ROLE" = control ]; then
       echo "    class: latency"
       echo "    anchor: exclusive"
       echo "    backends: [cuda]"
+      echo "    nodes: [ethproofs-gpu]      # only the replicas of that service prove it"
       echo "  - name: goat"
       echo "    class: batch"
       echo "    anchor: shared"

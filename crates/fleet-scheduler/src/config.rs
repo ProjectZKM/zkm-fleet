@@ -69,6 +69,11 @@ pub struct TenantConfig {
     /// Allowed node backends ("cuda", "cpu", "mock"); empty means any.
     #[serde(default)]
     pub backends: Vec<String>,
+    /// Node name prefixes that may run this tenant's jobs, e.g. `[ethproofs-gpu]` for
+    /// the replicas of that service; empty means any. A tenant whose proofs must come
+    /// from a particular prover configuration (keys, verification mode) pins it here.
+    #[serde(default)]
+    pub nodes: Vec<String>,
     #[serde(default = "default_max_queued")]
     pub max_queued: usize,
 }

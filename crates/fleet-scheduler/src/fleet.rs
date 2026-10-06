@@ -545,7 +545,7 @@ impl Fleet {
                     .find(|n| n.busy.as_deref() == Some(mine.as_str()))
                     .map(|n| n.info.name.clone())
             });
-            if let Some(hint) = &hint {
+            if let Some(hint) = hint.as_ref().filter(|h| placement::allowed(tenant, h)) {
                 let at = inner
                     .nodes
                     .values()

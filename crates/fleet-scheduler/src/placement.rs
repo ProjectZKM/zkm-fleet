@@ -26,8 +26,14 @@ pub enum Choice {
     NoNode,
 }
 
+/// Whether the tenant's node list admits a node of this name.
+pub fn allowed(tenant: &TenantConfig, name: &str) -> bool {
+    tenant.nodes.is_empty() || tenant.nodes.iter().any(|p| name.starts_with(p.as_str()))
+}
+
 pub fn eligible(node: &NodeView, tenant: &TenantConfig, failed_on: &[String]) -> bool {
     node.ready
+        && allowed(tenant, &node.name)
         && !failed_on.iter().any(|f| f == &node.name)
         && tenant
             .zkm_version
@@ -98,6 +104,7 @@ mod tests {
             anchor,
             zkm_version: Some("v2".into()),
             backends: vec![],
+            nodes: vec![],
             max_queued: 8,
         }
     }
@@ -161,6 +168,19 @@ mod tests {
         // Only the failed node is left (a tenant with one node): try it again.
         nodes[1].ready = false;
         assert_eq!(choose(&t, &["a".into()], None, &nodes), Choice::Run(0));
+    }
+
+    #[test]
+    fn a_tenant_runs_only_on_the_nodes_it_names() {
+        let mut t = tenant(Class::Latency, Anchor::Exclusive);
+        t.nodes = vec!["eth-gpu".into()];
+        let mut nodes = vec![node("goat-gpu-0", 1), node("eth-gpu-0", 4)];
+        nodes[1].ready = false;
+        // The only ready node is someone else's: wait rather than run there.
+        assert_eq!(choose(&t, &[], None, &nodes), Choice::NoNode);
+        assert_eq!(choose(&t, &[], Some("goat-gpu-0"), &nodes), Choice::NoNode);
+        nodes[1].ready = true;
+        assert_eq!(choose(&t, &[], Some("goat-gpu-0"), &nodes), Choice::Run(1));
     }
 
     #[test]
