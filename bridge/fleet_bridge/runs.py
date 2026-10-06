@@ -77,14 +77,26 @@ def docker_command(spec: dict, gpus: list[str]) -> list[str]:
         cmd += ["--user", str(p["user"])]
     if spec.get("workdir"):
         cmd += ["-w", spec["workdir"]]
-    for v in p.get("volumes", []):
-        path, _, opts = v.partition(":")
-        cmd += ["-v", f"{path}:{path}" + (f":{opts}" if opts else "")]
+    for path, opts in mounts(p):
+        if os.path.exists(path):
+            cmd += ["-v", f"{path}:{path}" + (f":{opts}" if opts else "")]
     for k, v in p.get("env", {}).items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(p["image"])
     cmd += spec["command"]
     return cmd
+
+
+def mounts(profile: dict) -> list[tuple[str, str]]:
+    """(path, options) per volume; a leading `?` marks a volume that may be absent."""
+    return [(v.lstrip("?").partition(":")[0], v.partition(":")[2]) for v in profile.get("volumes", [])]
+
+
+def missing_volumes(profile: dict) -> list[str]:
+    """Required volumes that do not exist here. Docker would create them, owned by root,
+    in someone's tree; a run fails instead."""
+    return [v.lstrip("?").partition(":")[0] for v in profile.get("volumes", [])
+            if not v.startswith("?") and not os.path.exists(v.partition(":")[0])]
 
 
 @ray.remote(max_restarts=0, max_task_retries=0)
@@ -104,6 +116,11 @@ class GpuRun:
         code = None
         try:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+            missing = missing_volumes(self.spec["profile"])
+            if missing:
+                _write_status(self.run_dir, state="failed", error=f"volumes missing on {socket.gethostname()}: {missing}",
+                              finished_at=time.time())
+                return
             cmd = docker_command(self.spec, self.gpus)
             out = subprocess.run(cmd, capture_output=True, text=True)
             if out.returncode != 0:
@@ -138,7 +155,7 @@ def _load_profiles(path: str) -> dict:
 
 
 def _inside(path: str, volumes: list[str]) -> bool:
-    roots = [v.partition(":")[0].rstrip("/") for v in volumes]
+    roots = [v.lstrip("?").partition(":")[0].rstrip("/") for v in volumes]
     return any(path == r or path.startswith(r + "/") for r in roots)
 
 

@@ -11,7 +11,9 @@ profiles:
     volumes:
       - /srv/trainer                    # code + venv
       - /srv/datasets:ro
-      - /srv/output
+      - ?/srv/output                    # `?`: optional, mounted only if it exists (a required
+                                        #   volume that is missing fails the run: docker would
+                                        #   create it, owned by root)
       - /mnt/models:rslave              # NFS: a remount reaches running jobs
       - /tmp/train_jobs                 # per-job scripts, caches, logs
     env:
