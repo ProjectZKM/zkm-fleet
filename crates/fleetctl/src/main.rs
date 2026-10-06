@@ -235,7 +235,8 @@ enum JobCmd {
         #[command(flatten)]
         submit: Submit,
     },
-    /// A run's output: the last lines, then with -f everything new until it ends.
+    /// A run's output: the last lines, then with -f everything new until it ends (for a
+    /// proof job, which has no output of its own, its record).
     Logs {
         id: String,
         #[arg(short, long)]
@@ -710,7 +711,24 @@ fn run_action(cmd: &JobCmd, conn: &Conn, out: &Out) -> anyhow::Result<()> {
             out.table(v.as_array().map(Vec::as_slice).unwrap_or_default(), PURGE_COLS, Some(&v));
         }
         JobCmd::Logs { id, follow, lines, rank } => {
-            let mut chunk = a.get(&format!("/runs/{id}/logs?rank={rank}&lines={lines}"))?;
+            let first = a.get(&format!("/runs/{id}/logs?rank={rank}&lines={lines}"));
+            let mut chunk = match first {
+                Ok(c) => c,
+                Err(run_err) => {
+                    // not a run: a proof job has no output of its own, its record is what there is
+                    let Ok(proof) = Admin::new(conn).and_then(|s| s.get(&format!("/jobs/{id}"))) else {
+                        return Err(run_err);
+                    };
+                    if !out.json {
+                        eprintln!(
+                            "{id} is a proof job: it has no output of its own (logs are a run's container \
+                             output). Its record (a failed attempt's error is in `error`):"
+                        );
+                    }
+                    out.record(&with_type("proof", &proof));
+                    return Ok(());
+                }
+            };
             let mut stdout = std::io::stdout();
             loop {
                 if out.json {
