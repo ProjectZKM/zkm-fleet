@@ -51,32 +51,25 @@ enum Cmd {
         #[command(flatten)]
         conn: Conn,
     },
-    /// Everything going on, newest first: proof jobs and one-shot runs in one list.
-    Ps(PsArgs),
-    /// One proof job or one run, by its id.
-    Show {
-        id: String,
-        #[command(flatten)]
-        conn: Conn,
-    },
-    /// Proof jobs: the newest (by default), or one job's record by its id.
+    /// Proof jobs and one-shot runs: the list (by default), one by its id, or submit /
+    /// logs / cancel / purge / fetch a run.
     Job(JobArgs),
+    /// The list of proof jobs and runs (`job` without an id).
+    Ps(PsArgs),
     /// Prover nodes: the list (by default), or drain / undrain one.
     Node(NodeArgs),
     /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY).
     #[command(subcommand)]
     Credential(CredentialCmd),
-    /// One-shot jobs (training, batch work) through the runs API, from any machine that reaches it.
-    #[command(subcommand)]
-    Run(RunCmd),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
     /// certificates (install.sh runs these; no scheduler is needed).
     #[command(subcommand)]
     Init(InitCmd),
 }
 
+/// Which proof jobs and runs a list shows.
 #[derive(Args)]
-struct PsArgs {
+struct ListArgs {
     /// How many of the newest.
     #[arg(short = 'n', long, default_value_t = 20)]
     limit: usize,
@@ -86,8 +79,9 @@ struct PsArgs {
     /// Only what is queued or running.
     #[arg(short, long)]
     active: bool,
-    #[command(flatten)]
-    conn: Conn,
+    /// Only this tenant's proof jobs (runs belong to no tenant).
+    #[arg(long)]
+    tenant: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -97,15 +91,22 @@ enum Kind {
 }
 
 #[derive(Args)]
+struct PsArgs {
+    #[command(flatten)]
+    list: ListArgs,
+    #[command(flatten)]
+    conn: Conn,
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct JobArgs {
-    /// A job's id (the SDK's proof_id); without one, the newest jobs.
+    #[command(subcommand)]
+    cmd: Option<JobCmd>,
+    /// A proof job's or a run's id: its record. Without one, the list.
     id: Option<String>,
-    /// Only this tenant's jobs.
-    #[arg(long)]
-    tenant: Option<String>,
-    /// How many of the newest jobs.
-    #[arg(short = 'n', long, default_value_t = 20)]
-    limit: usize,
+    #[command(flatten)]
+    list: ListArgs,
     #[command(flatten)]
     conn: Conn,
 }
@@ -236,27 +237,13 @@ struct Submit {
     command: Vec<String>,
 }
 
+/// What can be done to a run (a proof job is the scheduler's and its client's).
 #[derive(Subcommand)]
-enum RunCmd {
-    /// Queue a run: fleetctl run submit --profile P --gpus 1 --mount /data:ro -- python3 train.py
+enum JobCmd {
+    /// Queue a run: fleetctl job submit --profile P --gpus 1 --mount /data:ro -- python3 train.py
     Submit {
         #[command(flatten)]
         submit: Submit,
-        #[command(flatten)]
-        conn: Conn,
-    },
-    /// A run's state, attempts, cause, latest metric.
-    Status {
-        id: String,
-        #[command(flatten)]
-        conn: Conn,
-    },
-    /// The newest runs.
-    List {
-        #[arg(short = 'n', long, default_value_t = 20)]
-        n: usize,
-        #[command(flatten)]
-        conn: Conn,
     },
     /// A run's output: the last lines, then with -f everything new until it ends.
     Logs {
@@ -268,30 +255,20 @@ enum RunCmd {
         /// A --nodes run's rank k.
         #[arg(long, default_value_t = 0)]
         rank: usize,
-        #[command(flatten)]
-        conn: Conn,
     },
     /// Stop a run (its containers are removed, its cards freed).
-    Cancel {
-        id: String,
-        #[command(flatten)]
-        conn: Conn,
-    },
+    Cancel { id: String },
     /// Delete a finished run's record (out/ included), or every finished run older than --older-than days.
     Purge {
         id: Option<String>,
         #[arg(long)]
         older_than: Option<f64>,
-        #[command(flatten)]
-        conn: Conn,
     },
     /// The run's out/ as a tar.gz (to --out, else stdout).
     Fetch {
         id: String,
         #[arg(long)]
         out: Option<PathBuf>,
-        #[command(flatten)]
-        conn: Conn,
     },
 }
 
@@ -327,9 +304,8 @@ fn main() -> anyhow::Result<()> {
     let out = Out { json: cli.json };
     match &cli.cmd {
         Cmd::Init(i) => init(i, &out),
-        Cmd::Run(r) => run(r, &out),
-        Cmd::Ps(p) => ps(p, &out),
-        Cmd::Show { id, conn } => show(id, conn, &out),
+        Cmd::Job(j) => job(j, &out),
+        Cmd::Ps(p) => list(&p.list, &p.conn, &out),
         other => admin(other, &out),
     }
 }
@@ -339,26 +315,11 @@ impl Cmd {
     fn conn(&self) -> &Conn {
         match self {
             Cmd::Status { conn } => conn,
-            Cmd::Job(j) => &j.conn,
             Cmd::Node(n) => &n.conn,
             Cmd::Credential(
                 CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
             ) => conn,
-            Cmd::Init(_) | Cmd::Run(_) | Cmd::Ps(_) | Cmd::Show { .. } => unreachable!("not the scheduler's admin API"),
-        }
-    }
-}
-
-impl RunCmd {
-    fn conn(&self) -> &Conn {
-        match self {
-            RunCmd::Submit { conn, .. }
-            | RunCmd::Status { conn, .. }
-            | RunCmd::List { conn, .. }
-            | RunCmd::Logs { conn, .. }
-            | RunCmd::Cancel { conn, .. }
-            | RunCmd::Purge { conn, .. }
-            | RunCmd::Fetch { conn, .. } => conn,
+            Cmd::Init(_) | Cmd::Job(_) | Cmd::Ps(_) => unreachable!("not the scheduler's admin API alone"),
         }
     }
 }
@@ -430,7 +391,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
     match cmd {
         Cmd::Status { conn } => {
             let mut v = a.get("/status")?;
-            let runs = fetch_rows(Kind::Run, conn, 200).map(|rows| rows.into_iter().filter(is_active).collect::<Vec<_>>());
+            let runs = fetch_rows(Kind::Run, conn, 200, None).map(|rows| rows.into_iter().filter(is_active).collect::<Vec<_>>());
             if out.json {
                 if let Ok(r) = &runs {
                     v["runs"] = Value::Array(r.clone());
@@ -451,15 +412,6 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
                     Err(e) => println!("runs: the runs API is not reachable ({e:#})"),
                 }
             }
-        }
-        Cmd::Job(JobArgs { id: Some(id), .. }) => out.record(&a.get(&format!("/jobs/{id}"))?),
-        Cmd::Job(JobArgs { id: None, tenant, limit, .. }) => {
-            let path = match tenant {
-                Some(t) => format!("/jobs?limit={limit}&tenant={t}"),
-                None => format!("/jobs?limit={limit}"),
-            };
-            let v = a.get(&path)?;
-            out.table(v.as_array().map(Vec::as_slice).unwrap_or_default(), JOB_COLS, Some(&v));
         }
         Cmd::Node(NodeArgs { cmd: None | Some(NodeCmd::List), .. }) => {
             let v = a.get("/status")?;
@@ -535,7 +487,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
             out.done(&format!("revoked {address}"), json!({ "revoked": address }));
         }
-        Cmd::Init(_) | Cmd::Run(_) | Cmd::Ps(_) | Cmd::Show { .. } => unreachable!("not the scheduler's admin API"),
+        Cmd::Init(_) | Cmd::Job(_) | Cmd::Ps(_) => unreachable!("not the scheduler's admin API alone"),
     }
     Ok(())
 }
@@ -551,27 +503,8 @@ const NODE_COLS: &[out::Col] = &[
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
 const ANCHOR_COLS: &[out::Col] = &[col("TENANT", "tenant"), col("PROGRAM", "program"), col("ANCHORED ON", "node"), col("NODE GPUS", "gpus")];
-const JOB_COLS: &[out::Col] = &[
-    col("JOB", "id"),
-    col("TENANT", "tenant"),
-    col("STATE", "state"),
-    col("NODE", "node"),
-    col("TRY", "attempts"),
-    col("CYCLES", "cycles"),
-    col("PROVE", "prove_ms"),
-    col("CREATED", "created_ms"),
-];
 const CREDENTIAL_COLS: &[out::Col] =
     &[col("ADDRESS", "address"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
-const RUN_COLS: &[out::Col] = &[
-    col("RUN", "id"),
-    col("STATE", "state"),
-    col("CARDS", "gpus"),
-    col("EXIT", "exit_code"),
-    col("CAUSE", "cause"),
-    col("SUBMITTED", "submitted_at"),
-    col("FINISHED", "finished_at"),
-];
 const PURGE_COLS: &[out::Col] =
     &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
 
@@ -670,11 +603,12 @@ fn run_row(r: &Value) -> Value {
 }
 
 /// The newest proof jobs or runs, as `ps` rows.
-fn fetch_rows(kind: Kind, conn: &Conn, limit: usize) -> anyhow::Result<Vec<Value>> {
+fn fetch_rows(kind: Kind, conn: &Conn, limit: usize, tenant: Option<&str>) -> anyhow::Result<Vec<Value>> {
     let (v, row): (Value, fn(&Value) -> Value) = match kind {
         Kind::Proof => {
             let a = Admin::new(conn)?;
-            (a.get(&format!("/jobs?limit={limit}"))?, proof_row)
+            let only = tenant.map(|t| format!("&tenant={t}")).unwrap_or_default();
+            (a.get(&format!("/jobs?limit={limit}{only}"))?, proof_row)
         }
         Kind::Run => {
             let a = Admin::runs(conn)?;
@@ -684,17 +618,19 @@ fn fetch_rows(kind: Kind, conn: &Conn, limit: usize) -> anyhow::Result<Vec<Value
     Ok(v.as_array().into_iter().flatten().map(row).collect())
 }
 
-fn ps(p: &PsArgs, out: &Out) -> anyhow::Result<()> {
-    let kinds: Vec<Kind> = match p.kind {
-        Some(k) => vec![k],
-        None => vec![Kind::Proof, Kind::Run],
+/// Proof jobs and runs, newest first.
+fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let kinds: Vec<Kind> = match (p.kind, &p.tenant) {
+        (Some(k), _) => vec![k],
+        (None, Some(_)) => vec![Kind::Proof],
+        (None, None) => vec![Kind::Proof, Kind::Run],
     };
     // --active looks further back, so a long run is not pushed out by many short proofs
     let fetch = if p.active { 1000 } else { p.limit };
     let mut rows = Vec::new();
     let mut reached = 0;
     for k in &kinds {
-        match fetch_rows(*k, &p.conn, fetch) {
+        match fetch_rows(*k, conn, fetch, p.tenant.as_deref()) {
             Ok(r) => {
                 rows.extend(r);
                 reached += 1;
@@ -726,7 +662,7 @@ fn with_type(t: &str, record: &Value) -> Value {
 }
 
 /// A proof job or a run, by id: the scheduler is asked first, then the runs API.
-fn show(id: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn record(id: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     let proof = Admin::new(conn).and_then(|a| a.get(&format!("/jobs/{id}")));
     if let Ok(v) = &proof {
         out.record(&with_type("proof", v));
@@ -744,11 +680,20 @@ fn show(id: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     }
 }
 
-fn run(cmd: &RunCmd, out: &Out) -> anyhow::Result<()> {
+fn job(j: &JobArgs, out: &Out) -> anyhow::Result<()> {
+    match (&j.cmd, &j.id) {
+        (None, None) => list(&j.list, &j.conn, out),
+        (None, Some(id)) => record(id, &j.conn, out),
+        (Some(cmd), _) => run_action(cmd, &j.conn, out),
+    }
+}
+
+/// submit / logs / cancel / purge / fetch, through the runs API.
+fn run_action(cmd: &JobCmd, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     use reqwest::Method as M;
-    let a = Admin::runs(cmd.conn())?;
+    let a = Admin::runs(conn)?;
     match cmd {
-        RunCmd::Submit { submit, .. } => {
+        JobCmd::Submit { submit } => {
             let mut body = serde_json::to_value(submit)?;
             let mut uploaded = Value::Null;
             if let Some(code) = &submit.code {
@@ -765,13 +710,8 @@ fn run(cmd: &RunCmd, out: &Out) -> anyhow::Result<()> {
             }
             out.record(&v);
         }
-        RunCmd::Status { id, .. } => out.record(&a.get(&format!("/runs/{id}"))?),
-        RunCmd::Cancel { id, .. } => out.record(&a.send(a.req(M::POST, &format!("/runs/{id}/cancel")))?),
-        RunCmd::List { n, .. } => {
-            let v = a.get(&format!("/runs?n={n}"))?;
-            out.table(v.as_array().map(Vec::as_slice).unwrap_or_default(), RUN_COLS, Some(&v));
-        }
-        RunCmd::Purge { id, older_than, .. } => {
+        JobCmd::Cancel { id } => out.record(&a.send(a.req(M::POST, &format!("/runs/{id}/cancel")))?),
+        JobCmd::Purge { id, older_than } => {
             let path = match (id, older_than) {
                 (Some(id), _) => format!("/runs/{id}"),
                 (None, Some(days)) => format!("/runs?older_than={days}"),
@@ -780,7 +720,7 @@ fn run(cmd: &RunCmd, out: &Out) -> anyhow::Result<()> {
             let v = a.send(a.req(M::DELETE, &path))?;
             out.table(v.as_array().map(Vec::as_slice).unwrap_or_default(), PURGE_COLS, Some(&v));
         }
-        RunCmd::Logs { id, follow, lines, rank, .. } => {
+        JobCmd::Logs { id, follow, lines, rank } => {
             let mut chunk = a.get(&format!("/runs/{id}/logs?rank={rank}&lines={lines}"))?;
             let mut stdout = std::io::stdout();
             loop {
@@ -800,7 +740,7 @@ fn run(cmd: &RunCmd, out: &Out) -> anyhow::Result<()> {
                 chunk = a.get(&format!("/runs/{id}/logs?rank={rank}&offset={offset}"))?;
             }
         }
-        RunCmd::Fetch { id, out: file, .. } => {
+        JobCmd::Fetch { id, out: file } => {
             if file.is_none() && out.json {
                 bail!("fetch writes the tar.gz itself to stdout; with --json give --out FILE");
             }

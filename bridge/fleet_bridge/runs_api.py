@@ -1,4 +1,4 @@
-"""One-shot runs over HTTP, for `fleetctl run`: the same actions as `run.sh`, behind
+"""One-shot runs over HTTP, for `fleetctl job`: the same actions as `run.sh`, behind
 the admin token, so runs can be submitted from any machine that reaches the port.
 
     POST   /runs                     submit (JSON: the RunArgs fields marked `remote`, plus "command")

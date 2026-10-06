@@ -617,7 +617,7 @@ class ServiceSpec(Record):
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
-    # the runs API (one-shot runs over HTTP, for `fleetctl run`): where it listens, and the
+    # the runs API (one-shot runs over HTTP, for `fleetctl job`): where it listens, and the
     # profiles file and runs dir of this machine (pin it with `machine:` to where they are)
     listen: str = "127.0.0.1:9192"
     profiles: str | None = None

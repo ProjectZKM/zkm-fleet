@@ -44,17 +44,16 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ```bash
 fleetctl status                                       # queue, nodes, anchors, runs going on
-fleetctl ps                                           # proof jobs and runs, newest first (--active, --type proof|run, -n N)
-fleetctl show <id>                                    # one proof job or run
+fleetctl job                                          # proof jobs and runs, newest first (--active, --type proof|run, --tenant T, -n N); `ps` is the same
+fleetctl job <id>                                     # one proof job or run
 ```
 
 | task | how |
 |---|---|
 | add / change provers | edit `/etc/zkm-fleet/services.yaml` (see `deploy/services.example.yaml`), then `/opt/zkm-fleet/deploy/apply.sh`; a changed spec (e.g. a new image digest) drains and replaces that actor; `python -m fleet_bridge apply --dry-run --services ...` only lists what an apply would start, stop or replace |
 | a GPU app (ComfyUI, an inference server) | a `kind: app` service: a container on one card, serving on `port_base` + replica index, its data mounted at the same paths; `python -m fleet_bridge render --services … --actor <name>-0 --gpus <card>` prints the `docker run` to try it by hand |
-| a one-shot GPU job (training) | a profile in `/etc/zkm-fleet/runs.yaml` (see `deploy/runs.example.yaml`), then from any machine that reaches the runs API: `fleetctl run submit --profile P --gpus 1 --cpus 16 --gpu-mem 20 --mount PATH:ro -- CMD` (or `/opt/zkm-fleet/deploy/run.sh submit ...` on the control machine). It queues until a card is free and has the memory, runs capped at its CPUs, writes to its own `{out}`, frees the card on exit. `--gpus 0.5` shares a card, `--nodes N` spreads it over N machines, `--after ID` / `--retry N` / `--restart-on-oom N` sequence and retry, `--code git:REPO@REF` (on the server) or a local `.tar.gz` (uploaded) pins the code. `fleetctl run list`, `status ID`, `logs ID -f`, `fetch ID --out F`, `cancel ID`, `purge ID` |
-| the runs API | a `kind: runs-api` service (on the control machine, `127.0.0.1:9192` by default, the admin token); `fleetctl run` talks to it (`--runs-url` / `FLEET_RUNS_URL`). From another machine: `ssh -N -L 9191:127.0.0.1:9191 -L 9192:127.0.0.1:9192 <control machine>` and the admin token in `~/.config/zkm-fleet/admin.token` |
-| jobs | `fleetctl job` (the newest; `--tenant T`, `-n N`), `fleetctl job <proof_id>` (one record) |
+| a one-shot GPU job (training) | a profile in `/etc/zkm-fleet/runs.yaml` (see `deploy/runs.example.yaml`), then from any machine that reaches the runs API: `fleetctl job submit --profile P --gpus 1 --cpus 16 --gpu-mem 20 --mount PATH:ro -- CMD` (or `/opt/zkm-fleet/deploy/run.sh submit ...` on the control machine). It queues until a card is free and has the memory, runs capped at its CPUs, writes to its own `{out}`, frees the card on exit. `--gpus 0.5` shares a card, `--nodes N` spreads it over N machines, `--after ID` / `--retry N` / `--restart-on-oom N` sequence and retry, `--code git:REPO@REF` (on the server) or a local `.tar.gz` (uploaded) pins the code. `fleetctl job` (the list), `job ID`, `job logs ID -f`, `job fetch ID --out F`, `job cancel ID`, `job purge ID` |
+| the runs API | a `kind: runs-api` service (on the control machine, `127.0.0.1:9192` by default, the admin token); `fleetctl job` talks to it for runs (`--runs-url` / `FLEET_RUNS_URL`). From another machine: `ssh -N -L 9191:127.0.0.1:9191 -L 9192:127.0.0.1:9192 <control machine>` and the admin token in `~/.config/zkm-fleet/admin.token` |
 | nodes | `fleetctl node` (the list), `node drain <name>` (finishes its job), later `undrain` |
 | output | every `fleetctl` command prints a formatted view; `--json` prints the data as JSON |
 | tenants | `/etc/zkm-fleet/fleet.yaml` (class, anchoring, allowed backends, `nodes` (name prefixes that may run it, for a tenant tied to one prover configuration), queue cap), then `docker compose -p zkm-fleet restart scheduler` |

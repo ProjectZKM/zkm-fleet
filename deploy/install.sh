@@ -229,7 +229,7 @@ if [ "$ROLE" = control ]; then
       echo "node_binary: $PREFIX/bin/fleet-ziren-node"
       echo "log_dir: $WORKDIR/logs"
       echo "services:                # add ziren-gpu / ziren-cpu services, then: $PREFIX/deploy/apply.sh"
-      echo "  - name: runs-api         # one-shot runs over HTTP, for fleetctl run (admin token)"
+      echo "  - name: runs-api         # one-shot runs over HTTP, for fleetctl job (admin token)"
       echo "    kind: runs-api"
       echo "    cpus: 1"
       echo "    listen: 127.0.0.1:9192"
@@ -263,7 +263,7 @@ if [ "$ROLE" = control ]; then
   cat <<EOF
 
   status:      fleetctl status          (fleetctl is in $LINKDIR; --json for JSON)
-  runs:        fleetctl run submit --profile P --gpus 1 -- CMD   (profiles in $ETC/runs.yaml)
+  jobs:        fleetctl job (proofs and runs); fleetctl job submit --profile P --gpus 1 -- CMD   (profiles in $ETC/runs.yaml)
   provers:     edit $ETC/services.yaml, then $PREFIX/deploy/apply.sh
   a client:    fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 \\
                  --tls-dir $ETC/tls --out ethproofs.env

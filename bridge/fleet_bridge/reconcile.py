@@ -20,7 +20,7 @@ GOAT on 0, EthProofs on 2-7 and leaves 1 for one-shot runs.
 
 An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
 server): see GpuApp and deploy/services.example.yaml. A `runs-api` serves one-shot
-runs over HTTP for `fleetctl run` (runs_api.py).
+runs over HTTP for `fleetctl job` (runs_api.py).
 
 Each replica gets its own placement group with one STRICT_PACK bundle: its
 cards, CPUs and memory all come from ONE machine (Ray never splits a replica's
