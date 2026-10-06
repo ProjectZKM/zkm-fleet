@@ -118,7 +118,9 @@ def reconcile_once(cfg: dict) -> dict:
         log.info("stopping %s (no longer wanted)", name)
         stop(name)
         report["stopped"].append(name)
-    for name, spec in sorted(want.items()):
+    # In the order of the services file: on one machine Ray hands out the lowest free
+    # cards, so the order decides which service gets which cards.
+    for name, spec in want.items():
         if name not in have:
             log.info("starting %s", name)
             try:
