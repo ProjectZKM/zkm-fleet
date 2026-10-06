@@ -729,10 +729,14 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
             };
             let elf = app["elf_id"].as_str().unwrap_or("");
             if !yes {
+                let rest = if elf.is_empty() {
+                    String::new() // requests refused before a program was known: no ELF, no anchor
+                } else {
+                    format!(", its anchor, and its ELF {elf} unless another tenant uses it")
+                };
                 bail!(
-                    "would delete proof app {name}: {} job record(s) with their inputs and proofs, its anchor, and \
-                     its ELF {elf} unless another tenant uses it ({} queued or running: refused while any is). \
-                     Pass --yes to delete",
+                    "would delete proof app {name}: {} job record(s) with their inputs and proofs{rest} \
+                     ({} queued or running: refused while any is). Pass --yes to delete",
                     app["jobs"], app["active"]
                 );
             }
