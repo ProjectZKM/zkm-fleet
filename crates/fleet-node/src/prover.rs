@@ -180,6 +180,9 @@ impl Node {
 
     async fn run(&self, req: ProveRequest) -> Result<ProveResponse, Status> {
         let t0 = Instant::now();
+        if !self.ready().await {
+            return Err(Status::unavailable("GPU server not ready"));
+        }
         let keys = self.keys_for(&req.elf_id, req.elf).await?;
         let kind = match ProofKind::try_from(req.kind).unwrap_or(ProofKind::Unspecified) {
             ProofKind::Core => ZKMProofKind::Core,
@@ -215,7 +218,15 @@ impl Node {
         })
         .await
         .map_err(|e| Status::internal(format!("prover panicked: {e}")))?
-        .map_err(|e| Status::internal(format!("{e:#}")))?;
+        .map_err(|e| {
+            // The GPU server went away mid-proof: not the job's fault, the scheduler retries it.
+            let msg = format!("{e:#}");
+            if msg.contains("error sending request") || msg.contains("onnection refused") {
+                Status::unavailable(msg)
+            } else {
+                Status::internal(msg)
+            }
+        })?;
         if self.backend == "mock" {
             if let Some(ms) = std::env::var("FLEET_MOCK_DELAY_MS")
                 .ok()

@@ -50,6 +50,12 @@ fn classify(status: &tonic::Status) -> Failure {
     match status.code() {
         tonic::Code::Unavailable => Failure::NotStarted,
         tonic::Code::ResourceExhausted => Failure::Busy,
+        // The node could not reach its GPU server (restarting, removed): nothing about the job.
+        _ if m.contains("CUDA RPC")
+            && (m.contains("error sending request") || m.contains("onnection refused")) =>
+        {
+            Failure::NotStarted
+        }
         tonic::Code::Unknown | tonic::Code::Cancelled | tonic::Code::Aborted
             if m.contains("transport") || m.contains("connection") || m.contains("broken pipe") =>
         {
@@ -838,5 +844,7 @@ mod tests {
         );
         assert_eq!(c(tonic::Code::Internal, "gpu fell over"), Failure::Prover);
         assert_eq!(c(tonic::Code::Unknown, "panicked"), Failure::Prover);
+        let gpu_gone = "Internal error: io error: CUDA RPC `prove_core_stateless` failed: error sending request for url (http://127.0.0.1:30101/twirp/api.ProverService/ProveCoreStateless)";
+        assert_eq!(c(tonic::Code::Internal, gpu_gone), Failure::NotStarted);
     }
 }
