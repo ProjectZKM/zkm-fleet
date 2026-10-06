@@ -1,5 +1,6 @@
 """python -m fleet_bridge {apply|status|down} --services services.yaml [--address 127.0.0.1:6379]
    python -m fleet_bridge render --services services.yaml --actor <name>-<i> --gpus 0[,1]
+   python -m fleet_bridge run submit|status|cancel|list|render ...   (one-shot jobs: see runs.py)
 
 apply makes the prover actors match the services file (start, stop, replace on a
 spec change). The actors are detached and Ray restarts them itself, so nothing
@@ -13,6 +14,7 @@ import argparse
 import json
 import logging
 import shlex
+import sys
 
 import ray
 import yaml
@@ -21,6 +23,10 @@ from . import reconcile
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        from . import runs
+
+        return runs.main(sys.argv[2:])
     p = argparse.ArgumentParser(prog="fleet_bridge")
     p.add_argument("command", choices=["apply", "status", "down", "render"])
     p.add_argument("--services", default="services.yaml")

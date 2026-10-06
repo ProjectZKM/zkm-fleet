@@ -229,6 +229,17 @@ if [ "$ROLE" = control ]; then
 cd "$PREFIX/bridge" && exec "$PREFIX/venv/bin/python" -m fleet_bridge apply --services "$ETC/services.yaml" --address 127.0.0.1:6379
 EOF
   chmod +x "$PREFIX/deploy/apply.sh"
+  mkdir -p "$WORKDIR/runs"
+  [ -f "$ETC/runs.yaml" ] || echo "profiles: {}   # one-shot job profiles: see deploy/runs.example.yaml" > "$ETC/runs.yaml"
+  cat > "$PREFIX/deploy/run.sh" <<EOF
+#!/bin/bash
+# One-shot GPU jobs (profiles in $ETC/runs.yaml):
+#   run.sh submit --profile NAME [--name N] [--gpus N] [--cpus N] [--log FILE] [--workdir DIR] -- CMD ARG...
+#   run.sh status ID | cancel ID | list
+cd "$PREFIX/bridge" && exec "$PREFIX/venv/bin/python" -m fleet_bridge run \\
+  --profiles "$ETC/runs.yaml" --runs-dir "$WORKDIR/runs" "\$@"
+EOF
+  chmod +x "$PREFIX/deploy/run.sh"
   "$PREFIX/deploy/apply.sh"
 fi
 
