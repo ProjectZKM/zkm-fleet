@@ -2,13 +2,18 @@
 
     services:
       - name: ethproofs-gpu        # replica i runs as actor "<name>-<i>"
-        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app
+        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold
         replicas: 1
         gpus: 2
         cpus: 48
         memory_gb: 256
         image: ghcr.io/projectzkm/ziren-gpu@sha256:...
         env: {VERIFY_VK: "true", ZIREN_LEAF_HOST_THREADS: "3"}
+
+A `hold` (`gpus: N`, no image) keeps the next free cards out of reach of the
+services listed after it while they start, then frees them: on one machine Ray
+hands out the lowest free cards, so `goat (1) / hold (1) / ethproofs (6)` puts
+GOAT on 0, EthProofs on 2-7 and leaves 1 for one-shot runs.
 
 An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
 server): see GpuApp and deploy/services.example.yaml.
@@ -42,7 +47,7 @@ def _replica_specs(cfg: dict) -> dict[str, dict]:
     out = {}
     for svc in cfg.get("services", []):
         kind = svc.get("kind", "ziren-gpu")
-        if kind not in KINDS:
+        if kind not in KINDS and kind != "hold":
             raise ValueError(f"service {svc['name']}: unknown kind {kind}")
         for i in range(int(svc.get("replicas", 1))):
             name = f"{svc['name']}-{i}"
@@ -54,7 +59,7 @@ def _replica_specs(cfg: dict) -> dict[str, dict]:
 
 def _bundle(spec: dict) -> dict:
     b = {"CPU": float(spec.get("cpus", 1))}
-    if spec["kind"] in ("ziren-gpu", "app"):
+    if spec["kind"] in ("ziren-gpu", "app", "hold"):
         b["GPU"] = float(spec.get("gpus", 1))
     if spec.get("memory_gb"):
         b["memory"] = float(spec["memory_gb"]) * 2**30
@@ -113,14 +118,40 @@ def stop(name: str):
 def reconcile_once(cfg: dict) -> dict:
     want = _replica_specs(cfg)
     have = _running()
-    report = {"started": [], "stopped": [], "replaced": [], "healthy": [], "unhealthy": []}
+    report = {"started": [], "stopped": [], "replaced": [], "healthy": [], "unhealthy": [], "held": []}
+    try:
+        _reconcile(want, have, report)
+    finally:
+        # Holds only steer which cards the services after them get; release them.
+        for pg in report.pop("_holds", []):
+            remove_placement_group(pg)
+    return report
+
+
+def _reconcile(want: dict, have: dict, report: dict):
     for name in sorted(set(have) - set(want)):
         log.info("stopping %s (no longer wanted)", name)
         stop(name)
         report["stopped"].append(name)
     # In the order of the services file: on one machine Ray hands out the lowest free
     # cards, so the order decides which service gets which cards.
-    for name, spec in want.items():
+    names = list(want)
+    for i, (name, spec) in enumerate(want.items()):
+        if spec["kind"] == "hold":
+            # A hold takes the next free cards while the services after it start (Ray hands
+            # out the lowest free cards), so they land past it; the cards are freed at the
+            # end, for one-shot runs. Only when one of those services has to start.
+            later = [n for n in names[i + 1:] if want[n]["kind"] != "hold" and n not in have]
+            if later:
+                pg = placement_group([_bundle(spec)], strategy="STRICT_PACK", name=f"hold-{name}")
+                try:
+                    ray.get(pg.ready(), timeout=60)
+                    report.setdefault("_holds", []).append(pg)
+                    report["held"].append(name)
+                except Exception as e:
+                    log.warning("hold %s not placed (%s); the services after it take the lowest cards", name, e)
+                    remove_placement_group(pg)
+            continue
         if name not in have:
             log.info("starting %s", name)
             try:
