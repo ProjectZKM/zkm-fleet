@@ -40,13 +40,19 @@ pub fn eligible(node: &NodeView, tenant: &TenantConfig, failed_on: &[String]) ->
             .map_or(true, |r| r == &tenant.name)
 }
 
-/// `anchor` is the name of the node this (tenant, program) is anchored to.
+/// `anchor` is the name of the node this (tenant, program) is anchored to. Nodes the
+/// job failed on are avoided while another node could take it; when none could (a
+/// tenant with one node), they are tried again: the attempt limit ends the retries.
 pub fn choose(
     tenant: &TenantConfig,
     failed_on: &[String],
     anchor: Option<&str>,
     nodes: &[NodeView],
 ) -> Choice {
+    let elsewhere = nodes
+        .iter()
+        .any(|n| eligible(n, tenant, &[]) && !failed_on.contains(&n.name));
+    let failed_on: &[String] = if elsewhere { failed_on } else { &[] };
     if tenant.anchor != Anchor::None {
         if let Some(name) = anchor {
             if let Some((i, n)) = nodes.iter().enumerate().find(|(_, n)| n.name == name) {
@@ -133,14 +139,35 @@ mod tests {
     }
 
     #[test]
-    fn version_backend_reservation_and_failures_exclude() {
+    fn version_backend_reservation_and_readiness_exclude() {
         let t = tenant(Class::Batch, Anchor::None);
         let mut nodes = vec![node("a", 1), node("b", 1), node("c", 1), node("d", 1)];
         nodes[0].zkm_version = "v1".into();
         nodes[1].reserved_for = Some("other".into());
         nodes[2].ready = false;
-        assert_eq!(choose(&t, &["d".into()], None, &nodes), Choice::NoNode);
         assert_eq!(choose(&t, &[], None, &nodes), Choice::Run(3));
+        nodes[3].busy = true;
+        assert_eq!(choose(&t, &[], None, &nodes), Choice::NoNode);
+    }
+
+    #[test]
+    fn a_failed_node_is_avoided_while_another_could_run_the_job() {
+        let t = tenant(Class::Batch, Anchor::None);
+        let mut nodes = vec![node("a", 1), node("b", 1)];
+        assert_eq!(choose(&t, &["a".into()], None, &nodes), Choice::Run(1));
+        // The other node is busy, not gone: wait for it rather than retry on `a`.
+        nodes[1].busy = true;
+        assert_eq!(choose(&t, &["a".into()], None, &nodes), Choice::NoNode);
+        // Only the failed node is left (a tenant with one node): try it again.
+        nodes[1].ready = false;
+        assert_eq!(choose(&t, &["a".into()], None, &nodes), Choice::Run(0));
+    }
+
+    #[test]
+    fn a_tenant_with_one_node_retries_on_it_even_when_anchored() {
+        let t = tenant(Class::Latency, Anchor::Exclusive);
+        let nodes = vec![node("a", 4)];
+        assert_eq!(choose(&t, &["a".into()], Some("a"), &nodes), Choice::Run(0));
     }
 
     #[test]

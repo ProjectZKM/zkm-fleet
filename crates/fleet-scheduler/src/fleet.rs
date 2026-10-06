@@ -787,11 +787,12 @@ impl Fleet {
         self.release(node_id, None);
         let max = self.cfg.max_attempts;
         let j = self.update_job(job_id, |j| {
-            if let Some(n) = node_name.clone().or_else(|| j.node.clone()) {
-                j.failed_on.push(n);
-            }
+            // A node that never started the job says nothing about the job: placement
+            // waits for its machine's heartbeats instead (it was marked not ready above).
             if failure == Failure::NotStarted {
                 j.attempts = j.attempts.saturating_sub(1);
+            } else if let Some(n) = node_name.clone().or_else(|| j.node.clone()) {
+                j.failed_on.push(n);
             }
             j.error = msg.to_string();
             if j.attempts >= max || j.failed_on.len() >= MAX_NODES_TRIED {
