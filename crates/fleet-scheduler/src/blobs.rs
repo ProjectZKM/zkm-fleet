@@ -73,6 +73,26 @@ impl Blobs {
     pub fn path(&self, job_id: &str, name: &str) -> anyhow::Result<PathBuf> {
         Ok(self.job_dir(job_id)?.join(name))
     }
+
+    /// Removes a job's files (input, proof, public values).
+    pub fn remove_job(&self, job_id: &str) -> anyhow::Result<()> {
+        let dir = self.job_dir(job_id)?;
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    /// Removes a stored ELF; false when there was none.
+    pub fn remove_elf(&self, elf_id: &str) -> anyhow::Result<bool> {
+        anyhow::ensure!(is_safe_id(elf_id), "bad elf id");
+        let path = self.root.join("elf").join(elf_id);
+        if !path.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(path)?;
+        Ok(true)
+    }
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {

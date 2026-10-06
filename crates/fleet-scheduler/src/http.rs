@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::Fleet;
+use crate::store::JobFilter;
 use crate::token;
 
 #[derive(Clone)]
@@ -30,7 +31,7 @@ pub fn router(state: HttpState) -> Router {
             "/credentials/:address",
             axum::routing::delete(revoke_credential),
         )
-        .route("/apps", get(apps))
+        .route("/apps", get(apps).delete(delete_app))
         .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
@@ -75,7 +76,7 @@ async fn public_values(
     Path(proof_id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<PublicValuesQuery>,
 ) -> Response {
-    if !is_safe_id(&proof_id) || !s.fleet.public_values_open(&proof_id, q.key.as_deref()).await {
+    if !is_safe_id(&proof_id) || !s.fleet.public_values_open(&proof_id, q.key.as_deref()) {
         return StatusCode::NOT_FOUND.into_response();
     }
     match s.fleet.blobs.get(&proof_id, blobs::PUBLIC_VALUES) {
@@ -128,6 +129,9 @@ async fn revoke_credential(State(s): State<HttpState>, Path(address): Path<Strin
 #[derive(Deserialize)]
 struct JobsQuery {
     tenant: Option<String>,
+    elf: Option<String>,
+    #[serde(default)]
+    active: bool,
     #[serde(default = "default_jobs_limit")]
     limit: usize,
 }
@@ -143,8 +147,28 @@ async fn apps(State(s): State<HttpState>) -> Response {
     }
 }
 
+/// An app by its exact key (both given; empty for the rejected requests' app).
+#[derive(Deserialize)]
+struct AppKey {
+    tenant: Option<String>,
+    elf_id: Option<String>,
+}
+
+async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+    let (Some(tenant), Some(elf_id)) = (k.tenant, k.elf_id) else {
+        return (StatusCode::BAD_REQUEST, "give tenant and elf_id (the full id, as GET /admin/apps lists it)").into_response();
+    };
+    match s.fleet.delete_app(&tenant, &elf_id).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => match e.downcast_ref::<crate::fleet::Refusal>() {
+            Some(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST), r.message.clone()).into_response(),
+            None => internal(e),
+        },
+    }
+}
+
 async fn jobs(State(s): State<HttpState>, axum::extract::Query(q): axum::extract::Query<JobsQuery>) -> Response {
-    match s.fleet.recent_jobs(q.tenant.as_deref(), q.limit.min(1000)).await {
+    match s.fleet.recent_jobs(&JobFilter { tenant: q.tenant, elf: q.elf, active: q.active }, q.limit.min(1000)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => internal(e),
     }

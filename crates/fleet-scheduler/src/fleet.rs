@@ -123,6 +123,28 @@ pub struct Fleet {
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
+    /// Submits hold it shared, an app's delete exclusively: no job of an app is accepted
+    /// while the app (and its ELF) is being deleted.
+    app_ops: tokio::sync::RwLock<()>,
+}
+
+/// A request refused for what it asks (the admin API answers with `status`).
+#[derive(Debug)]
+pub struct Refusal {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+fn refuse(status: u16, message: String) -> anyhow::Error {
+    Refusal { status, message }.into()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -167,6 +189,7 @@ impl Fleet {
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
+            app_ops: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -190,15 +213,10 @@ impl Fleet {
         hex::encode(&mac.finalize().into_bytes()[..16])
     }
 
-    /// Whether `key` opens this proof's public values. Proofs finished before this
-    /// scheduler started were handed out without a key and stay readable without one.
-    pub async fn public_values_open(&self, proof_id: &str, key: Option<&str>) -> bool {
-        if let Some(k) = key {
-            use subtle_eq::ConstantTimeEq;
-            return k.as_bytes().ct_eq(self.public_values_key(proof_id).as_bytes());
-        }
-        let started = now_ms().saturating_sub(self.started.elapsed().as_millis() as u64);
-        matches!(self.job(proof_id).await, Ok(Some(j)) if j.finished_ms.is_some_and(|f| f < started))
+    /// Whether `key` opens this proof's public values.
+    pub fn public_values_open(&self, proof_id: &str, key: Option<&str>) -> bool {
+        use subtle_eq::ConstantTimeEq;
+        key.is_some_and(|k| k.as_bytes().ct_eq(self.public_values_key(proof_id).as_bytes()))
     }
 
     pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
@@ -306,6 +324,10 @@ impl Fleet {
 
     /// Records a new job. A known id is left as it is (the SDK may resubmit).
     pub async fn submit(&self, job: Job) -> anyhow::Result<bool> {
+        let _ops = self.app_ops.read().await;
+        if !job.state.is_terminal() && !self.blobs.has_elf(&job.elf_id) {
+            anyhow::bail!("program {} is not stored (its app was deleted): send the ELF itself again", job.elf_id);
+        }
         {
             let inner = self.inner.lock();
             if inner.jobs.contains_key(&job.id) {
@@ -351,9 +373,63 @@ impl Fleet {
             .collect())
     }
 
+    /// Deletes a proof app: its jobs' records and files, its anchor, and its ELF when no
+    /// other app uses it. Refused while any of its jobs is queued or running.
+    pub async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
+        let _ops = self.app_ops.write().await;
+        let apps = self.store.apps().await?;
+        let app = apps
+            .iter()
+            .find(|a| a.tenant == tenant && a.elf_id == elf_id)
+            .ok_or_else(|| refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id))))?;
+        let live = self
+            .inner
+            .lock()
+            .jobs
+            .values()
+            .filter(|e| e.job.tenant == tenant && e.job.elf_id == elf_id && !e.job.state.is_terminal())
+            .count() as u64;
+        if app.active > 0 || live > 0 {
+            return Err(refuse(409, format!(
+                "{} has {} job(s) queued or running: delete it when they are done",
+                app_name(tenant, elf_id),
+                app.active.max(live)
+            )));
+        }
+        let ids = self.store.delete_app(tenant, elf_id).await?;
+        {
+            let mut inner = self.inner.lock();
+            for id in &ids {
+                inner.jobs.remove(id);
+            }
+            if let Some(node) = inner.anchors.remove(&(tenant.to_string(), elf_id.to_string())) {
+                // an exclusive anchor reserved its node for the tenant: free it unless
+                // another of the tenant's programs is anchored there
+                let still = inner.anchors.iter().any(|((t, _), n)| t == tenant && *n == node);
+                if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
+                    inner.reserved.remove(&node);
+                }
+            }
+        }
+        let mut files_failed = 0;
+        for id in &ids {
+            if self.blobs.remove_job(id).is_err() {
+                files_failed += 1;
+            }
+        }
+        let shared = apps.iter().any(|a| a.elf_id == elf_id && a.tenant != tenant)
+            || self.inner.lock().jobs.values().any(|e| e.job.elf_id == elf_id);
+        let elf_removed = !elf_id.is_empty() && !shared && self.blobs.remove_elf(elf_id).unwrap_or(false);
+        tracing::info!(app = %app_name(tenant, elf_id), jobs = ids.len(), elf_removed, "app deleted");
+        Ok(serde_json::json!({
+            "app": app_name(tenant, elf_id), "jobs_deleted": ids.len(), "elf_removed": elf_removed,
+            "files_not_removed": files_failed,
+        }))
+    }
+
     /// The newest jobs (the store has every one), of one tenant or all.
-    pub async fn recent_jobs(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
-        self.store.recent(tenant, limit).await
+    pub async fn recent_jobs(&self, f: &crate::store::JobFilter, limit: usize) -> anyhow::Result<Vec<Job>> {
+        self.store.recent(f, limit).await
     }
 
     /// Waits up to `timeout` for the job to reach a terminal state.
@@ -872,6 +948,7 @@ impl Fleet {
             } else {
                 j.state = JobState::Queued;
                 j.node = None;
+                j.started_ms = None; // waiting again: it starts anew when placed
             }
         });
         if let Some(j) = &j {

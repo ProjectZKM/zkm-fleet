@@ -458,3 +458,30 @@ async fn without_client_cert_identity_a_forged_header_is_ignored() {
         .into_inner();
     assert_eq!(s.status, S::Success as i32);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
+    let mut h = start().await;
+    add_node(&h, "gpu-a", 2, false).await;
+    h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
+    let curl = |args: &[&str]| {
+        let out = std::process::Command::new("curl")
+            .args(["-s", "-H", &format!("authorization: Bearer {ADMIN}")])
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let apps: serde_json::Value = serde_json::from_str(&curl(&[&format!("{}/admin/apps", h.http)])).unwrap();
+    let app = apps.as_array().unwrap().iter().find(|a| a["tenant"] == "eth").unwrap().clone();
+    let elf = app["elf_id"].as_str().unwrap();
+    assert_eq!(app["jobs"], 1);
+    let gone = curl(&["-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
+    let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
+    assert_eq!((gone["jobs_deleted"].as_u64(), gone["elf_removed"].as_bool()), (Some(1), Some(true)));
+    let s = h.stage.get_status(GetStatusRequest { proof_id: "job-d".into() }).await.unwrap().into_inner();
+    assert_eq!(s.status, S::Unspecified as i32, "the deleted app's job is gone");
+    let again = curl(&["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
+    assert_eq!(again, "404");
+}

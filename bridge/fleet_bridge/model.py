@@ -262,6 +262,11 @@ class RunState(str, enum.Enum):
     def terminal(self) -> bool:
         return self in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED)
 
+    @property
+    def active(self) -> bool:
+        """Queued or running (a lost run is neither: nothing is running it any more)."""
+        return not self.terminal and self is not RunState.LOST
+
 
 class Cause(str, enum.Enum):
     """Why an attempt ended short of exit 0."""

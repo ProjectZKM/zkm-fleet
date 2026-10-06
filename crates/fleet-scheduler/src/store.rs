@@ -23,37 +23,68 @@ impl JobState {
         matches!(self, JobState::Succeeded | JobState::Failed(_))
     }
 
-    fn to_db(self) -> (i32, i32) {
+    /// Its name, as the database and the admin API have it.
+    pub fn name(self) -> &'static str {
         match self {
-            JobState::Queued => (0, 0),
-            JobState::Running => (1, 0),
-            JobState::Succeeded => (2, 0),
-            JobState::Failed(s) => (3, s as i32),
+            JobState::Queued => "queued",
+            JobState::Running => "running",
+            JobState::Succeeded => "succeeded",
+            JobState::Failed(_) => "failed",
         }
     }
 
-    fn from_db(state: i32, status: i32) -> Self {
-        match state {
-            0 => JobState::Queued,
-            1 => JobState::Running,
-            2 => JobState::Succeeded,
-            _ => JobState::Failed(
-                StageStatus::try_from(status).unwrap_or(StageStatus::InternalError),
-            ),
+    /// The stage status a failed job ended with, by name.
+    pub fn fail_status(self) -> Option<String> {
+        match self {
+            JobState::Failed(s) => Some(status_name(s)),
+            _ => None,
         }
+    }
+
+    fn from_names(state: &str, fail_status: Option<&str>) -> anyhow::Result<Self> {
+        Ok(match state {
+            "queued" => JobState::Queued,
+            "running" => JobState::Running,
+            "succeeded" => JobState::Succeeded,
+            "failed" => JobState::Failed(
+                fail_status
+                    .and_then(|n| StageStatus::from_str_name(&n.to_ascii_uppercase()))
+                    .unwrap_or(StageStatus::InternalError),
+            ),
+            other => anyhow::bail!("unknown job state {other:?}"),
+        })
     }
 }
 
-/// A job as the admin API shows it: the record itself, its kind and state by name.
-#[derive(Debug, Clone, serde::Serialize)]
+const STATES: [&str; 4] = ["queued", "running", "succeeded", "failed"];
+
+/// A stage status by name: `prove_error`.
+pub fn status_name(s: StageStatus) -> String {
+    s.as_str_name().to_ascii_lowercase()
+}
+
+/// A proof kind by name: `compressed`.
+pub fn kind_name(k: ProofKind) -> String {
+    k.as_str_name().trim_start_matches("PROOF_KIND_").to_ascii_lowercase()
+}
+
+fn kind_from_name(n: &str) -> ProofKind {
+    ProofKind::from_str_name(&format!("PROOF_KIND_{}", n.to_ascii_uppercase())).unwrap_or(ProofKind::Unspecified)
+}
+
+/// Every value of a proto enum, by its number from 0 up.
+fn all<T: TryFrom<i32>>() -> Vec<T> {
+    (0..).map_while(|i| T::try_from(i).ok()).collect()
+}
+
+/// A proof job: an instance of a proof app (its tenant's program).
+#[derive(Debug, Clone)]
 pub struct Job {
     /// The SDK's proof_id.
     pub id: String,
     pub tenant: String,
     pub elf_id: String,
-    #[serde(serialize_with = "by_debug_name")]
     pub kind: ProofKind,
-    #[serde(serialize_with = "by_debug_name")]
     pub state: JobState,
     pub error: String,
     /// Node name (stable across node restarts) the job runs or ran on.
@@ -68,8 +99,29 @@ pub struct Job {
     pub finished_ms: Option<u64>,
 }
 
-fn by_debug_name<T: std::fmt::Debug, S: serde::Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&format!("{v:?}"))
+/// The admin API's job: the database row's fields and names (kind, state and
+/// fail_status by name).
+impl serde::Serialize for Job {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut m = s.serialize_struct("Job", 15)?;
+        m.serialize_field("id", &self.id)?;
+        m.serialize_field("tenant", &self.tenant)?;
+        m.serialize_field("elf_id", &self.elf_id)?;
+        m.serialize_field("kind", &kind_name(self.kind))?;
+        m.serialize_field("state", self.state.name())?;
+        m.serialize_field("fail_status", &self.state.fail_status())?;
+        m.serialize_field("error", &self.error)?;
+        m.serialize_field("node", &self.node)?;
+        m.serialize_field("attempts", &self.attempts)?;
+        m.serialize_field("failed_on", &self.failed_on)?;
+        m.serialize_field("cycles", &self.cycles)?;
+        m.serialize_field("prove_ms", &self.prove_ms)?;
+        m.serialize_field("created_ms", &self.created_ms)?;
+        m.serialize_field("started_ms", &self.started_ms)?;
+        m.serialize_field("finished_ms", &self.finished_ms)?;
+        m.end()
+    }
 }
 
 /// A proof app: one tenant's program, and how its jobs (instances) went.
@@ -111,14 +163,35 @@ pub trait Store: Send + Sync {
     /// Queued and running jobs, oldest first, for recovery after a restart.
     async fn incomplete(&self) -> anyhow::Result<Vec<Job>>;
     /// The newest jobs, of one tenant or all.
-    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>>;
+    async fn recent(&self, f: &JobFilter, limit: usize) -> anyhow::Result<Vec<Job>>;
     /// Every (tenant, program) that has had a job, most recently used first.
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>>;
+    /// Deletes an app's finished jobs; returns their ids.
+    async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>>;
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
     /// Marks the credential revoked; returns false when the address is unknown.
     async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool>;
     async fn credentials(&self) -> anyhow::Result<Vec<Credential>>;
+}
+
+/// Which jobs a listing takes.
+#[derive(Debug, Default, Clone)]
+pub struct JobFilter {
+    /// Only this tenant's.
+    pub tenant: Option<String>,
+    /// Only the jobs of programs whose id starts with this (an app name carries the first 8).
+    pub elf: Option<String>,
+    /// Only queued or running ones.
+    pub active: bool,
+}
+
+impl JobFilter {
+    pub fn matches(&self, j: &Job) -> bool {
+        self.tenant.as_ref().is_none_or(|t| &j.tenant == t)
+            && self.elf.as_ref().is_none_or(|e| j.elf_id.starts_with(e.as_str()))
+            && (!self.active || !j.state.is_terminal())
+    }
 }
 
 #[derive(Default)]
@@ -150,14 +223,8 @@ impl Store for MemoryStore {
         Ok(v)
     }
 
-    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
-        let mut v: Vec<Job> = self
-            .jobs
-            .lock()
-            .values()
-            .filter(|j| tenant.is_none_or(|t| j.tenant == t))
-            .cloned()
-            .collect();
+    async fn recent(&self, f: &JobFilter, limit: usize) -> anyhow::Result<Vec<Job>> {
+        let mut v: Vec<Job> = self.jobs.lock().values().filter(|j| f.matches(j)).cloned().collect();
         v.sort_by_key(|j| std::cmp::Reverse(j.created_ms));
         v.truncate(limit);
         Ok(v)
@@ -192,6 +259,19 @@ impl Store for MemoryStore {
         Ok(v)
     }
 
+    async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>> {
+        let mut jobs = self.jobs.lock();
+        let ids: Vec<String> = jobs
+            .values()
+            .filter(|j| j.tenant == tenant && j.elf_id == elf_id && j.state.is_terminal())
+            .map(|j| j.id.clone())
+            .collect();
+        for id in &ids {
+            jobs.remove(id);
+        }
+        Ok(ids)
+    }
+
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {
         let mut creds = self.creds.lock();
         anyhow::ensure!(
@@ -222,58 +302,156 @@ pub struct PgStore {
     pool: PgPool,
 }
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS fleet_jobs (
-    id          TEXT PRIMARY KEY,
-    tenant      TEXT NOT NULL,
-    elf_id      TEXT NOT NULL,
-    kind        INT  NOT NULL,
-    state       INT  NOT NULL,
-    status      INT  NOT NULL DEFAULT 0,
-    error       TEXT NOT NULL DEFAULT '',
+/// The schema this scheduler writes; `fleet_schema` records what a database has.
+const SCHEMA_VERSION: i32 = 1;
+
+fn quoted(names: impl IntoIterator<Item = String>) -> String {
+    names.into_iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
+}
+
+/// The tables (schema 1). Names, not numbers: a state, kind or stage status reads the
+/// same in the database as in the admin API, and the CHECKs list what may be there.
+fn schema() -> String {
+    let kinds = quoted(all::<ProofKind>().into_iter().map(kind_name));
+    let statuses = quoted(all::<StageStatus>().into_iter().map(status_name));
+    let states = quoted(STATES.map(String::from));
+    format!(
+        r#"
+CREATE TABLE fleet_jobs (
+    id          TEXT    PRIMARY KEY,
+    tenant      TEXT    NOT NULL,
+    elf_id      TEXT    NOT NULL,
+    kind        TEXT    NOT NULL CONSTRAINT fleet_jobs_kind_known CHECK (kind IN ({kinds})),
+    state       TEXT    NOT NULL CONSTRAINT fleet_jobs_state_known CHECK (state IN ({states})),
+    fail_status TEXT             CONSTRAINT fleet_jobs_fail_status_known CHECK (fail_status IN ({statuses})),
+    error       TEXT    NOT NULL DEFAULT '',
     node        TEXT,
-    attempts    INT  NOT NULL DEFAULT 0,
-    failed_on   TEXT NOT NULL DEFAULT '',
-    cycles      BIGINT NOT NULL DEFAULT 0,
-    prove_ms    BIGINT NOT NULL DEFAULT 0,
-    created_ms  BIGINT NOT NULL,
+    attempts    INT     NOT NULL DEFAULT 0 CONSTRAINT fleet_jobs_attempts_counted CHECK (attempts >= 0),
+    failed_on   TEXT[]  NOT NULL DEFAULT '{{}}',
+    cycles      BIGINT  NOT NULL DEFAULT 0 CONSTRAINT fleet_jobs_cycles_counted CHECK (cycles >= 0),
+    prove_ms    BIGINT  NOT NULL DEFAULT 0 CONSTRAINT fleet_jobs_prove_ms_counted CHECK (prove_ms >= 0),
+    created_ms  BIGINT  NOT NULL,
     started_ms  BIGINT,
-    finished_ms BIGINT
+    finished_ms BIGINT,
+    CONSTRAINT fleet_jobs_failed_has_status CHECK ((state = 'failed') = (fail_status IS NOT NULL)),
+    CONSTRAINT fleet_jobs_ended_has_finish CHECK ((state IN ('succeeded', 'failed')) = (finished_ms IS NOT NULL))
 );
-CREATE INDEX IF NOT EXISTS fleet_jobs_incomplete ON fleet_jobs (state) WHERE state < 2;
-CREATE TABLE IF NOT EXISTS fleet_credentials (
-    address    TEXT PRIMARY KEY,
-    tenant     TEXT NOT NULL,
-    label      TEXT NOT NULL DEFAULT '',
+CREATE INDEX fleet_jobs_created ON fleet_jobs (created_ms DESC);
+CREATE INDEX fleet_jobs_app ON fleet_jobs (tenant, elf_id, created_ms DESC);
+CREATE INDEX fleet_jobs_active ON fleet_jobs (created_ms) WHERE state IN ('queued', 'running');
+COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a tenant''s program). Payloads are files in the data dir.';
+COMMENT ON COLUMN fleet_jobs.id IS 'The SDK''s proof_id.';
+COMMENT ON COLUMN fleet_jobs.tenant IS 'Empty for a request refused before its tenant was known.';
+COMMENT ON COLUMN fleet_jobs.elf_id IS 'Hex SHA-256 of the guest ELF; empty for a request refused before it was read.';
+COMMENT ON COLUMN fleet_jobs.fail_status IS 'The stage status a failed job ended with (what GetStatus answers).';
+COMMENT ON COLUMN fleet_jobs.node IS 'Name of the node it runs or ran on (stable across node restarts).';
+COMMENT ON COLUMN fleet_jobs.failed_on IS 'Nodes an attempt failed on; a retry avoids them.';
+COMMENT ON COLUMN fleet_jobs.started_ms IS 'Unix ms the current (or last) attempt started; cleared when it is queued again.';
+
+CREATE TABLE fleet_credentials (
+    address    TEXT   PRIMARY KEY CONSTRAINT fleet_credentials_address_hex CHECK (address ~ '^[0-9a-f]{{40}}$'),
+    tenant     TEXT   NOT NULL CONSTRAINT fleet_credentials_tenant_named CHECK (tenant <> ''),
+    label      TEXT   NOT NULL DEFAULT '',
     created_ms BIGINT NOT NULL,
     revoked_ms BIGINT
 );
-"#;
+COMMENT ON TABLE fleet_credentials IS 'Tenant signing keys: the SDK''s ZKM_PRIVATE_KEY maps to its address.';
+COMMENT ON COLUMN fleet_credentials.address IS 'Lower-case hex address without 0x.';
+"#
+    )
+}
+
+/// A script that ends by recording the version it brought the database to.
+fn applying(body: String) -> String {
+    format!(
+        "{body}\nINSERT INTO fleet_schema (version, applied_ms) \
+         VALUES ({SCHEMA_VERSION}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
+    )
+}
+
+// the scripts, made once (a query's text must outlive the connection's future)
+static CREATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(schema()));
+static MIGRATE_0_TO_1: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(migrate_0_to_1()));
+
+/// Schema 0 (numbers for state, stage status and kind; failed_on comma-joined) into 1:
+/// both tables rebuilt from the old ones, so a migrated database has the same tables,
+/// constraints and indexes as a new one.
+fn migrate_0_to_1() -> String {
+    let case = |col: &str, pairs: Vec<(i32, String)>, default: &str| {
+        let arms: String = pairs.iter().map(|(n, name)| format!(" WHEN {n} THEN '{name}'")).collect();
+        format!("CASE {col}{arms} ELSE {default} END")
+    };
+    let kind = case("kind", all::<ProofKind>().into_iter().map(|k| (k as i32, kind_name(k))).collect(), "'unspecified'");
+    let status = case("status", all::<StageStatus>().into_iter().map(|s| (s as i32, status_name(s))).collect(), "'internal_error'");
+    format!(
+        r#"
+ALTER TABLE fleet_jobs RENAME TO fleet_jobs_v0;
+ALTER INDEX fleet_jobs_pkey RENAME TO fleet_jobs_v0_pkey;
+DROP INDEX IF EXISTS fleet_jobs_incomplete;
+ALTER TABLE fleet_credentials RENAME TO fleet_credentials_v0;
+ALTER INDEX fleet_credentials_pkey RENAME TO fleet_credentials_v0_pkey;
+{schema}
+INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, fail_status, error, node, attempts, failed_on, cycles,
+                        prove_ms, created_ms, started_ms, finished_ms)
+SELECT id, tenant, elf_id, {kind},
+       CASE state WHEN 0 THEN 'queued' WHEN 1 THEN 'running' WHEN 2 THEN 'succeeded' ELSE 'failed' END,
+       CASE WHEN state >= 3 THEN {status} END,
+       error, node, attempts,
+       CASE WHEN failed_on = '' THEN '{{}}'::text[] ELSE string_to_array(failed_on, ',') END,
+       cycles, prove_ms, created_ms, started_ms, finished_ms
+FROM fleet_jobs_v0;
+INSERT INTO fleet_credentials SELECT address, tenant, label, created_ms, revoked_ms FROM fleet_credentials_v0;
+DROP TABLE fleet_jobs_v0;
+DROP TABLE fleet_credentials_v0;
+"#,
+        schema = schema()
+    )
+}
 
 impl PgStore {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        Self::migrate(&pool).await?;
         Ok(Self { pool })
     }
 
+    /// Brings the database to SCHEMA_VERSION: creates the tables in a new database,
+    /// rebuilds a schema-0 one. A script is one query, which Postgres runs as one
+    /// transaction; fleet_schema's key refuses a second scheduler doing it at once.
+    async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS fleet_schema (version INT PRIMARY KEY, applied_ms BIGINT NOT NULL);
+             COMMENT ON TABLE fleet_schema IS 'Schema versions applied to this database (the scheduler migrates on start).';",
+        )
+        .execute(pool)
+        .await?;
+        let have: Option<i32> = sqlx::query_scalar("SELECT max(version) FROM fleet_schema").fetch_one(pool).await?;
+        let jobs_table: bool = sqlx::query_scalar("SELECT to_regclass('fleet_jobs') IS NOT NULL").fetch_one(pool).await?;
+        let script = match have {
+            Some(v) if v == SCHEMA_VERSION => return Ok(()),
+            Some(v) if v > SCHEMA_VERSION => {
+                anyhow::bail!("the database has schema {v}, newer than this scheduler's {SCHEMA_VERSION}")
+            }
+            Some(v) => anyhow::bail!("no migration from schema {v}"),
+            None if jobs_table => MIGRATE_0_TO_1.as_str(),
+            None => CREATE.as_str(),
+        };
+        sqlx::raw_sql(script).execute(pool).await?;
+        tracing::info!(from = ?have.or(jobs_table.then_some(0)), to = SCHEMA_VERSION, "database schema migrated");
+        Ok(())
+    }
+
     fn row_to_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<Job> {
-        let failed_on: String = row.try_get("failed_on")?;
         Ok(Job {
             id: row.try_get("id")?,
             tenant: row.try_get("tenant")?,
             elf_id: row.try_get("elf_id")?,
-            kind: ProofKind::try_from(row.try_get::<i32, _>("kind")?)
-                .unwrap_or(ProofKind::Unspecified),
-            state: JobState::from_db(row.try_get("state")?, row.try_get("status")?),
+            kind: kind_from_name(row.try_get("kind")?),
+            state: JobState::from_names(row.try_get("state")?, row.try_get("fail_status")?)?,
             error: row.try_get("error")?,
             node: row.try_get("node")?,
             attempts: row.try_get::<i32, _>("attempts")? as u32,
-            failed_on: failed_on
-                .split(',')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect(),
+            failed_on: row.try_get("failed_on")?,
             cycles: row.try_get::<i64, _>("cycles")? as u64,
             prove_ms: row.try_get::<i64, _>("prove_ms")? as u64,
             created_ms: row.try_get::<i64, _>("created_ms")? as u64,
@@ -290,24 +468,23 @@ impl PgStore {
 #[async_trait]
 impl Store for PgStore {
     async fn upsert(&self, j: &Job) -> anyhow::Result<()> {
-        let (state, status) = j.state.to_db();
         sqlx::query(
-            "INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, status, error, node, attempts, failed_on, \
+            "INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, fail_status, error, node, attempts, failed_on, \
              cycles, prove_ms, created_ms, started_ms, finished_ms) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
-             ON CONFLICT (id) DO UPDATE SET state=$5, status=$6, error=$7, node=$8, attempts=$9, failed_on=$10, \
+             ON CONFLICT (id) DO UPDATE SET state=$5, fail_status=$6, error=$7, node=$8, attempts=$9, failed_on=$10, \
              cycles=$11, prove_ms=$12, started_ms=$14, finished_ms=$15",
         )
         .bind(&j.id)
         .bind(&j.tenant)
         .bind(&j.elf_id)
-        .bind(j.kind as i32)
-        .bind(state)
-        .bind(status)
+        .bind(kind_name(j.kind))
+        .bind(j.state.name())
+        .bind(j.state.fail_status())
         .bind(&j.error)
         .bind(&j.node)
         .bind(j.attempts as i32)
-        .bind(j.failed_on.join(","))
+        .bind(j.failed_on.clone())
         .bind(j.cycles as i64)
         .bind(j.prove_ms as i64)
         .bind(j.created_ms as i64)
@@ -327,17 +504,21 @@ impl Store for PgStore {
     }
 
     async fn incomplete(&self) -> anyhow::Result<Vec<Job>> {
-        let rows = sqlx::query("SELECT * FROM fleet_jobs WHERE state < 2 ORDER BY created_ms")
+        let rows = sqlx::query("SELECT * FROM fleet_jobs WHERE state IN ('queued', 'running') ORDER BY created_ms")
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(Self::row_to_job).collect()
     }
 
-    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
+    async fn recent(&self, f: &JobFilter, limit: usize) -> anyhow::Result<Vec<Job>> {
         let rows = sqlx::query(
-            "SELECT * FROM fleet_jobs WHERE ($1::text IS NULL OR tenant = $1) ORDER BY created_ms DESC LIMIT $2",
+            "SELECT * FROM fleet_jobs WHERE ($1::text IS NULL OR tenant = $1)
+               AND ($2::text IS NULL OR starts_with(elf_id, $2)) AND (NOT $3 OR state IN ('queued', 'running'))
+             ORDER BY created_ms DESC LIMIT $4",
         )
-        .bind(tenant)
+        .bind(&f.tenant)
+        .bind(&f.elf)
+        .bind(f.active)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -346,9 +527,10 @@ impl Store for PgStore {
 
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
         let rows = sqlx::query(
-            "SELECT tenant, elf_id, count(*) AS jobs, count(*) FILTER (WHERE state < 2) AS active,
-                    count(*) FILTER (WHERE state = 2) AS succeeded, count(*) FILTER (WHERE state = 3) AS failed,
-                    max(created_ms) AS last_created_ms, avg(prove_ms) FILTER (WHERE state = 2)::float8 AS mean_prove_ms
+            "SELECT tenant, elf_id, count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active,
+                    count(*) FILTER (WHERE state = 'succeeded') AS succeeded,
+                    count(*) FILTER (WHERE state = 'failed') AS failed, max(created_ms) AS last_created_ms,
+                    avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms
              FROM fleet_jobs GROUP BY tenant, elf_id ORDER BY last_created_ms DESC",
         )
         .fetch_all(&self.pool)
@@ -367,6 +549,15 @@ impl Store for PgStore {
                 })
             })
             .collect()
+    }
+
+    async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("DELETE FROM fleet_jobs WHERE tenant = $1 AND elf_id = $2 AND state IN ('succeeded', 'failed') RETURNING id")
+            .bind(tenant)
+            .bind(elf_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get("id")?)).collect()
     }
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {

@@ -46,11 +46,6 @@ struct Conn {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Queue, nodes, anchors, and the runs going on.
-    Status {
-        #[command(flatten)]
-        conn: Conn,
-    },
     /// Apps: proof programs (a tenant's ELF) and run profiles (runs.yaml), with their jobs.
     App(AppArgs),
     /// Jobs, the instances of apps (proof jobs and runs): the list (by default), one by
@@ -68,7 +63,10 @@ enum Cmd {
 }
 
 #[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct AppArgs {
+    #[command(subcommand)]
+    cmd: Option<AppCmd>,
     /// Only proof apps, or only run apps.
     #[arg(long = "type", value_enum)]
     kind: Option<Kind>,
@@ -76,11 +74,25 @@ struct AppArgs {
     conn: Conn,
 }
 
-/// Which proof jobs and runs a list shows.
+#[derive(Subcommand)]
+enum AppCmd {
+    /// Delete an app, refused while any of its jobs is queued or running. A proof app
+    /// (tenant/<elf>) goes with its jobs' records, inputs and proofs, its anchor, and its
+    /// ELF when no other tenant uses it; a run app's profile leaves runs.yaml and its past
+    /// runs stay. Without --yes it only says what it would delete.
+    Delete {
+        /// The app, as `fleetctl app` names it (a proof app's full elf id works too).
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Which jobs a list shows: every one still queued or running, and the newest finished.
 #[derive(Args)]
 struct ListArgs {
-    /// How many of the newest.
-    #[arg(short = 'n', long, default_value_t = 20)]
+    /// How many of the newest of each type (proof jobs, runs); the active ones are always shown.
+    #[arg(short = 'n', long, default_value_t = 10)]
     limit: usize,
     /// Only proof jobs, or only runs.
     #[arg(long = "type", value_enum)]
@@ -91,7 +103,7 @@ struct ListArgs {
     /// Only this tenant's proof jobs (runs belong to no tenant).
     #[arg(long)]
     tenant: Option<String>,
-    /// Only the jobs of this app (as `fleetctl app` names it).
+    /// Only the jobs of this app (as `fleetctl app` names it: tenant/<elf> or a run profile).
     #[arg(long)]
     app: Option<String>,
 }
@@ -319,7 +331,6 @@ impl Cmd {
     /// The connection of a command that talks to the scheduler.
     fn conn(&self) -> &Conn {
         match self {
-            Cmd::Status { conn } => conn,
             Cmd::Node(n) => &n.conn,
             Cmd::Credential(
                 CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
@@ -388,36 +399,16 @@ impl Admin {
     fn get(&self, path: &str) -> anyhow::Result<Value> {
         self.send(self.req(reqwest::Method::GET, path))
     }
+
+    fn get_q(&self, path: &str, query: &[(&str, String)]) -> anyhow::Result<Value> {
+        self.send(self.req(reqwest::Method::GET, path).query(query))
+    }
 }
 
 fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
     let a = Admin::new(cmd.conn())?;
     use reqwest::Method as M;
     match cmd {
-        Cmd::Status { conn } => {
-            let mut v = a.get("/status")?;
-            let runs = fetch_rows(Kind::Run, conn, 200, None).map(|rows| rows.into_iter().filter(is_active).collect::<Vec<_>>());
-            if out.json {
-                if let Ok(r) = &runs {
-                    v["runs"] = Value::Array(r.clone());
-                }
-                out.record(&v);
-            } else {
-                println!("proof jobs: queued {}  running {}\n", v["queued"], v["running"]);
-                out.table(&node_rows(&v), NODE_COLS, None);
-                let anchors = anchor_rows(&v);
-                if !anchors.is_empty() {
-                    println!();
-                    out.table(&anchors, ANCHOR_COLS, None);
-                }
-                println!();
-                match runs {
-                    Ok(r) if r.is_empty() => println!("runs: none going on"),
-                    Ok(r) => out.table(&r, PS_COLS, None),
-                    Err(e) => println!("runs: the runs API is not reachable ({e:#})"),
-                }
-            }
-        }
         Cmd::Node(NodeArgs { cmd: None | Some(NodeCmd::List), .. }) => {
             let v = a.get("/status")?;
             out.table(&node_rows(&v), NODE_COLS, Some(&v["nodes"]));
@@ -507,7 +498,6 @@ const NODE_COLS: &[out::Col] = &[
     col("BUSY WITH", "busy"),
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
-const ANCHOR_COLS: &[out::Col] = &[col("APP", "app"), col("ANCHORED ON", "node"), col("NODE GPUS", "gpus")];
 const CREDENTIAL_COLS: &[out::Col] =
     &[col("ADDRESS", "address"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
 const PURGE_COLS: &[out::Col] =
@@ -529,28 +519,6 @@ fn node_rows(status: &Value) -> Vec<Value> {
                 "no"
             });
             r
-        })
-        .collect()
-}
-
-/// Anchors as rows: a tenant's program pinned to one prover node (all that node's cards).
-fn anchor_rows(status: &Value) -> Vec<Value> {
-    let gpus = |node: &str| {
-        status["nodes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|n| n["name"].as_str() == Some(node))
-            .map(|n| n["gpus"].clone())
-            .unwrap_or(Value::Null)
-    };
-    status["anchors"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|a| {
-            let node = a[2].as_str().unwrap_or("");
-            json!({ "app": proof_app(&a[0], &a[1]), "node": node, "gpus": gpus(node) })
         })
         .collect()
 }
@@ -593,13 +561,12 @@ fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
     json!(format!("{}/{}", if tenant.is_empty() { "?" } else { tenant }, &elf[..8.min(elf.len())]))
 }
 
-/// A proof job as a list row (times from milliseconds to seconds, the state in lower case).
+/// A proof job as a list row (times from milliseconds to seconds).
 fn proof_row(j: &Value) -> Value {
     let secs = |k: &str| j[k].as_f64().map(|ms| ms / 1000.0);
-    let state = j["state"].as_str().unwrap_or("").split('(').next().unwrap_or("").to_ascii_lowercase();
     json!({
         "type": "proof", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "owner": j["tenant"],
-        "state": state, "where": j["node"],
+        "state": j["state"], "where": j["node"],
         "created_at": secs("created_ms"), "started_at": secs("started_ms"), "finished_at": secs("finished_ms"),
         "took_ms": took_ms(secs("started_ms"), secs("finished_ms")), "record": j,
     })
@@ -616,38 +583,97 @@ fn run_row(r: &Value) -> Value {
     })
 }
 
-/// The newest proof jobs or runs, as `ps` rows.
-fn fetch_rows(kind: Kind, conn: &Conn, limit: usize, tenant: Option<&str>) -> anyhow::Result<Vec<Value>> {
-    let (v, row): (Value, fn(&Value) -> Value) = match kind {
-        Kind::Proof => {
-            let a = Admin::new(conn)?;
-            let only = tenant.map(|t| format!("&tenant={t}")).unwrap_or_default();
-            (a.get(&format!("/jobs?limit={limit}{only}"))?, proof_row)
-        }
-        Kind::Run => {
-            let a = Admin::runs(conn)?;
-            (a.get(&format!("/runs?n={limit}"))?, run_row)
-        }
-    };
-    Ok(v.as_array().into_iter().flatten().map(row).collect())
+/// An app by the name `fleetctl app` shows: a proof app is `tenant/<elf id prefix>`
+/// (`?` for no tenant) or `(rejected)`; any other name is a run app.
+enum AppRef {
+    Proof { tenant: String, elf: String },
+    Run(String),
 }
 
-/// Proof jobs and runs, newest first.
-fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
-    let kinds: Vec<Kind> = match (p.kind, &p.tenant) {
-        (Some(k), _) => vec![k],
-        (None, Some(_)) => vec![Kind::Proof],
-        (None, None) => vec![Kind::Proof, Kind::Run],
+impl AppRef {
+    fn parse(name: &str) -> Self {
+        if name == "(rejected)" {
+            return AppRef::Proof { tenant: String::new(), elf: String::new() };
+        }
+        match name.split_once('/') {
+            Some((t, e)) => AppRef::Proof { tenant: if t == "?" { String::new() } else { t.into() }, elf: e.into() },
+            None => AppRef::Run(name.into()),
+        }
+    }
+}
+
+/// Which jobs to fetch from one side.
+struct Want<'a> {
+    limit: usize,
+    active: bool,
+    tenant: Option<&'a str>,
+    app: Option<&'a str>,
+}
+
+/// The newest proof jobs or runs that `want` asks for, as list rows (none when the
+/// filter can only match the other type).
+fn fetch_rows(kind: Kind, conn: &Conn, want: &Want) -> anyhow::Result<Vec<Value>> {
+    let app = want.app.map(AppRef::parse);
+    let mut q: Vec<(&str, String)> = vec![("limit", want.limit.to_string()), ("n", want.limit.to_string())];
+    if want.active {
+        q.push(("active", "true".into()));
+    }
+    let (v, row): (Value, fn(&Value) -> Value) = match (kind, app) {
+        (Kind::Proof, Some(AppRef::Run(_))) | (Kind::Run, Some(AppRef::Proof { .. })) => return Ok(vec![]),
+        (Kind::Run, _) if want.tenant.is_some() => return Ok(vec![]), // runs belong to no tenant
+        (Kind::Proof, app) => {
+            let tenant = match (&app, want.tenant) {
+                (Some(AppRef::Proof { tenant, .. }), Some(t)) if tenant != t => return Ok(vec![]),
+                (Some(AppRef::Proof { tenant, .. }), _) => Some(tenant.as_str()),
+                (_, t) => t,
+            };
+            if let Some(t) = tenant {
+                q.push(("tenant", t.into()));
+            }
+            if let Some(AppRef::Proof { elf, .. }) = &app {
+                q.push(("elf", elf.clone()));
+            }
+            (Admin::new(conn)?.get_q("/jobs", &q)?, proof_row)
+        }
+        (Kind::Run, app) => {
+            if let Some(AppRef::Run(name)) = &app {
+                q.push(("profile", name.clone()));
+            }
+            (Admin::runs(conn)?.get_q("/runs", &q)?, run_row)
+        }
     };
-    // --active and --app look further back, so a long run is not pushed out by many short proofs
-    let fetch = if p.active || p.app.is_some() { 1000 } else { p.limit };
-    let mut rows = Vec::new();
+    let rows = v.as_array().into_iter().flatten().map(row);
+    // an app name is exact (a proof app's elf part is a prefix on the server)
+    Ok(rows
+        .filter(|r| want.app.is_none_or(|a| r["app"].as_str() == Some(a)) && (!want.active || is_active(r)))
+        .collect())
+}
+
+/// Every job of both types still queued or running, then the newest `-n` of each type.
+fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let kinds: Vec<Kind> = match p.kind {
+        Some(k) => vec![k],
+        None => vec![Kind::Proof, Kind::Run],
+    };
+    let mut rows: Vec<Value> = Vec::new();
     let mut reached = 0;
     for k in &kinds {
-        match fetch_rows(*k, conn, fetch, p.tenant.as_deref()) {
+        let want = |limit, active| Want { limit, active, tenant: p.tenant.as_deref(), app: p.app.as_deref() };
+        // the active ones however old (a long run outlives many short proofs), then the newest
+        let fetched = fetch_rows(*k, conn, &want(1000, true)).and_then(|mut r| {
+            if !p.active {
+                r.extend(fetch_rows(*k, conn, &want(p.limit, false))?);
+            }
+            Ok(r)
+        });
+        match fetched {
             Ok(r) => {
-                rows.extend(r);
                 reached += 1;
+                for row in r {
+                    if !rows.iter().any(|x| x["id"] == row["id"]) {
+                        rows.push(row);
+                    }
+                }
             }
             Err(e) => eprintln!(
                 "{}: not reachable ({e:#}); listing the rest",
@@ -658,9 +684,8 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     if reached == 0 {
         bail!("neither the scheduler nor the runs API answered");
     }
-    rows.retain(|r| (!p.active || is_active(r)) && p.app.as_ref().is_none_or(|a| r["app"].as_str() == Some(a)));
-    rows.sort_by(|a, b| b["created_at"].as_f64().unwrap_or(0.0).total_cmp(&a["created_at"].as_f64().unwrap_or(0.0)));
-    rows.truncate(p.limit);
+    let created = |r: &Value| r["created_at"].as_f64().unwrap_or(0.0);
+    rows.sort_by(|a, b| is_active(b).cmp(&is_active(a)).then(created(b).total_cmp(&created(a))));
     out.table(&rows, PS_COLS, None);
     Ok(())
 }
@@ -676,8 +701,73 @@ const APP_COLS: &[out::Col] = &[
     col("DETAIL", "detail"),
 ];
 
+/// Deletes an app (after showing what goes with it, until --yes).
+fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    use reqwest::Method as M;
+    match AppRef::parse(name) {
+        AppRef::Proof { tenant, .. } => {
+            let a = Admin::new(conn)?;
+            let apps = a.get("/apps")?;
+            let found: Vec<&Value> = apps
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|x| {
+                    x["name"].as_str() == Some(name)
+                        || (x["tenant"].as_str() == Some(&tenant)
+                            && name.split_once('/').map(|(_, e)| e) == x["elf_id"].as_str())
+                })
+                .collect();
+            let app = match found.as_slice() {
+                [] => bail!("no proof app {name} (fleetctl app --type proof lists them)"),
+                [one] => *one,
+                many => bail!(
+                    "{name} names {} programs; give the full elf id: {}",
+                    many.len(),
+                    many.iter().map(|x| format!("{}/{}", tenant, x["elf_id"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
+                ),
+            };
+            let elf = app["elf_id"].as_str().unwrap_or("");
+            if !yes {
+                bail!(
+                    "would delete proof app {name}: {} job record(s) with their inputs and proofs, its anchor, and \
+                     its ELF {elf} unless another tenant uses it ({} queued or running: refused while any is). \
+                     Pass --yes to delete",
+                    app["jobs"], app["active"]
+                );
+            }
+            let v = a.send(a.req(M::DELETE, "/apps").query(&[("tenant", app["tenant"].as_str().unwrap_or("")), ("elf_id", elf)]))?;
+            out.done(
+                &format!("deleted proof app {name}: {} job(s), ELF {}", v["jobs_deleted"],
+                         if v["elf_removed"].as_bool() == Some(true) { "removed" } else { "kept (in use or absent)" }),
+                v,
+            );
+        }
+        AppRef::Run(_) => {
+            let a = Admin::runs(conn)?;
+            let apps = a.get("/apps")?;
+            let Some(app) = apps.as_array().into_iter().flatten().find(|x| x["name"].as_str() == Some(name)) else {
+                bail!("no run app {name} (fleetctl app --type run lists them)");
+            };
+            if !yes {
+                bail!(
+                    "would remove run app {name} (its profile) from runs.yaml; its {} past run(s) \
+                     stay ({} queued or running: refused while any is). Pass --yes to delete",
+                    app["jobs"], app["active"]
+                );
+            }
+            let v = a.send(a.req(M::DELETE, &format!("/apps/{name}")))?;
+            out.done(&format!("deleted run app {name}; its {} past run(s) stay", v["runs_kept"]), v);
+        }
+    }
+    Ok(())
+}
+
 /// Proof apps from the scheduler and run apps from the runs API, most recently used first.
 fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
+    if let Some(AppCmd::Delete { name, yes }) = &p.cmd {
+        return delete_app(name, *yes, &p.conn, out);
+    }
     let mut rows: Vec<Value> = Vec::new();
     let mut raw = serde_json::Map::new();
     let mut reached = 0;
@@ -708,7 +798,12 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
                     rows.push(json!({
                         "type": "run", "name": a["name"], "active": a["active"], "jobs": a["jobs"],
                         "succeeded": a["succeeded"], "failed": a["failed"], "last_at": a["last_submitted_at"],
-                        "detail": format!("image {}, up to {} GPUs", a["image"].as_str().unwrap_or("?"), a["max_gpus"]),
+                        "detail": if a["removed"].as_bool() == Some(true) {
+                            "removed from runs.yaml: only its past runs are left".to_string()
+                        } else {
+                            let gpus = a["max_gpus"].as_u64().unwrap_or(0);
+                            format!("image {}, up to {gpus} GPU{}", a["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" })
+                        },
                     }));
                 }
                 raw.insert("run".into(), v);

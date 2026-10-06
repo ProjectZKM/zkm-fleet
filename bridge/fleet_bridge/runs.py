@@ -49,6 +49,7 @@ machine.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import io
 import json
@@ -136,16 +137,28 @@ def vram_shortfall(cards: list[str], need_mib: int | None) -> list[str]:
 
 # ── records on disk ──────────────────────────────────────────────────────────
 
+class NotFound(SystemExit):
+    """No such run or app (run.sh prints it like any refusal; the API answers 404)."""
+
+
+class Conflict(SystemExit):
+    """Refused because of the state it is in (the API answers 409)."""
+
+
+# A run id: what a submit makes of the name, never `.`/`..` or a dot entry of the runs dir.
+RUN_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
 class RunDir:
     """A run's record directory and the files in it."""
 
     def __init__(self, runs_dir: str, run_id: str, *, must_exist: bool = True) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id or ""):
-            raise SystemExit(f"not a run id: {run_id!r}")
+        if not RUN_ID.fullmatch(run_id or ""):
+            raise NotFound(f"no run {run_id!r} (not a run id)")
         self.id = run_id
         self.path = os.path.join(runs_dir, run_id)
         if must_exist and not os.path.isdir(self.path):
-            raise SystemExit(f"no run {run_id}")
+            raise NotFound(f"no run {run_id}")
 
     @property
     def spec_path(self) -> str:
@@ -170,15 +183,18 @@ class RunDir:
         return RunStatus.read(self.status_path)
 
     def update(self, **changes: Any) -> RunStatus:
-        """Merges typed changes into status.json. A cancel wins over whatever the actor
-        reports afterwards."""
-        st = self.status()
-        new_state = changes.get("state")
-        if st.state is RunState.CANCELLED and new_state not in (None, RunState.CANCELLED):
+        """Merges typed changes into status.json, under the run's lock (the actor and a
+        cancel write it). Once the run has ended, a late report from the actor that it is
+        going (or ended otherwise) is dropped: a cancel wins."""
+        with open(os.path.join(self.path, ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            st = self.status()
+            new_state = changes.get("state")
+            if st.state.terminal and new_state not in (None, st.state):
+                return st
+            st = st.merged(**changes)
+            st.write(self.status_path)
             return st
-        st = st.merged(**changes)
-        st.write(self.status_path)
-        return st
 
     def state(self) -> RunState | None:
         try:
@@ -604,9 +620,28 @@ def _machine_resource(machine: str) -> str:
     raise SystemExit(f"--machine {machine}: no live Ray node of that name or address (have: {', '.join(alive)})")
 
 
-def _capture_code(source: str, code_dir: str) -> CodeRecord:
+def _extract(data: bytes, code_dir: str) -> None:
+    """A code tarball into code/: regular files and directories only, every one inside
+    code/ (no absolute or `..` paths, links or devices: the bridge user writes them)."""
+    with tarfile.open(fileobj=io.BytesIO(data)) as t:
+        members = t.getmembers()
+        root = os.path.realpath(code_dir)
+        for m in members:
+            dest = os.path.realpath(os.path.join(root, m.name))
+            if not (m.isfile() or m.isdir()) or os.path.isabs(m.name) or not dest.startswith(root + os.sep) and dest != root:
+                raise SystemExit(f"--code: refusing tarball member {m.name!r} (only files and directories inside the tree)")
+            m.mode &= 0o755
+        for m in members:
+            t.extract(m, root, set_attrs=m.isfile())
+
+
+def _capture_code(source: str, code_dir: str, roots: list[str]) -> CodeRecord:
     """--code git:/repo@ref (git archive of that commit) or FILE.tar.gz, extracted into
-    the run's code/ so the run executes exactly that and records what it was."""
+    the run's code/ so the run executes exactly that and records what it was. The repo or
+    file must be inside `roots` (the profile's allowed roots, or the uploads dir)."""
+    path = source[4:].rpartition("@")[0] or source[4:] if source.startswith("git:") else source
+    if not _inside(os.path.realpath(path), [os.path.realpath(r) for r in roots]):
+        raise SystemExit(f"--code {source}: outside what the profile allows ({', '.join(roots)})")
     os.makedirs(code_dir)
     if source.startswith("git:"):
         repo, _, ref = source[4:].rpartition("@")
@@ -617,7 +652,7 @@ def _capture_code(source: str, code_dir: str) -> CodeRecord:
             raise SystemExit(f"--code {source}: {commit.stderr.strip()}")
         sha = commit.stdout.strip()
         arch = subprocess.run(["git", "-C", repo, "archive", "--format=tar", sha], capture_output=True)
-        tarfile.open(fileobj=io.BytesIO(arch.stdout)).extractall(code_dir)
+        _extract(arch.stdout, code_dir)
         dirty = _sh(["git", "-C", repo, "status", "--porcelain"]).stdout.strip()
         return CodeRecord(source=source, repo=repo, ref=ref, commit=sha,
                           note="working-tree changes are NOT included" if dirty else None)
@@ -625,7 +660,7 @@ def _capture_code(source: str, code_dir: str) -> CodeRecord:
         raise SystemExit(f"--code {source}: no such file (a tarball on this machine, or git:/repo@ref)")
     with open(source, "rb") as f:
         data = f.read()
-    tarfile.open(fileobj=io.BytesIO(data)).extractall(code_dir)
+    _extract(data, code_dir)
     return CodeRecord(source=source, sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
 
 
@@ -695,7 +730,7 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
         RunDir(a.runs_dir, a.after)
     place = _placement(a)
 
-    base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40]
+    base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40].lstrip(".") or "run"
     run = RunDir(a.runs_dir, f"{base}-{uuid.uuid4().hex[:8]}", must_exist=False)
     os.makedirs(run.out)
     writable = [m.path for m in mounts if m.mode is MountMode.RW] + [run.out]
@@ -705,7 +740,7 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
     code = None
     if a.code:
         try:
-            code = _capture_code(a.code, run.code)
+            code = _capture_code(a.code, run.code, profile.allow + [os.path.join(a.runs_dir, UPLOADS_DIR)])
         except BaseException:
             shutil.rmtree(run.path)
             raise
@@ -746,10 +781,15 @@ def _going(run_id: str) -> bool:
     return _alive(actor_name(run_id)) or _alive(waiter_name(run_id))
 
 
+def _state(run_id: str, st: RunStatus) -> RunState:
+    """The state as it is: a run that has not ended but has no actor any more is lost."""
+    return RunState.LOST if not st.state.terminal and not _going(run_id) else st.state
+
+
 def status(a: RunArgs, run_id: str) -> RunStatus:
     run = RunDir(a.runs_dir, run_id)
     st = run.status()
-    if not st.state.terminal and not _going(run_id):
+    if _state(run_id, st) is RunState.LOST:
         # The actor is gone without reporting (a Ray restart): say what the container does.
         st = st.merged(state=RunState.LOST, container=_container_states(st, run_id))
     return st.merged(metrics=run.last_metrics(), out=run.spec().out)
@@ -767,6 +807,8 @@ def _container_states(st: RunStatus, run_id: str) -> str:
 def cancel(a: RunArgs, run_id: str) -> RunStatus:
     run = RunDir(a.runs_dir, run_id)
     st = run.update(state=RunState.CANCELLED, finished_at=time.time())
+    if st.state is not RunState.CANCELLED:
+        raise Conflict(f"{run_id} already {st.state.value}: nothing to cancel")
     names = [actor_name(run_id), waiter_name(run_id)] + [actor_name(run_id, i) for i in range(1, st.nodes)]
     for name in names:
         try:
@@ -792,7 +834,7 @@ def log_chunk(runs_dir: str, run_id: str, rank: int = 0, offset: int | None = No
     log_path = run.spec().rank_log_path(rank)
     size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
     if offset is None:
-        data = "\n".join(_tail(log_path, 1 << 20).splitlines()[-lines:])
+        data = "\n".join(_tail(log_path, 1 << 20).splitlines()[-lines:] if lines else [])
         data, end = (data + "\n" if data else ""), size
     else:
         start = min(offset, size)
@@ -800,7 +842,11 @@ def log_chunk(runs_dir: str, run_id: str, rank: int = 0, offset: int | None = No
             f.seek(start)
             raw = f.read(max_bytes)
         data, end = raw.decode(errors="replace"), start + len(raw)
-    done = end >= size and (run.state() or RunState.LOST).terminal
+    try:
+        state = _state(run_id, run.status())
+    except (OSError, ValueError):
+        state = RunState.LOST
+    done = end >= size and not state.active
     return LogChunk(data=data, offset=end, done=done)
 
 
@@ -858,6 +904,12 @@ def purge(a: RunArgs, run_id: str | None) -> list[Purged]:
         if (state is None or not state.terminal) and _going(run.id):
             done.append(Purged(id=run.id, purged=False, reason=f"still {state.value if state else '?'}: cancel it first"))
             continue
+        if state is not None and not state.terminal:  # lost: its containers may still hold cards
+            containers = _container_states(run.status(), run.id)
+            if "running" in containers or "unknown" in containers:
+                done.append(Purged(id=run.id, purged=False, state=RunState.LOST,
+                                   reason=f"lost, container {containers}: cancel it first (that removes it)"))
+                continue
         size = _dir_bytes(run.path)
         shutil.rmtree(run.path)
         done.append(Purged(id=run.id, purged=True, state=state, bytes=size))
@@ -881,19 +933,25 @@ class RunSummary(Record):
     finished_at: float | None = None
 
 
-def list_runs(a: RunArgs, n: int = 20) -> list[RunSummary]:
+def list_runs(a: RunArgs, n: int = 20, active: bool = False, profile: str | None = None) -> list[RunSummary]:
+    """The newest n runs by submit time, of one app and only the active ones when asked
+    (every run is read, as `apps` does, so an old run still going is not missed)."""
     if not os.path.isdir(a.runs_dir):
         return []
-    ids = sorted((d for d in os.listdir(a.runs_dir) if not d.startswith(".")),
-                 key=lambda d: os.path.getmtime(os.path.join(a.runs_dir, d)), reverse=True)
     out = []
-    for i in ids[:n]:
+    for i in os.listdir(a.runs_dir):
+        if i.startswith("."):
+            continue
         try:
             run = RunDir(a.runs_dir, i)
-            out.append(from_dict(RunSummary, {**run.status().dump(), "profile": run.spec().profile_name}))
+            st = run.status()
+            s = from_dict(RunSummary, {**st.dump(), "state": _state(i, st), "profile": run.spec().profile_name})
         except (SystemExit, OSError, ValueError):
-            pass
-    return out
+            continue
+        if (not active or s.state.active) and (profile is None or s.profile == profile):
+            out.append(s)
+    out.sort(key=lambda s: s.submitted_at or 0, reverse=True)
+    return out[:n]
 
 
 @dataclass(kw_only=True)
@@ -909,8 +967,10 @@ class RunApp(Record):
     jobs: int = 0
     active: int = 0
     succeeded: int = 0
-    failed: int = 0
+    failed: int = 0  # failed or lost
+    cancelled: int = 0
     last_submitted_at: float | None = None
+    removed: bool = False  # no longer in runs.yaml: only its past runs are left
 
 
 def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
@@ -927,14 +987,82 @@ def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
         except (SystemExit, OSError, ValueError):
             continue
         app = by_name.get(spec.profile_name)
-        if app is None:  # a profile since removed from runs.yaml
-            continue
+        if app is None:  # a profile since removed from runs.yaml (or model staging's own)
+            p = spec.profile
+            app = by_name[spec.profile_name] = RunApp(name=spec.profile_name, image=p.image, user=p.user,
+                                                      max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
+                                                      allow=p.allow, removed=True)
+        state = _state(d, st)
         app.jobs += 1
-        app.active += 0 if st.state.terminal else 1
-        app.succeeded += st.state is RunState.SUCCEEDED
-        app.failed += st.state is RunState.FAILED
+        app.active += state.active
+        app.succeeded += state is RunState.SUCCEEDED
+        app.failed += state in (RunState.FAILED, RunState.LOST)
+        app.cancelled += state is RunState.CANCELLED
         app.last_submitted_at = max(app.last_submitted_at or 0, st.submitted_at)
     return sorted(by_name.values(), key=lambda x: x.last_submitted_at or 0, reverse=True)
+
+
+@dataclass(kw_only=True)
+class AppDeleted(Record):
+    app: str
+    profiles: str  # the file it was removed from
+    runs_kept: int  # its past runs stay listed (under an app that no longer exists)
+
+
+def _without_profile(text: str, name: str) -> str:
+    """runs.yaml's text with one profile's block cut out, the rest (comments included)
+    as it was: from its `name:` line (and the comment right above it) to the next line
+    at its indentation or less."""
+    lines = text.splitlines(keepends=True)
+    top = next((i for i, l in enumerate(lines) if re.match(r"profiles:\s*(#.*)?$", l)), None)
+    if top is None:
+        raise SystemExit("runs.yaml: no block-style `profiles:` mapping to remove it from")
+    key = re.compile(rf"""(\s+)(?:{re.escape(name)}|"{re.escape(name)}"|'{re.escape(name)}'):\s*(#.*)?$""")
+    start = next((i for i in range(top + 1, len(lines)) if key.match(lines[i].rstrip("\n"))), None)
+    if start is None:
+        raise SystemExit(f"runs.yaml: profile {name} is not written as a block under `profiles:`; edit it by hand")
+    indent = len(lines[start]) - len(lines[start].lstrip(" "))
+    end = start + 1
+    while end < len(lines):
+        l = lines[end]
+        body = l.strip()
+        if body and not body.startswith("#") and (len(l) - len(l.lstrip(" "))) <= indent:
+            break
+        end += 1
+    while end > start + 1 and lines[end - 1].strip().startswith("#"):  # comments heading the next entry
+        end -= 1
+    while start - 1 > top and lines[start - 1].startswith(" " * indent + "#"):  # its own heading comment
+        start -= 1
+    return "".join(lines[:start] + lines[end:])
+
+
+def delete_app(a: RunArgs, name: str) -> AppDeleted:
+    """Removes a run app (its profile in runs.yaml), refused while any of its runs is
+    queued or running. Its past runs stay, with their logs and out/."""
+    config = load_config(a.profiles)
+    if name not in config.profiles:
+        raise NotFound(f"no run app {name} in runs.yaml (have: {', '.join(config.profiles) or 'none'})")
+    if config.stage_profile == name:
+        raise Conflict(f"{name} is runs.yaml's stage_profile (model staging runs in it): change that first")
+    going = [s.id for s in list_runs(a, 1000, active=True, profile=name)]
+    if going:
+        raise Conflict(f"{name} has {len(going)} run(s) queued or running ({', '.join(going[:5])}): "
+                       "delete it when they are done, or cancel them")
+    with open(a.profiles) as f:
+        text = f.read()
+    new = _without_profile(text, name)
+    before, after = yaml.safe_load(text) or {}, yaml.safe_load(new) or {}
+    expect = {**before, "profiles": {k: v for k, v in before["profiles"].items() if k != name}}
+    if after != expect:
+        raise SystemExit(f"runs.yaml: removing {name}'s block would change more than that profile; edit it by hand")
+    tmp = f"{a.profiles}.tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    shutil.copymode(a.profiles, tmp)
+    os.replace(tmp, a.profiles)
+    kept = len(list_runs(a, 1 << 30, profile=name))
+    print(f"run app {name} deleted ({kept} past runs kept)", flush=True)
+    return AppDeleted(app=name, profiles=a.profiles, runs_kept=kept)
 
 
 def stage_model(a: RunArgs, config: RunsConfig) -> Submitted:

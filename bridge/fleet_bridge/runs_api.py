@@ -2,8 +2,9 @@
 the admin token, so runs can be submitted from any machine that reaches the port.
 
     POST   /runs                     submit (JSON: the RunArgs fields marked `remote`, plus "command")
-    GET    /runs?n=N                 the newest runs
+    GET    /runs?n=N[&active=1][&profile=P]  the newest runs (only the active ones, one app's)
     GET    /apps                     the run apps (runs.yaml profiles) and their runs
+    DELETE /apps/{name}              remove a run app (its profile), refused while it has runs going
     GET    /runs/{id}                status
     GET    /runs/{id}/logs           ?rank=K&lines=N (the tail) or &offset=O (what came after O)
     POST   /runs/{id}/cancel
@@ -29,6 +30,7 @@ import os
 import socket
 import threading
 import urllib.parse
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -52,6 +54,7 @@ class Api:
 
     def __init__(self, profiles: str, runs_dir: str) -> None:
         self.profiles, self.runs_dir = profiles, runs_dir
+        self.lock = threading.Lock()  # a submit and an app's delete do not interleave
         os.makedirs(os.path.join(runs_dir, runs.UPLOADS_DIR), exist_ok=True)
 
     def args(self, **changes: Any) -> RunArgs:
@@ -65,15 +68,23 @@ class Api:
         unknown = set(body) - RunArgs.remote_fields()
         if unknown:
             raise ApiError(400, f"unknown or server-side fields: {sorted(unknown)}")
-        return runs.submit(self.args(**body), command, runs.load_config(self.profiles))
+        with self.lock:
+            return runs.submit(self.args(**body), command, runs.load_config(self.profiles))
+
+    def delete_app(self, name: str) -> Record:
+        with self.lock:
+            return runs.delete_app(self.args(), name)
 
     def upload(self, data: bytes) -> Uploaded:
         if not data:
             raise ApiError(400, "empty body")
         sha = hashlib.sha256(data).hexdigest()
+        os.makedirs(os.path.join(self.runs_dir, runs.UPLOADS_DIR), exist_ok=True)
         path = os.path.join(self.runs_dir, runs.UPLOADS_DIR, f"{sha}.tar.gz")
-        if not os.path.exists(path):
-            tmp = f"{path}.tmp"
+        if os.path.exists(path):
+            os.utime(path)  # uploaded again now: `purge --older-than` keeps it
+        else:
+            tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
             with open(tmp, "wb") as f:
                 f.write(data)
             os.replace(tmp, path)
@@ -96,14 +107,49 @@ def _query(path: str) -> tuple[list[str], dict[str, str]]:
 
 def _int(q: dict[str, str], key: str, default: int | None) -> int | None:
     try:
-        return int(q[key]) if key in q else default
+        v = int(q[key]) if key in q else default
     except ValueError:
         raise ApiError(400, f"{key}: an integer") from None
+    if v is not None and v < 0:
+        raise ApiError(400, f"{key}: not negative")
+    return v
+
+
+def _float(q: dict[str, str], key: str) -> float:
+    try:
+        return float(q[key])
+    except ValueError:
+        raise ApiError(400, f"{key}: a number") from None
+
+
+class _Chunked:
+    """A response body in HTTP/1.1 chunks: a stream that breaks off is seen by the client
+    as broken (no last chunk), not as a short, complete file."""
+
+    def __init__(self, w: Any) -> None:
+        self.w = w
+
+    def write(self, b: bytes) -> int:
+        if b:
+            self.w.write(f"{len(b):x}\r\n".encode() + bytes(b) + b"\r\n")
+        return len(b)
+
+    def flush(self) -> None:
+        self.w.flush()
+
+    def end(self) -> None:
+        self.w.write(b"0\r\n\r\n")
+
+
+def _flag(q: dict[str, str], key: str) -> bool:
+    return q.get(key, "").lower() in ("1", "true", "yes")
 
 
 def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "zkm-fleet-runs/1"
+        protocol_version = "HTTP/1.1"  # for the chunked fetch; every connection still serves one request
+        streaming = False  # the headers of a streamed answer are out: an error can only end it
 
         def log_message(self, fmt: str, *args: Any) -> None:  # the actor log, one line per call
             print(f"{self.address_string()} {fmt % args}", flush=True)
@@ -112,6 +158,8 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
             self.send_response(status)
             self.send_header("content-type", ctype)
             self.send_header("content-length", str(len(body)))
+            self.send_header("connection", "close")  # a body left unread cannot become the next request
+            self.close_connection = True
             self.end_headers()
             self.wfile.write(body)
 
@@ -146,14 +194,21 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._send(401, b"missing or wrong admin token", "text/plain")
             try:
                 self._route(method, parts, q)
-            except ApiError as e:
+            except Exception as e:
+                if self.streaming:  # a broken stream: close it without its last chunk
+                    print(f"{self.path}: stream broken off: {type(e).__name__}: {e}", flush=True)
+                    self.close_connection = True
+                    return
+                self._error(e)
+
+        def _error(self, e: BaseException) -> None:
+            if isinstance(e, ApiError):
                 self._send(e.status, str(e).encode(), "text/plain")
-            except SystemExit as e:  # the same refusals run.sh prints
-                msg = str(e.code)
-                self._send(404 if msg.startswith("no run ") else 400, msg.encode(), "text/plain")
-            except ModelError as e:
-                self._send(400, str(e).encode(), "text/plain")
-            except Exception as e:  # report, keep serving
+            elif isinstance(e, (runs.NotFound, runs.Conflict)):
+                self._send(404 if isinstance(e, runs.NotFound) else 409, str(e.code).encode(), "text/plain")
+            elif isinstance(e, (SystemExit, ModelError)):  # the same refusals run.sh prints
+                self._send(400, str(e.code if isinstance(e, SystemExit) else e).encode(), "text/plain")
+            else:  # report, keep serving
                 self._send(500, f"{type(e).__name__}: {e}".encode(), "text/plain")
 
         def _route(self, method: str, parts: list[str], q: dict[str, str]) -> None:
@@ -162,10 +217,13 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._json(201, api.submit(self._json_body()))
             if (method, head, n) == ("GET", "apps", 1):
                 return self._json(200, runs.apps(api.args(), runs.load_config(api.profiles)))
+            if (method, head, n) == ("DELETE", "apps", 2):
+                return self._json(200, api.delete_app(parts[1]))
             if (method, head, n) == ("GET", "runs", 1):
-                return self._json(200, runs.list_runs(api.args(), _int(q, "n", 20) or 20))
+                return self._json(200, runs.list_runs(api.args(), _int(q, "n", 20) or 0, active=_flag(q, "active"),
+                                                      profile=q.get("profile")))
             if (method, head, n) == ("DELETE", "runs", 1) and "older_than" in q:
-                return self._json(200, runs.purge(api.args(older_than=float(q["older_than"])), None))
+                return self._json(200, runs.purge(api.args(older_than=_float(q, "older_than")), None))
             if (method, head, n) == ("GET", "runs", 2):
                 return self._json(200, runs.status(api.args(), parts[1]))
             if (method, head, n) == ("DELETE", "runs", 2):
@@ -183,15 +241,20 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
         def _logs_or_out(self, parts: list[str], q: dict[str, str]) -> None:
             if parts[2] == "logs":
                 chunk = runs.log_chunk(api.runs_dir, parts[1], _int(q, "rank", 0) or 0, _int(q, "offset", None),
-                                       _int(q, "lines", 50) or 50)
+                                       _int(q, "lines", 50) or 0)
                 return self._json(200, chunk)
             if parts[2] == "out.tar.gz":
                 runs.RunDir(api.runs_dir, parts[1])  # 404 before the headers go out
                 self.send_response(200)
                 self.send_header("content-type", "application/gzip")
+                self.send_header("transfer-encoding", "chunked")
                 self.send_header("connection", "close")
+                self.close_connection = True
                 self.end_headers()
-                runs.fetch(api.args(), parts[1], out=self.wfile)
+                self.streaming = True
+                body = _Chunked(self.wfile)
+                runs.fetch(api.args(), parts[1], out=body)
+                body.end()
                 return None
             return self._missing()
 
