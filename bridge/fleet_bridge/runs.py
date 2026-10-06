@@ -8,10 +8,11 @@
     run.sh status|cancel|logs [-f] [-n N] [--rank K]|fetch|purge ID     run.sh list     run.sh purge --older-than DAYS
     run.sh stage-model REPO [--revision R] [--include GLOB]...
 
-A run's record is RUNS_DIR/<id>/: spec.json, status.json, log (its output),
-out/ (mounted read-write into the job: FLEET_OUT, `{out}`; metrics.jsonl there is
-what `status` reports as metrics) and, with --code, code/ (read-only: FLEET_CODE,
-`{code}`). `fetch` streams out/ as a tar.gz; `purge` deletes the whole record.
+A run's record is RUNS_DIR/<id>/: spec.json (a RunSpec), status.json (a RunStatus),
+log (its output), out/ (mounted read-write into the job: FLEET_OUT, `{out}`;
+metrics.jsonl there is what `status` reports as metrics) and, with --code, code/
+(read-only: FLEET_CODE, `{code}`). `fetch` streams out/ as a tar.gz; `purge`
+deletes the whole record.
 
 Every other path a job touches is in its request (`--mount PATH:ro|rw`, own path,
 existing, under the profile's `allow` roots). The profile (runs.yaml) fixes the
@@ -21,18 +22,18 @@ Placement: one STRICT_PACK bundle per run, so its cards and CPUs come from one
 machine (--machine pins which). --nodes N spreads a run over N machines (STRICT_SPREAD:
 one bundle of --gpus cards and --cpus CPUs on each of N different machines, --machine
 repeated N times pins them): one container per machine, started together, all
-ended when one fails; every container sees FLEET_NNODES / FLEET_NODE_RANK /
-FLEET_MASTER_ADDR / FLEET_MASTER_PORT (and MASTER_ADDR, MASTER_PORT, NODE_RANK,
-NNODES and torchrun's PET_* so `torchrun train.py` joins the gang as is), rank
-k's output goes to log.rank<k>. `--gpus 0.5` asks for half a card: runs whose
-fractions fit share it, each started only if its --gpu-mem is free then (the
-check is at start; size --gpu-mem for the job's peak). While none can take it the run is queued. Ray's
-grant is logical, so before starting the actor checks the cards' real free memory
-against --gpu-mem (default: the profile's, else the whole card) and waits as
-waiting_vram (naming who holds them) up to --vram-wait. --after waits for another
-run in a CPU-free waiter that holds no card, then launches only if it succeeded.
+ended when one fails; every container sees the GangEnv variables (FLEET_NNODES /
+FLEET_NODE_RANK / FLEET_MASTER_ADDR / FLEET_MASTER_PORT, also under the names
+torchrun reads, so `torchrun train.py` joins the gang as is); rank k's output goes
+to log.rank<k>. `--gpus 0.5` asks for half a card: runs whose fractions fit share
+it, each started only if its --gpu-mem is free then (the check is at start; size
+--gpu-mem for the job's peak). Ray's grant is logical, so before starting the actor
+checks the cards' real free memory against --gpu-mem (default: the profile's, else
+the whole card) and waits as waiting_vram (naming who holds them) up to --vram-wait.
+--after waits for another run in a CPU-free waiter that holds no card, then
+launches only if it succeeded.
 
-A failed attempt gets a cause (gpu-oom from the log, host-oom from docker,
+A failed attempt gets a Cause (gpu-oom from the log, host-oom from docker,
 exit-code; with who held the card at that moment). --retry N repeats any failure,
 --restart-on-oom N only out-of-memory ones; FLEET_ATTEMPT tells the job which
 attempt it is, so it can resume from a checkpoint in its out/.
@@ -63,34 +64,48 @@ import tarfile
 import threading
 import time
 import uuid
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable
+
+import logging
 
 import ray
+import yaml
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from .rayapi import alive_nodes, current_placement_group, node_ip, nodes
+from .model import (Attempt, Bundle, CardState, Cause, CodeRecord, GangEnv, Holder, Mount, MountMode, Profile,
+                    RankInfo, Record, RunArgs, RunsConfig, RunSpec, RunState, RunStatus, argparser, from_args,
+                    from_dict, to_env)
+
 NAMESPACE = "zkm-fleet"
-TERMINAL = ("succeeded", "failed", "cancelled")
 NETWORK_FS = ("nfs", "cifs", "smb2", "smb3", "ceph", "lustre", "gpfs", "beegfs", "glusterfs", "fuse")
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
                      r"|CUDA error: out of memory", re.I)
+SPEC_FILE, STATUS_FILE, OUT_DIR, CODE_DIR, LOG_FILE, METRICS_FILE = "spec.json", "status.json", "out", "code", "log", "metrics.jsonl"
+
+
+def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(argv, capture_output=True, text=True)
 
 
 # ── the cards as they really are ─────────────────────────────────────────────
 
-def card_memory(cards: list[str]) -> dict[str, dict]:
+def card_memory(cards: list[str]) -> dict[str, CardState]:
     """Physical state of host cards: free / total MiB and the processes holding memory
     (pid, MiB, command). Ray's grant is logical; this is what is really on the card."""
     if not cards:
         return {}
-    q = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.total",
-                        "--format=csv,noheader,nounits", "-i", ",".join(cards)], capture_output=True, text=True)
-    out, by_uuid = {}, {}
+    q = _sh(["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.total",
+             "--format=csv,noheader,nounits", "-i", ",".join(cards)])
+    out: dict[str, CardState] = {}
+    by_uuid: dict[str, str] = {}
     for line in q.stdout.strip().splitlines():
         idx, uuid_, free, total = [x.strip() for x in line.split(",")]
-        out[idx] = {"free_mib": int(free), "total_mib": int(total), "holders": []}
+        out[idx] = CardState(index=idx, free_mib=int(free), total_mib=int(total))
         by_uuid[uuid_] = idx
-    apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory",
-                           "--format=csv,noheader,nounits"], capture_output=True, text=True)
+    apps = _sh(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"])
     for line in apps.stdout.strip().splitlines():
         uuid_, pid, used = [x.strip() for x in line.split(",")]
         if uuid_ in by_uuid:
@@ -99,13 +114,12 @@ def card_memory(cards: list[str]) -> dict[str, dict]:
                     cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()[:80]
             except OSError:
                 cmd = "?"
-            out[by_uuid[uuid_]]["holders"].append({"pid": int(pid), "mib": int(used), "cmd": cmd})
+            out[by_uuid[uuid_]].holders.append(Holder(pid=int(pid), mib=int(used), cmd=cmd))
     return out
 
 
 def _holders(cards: list[str]) -> str:
-    return "; ".join(f"card {i}: " + (", ".join(f"pid {h['pid']} {h['mib']} MiB ({h['cmd']})" for h in c["holders"])
-                                     or "no process") for i, c in card_memory(cards).items())
+    return "; ".join(f"card {i}: {c.held_by()}" for i, c in card_memory(cards).items())
 
 
 def vram_shortfall(cards: list[str], need_mib: int | None) -> list[str]:
@@ -113,99 +127,127 @@ def vram_shortfall(cards: list[str], need_mib: int | None) -> list[str]:
     stated need the job wants the whole card (95% free)."""
     short = []
     for idx, c in card_memory(cards).items():
-        need = need_mib if need_mib else int(c["total_mib"] * 0.95)
-        if c["free_mib"] < need:
-            who = ", ".join(f"pid {h['pid']} {h['mib']} MiB ({h['cmd']})" for h in c["holders"]) or "no listed process"
-            short.append(f"card {idx}: {c['free_mib']} MiB free, needs {need} MiB; held by {who}")
+        need = need_mib if need_mib else int(c.total_mib * 0.95)
+        if c.free_mib < need:
+            short.append(f"card {idx}: {c.free_mib} MiB free, needs {need} MiB; held by {c.held_by()}")
     return short
 
 
-# ── records ──────────────────────────────────────────────────────────────────
+# ── records on disk ──────────────────────────────────────────────────────────
 
-def _write_status(run_dir: str, **fields):
-    path = os.path.join(run_dir, "status.json")
-    try:
-        with open(path) as f:
-            status = json.load(f)
-    except (OSError, ValueError):
-        status = {}
-    if status.get("state") == "cancelled" and fields.get("state") not in (None, "cancelled"):
-        return status  # a cancel wins over whatever the actor reports afterwards
-    status.update(fields)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(status, f, indent=2)
-    os.replace(tmp, path)
-    return status
+class RunDir:
+    """A run's record directory and the files in it."""
 
+    def __init__(self, runs_dir: str, run_id: str, *, must_exist: bool = True) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id or ""):
+            raise SystemExit(f"not a run id: {run_id!r}")
+        self.id = run_id
+        self.path = os.path.join(runs_dir, run_id)
+        if must_exist and not os.path.isdir(self.path):
+            raise SystemExit(f"no run {run_id}")
 
-def _read_status(run_dir: str) -> dict:
-    with open(os.path.join(run_dir, "status.json")) as f:
-        return json.load(f)
+    @property
+    def spec_path(self) -> str:
+        return os.path.join(self.path, SPEC_FILE)
 
+    @property
+    def status_path(self) -> str:
+        return os.path.join(self.path, STATUS_FILE)
 
-def _run_dir(runs_dir: str, run_id: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id or ""):
-        raise SystemExit(f"not a run id: {run_id!r}")
-    d = os.path.join(runs_dir, run_id)
-    if not os.path.isdir(d):
-        raise SystemExit(f"no run {run_id}")
-    return d
+    @property
+    def out(self) -> str:
+        return os.path.join(self.path, OUT_DIR)
+
+    @property
+    def code(self) -> str:
+        return os.path.join(self.path, CODE_DIR)
+
+    def spec(self) -> RunSpec:
+        return RunSpec.read(self.spec_path)
+
+    def status(self) -> RunStatus:
+        return RunStatus.read(self.status_path)
+
+    def update(self, **changes: Any) -> RunStatus:
+        """Merges typed changes into status.json. A cancel wins over whatever the actor
+        reports afterwards."""
+        st = self.status()
+        new_state = changes.get("state")
+        if st.state is RunState.CANCELLED and new_state not in (None, RunState.CANCELLED):
+            return st
+        st = st.merged(**changes)
+        st.write(self.status_path)
+        return st
+
+    def state(self) -> RunState | None:
+        try:
+            return self.status().state
+        except (OSError, ValueError):
+            return None
+
+    def last_metrics(self) -> dict[str, Any] | None:
+        for line in reversed(_tail(os.path.join(self.spec().out, METRICS_FILE), 16384).splitlines()):
+            try:
+                parsed = json.loads(line)
+            except ValueError:
+                continue
+            return parsed if isinstance(parsed, dict) else {"value": parsed}
+        return None
 
 
 def container_name(run_id: str, rank: int = 0) -> str:
     return f"fleet-run-{run_id}" + (f"-r{rank}" if rank else "")
 
 
-def _expand(text: str, spec: dict) -> str:
-    return text.replace("{out}", spec["out"]).replace("{code}", spec.get("code_dir") or "{code}")
+def actor_name(run_id: str, rank: int = 0) -> str:
+    return f"run-{run_id}" + (f"-r{rank}" if rank else "")
 
 
-def docker_command(spec: dict, gpus: list[str], attempt: int = 1, rank: int = 0, gang: dict | None = None) -> list[str]:
+def waiter_name(run_id: str) -> str:
+    return f"wait-{run_id}"
+
+
+def pg_name(run_id: str) -> str:
+    return f"pg-run-{run_id}"
+
+
+def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int = 0,
+                   gang: GangEnv | None = None) -> list[str]:
     """The `docker run` for a run (or one rank of it) on the given host cards."""
-    p = spec["profile"]
-    cmd = ["docker", "run", "-d", "--name", container_name(spec["id"], rank), "--network", "host",
-           f"--shm-size={p.get('shm_gb', 16)}g", "--label", "zkm-fleet=run", "--label", f"zkm-fleet.run={spec['id']}"]
+    p = spec.profile
+    cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", "host",
+           f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=run", "--label", f"zkm-fleet.run={spec.id}"]
     if gpus:
         cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"', "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
-    if spec.get("cpus"):
-        cmd += [f"--cpus={spec['cpus']}", "-e", f"OMP_NUM_THREADS={spec['cpus']}"]
-    if p.get("user"):
-        cmd += ["--user", str(p["user"])]
-    if spec.get("workdir"):
-        cmd += ["-w", _expand(spec["workdir"], spec)]
-    for path, mode in spec.get("mounts", []):
-        cmd += ["-v", f"{path}:{path}" + (":ro" if mode == "ro" else "")]
-    cmd += ["-v", f"{spec['out']}:{spec['out']}"]
-    if spec.get("code_dir"):
-        cmd += ["-v", f"{spec['code_dir']}:{spec['code_dir']}:ro"]
-    env = {"PYTHONUNBUFFERED": "1", **p.get("env", {}), **spec.get("env", {}),
-           "FLEET_RUN_ID": spec["id"], "FLEET_OUT": spec["out"], "FLEET_METRICS": os.path.join(spec["out"], "metrics.jsonl"),
-           "FLEET_ATTEMPT": str(attempt), **(gang or {})}
-    if spec.get("code_dir"):
-        env["FLEET_CODE"] = spec["code_dir"]
+    if spec.cpus:
+        cmd += [f"--cpus={spec.cpus}", "-e", f"OMP_NUM_THREADS={spec.cpus}"]
+    if p.user:
+        cmd += ["--user", p.user]
+    if spec.workdir:
+        cmd += ["-w", spec.expand(spec.workdir)]
+    for m in spec.mounts:
+        cmd += ["-v", m.docker()]
+    cmd += ["-v", f"{spec.out}:{spec.out}"]
+    if spec.code_dir:
+        cmd += ["-v", f"{spec.code_dir}:{spec.code_dir}:ro"]
+    env: dict[str, str] = {"PYTHONUNBUFFERED": "1", **p.env, **spec.env,
+                           "FLEET_RUN_ID": spec.id, "FLEET_OUT": spec.out,
+                           "FLEET_METRICS": os.path.join(spec.out, METRICS_FILE), "FLEET_ATTEMPT": str(attempt)}
+    if spec.code_dir:
+        env["FLEET_CODE"] = spec.code_dir
+    if gang:
+        env.update(to_env(gang))
     for k, v in env.items():
-        cmd += ["-e", f"{k}={_expand(str(v), spec)}"]
-    cmd.append(p["image"])
-    cmd += [_expand(a, spec) for a in spec["command"]]
+        cmd += ["-e", f"{k}={spec.expand(v)}"]
+    cmd.append(p.image)
+    cmd += [spec.expand(a) for a in spec.command]
     return cmd
 
 
-def parse_mount(text: str) -> tuple[str, str]:
-    """`PATH` or `PATH:ro` / `PATH:rw` -> (normalised absolute path, mode)."""
-    path, _, mode = text.partition(":")
-    mode = mode or "rw"
-    if mode not in ("ro", "rw"):
-        raise SystemExit(f"--mount {text}: mode must be ro or rw")
-    if not path.startswith("/") or ".." in path.split("/"):
-        raise SystemExit(f"--mount {text}: needs an absolute path without '..'")
-    return os.path.normpath(path), mode
-
-
-def missing_mounts(spec: dict) -> list[str]:
+def missing_mounts(spec: RunSpec) -> list[str]:
     """Mounts that do not exist where the run landed; the run fails instead of docker
     creating them, owned by root, in someone's tree."""
-    return [path for path, _ in spec.get("mounts", []) if not os.path.exists(path)]
+    return [m.path for m in spec.mounts if not os.path.exists(m.path)]
 
 
 def _tail(path: str, nbytes: int = 65536) -> str:
@@ -218,15 +260,6 @@ def _tail(path: str, nbytes: int = 65536) -> str:
         return ""
 
 
-def _last_metrics(spec: dict) -> dict | None:
-    for line in reversed(_tail(os.path.join(spec["out"], "metrics.jsonl"), 16384).splitlines()):
-        try:
-            return json.loads(line)
-        except ValueError:
-            continue
-    return None
-
-
 # ── the actors ───────────────────────────────────────────────────────────────
 
 class _Rank:
@@ -234,37 +267,36 @@ class _Rank:
     Rank 0 lives inside the run's actor; on a run over several machines (--nodes)
     every other rank is a RankActor on its own machine."""
 
-    def __init__(self, spec: dict, run_dir: str, rank: int = 0):
-        self.spec, self.run_dir, self.rank = spec, run_dir, rank
-        self.gpus = [str(int(g)) for g in ray.get_gpu_ids()]
-        self.name = container_name(spec["id"], rank)
-        base = spec.get("log") or os.path.join(run_dir, "log")
-        self.log_path = base if rank == 0 else f"{base}.rank{rank}"
-        self.follower, self.log, self.offset = None, None, 0
+    def __init__(self, spec: RunSpec, rank: int = 0) -> None:
+        self.spec, self.rank = spec, rank
+        self.gpus: list[str] = [str(int(g)) for g in ray.get_gpu_ids()]
+        self.name = container_name(spec.id, rank)
+        self.log_path = spec.rank_log_path(rank)
+        self.follower: subprocess.Popen[bytes] | None = None
+        self.log: io.BufferedWriter | None = None
+        self.offset = 0
 
-    def info(self) -> dict:
-        return {"rank": self.rank, "machine": socket.gethostname(), "node_ip": ray.util.get_node_ip_address(),
-                "gpus": self.gpus, "container": self.name}
+    def info(self) -> RankInfo:
+        return RankInfo(rank=self.rank, machine=socket.gethostname(), node_ip=node_ip(),
+                        gpus=self.gpus, container=self.name)
 
     def check(self, need: int | None) -> str | None:
         """Why this machine cannot run the job at all (None when it can)."""
         missing = missing_mounts(self.spec)
         if missing:
             return f"mounts missing on {socket.gethostname()}: {missing}"
-        too_big = [f"card {i}: {c['total_mib']} MiB in all, the job asks {need} MiB"
-                   for i, c in card_memory(self.gpus).items() if need and need > c["total_mib"]]
+        too_big = [f"card {i}: {c.total_mib} MiB in all, the job asks {need} MiB"
+                   for i, c in card_memory(self.gpus).items() if need and need > c.total_mib]
         return "--gpu-mem exceeds the card: " + "; ".join(too_big) if too_big else None
 
     def shortfall(self, need: int | None) -> list[str]:
         return vram_shortfall(self.gpus, need) if self.gpus else []
 
-    def start(self, attempt: int, gang: dict) -> str | None:
+    def start(self, attempt: int, gang: GangEnv | None) -> str | None:
         """Starts the container; returns docker's error, or None."""
-        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
-        env = dict(gang)
-        if gang:
-            env.update(FLEET_NODE_RANK=self.rank, NODE_RANK=self.rank, PET_NODE_RANK=self.rank)
-        out = subprocess.run(docker_command(self.spec, self.gpus, attempt, self.rank, env), capture_output=True, text=True)
+        _sh(["docker", "rm", "-f", self.name])
+        mine = replace(gang, node_rank=self.rank) if gang else None
+        out = _sh(docker_command(self.spec, self.gpus, attempt, self.rank, mine))
         if out.returncode != 0:
             return out.stderr.strip()[:500]
         self.offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
@@ -272,151 +304,155 @@ class _Rank:
         self.follower = subprocess.Popen(["docker", "logs", "-f", self.name], stdout=self.log, stderr=subprocess.STDOUT)
         return None
 
-    def wait(self) -> dict:
-        """Waits for the container to end; returns {exit_code, cause, ...}."""
-        waited = subprocess.run(["docker", "wait", self.name], capture_output=True, text=True)
+    def wait(self) -> Attempt:
+        """Waits for the container to end and says how it ended."""
+        waited = _sh(["docker", "wait", self.name])
         time.sleep(1)  # let the follower drain the last lines
-        if self.follower:
+        if self.follower and self.log:
             self.follower.terminate()
             self.log.close()
-        code = int(waited.stdout.strip()) if waited.stdout.strip().lstrip("-").isdigit() else None
-        result = {"exit_code": code}
+        text = waited.stdout.strip()
+        code = int(text) if text.lstrip("-").isdigit() else None
+        result = Attempt(exit_code=code)
         if code != 0:
-            insp = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}}", self.name],
-                                  capture_output=True, text=True)
+            insp = _sh(["docker", "inspect", "-f", "{{.State.OOMKilled}}", self.name])
             with open(self.log_path, "rb") as f:
                 f.seek(self.offset)
                 this_attempt = f.read()[-65536:].decode(errors="replace")
             m = GPU_OOM.search(this_attempt)
             if m:
-                result.update(cause="gpu-oom", evidence=m.group(0), card_holders=_holders(self.gpus))
+                result = replace(result, cause=Cause.GPU_OOM, evidence=m.group(0), card_holders=_holders(self.gpus))
             elif insp.stdout.strip() == "true":
-                result.update(cause="host-oom", evidence="docker: OOMKilled")
+                result = replace(result, cause=Cause.HOST_OOM, evidence="docker: OOMKilled")
             else:
-                result.update(cause="exit-code")
-        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+                result = replace(result, cause=Cause.EXIT_CODE)
+        _sh(["docker", "rm", "-f", self.name])
         return result
 
-    def kill(self):
-        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+    def kill(self) -> None:
+        _sh(["docker", "rm", "-f", self.name])
 
 
-# kill() must reach a rank while it blocks in wait()
-RankActor = ray.remote(max_restarts=0, max_task_retries=0, max_concurrency=4)(_Rank)
+RankActor = ray.remote(_Rank)
 
 
-@ray.remote(max_restarts=0, max_task_retries=0)
-class GpuRun:
+class _GpuRun:
     """Runs one job to completion (with its retries). Not restarted by Ray: a run that
     dies is reported, not silently repeated. With --nodes N it is rank 0 and starts
     one RankActor per other bundle of its placement group (one per machine); every
     attempt starts all ranks together, and the first rank to fail ends the others."""
 
-    def __init__(self, spec: dict, run_dir: str):
-        self.spec, self.run_dir = spec, run_dir
-        self.ranks = [_Rank(spec, run_dir, 0)]
-        self.gpus = self.ranks[0].gpus
-        if int(spec.get("nodes", 1)) > 1:
-            pg = ray.util.get_current_placement_group()
-            for i in range(1, int(spec["nodes"])):
-                b = _bundle(spec, i)
-                self.ranks.append(RankActor.options(
-                    name=f"run-{spec['id']}-r{i}", namespace=NAMESPACE, num_cpus=b["CPU"], num_gpus=b.get("GPU", 0),
+    def __init__(self, spec: RunSpec, run_dir: str) -> None:
+        self.spec = spec
+        self.dir = RunDir(os.path.dirname(run_dir), os.path.basename(run_dir))
+        self.local = _Rank(spec, 0)  # rank 0, in this process
+        self.others: list[Any] = []  # RankActor handles, one per further machine
+        self.gpus = self.local.gpus
+        self.infos: list[RankInfo] = []
+        if spec.nodes > 1:
+            pg = current_placement_group()
+            for i in range(1, spec.nodes):
+                b = bundle(spec, i)
+                # kill() must reach a rank while it blocks in wait(): hence the concurrency
+                self.others.append(RankActor.options(
+                    name=actor_name(spec.id, i), namespace=NAMESPACE, num_cpus=b.cpu, num_gpus=b.gpu,
+                    max_restarts=0, max_task_retries=0, max_concurrency=4,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=i),
-                ).remote(spec, run_dir, i))
+                ).remote(spec, i))
         # where the containers will live: cancel and status reach them there
-        info = self.ranks[0].info()
-        _write_status(run_dir, machine=info["machine"], node_ip=info["node_ip"])
+        info = self.local.info()
+        self.dir.update(machine=info.machine, node_ip=info.node_ip)
         threading.Thread(target=self._run, daemon=True).start()
 
-    def ping(self) -> dict:
-        return {"id": self.spec["id"], "gpus": self.gpus, "machine": socket.gethostname()}
+    @property
+    def n(self) -> int:
+        return 1 + len(self.others)
 
-    def _all(self, method: str, *args) -> list:
+    def ping(self) -> RankInfo:
+        return self.local.info()
+
+    def _all(self, method: str, *args: Any) -> list[Any]:
         """Calls a method on every rank (the others in parallel), results in rank order."""
-        refs = [getattr(r, method).remote(*args) for r in self.ranks[1:]]
-        return [getattr(self.ranks[0], method)(*args)] + ray.get(refs, timeout=300)
+        refs = [getattr(r, method).remote(*args) for r in self.others]
+        return [getattr(self.local, method)(*args)] + list(ray.get(refs, timeout=300))
 
     def _label(self, i: int) -> str:
-        return f"rank {i} ({self.infos[i]['machine']}): " if len(self.ranks) > 1 else ""
+        return f"rank {i} ({self.infos[i].machine}): " if self.n > 1 else ""
 
     def _wait_vram(self, need: int | None) -> bool:
-        deadline = time.time() + int(self.spec.get("vram_wait_s", 1800))
+        deadline = time.time() + self.spec.vram_wait_s
         while True:
             short = [self._label(i) + s for i, ss in enumerate(self._all("shortfall", need)) for s in ss]
             if not short:
                 return True
             if time.time() > deadline:
-                _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
-                              error="cards not free in time: " + "; ".join(short))
+                self.dir.update(state=RunState.FAILED, gpus=self.gpus, finished_at=time.time(),
+                                error="cards not free in time: " + "; ".join(short))
                 return False
-            _write_status(self.run_dir, state="waiting_vram", gpus=self.gpus, detail="; ".join(short))
+            self.dir.update(state=RunState.WAITING_VRAM, gpus=self.gpus, detail="; ".join(short))
             time.sleep(15)
 
-    def _gang_env(self) -> dict:
-        """Where the ranks meet: rank 0's machine and a port free there. Also as torchrun's
-        PET_* variables, so a plain `torchrun train.py` joins the gang."""
-        if len(self.ranks) == 1:
-            return {}
+    def _gang_env(self) -> GangEnv | None:
+        """Where the ranks meet: rank 0's machine and a port free there."""
+        if self.n == 1:
+            return None
         with socket.socket() as sock:
             sock.bind(("", 0))
-            port = sock.getsockname()[1]
-        n, addr, per = len(self.ranks), self.infos[0]["node_ip"], max(len(self.gpus), 1)
-        return {"FLEET_NNODES": n, "FLEET_MASTER_ADDR": addr, "FLEET_MASTER_PORT": port,
-                "MASTER_ADDR": addr, "MASTER_PORT": port, "NNODES": n,
-                "PET_NNODES": n, "PET_MASTER_ADDR": addr, "PET_MASTER_PORT": port, "PET_NPROC_PER_NODE": per}
+            port = int(sock.getsockname()[1])
+        return GangEnv(nnodes=self.n, master_addr=self.infos[0].node_ip, master_port=port,
+                       nproc_per_node=max(len(self.gpus), 1))
 
-    def _attempt(self, attempt: int) -> dict:
-        """One start of every rank; returns {exit_code, cause, ...} of the first that failed."""
-        n = len(self.ranks)
-        errors = self._all("start", attempt, self._gang_env())
+    def _attempt(self, attempt: int) -> Attempt:
+        """One start of every rank; how the first rank to fail ended, or exit 0."""
+        n = self.n
+        errors: list[str | None] = self._all("start", attempt, self._gang_env())
         bad = [(i, e) for i, e in enumerate(errors) if e]
         if bad:
             self._kill_all()
-            return {"exit_code": None, "cause": "docker-run", "error": "; ".join(self._label(i) + e for i, e in bad)}
-        _write_status(self.run_dir, state="running", gpus=self.gpus, container=self.ranks[0].name,
-                      attempt=attempt, started_at=time.time(), detail=None)
-        done: queue.Queue = queue.Queue()
+            return Attempt(exit_code=None, cause=Cause.DOCKER_RUN, error="; ".join(self._label(i) + e for i, e in bad))
+        self.dir.update(state=RunState.RUNNING, gpus=self.gpus, container=self.local.name, attempt=attempt,
+                        started_at=time.time(), detail=None)
+        done: queue.Queue[tuple[int, Attempt]] = queue.Queue()
 
-        def wait(i: int):
+        def wait(i: int) -> None:
             try:
-                res = self.ranks[0].wait() if i == 0 else ray.get(self.ranks[i].wait.remote())
+                res: Attempt = self.local.wait() if i == 0 else ray.get(self.others[i - 1].wait.remote())
             except Exception as e:  # its machine or actor died
-                res = {"exit_code": None, "cause": "rank-lost", "error": repr(e)[:300]}
+                res = Attempt(exit_code=None, cause=Cause.RANK_LOST, error=repr(e)[:300])
             done.put((i, res))
 
         for i in range(n):
             threading.Thread(target=wait, args=(i,), daemon=True).start()
-        failed = None
+        failed: tuple[int, Attempt] | None = None
         for _ in range(n):
             i, res = done.get()
-            if res.get("exit_code") != 0 and failed is None:
+            if not res.ok and failed is None:
                 failed = (i, res)
                 if n > 1:
                     self._kill_all()  # a gang without one rank only hangs
         if failed is None:
-            return {"exit_code": 0}
+            return Attempt(exit_code=0)
         i, res = failed
-        return {**res, "rank": i, "machine": self.infos[i]["machine"]} if n > 1 else res
+        return replace(res, rank=i, machine=self.infos[i].machine) if n > 1 else res
 
-    def _kill_all(self):
-        self.ranks[0].kill()
-        for r in self.ranks[1:]:
+    def _kill_all(self) -> None:
+        self.local.kill()
+        for r in self.others:
             r.kill.remote()
 
-    def _run(self):
-        code = None
+    def _run(self) -> None:
+        code: int | None = None
         try:
-            need = int(self.spec.get("gpu_mem_gb") or 0) * 1024 or None
+            need = self.spec.need_mib
             self.infos = self._all("info")
-            if len(self.ranks) > 1:
-                _write_status(self.run_dir, ranks=self.infos)
+            if self.n > 1:
+                self.dir.update(ranks=self.infos)
             problems = [self._label(i) + p for i, p in enumerate(self._all("check", need)) if p]
             if problems:
-                _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
-                              error="; ".join(problems))
+                self.dir.update(state=RunState.FAILED, gpus=self.gpus, finished_at=time.time(), error="; ".join(problems))
                 return
-            retries, oom_restarts, attempts = int(self.spec.get("retry", 0)), int(self.spec.get("restart_on_oom", 0)), []
+            retries, oom_restarts = self.spec.retry, self.spec.restart_on_oom
+            attempts: list[Attempt] = []
             attempt = 0
             while True:
                 attempt += 1
@@ -424,83 +460,88 @@ class GpuRun:
                     return
                 result = self._attempt(attempt)
                 attempts.append(result)
-                code = result.get("exit_code")
-                if code == 0:
-                    _write_status(self.run_dir, state="succeeded", exit_code=0, attempts=attempts, finished_at=time.time())
+                code = result.exit_code
+                if result.ok:
+                    self.dir.update(state=RunState.SUCCEEDED, exit_code=0, attempts=attempts, finished_at=time.time())
                     return
-                if _read_status(self.run_dir).get("state") == "cancelled":
+                if self.dir.state() is RunState.CANCELLED:
                     return
-                oom = result.get("cause") in ("gpu-oom", "host-oom")
-                if oom and oom_restarts > 0:
+                if result.cause is not None and result.cause.oom and oom_restarts > 0:
                     oom_restarts -= 1
                 elif retries > 0:
                     retries -= 1
                 else:
-                    _write_status(self.run_dir, state="failed", exit_code=code, cause=result.get("cause"),
-                                  error=result.get("error") or result.get("evidence"), attempts=attempts,
-                                  finished_at=time.time())
+                    self.dir.update(state=RunState.FAILED, exit_code=code, cause=result.cause, error=result.reason,
+                                    attempts=attempts, finished_at=time.time())
                     return
-                _write_status(self.run_dir, state="retrying", attempts=attempts,
-                              detail=f"attempt {attempt} ended {result.get('cause')} (exit {code}); trying again")
+                self.dir.update(state=RunState.RETRYING, attempts=attempts,
+                                detail=f"attempt {attempt} ended {result.cause.value if result.cause else '?'} "
+                                       f"(exit {code}); trying again")
         except Exception as e:  # report, never hang the cards
-            _write_status(self.run_dir, state="failed", error=repr(e), finished_at=time.time())
+            self.dir.update(state=RunState.FAILED, error=repr(e), finished_at=time.time())
         finally:
             try:
                 self._kill_all()
                 time.sleep(2)  # let the other ranks' kills land before their actors go with the group
-                remove_placement_group(ray.util.get_placement_group(f"pg-run-{self.spec['id']}"))
+                remove_placement_group(ray.util.get_placement_group(pg_name(self.spec.id)))
             finally:
                 os._exit(0 if code == 0 else 1)
 
 
-@ray.remote(num_cpus=0, max_restarts=0)
-class RunWaiter:
+GpuRun = ray.remote(_GpuRun)
+
+
+class _RunWaiter:
     """Holds a run until the run it depends on ends, without holding any card (a run
     waiting on another with the only free card would otherwise deadlock), then
     launches it if that run succeeded."""
 
-    def __init__(self, spec: dict, run_dir: str, runs_dir: str):
-        self.spec, self.run_dir, self.runs_dir = spec, run_dir, runs_dir
+    def __init__(self, spec: RunSpec, run_dir: str, runs_dir: str) -> None:
+        self.spec, self.runs_dir = spec, runs_dir
+        self.dir = RunDir(runs_dir, os.path.basename(run_dir))
         threading.Thread(target=self._wait, daemon=True).start()
 
-    def _wait(self):
-        dep = self.spec["after"]
+    def _wait(self) -> None:
+        dep = self.spec.after or ""
         try:
             while True:
-                if _read_status(self.run_dir).get("state") == "cancelled":
+                if self.dir.state() is RunState.CANCELLED:
                     return
                 try:
-                    st = _read_status(os.path.join(self.runs_dir, dep)).get("state")
-                except (OSError, ValueError):
+                    st: RunState | str = RunDir(self.runs_dir, dep).status().state
+                except (SystemExit, OSError, ValueError):
                     st = "missing"
-                if st == "succeeded":
-                    _write_status(self.run_dir, state="queued", detail=None)
-                    _launch(self.spec, self.run_dir)
+                if st is RunState.SUCCEEDED:
+                    self.dir.update(state=RunState.QUEUED, detail=None)
+                    launch(self.spec, self.dir.path)
                     return
-                if st in ("failed", "cancelled", "missing", "lost"):
-                    _write_status(self.run_dir, state="failed", finished_at=time.time(),
-                                  error=f"dependency {dep} ended {st}; not started")
+                if st == "missing" or st in (RunState.FAILED, RunState.CANCELLED, RunState.LOST):
+                    ended = st.value if isinstance(st, RunState) else st
+                    self.dir.update(state=RunState.FAILED, finished_at=time.time(),
+                                    error=f"dependency {dep} ended {ended}; not started")
                     return
                 time.sleep(10)
         finally:
             os._exit(0)
 
 
+RunWaiter = ray.remote(_RunWaiter)
+
+
 @ray.remote(num_cpus=0, max_retries=0)
 def _on_node(argv: list[str]) -> str:
-    return subprocess.run(argv, capture_output=True, text=True).stdout
+    return _sh(argv).stdout
 
 
-def _on_run_machine(st: dict, argv: list[str]) -> str | None:
-    """Runs argv on the machine the run landed on (its container is there) and returns
+def _on_run_machine(place: RankInfo, argv: list[str]) -> str | None:
+    """Runs argv on the machine a rank landed on (its container is there) and returns
     its stdout; None when that machine has left the cluster."""
-    ip = st.get("node_ip")
-    if not ip:  # never landed (or a record from before node_ip): only this machine can have it
-        return subprocess.run(argv, capture_output=True, text=True).stdout
-    if not any(n.get("Alive") and n.get("NodeManagerAddress") == ip for n in ray.nodes()):
+    if not place.node_ip:  # never landed (or a record from before node_ip): only this machine can have it
+        return _sh(argv).stdout
+    if not any(n.get("NodeManagerAddress") == place.node_ip for n in alive_nodes()):
         return None
     try:
-        return ray.get(_on_node.options(resources={f"node:{ip}": 0.001}).remote(argv), timeout=60)
+        return str(ray.get(_on_node.options(resources={f"node:{place.node_ip}": 0.001}).remote(argv), timeout=60))
     except Exception:
         return None
 
@@ -510,41 +551,33 @@ def _shared_storage(path: str) -> bool:
     so for one the type check does not know, e.g. a bind mount of one)."""
     if os.environ.get("FLEET_RUNS_SHARED") == "1":
         return True
-    fs = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True).stdout.strip()
-    return fs.startswith(NETWORK_FS)
+    return _sh(["stat", "-f", "-c", "%T", path]).stdout.strip().startswith(NETWORK_FS)
 
 
-def _bundle(spec: dict, rank: int = 0) -> dict:
+def bundle(spec: RunSpec, rank: int = 0) -> Bundle:
     """One machine's share: --gpus cards and --cpus CPUs (per machine with --nodes)."""
-    b = {"CPU": float(max(spec["cpus"], 1))}
-    if spec["gpus"]:
-        b["GPU"] = float(spec["gpus"])
-    pins = spec.get("machine_resources") or ([spec["machine_resource"]] if spec.get("machine_resource") else [])
-    if pins:
-        b[pins[rank]] = 0.001
-    return b
+    return Bundle(cpu=float(max(spec.cpus, 1)), gpu=float(spec.gpus),
+                  pin=spec.machine_resources[rank] if spec.machine_resources else None)
 
 
-def _launch(spec: dict, run_dir: str):
-    n = int(spec.get("nodes", 1))
-    b = _bundle(spec)
+def launch(spec: RunSpec, run_dir: str) -> None:
+    b = bundle(spec)
     # one bundle per machine; several only on DIFFERENT machines
-    pg = placement_group([_bundle(spec, i) for i in range(n)], strategy="STRICT_SPREAD" if n > 1 else "STRICT_PACK",
-                         name=f"pg-run-{spec['id']}", lifetime="detached")
+    pg = placement_group([bundle(spec, i).to_ray() for i in range(spec.nodes)],
+                         strategy="STRICT_SPREAD" if spec.nodes > 1 else "STRICT_PACK",
+                         name=pg_name(spec.id), lifetime="detached")
     GpuRun.options(
-        name=f"run-{spec['id']}", namespace=NAMESPACE, lifetime="detached",
-        num_cpus=b["CPU"], num_gpus=b.get("GPU", 0),
+        name=actor_name(spec.id), namespace=NAMESPACE, lifetime="detached", num_cpus=b.cpu, num_gpus=b.gpu,
+        max_restarts=0, max_task_retries=0,
         scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
     ).remote(spec, run_dir)
 
 
 # ── submit ───────────────────────────────────────────────────────────────────
 
-def _load_config(path: str) -> dict:
-    import yaml
-
+def load_config(path: str) -> RunsConfig:
     with open(path) as f:
-        return yaml.safe_load(f) or {}
+        return RunsConfig.load(yaml.safe_load(f) or {})
 
 
 def _inside(path: str, roots: list[str]) -> bool:
@@ -554,14 +587,14 @@ def _inside(path: str, roots: list[str]) -> bool:
 
 def _machine_resource(machine: str) -> str:
     """Ray's per-node resource for a machine given by host name or IP."""
-    for n in ray.nodes():
-        if n.get("Alive") and machine in (n.get("NodeManagerHostname"), n.get("NodeManagerAddress")):
+    for n in alive_nodes():
+        if machine in (n.get("NodeManagerHostname"), n.get("NodeManagerAddress")):
             return f"node:{n['NodeManagerAddress']}"
-    alive = [f"{n.get('NodeManagerHostname')} ({n.get('NodeManagerAddress')})" for n in ray.nodes() if n.get("Alive")]
+    alive = [f"{n.get('NodeManagerHostname')} ({n.get('NodeManagerAddress')})" for n in alive_nodes()]
     raise SystemExit(f"--machine {machine}: no live Ray node of that name or address (have: {', '.join(alive)})")
 
 
-def _capture_code(source: str, code_dir: str) -> dict:
+def _capture_code(source: str, code_dir: str) -> CodeRecord:
     """--code git:/repo@ref (git archive of that commit) or FILE.tar.gz, extracted into
     the run's code/ so the run executes exactly that and records what it was."""
     os.makedirs(code_dir)
@@ -569,110 +602,124 @@ def _capture_code(source: str, code_dir: str) -> dict:
         repo, _, ref = source[4:].rpartition("@")
         if not repo:
             repo, ref = source[4:], "HEAD"
-        commit = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{ref}^{{commit}}"],
-                                capture_output=True, text=True)
+        commit = _sh(["git", "-C", repo, "rev-parse", "--verify", f"{ref}^{{commit}}"])
         if commit.returncode != 0:
             raise SystemExit(f"--code {source}: {commit.stderr.strip()}")
         sha = commit.stdout.strip()
         arch = subprocess.run(["git", "-C", repo, "archive", "--format=tar", sha], capture_output=True)
         tarfile.open(fileobj=io.BytesIO(arch.stdout)).extractall(code_dir)
-        dirty = subprocess.run(["git", "-C", repo, "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
-        return {"source": source, "repo": repo, "ref": ref, "commit": sha,
-                "note": "working-tree changes are NOT included" if dirty else None}
+        dirty = _sh(["git", "-C", repo, "status", "--porcelain"]).stdout.strip()
+        return CodeRecord(source=source, repo=repo, ref=ref, commit=sha,
+                          note="working-tree changes are NOT included" if dirty else None)
     if not os.path.isfile(source):
         raise SystemExit(f"--code {source}: no such file (a tarball on this machine, or git:/repo@ref)")
-    data = open(source, "rb").read()
+    with open(source, "rb") as f:
+        data = f.read()
     tarfile.open(fileobj=io.BytesIO(data)).extractall(code_dir)
-    return {"source": source, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    return CodeRecord(source=source, sha256=hashlib.sha256(data).hexdigest(), bytes=len(data))
 
 
-def submit(a, cmd: list[str], config: dict) -> dict:
-    profiles = config.get("profiles", {})
-    if a.profile not in profiles:
-        raise SystemExit(f"unknown profile {a.profile!r} (have: {', '.join(profiles) or 'none'})")
-    profile = profiles[a.profile]
+@dataclass(kw_only=True)
+class Placement(Record):
+    """Where a submit may put the run, after the cluster's shape is checked."""
+
+    nodes: int
+    machines: list[str]
+    machine_resources: list[str]
+    note: str | None = None
+
+
+def _placement(a: RunArgs) -> Placement:
+    alive = len(alive_nodes())
+    machines = list(a.machine)
+    note = None
+    if a.nodes < 1:
+        raise SystemExit("--nodes: at least 1")
+    if a.nodes > alive:
+        raise SystemExit(f"--nodes {a.nodes}: the cluster has {alive} machine(s)")
+    if machines and len(machines) != a.nodes:
+        raise SystemExit(f"--machine: give one per node ({a.nodes}) or none")
+    if alive > 1 and not _shared_storage(a.runs_dir):
+        here = node_ip()
+        if a.nodes > 1:
+            raise SystemExit(f"--nodes {a.nodes}: the runs dir {a.runs_dir} is not shared storage")
+        if machines and _machine_resource(machines[0]) != f"node:{here}":
+            raise SystemExit(f"--machine {machines[0]}: the runs dir {a.runs_dir} is not shared storage, "
+                             "so a run can only land on this machine")
+        machines, note = [here], f"runs dir {a.runs_dir} is not shared storage: the run stays on this machine"
+    resources = [_machine_resource(m) for m in machines]
+    if len(set(resources)) != len(resources):
+        raise SystemExit("--machine: the nodes of one run are different machines")
+    return Placement(nodes=a.nodes, machines=machines, machine_resources=resources, note=note)
+
+
+@dataclass(kw_only=True)
+class Submitted(Record):
+    id: str
+    state: RunState
+    dir: str
+    out: str
+    note: str | None = None
+
+
+def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
+    if a.profile is None or a.profile not in config.profiles:
+        raise SystemExit(f"unknown profile {a.profile!r} (have: {', '.join(config.profiles) or 'none'})")
+    profile = config.profiles[a.profile]
     if not cmd:
         raise SystemExit("no command after --")
-    max_gpus = int(profile.get("max_gpus", 8))
-    if a.gpus > max_gpus:
-        raise SystemExit(f"profile {a.profile} allows at most {max_gpus} GPUs")
-    if a.gpus > 1 and a.gpus != int(a.gpus):
+    if a.gpus > profile.max_gpus:
+        raise SystemExit(f"profile {a.profile} allows at most {profile.max_gpus} GPUs")
+    if a.gpus > 1 and not float(a.gpus).is_integer():
         raise SystemExit("--gpus: whole cards, or one fraction of a card (0 < gpus < 1)")
-    a.gpus = int(a.gpus) if a.gpus == int(a.gpus) else a.gpus
-    if 0 < a.gpus < 1 and not (a.gpu_mem or profile.get("default_gpu_mem_gb")):
+    gpus = int(a.gpus) if float(a.gpus).is_integer() else a.gpus
+    if 0 < gpus < 1 and not (a.gpu_mem or profile.default_gpu_mem_gb):
         raise SystemExit("a fractional --gpus shares the card with other runs: give --gpu-mem (the job's peak GiB)")
-    mounts = [parse_mount(m) for m in a.mount]
-    allow = profile.get("allow", [])
-    for path, _ in mounts:
-        if not _inside(path, allow):
-            raise SystemExit(f"--mount {path} is outside what profile {a.profile} allows ({', '.join(allow) or 'nothing'})")
-        if not os.path.exists(path):
-            raise SystemExit(f"--mount {path} does not exist (create it before submitting)")
-    env = dict(e.split("=", 1) for e in a.env if "=" in e)
+    mounts = [Mount.parse(m) for m in a.mount]
+    for m in mounts:
+        if not _inside(m.path, profile.allow):
+            raise SystemExit(f"--mount {m.path} is outside what profile {a.profile} allows ({', '.join(profile.allow) or 'nothing'})")
+        if not os.path.exists(m.path):
+            raise SystemExit(f"--mount {m.path} does not exist (create it before submitting)")
     if a.after:
-        _run_dir(a.runs_dir, a.after)
-    note = None
-    nodes = int(a.nodes)
-    alive = len([n for n in ray.nodes() if n.get("Alive")])
-    if nodes < 1:
-        raise SystemExit("--nodes: at least 1")
-    if nodes > alive:
-        raise SystemExit(f"--nodes {nodes}: the cluster has {alive} machine(s)")
-    if a.machine and len(a.machine) not in (0, nodes):
-        raise SystemExit(f"--machine: give one per node ({nodes}) or none")
-    if alive > 1 and not _shared_storage(a.runs_dir):
-        here = ray.util.get_node_ip_address()
-        if nodes > 1:
-            raise SystemExit(f"--nodes {nodes}: the runs dir {a.runs_dir} is not shared storage")
-        if a.machine and _machine_resource(a.machine[0]) != f"node:{here}":
-            raise SystemExit(f"--machine {a.machine[0]}: the runs dir {a.runs_dir} is not shared storage, "
-                             "so a run can only land on this machine")
-        a.machine, note = [here], f"runs dir {a.runs_dir} is not shared storage: the run stays on this machine"
-    machine_resources = [_machine_resource(m) for m in a.machine] if a.machine else []
-    if len(set(machine_resources)) != len(machine_resources):
-        raise SystemExit("--machine: the nodes of one run are different machines")
-    machine_resource = machine_resources[0] if machine_resources else None
+        RunDir(a.runs_dir, a.after)
+    place = _placement(a)
 
     base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40]
-    run_id = f"{base}-{uuid.uuid4().hex[:8]}"
-    run_dir = os.path.join(a.runs_dir, run_id)
-    out = os.path.join(run_dir, "out")
-    os.makedirs(out)
-    if a.log and not (_inside(a.log, [p for p, mode in mounts if mode == "rw"]) or _inside(a.log, [out])):
-        shutil.rmtree(run_dir)
+    run = RunDir(a.runs_dir, f"{base}-{uuid.uuid4().hex[:8]}", must_exist=False)
+    os.makedirs(run.out)
+    writable = [m.path for m in mounts if m.mode is MountMode.RW] + [run.out]
+    if a.log and not _inside(a.log, writable):
+        shutil.rmtree(run.path)
         raise SystemExit(f"--log {a.log} is outside the run's writable mounts")
     code = None
     if a.code:
         try:
-            code = _capture_code(a.code, os.path.join(run_dir, "code"))
+            code = _capture_code(a.code, run.code)
         except BaseException:
-            shutil.rmtree(run_dir)
+            shutil.rmtree(run.path)
             raise
-    gpu_mem = a.gpu_mem or int(profile.get("default_gpu_mem_gb", 0) or 0)
-    spec = {"id": run_id, "profile_name": a.profile, "profile": profile, "command": cmd, "gpus": a.gpus,
-            "cpus": a.cpus, "mounts": mounts, "env": env, "log": a.log, "workdir": a.workdir, "out": out,
-            "code_dir": os.path.join(run_dir, "code") if code else None, "code": code,
-            "gpu_mem_gb": gpu_mem, "vram_wait_s": a.vram_wait, "retry": a.retry, "restart_on_oom": a.restart_on_oom,
-            "after": a.after, "machine": a.machine[0] if a.machine else None, "machine_resource": machine_resource,
-            "nodes": nodes, "machines": a.machine or None, "machine_resources": machine_resources or None}
-    if a.workdir and not _inside(_expand(a.workdir, spec), [p for p, _ in mounts] + [out] + ([spec["code_dir"]] if code else [])):
-        shutil.rmtree(run_dir)
+    gpu_mem = a.gpu_mem or profile.default_gpu_mem_gb
+    spec = RunSpec(id=run.id, profile_name=a.profile, profile=profile, command=cmd, gpus=gpus, cpus=a.cpus,
+                   mounts=mounts, env=a.env_map, log=a.log, workdir=a.workdir, out=run.out,
+                   code_dir=run.code if code else None, code=code, gpu_mem_gb=gpu_mem, vram_wait_s=a.vram_wait,
+                   retry=a.retry, restart_on_oom=a.restart_on_oom, after=a.after, nodes=place.nodes,
+                   machines=place.machines, machine_resources=place.machine_resources)
+    roots = [m.path for m in mounts] + [run.out] + ([run.code] if code else [])
+    if a.workdir and not _inside(spec.expand(a.workdir), roots):
+        shutil.rmtree(run.path)
         raise SystemExit(f"--workdir {a.workdir} is outside the run's mounts")
-    with open(os.path.join(run_dir, "spec.json"), "w") as f:
-        json.dump(spec, f, indent=2)
-    _write_status(run_dir, id=run_id, state="waiting_dependency" if a.after else "queued", submitted_at=time.time(),
-                  gpus_requested=a.gpus, cpus=a.cpus, gpu_mem_gb=gpu_mem or "whole card", after=a.after, code=code,
-                  **({"nodes": nodes} if nodes > 1 else {}))
+    spec.write(run.spec_path)
+    state = RunState.WAITING_DEPENDENCY if a.after else RunState.QUEUED
+    RunStatus(id=run.id, state=state, submitted_at=time.time(), gpus_requested=gpus, cpus=a.cpus,
+              gpu_mem_gb=gpu_mem or None, after=a.after, code=code, nodes=place.nodes).write(run.status_path)
     if a.after:
-        RunWaiter.options(name=f"wait-{run_id}", namespace=NAMESPACE, lifetime="detached",
-                          resources={machine_resource: 0.001} if machine_resource else None,
-                          ).remote(spec, run_dir, a.runs_dir)
+        pin = place.machine_resources[0] if place.machine_resources else None
+        RunWaiter.options(name=waiter_name(run.id), namespace=NAMESPACE, lifetime="detached", num_cpus=0,
+                          max_restarts=0, resources={pin: 0.001} if pin else None).remote(spec, run.path, a.runs_dir)
     else:
-        _launch(spec, run_dir)
-    res = {"id": run_id, "state": "waiting_dependency" if a.after else "queued", "dir": run_dir, "out": out}
-    if note:
-        res["note"] = note
-    return res
+        launch(spec, run.path)
+    return Submitted(id=run.id, state=state, dir=run.path, out=run.out, note=place.note)
 
 
 # ── other actions ────────────────────────────────────────────────────────────
@@ -685,64 +732,52 @@ def _alive(name: str) -> bool:
         return False
 
 
-def status(a, run_id: str) -> dict:
-    run_dir = _run_dir(a.runs_dir, run_id)
-    st = _read_status(run_dir)
-    if st.get("state") not in TERMINAL and not _alive(f"run-{run_id}") and not _alive(f"wait-{run_id}"):
+def _going(run_id: str) -> bool:
+    return _alive(actor_name(run_id)) or _alive(waiter_name(run_id))
+
+
+def status(a: RunArgs, run_id: str) -> RunStatus:
+    run = RunDir(a.runs_dir, run_id)
+    st = run.status()
+    if not st.state.terminal and not _going(run_id):
         # The actor is gone without reporting (a Ray restart): say what the container does.
-        st["state"] = "lost"
-        st["container"] = _container_states(st, run_id)
-    with open(os.path.join(run_dir, "spec.json")) as f:
-        spec = json.load(f)
-    metrics = _last_metrics(spec)
-    if metrics is not None:
-        st["metrics"] = metrics
-    st["out"] = spec["out"]
-    return st
+        st = st.merged(state=RunState.LOST, container=_container_states(st, run_id))
+    return st.merged(metrics=run.last_metrics(), out=run.spec().out)
 
 
-def _rank_places(st: dict, run_id: str) -> list[tuple[dict, str]]:
-    """(where, container name) for every rank of the run."""
-    ranks = st.get("ranks") or [{"rank": 0, "node_ip": st.get("node_ip"), "machine": st.get("machine")}]
-    return [(r, container_name(run_id, r["rank"])) for r in ranks]
-
-
-def _container_states(st: dict, run_id: str) -> str:
+def _container_states(st: RunStatus, run_id: str) -> str:
     states = []
-    for r, name in _rank_places(st, run_id):
-        out = _on_run_machine(r, ["docker", "inspect", "-f", "{{.State.Status}}", name])
-        state = (out.strip() or "gone") if out is not None else f"unknown ({r.get('machine')} left the cluster)"
-        states.append(f"rank {r['rank']} {state}" if st.get("ranks") else state)
+    for r in st.places():
+        out = _on_run_machine(r, ["docker", "inspect", "-f", "{{.State.Status}}", container_name(run_id, r.rank)])
+        state = (out.strip() or "gone") if out is not None else f"unknown ({r.machine} left the cluster)"
+        states.append(f"rank {r.rank} {state}" if st.ranks else state)
     return "; ".join(states)
 
 
-def cancel(a, run_id: str) -> dict:
-    run_dir = _run_dir(a.runs_dir, run_id)
-    st = _write_status(run_dir, state="cancelled", finished_at=time.time())
-    names = [f"run-{run_id}", f"wait-{run_id}"] + [f"run-{run_id}-r{i}" for i in range(1, int(st.get("nodes") or 1))]
+def cancel(a: RunArgs, run_id: str) -> RunStatus:
+    run = RunDir(a.runs_dir, run_id)
+    st = run.update(state=RunState.CANCELLED, finished_at=time.time())
+    names = [actor_name(run_id), waiter_name(run_id)] + [actor_name(run_id, i) for i in range(1, st.nodes)]
     for name in names:
         try:
             ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
         except ValueError:
             pass
-    gone = [r.get("machine") for r, name in _rank_places(st, run_id)
-            if _on_run_machine(r, ["docker", "rm", "-f", name]) is None]
+    gone = [r.machine for r in st.places()
+            if _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)]) is None]
     if gone:
-        st["container"] = f"not removed: {', '.join(map(str, gone))} left the cluster"
+        st = st.merged(container=f"not removed: {', '.join(gone)} left the cluster")
     try:
-        remove_placement_group(ray.util.get_placement_group(f"pg-run-{run_id}"))
+        remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
     except Exception:
         pass
     return st
 
 
-def logs(a, run_id: str):
+def logs(a: RunArgs, run_id: str) -> None:
     """The run's output: the last -n lines, then with -f everything new until it ends."""
-    run_dir = _run_dir(a.runs_dir, run_id)
-    with open(os.path.join(run_dir, "spec.json")) as f:
-        log_path = json.load(f).get("log") or os.path.join(run_dir, "log")
-    if a.rank:
-        log_path += f".rank{a.rank}"
+    run = RunDir(a.runs_dir, run_id)
+    log_path = run.spec().rank_log_path(a.rank)
     for line in _tail(log_path, 1 << 20).splitlines()[-a.lines:]:
         print(line)
     if not a.follow:
@@ -756,17 +791,17 @@ def logs(a, run_id: str):
             pos += len(chunk)
             sys.stdout.write(chunk.decode(errors="replace"))
             sys.stdout.flush()
-        elif _read_status(run_dir).get("state") in TERMINAL:
+        elif (run.state() or RunState.LOST).terminal:
             return
         else:
             time.sleep(1)
 
 
-def fetch(a, run_id: str):
+def fetch(a: RunArgs, run_id: str) -> None:
     """out/ as a tar.gz on stdout: `ssh box run.sh fetch ID > out.tgz`."""
-    run_dir = _run_dir(a.runs_dir, run_id)
+    run = RunDir(a.runs_dir, run_id)
     with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as t:
-        t.add(os.path.join(run_dir, "out"), arcname=f"{run_id}/out")
+        t.add(run.out, arcname=f"{run_id}/{OUT_DIR}")
 
 
 def _dir_bytes(d: str) -> int:
@@ -774,71 +809,89 @@ def _dir_bytes(d: str) -> int:
                if not os.path.islink(os.path.join(r, f)))
 
 
-def purge(a, run_id: str | None) -> list[dict]:
+@dataclass(kw_only=True)
+class Purged(Record):
+    id: str
+    purged: bool
+    state: RunState | None = None
+    bytes: int | None = None
+    reason: str | None = None
+
+
+def purge(a: RunArgs, run_id: str | None) -> list[Purged]:
     """Deletes finished runs' records (spec, status, log, out/, code/): one ID, or every
     finished run older than --older-than days. A run still going is refused."""
     if run_id:
-        targets = [_run_dir(a.runs_dir, run_id)]
+        targets = [RunDir(a.runs_dir, run_id)]
     elif a.older_than is not None:
         cut = time.time() - a.older_than * 86400
-        targets = [os.path.join(a.runs_dir, d) for d in os.listdir(a.runs_dir)
+        targets = [RunDir(a.runs_dir, d) for d in os.listdir(a.runs_dir)
                    if os.path.isdir(os.path.join(a.runs_dir, d)) and os.path.getmtime(os.path.join(a.runs_dir, d)) < cut]
     else:
         raise SystemExit("purge ID, or purge --older-than DAYS")
     done = []
-    for d in targets:
-        try:
-            st = _read_status(d)
-        except (OSError, ValueError):
-            st = {}
-        state = st.get("state")
-        rid = os.path.basename(d)
-        if state not in TERMINAL and (_alive(f"run-{rid}") or _alive(f"wait-{rid}")):
-            done.append({"id": os.path.basename(d), "purged": False, "reason": f"still {state}: cancel it first"})
+    for run in targets:
+        state = run.state()
+        if (state is None or not state.terminal) and _going(run.id):
+            done.append(Purged(id=run.id, purged=False, reason=f"still {state.value if state else '?'}: cancel it first"))
             continue
-        size = _dir_bytes(d)
-        shutil.rmtree(d)
-        done.append({"id": os.path.basename(d), "purged": True, "state": state, "bytes": size})
+        size = _dir_bytes(run.path)
+        shutil.rmtree(run.path)
+        done.append(Purged(id=run.id, purged=True, state=state, bytes=size))
     return done
 
 
-def list_runs(a, n: int = 20) -> list[dict]:
+@dataclass(kw_only=True)
+class RunSummary(Record):
+    """The columns `list` shows: a projection of RunStatus, loaded from its dump (the
+    codec drops the rest)."""
+
+    id: str
+    state: RunState
+    gpus: list[str] = field(default_factory=list)
+    exit_code: int | None = None
+    cause: Cause | None = None
+    after: str | None = None
+    submitted_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+def list_runs(a: RunArgs, n: int = 20) -> list[RunSummary]:
     if not os.path.isdir(a.runs_dir):
         return []
     ids = sorted(os.listdir(a.runs_dir), key=lambda d: os.path.getmtime(os.path.join(a.runs_dir, d)), reverse=True)
     out = []
     for i in ids[:n]:
         try:
-            st = _read_status(os.path.join(a.runs_dir, i))
-            out.append({k: st.get(k) for k in ("id", "state", "gpus", "exit_code", "cause", "after", "submitted_at",
-                                               "started_at", "finished_at")})
-        except (OSError, ValueError):
+            out.append(from_dict(RunSummary, RunDir(a.runs_dir, i).status().dump()))
+        except (SystemExit, OSError, ValueError):
             pass
     return out
 
 
-def stage_model(a, config: dict) -> dict:
+def stage_model(a: RunArgs, config: RunsConfig) -> Submitted:
     """Downloads a Hugging Face repo into the shared, read-only model store, as a queued
     CPU run (logged, cancellable like any other) with the fleet's token. Only when a
     person asks for that model."""
-    store, token_file = config.get("model_store"), config.get("hf_token_file")
+    store, token_file, repo = config.model_store, config.hf_token_file, a.run_id or ""
     if not store or not os.path.isdir(store):
         raise SystemExit("runs.yaml has no model_store directory: set model_store (and hf_token_file for gated repos)")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", a.repo or ""):
-        raise SystemExit(f"not a Hugging Face repo id: {a.repo!r}")
-    dest = os.path.join(store, a.repo, a.revision)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise SystemExit(f"not a Hugging Face repo id: {repo!r}")
+    dest = os.path.join(store, repo, a.revision)
     os.makedirs(dest, exist_ok=True)
     stager = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stage_model.py")
-    profile = dict(config["profiles"][config.get("stage_profile", a.profile or next(iter(config["profiles"])))])
-    profile["allow"] = [dest] + ([os.path.dirname(token_file)] if token_file else [])
-    profile["default_gpu_mem_gb"] = 0
-    staging = argparse.Namespace(**{**vars(a), "profile": "_stage", "name": f"stage-{a.repo.replace('/', '-')}",
-                                    "gpus": 0, "cpus": 2, "gpu_mem": 0, "mount": [f"{dest}:rw"]
-                                    + ([f"{os.path.dirname(token_file)}:ro"] if token_file else []),
-                                    "env": [f"HF_TOKEN_FILE={token_file}"] if token_file else [], "log": None,
-                                    "workdir": None, "after": None, "retry": 2, "restart_on_oom": 0,
-                                    "code": None, "machine": a.machine, "nodes": 1})
-    stage_cmd = ["python3", "{code}/stage_model.py", a.repo, a.revision, dest] + [f"--include={g}" for g in a.include]
+    base_name = config.stage_profile or a.profile or next(iter(config.profiles), None)
+    if base_name is None or base_name not in config.profiles:
+        raise SystemExit(f"stage-model: no profile to run in (have: {', '.join(config.profiles) or 'none'})")
+    token_dir = os.path.dirname(token_file) if token_file else None
+    profile = replace(config.profiles[base_name], allow=[dest] + ([token_dir] if token_dir else []), default_gpu_mem_gb=0)
+    staging = replace(a, profile="_stage", name=f"stage-{repo.replace('/', '-')}", gpus=0, cpus=2, gpu_mem=0,
+                      mount=[f"{dest}:rw"] + ([f"{token_dir}:ro"] if token_dir else []),
+                      env=[f"HF_TOKEN_FILE={token_file}"] if token_file else [], log=None, workdir=None, after=None,
+                      retry=2, restart_on_oom=0, nodes=1)
+    stage_cmd = ["python3", "{code}/stage_model.py", repo, a.revision, dest] + [f"--include={g}" for g in a.include]
     # the stager travels as the run's pinned code
     tgz = io.BytesIO()
     with tarfile.open(fileobj=tgz, mode="w:gz") as t:
@@ -847,81 +900,50 @@ def stage_model(a, config: dict) -> dict:
     with open(tmp, "wb") as f:
         f.write(tgz.getvalue())
     try:
-        staging.code = tmp
-        return submit(staging, stage_cmd, {"profiles": {"_stage": profile}})
+        return submit(replace(staging, code=tmp), stage_cmd, RunsConfig(profiles={"_stage": profile}))
     finally:
         os.remove(tmp)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def main(argv: list[str]):
+def _emit(value: Any, compact: bool = False) -> None:
+    data = value.dump() if isinstance(value, Record) else [v.dump() for v in value]
+    print(json.dumps(data, indent=None if compact else 2))
+
+
+def main(argv: list[str]) -> None:
     if "--" in argv:
         i = argv.index("--")
         argv, cmd = argv[:i], argv[i + 1:]
     else:
         cmd = []
-    p = argparse.ArgumentParser(prog="fleet_bridge run")
-    p.add_argument("action", choices=["submit", "status", "cancel", "list", "logs", "fetch", "purge", "render",
-                                      "stage-model"])
-    p.add_argument("run_id", nargs="?", help="a run id (stage-model: the Hugging Face repo)")
-    p.add_argument("--profiles", default=os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))
-    p.add_argument("--runs-dir", default=os.environ.get("FLEET_RUNS_DIR", "/var/lib/zkm-fleet/runs"))
-    p.add_argument("--address", default="127.0.0.1:6379")
-    p.add_argument("--profile")
-    p.add_argument("--name")
-    p.add_argument("--gpus", type=float, default=1, help="cards; a fraction (0.5) shares one card and needs a --gpu-mem")
-    p.add_argument("--cpus", type=int, default=8)
-    p.add_argument("--gpu-mem", type=int, default=0,
-                   help="GiB free each granted card must have before the job starts (default: the profile's, else the whole card)")
-    p.add_argument("--vram-wait", type=int, default=1800,
-                   help="seconds to wait for that memory before failing (the run shows waiting_vram meanwhile)")
-    p.add_argument("--machine", action="append", help="the machine (host name or IP) the run must land on; with --nodes N, repeat for each")
-    p.add_argument("--nodes", type=int, default=1,
-                   help="spread the run over N machines: --gpus and --cpus on each, one container per machine, "
-                        "ranks wired through FLEET_MASTER_ADDR / FLEET_NODE_RANK (and torchrun's PET_*)")
-    p.add_argument("--after", help="run only after this run succeeded")
-    p.add_argument("--retry", type=int, default=0, help="try a failed run again up to N times")
-    p.add_argument("--restart-on-oom", type=int, default=0, help="try again up to N times when an attempt ran out of memory")
-    p.add_argument("--code", help="git:/repo@ref or FILE.tar.gz, captured into the run (FLEET_CODE, {code})")
-    p.add_argument("--mount", action="append", default=[], help="PATH[:ro|:rw], mounted at its own path; repeat")
-    p.add_argument("--env", action="append", default=[], help="K=V for the job ({out} / {code} expand); repeat")
-    p.add_argument("--log", help="file the job's output is appended to (default RUNS_DIR/<id>/log)")
-    p.add_argument("--workdir")
-    p.add_argument("-f", "--follow", action="store_true", help="logs: keep printing until the run ends")
-    p.add_argument("-n", "--lines", type=int, default=50, help="logs: lines of history first")
-    p.add_argument("--rank", type=int, default=0, help="logs: a --nodes run's rank k (its output is log.rank<k>)")
-    p.add_argument("--older-than", type=float, help="purge: finished runs older than this many days")
-    p.add_argument("--revision", default="main", help="stage-model: branch, tag or commit")
-    p.add_argument("--include", action="append", default=[], help="stage-model: only files matching this glob; repeat")
-    p.add_argument("--host-gpus", default="0", help="render: host cards to show in the command")
-    a = p.parse_args(argv)
+    a = from_args(RunArgs, argparser(RunArgs, argparse.ArgumentParser(prog="fleet_bridge run")).parse_args(argv))
     os.makedirs(a.runs_dir, exist_ok=True)
-    config = _load_config(a.profiles)
-    if a.action == "render":
-        profile = config["profiles"][a.profile]
-        spec = {"id": a.name or "render", "profile": profile, "command": cmd, "cpus": a.cpus, "workdir": a.workdir,
-                "mounts": [parse_mount(m) for m in a.mount], "out": os.path.join(a.runs_dir, "<id>", "out"),
-                "env": dict(e.split("=", 1) for e in a.env if "=" in e)}
-        print(shlex.join(docker_command(spec, a.host_gpus.split(",") if a.gpus else [])))
-        return
-    if a.action == "list":
-        print(json.dumps(list_runs(a), indent=2))
-        return
-    if a.action == "logs":
-        return logs(a, a.run_id)
-    if a.action == "fetch":
-        return fetch(a, a.run_id)
-    ray.init(address=a.address, namespace=NAMESPACE, log_to_driver=False, logging_level="ERROR")
-    if a.action == "submit":
-        print(json.dumps(submit(a, cmd, config)))
-    elif a.action == "status":
-        print(json.dumps(status(a, a.run_id), indent=2))
-    elif a.action == "cancel":
-        print(json.dumps(cancel(a, a.run_id), indent=2))
-    elif a.action == "purge":
-        print(json.dumps(purge(a, a.run_id), indent=2))
-    elif a.action == "stage-model":
-        a.repo = a.run_id
-        print(json.dumps(stage_model(a, config)))
+    config = load_config(a.profiles)
+    actions: dict[str, Callable[[], None]] = {
+        "render": lambda: _render(a, cmd, config),
+        "list": lambda: _emit(list_runs(a)),
+        "logs": lambda: logs(a, a.run_id or ""),
+        "fetch": lambda: fetch(a, a.run_id or ""),
+        "submit": lambda: _emit(submit(a, cmd, config), compact=True),
+        "status": lambda: _emit(status(a, a.run_id or "")),
+        "cancel": lambda: _emit(cancel(a, a.run_id or "")),
+        "purge": lambda: _emit(purge(a, a.run_id)),
+        "stage-model": lambda: _emit(stage_model(a, config), compact=True),
+    }
+    if a.action not in ("render", "list", "logs", "fetch"):
+        ray.init(address=a.address, namespace=NAMESPACE, log_to_driver=False, logging_level=logging.ERROR)
+    actions[a.action]()
     sys.stdout.flush()
+
+
+def _render(a: RunArgs, cmd: list[str], config: RunsConfig) -> None:
+    """The `docker run` a request would get, on the given host cards, without Ray."""
+    if a.profile is None or a.profile not in config.profiles:
+        raise SystemExit(f"unknown profile {a.profile!r} (have: {', '.join(config.profiles) or 'none'})")
+    out = os.path.join(a.runs_dir, "<id>", OUT_DIR)
+    spec = RunSpec(id=a.name or "render", profile_name=a.profile, profile=config.profiles[a.profile], command=cmd,
+                   gpus=a.gpus, cpus=a.cpus, out=out, workdir=a.workdir, mounts=[Mount.parse(m) for m in a.mount],
+                   env=a.env_map)
+    print(shlex.join(docker_command(spec, a.host_gpus.split(",") if a.gpus else [])))

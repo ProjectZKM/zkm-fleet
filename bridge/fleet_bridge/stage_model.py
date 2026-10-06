@@ -9,6 +9,8 @@ is kept. HF_TOKEN_FILE (if set) authenticates gated repos. On success DEST gets
 a STAGED.json manifest; a partial download leaves *.part files and no manifest.
 """
 
+from __future__ import annotations
+
 import fnmatch
 import hashlib
 import json
@@ -17,11 +19,12 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from typing import Any
 
 HUB = "https://huggingface.co"
 
 
-def _request(url, token, headers=None):
+def _request(url: str, token: str | None, headers: dict[str, str] | None = None) -> urllib.request.Request:
     h = {"User-Agent": "zkm-fleet-stage-model/1"}
     if token:
         h["Authorization"] = f"Bearer {token}"
@@ -29,14 +32,14 @@ def _request(url, token, headers=None):
     return urllib.request.Request(url, headers=h)
 
 
-def list_files(repo, rev, token):
+def list_files(repo: str, rev: str, token: str | None) -> list[dict[str, Any]]:
     url = f"{HUB}/api/models/{repo}/tree/{urllib.parse.quote(rev, safe='')}?recursive=true"
     with urllib.request.urlopen(_request(url, token), timeout=60) as r:
-        entries = json.load(r)
+        entries: list[dict[str, Any]] = json.load(r)
     return [e for e in entries if e.get("type") == "file"]
 
 
-def sha256(path):
+def sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 24), b""):
@@ -44,7 +47,7 @@ def sha256(path):
     return h.hexdigest()
 
 
-def fetch(repo, rev, entry, dest, token):
+def fetch(repo: str, rev: str, entry: dict[str, Any], dest: str, token: str | None) -> None:
     rel = entry["path"]
     final = os.path.join(dest, rel)
     size = entry.get("size", 0)
@@ -84,7 +87,7 @@ def fetch(repo, rev, entry, dest, token):
     print(f"done  {rel} ({size} B{', sha256 ok' if want else ''})", flush=True)
 
 
-def main():
+def main() -> None:
     args = [a for a in sys.argv[1:] if not a.startswith("--include=")]
     include = [a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--include=")]
     repo, rev, dest = args

@@ -10,6 +10,9 @@
         image: ghcr.io/projectzkm/ziren-gpu@sha256:...
         env: {VERIFY_VK: "true", ZIREN_LEAF_HOST_THREADS: "3"}
 
+The file is a ServicesFile (model.py): the cluster settings at the top, then one
+ServiceSpec per entry; each replica becomes a ReplicaSpec.
+
 A `hold` (`gpus: N`, no image) keeps the next free cards out of reach of the
 services listed after it while they start, then frees them: on one machine Ray
 hands out the lowest free cards, so `goat (1) / hold (1) / ethproofs (6)` puts
@@ -34,56 +37,62 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 import urllib.request
+from typing import Any, Mapping
 
 import ray
-from ray.util.placement_group import placement_group, remove_placement_group
+from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
+from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
+from .model import ApplyReport, Bundle, ClusterConfig, Health, ReplicaSpec, ServiceKind, ServicesFile
+from .rayapi import actor_node_id
 
 NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
 
-KINDS = {"ziren-gpu": ZirenGpuProver, "ziren-cpu": ZirenCpuProver, "app": GpuApp}
+ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, ServiceKind.ZIREN_CPU: ZirenCpuProver,
+                                  ServiceKind.APP: GpuApp}
+# the cluster settings a replica's hash covers, as the file names them
+_SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
 
 
-def _replica_specs(cfg: dict) -> dict[str, dict]:
-    common = {
-        k: cfg[k]
-        for k in ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
-        if k in cfg
-    }
-    out = {}
-    for svc in cfg.get("services", []):
-        kind = svc.get("kind", "ziren-gpu")
-        if kind not in KINDS and kind != "hold":
-            raise ValueError(f"service {svc['name']}: unknown kind {kind}")
-        for i in range(int(svc.get("replicas", 1))):
-            name = f"{svc['name']}-{i}"
-            out[name] = {**common, **svc, "name": name, "kind": kind}
-            if kind == "app":
-                out[name]["index"] = i
+def load_services(data: Mapping[str, Any]) -> ServicesFile:
+    return ServicesFile.parse(data)
+
+
+def replica_specs(file: ServicesFile) -> dict[str, ReplicaSpec]:
+    """One ReplicaSpec per replica, in file order. `config` is the replica's mapping as
+    the file gives it (shared keys, the entry, its name and index), which the hash
+    covers."""
+    raw_services = {s["name"]: s for s in file.raw.get("services", [])}
+    shared = {k: file.raw[k] for k in _SHARED_KEYS if k in file.raw}
+    out: dict[str, ReplicaSpec] = {}
+    for svc in file.services:
+        for i in range(svc.replicas):
+            name = f"{svc.name}-{i}"
+            config = {**shared, **raw_services[svc.name], "name": name, "kind": svc.kind.value}
+            if svc.kind is ServiceKind.APP:
+                config["index"] = i
+            out[name] = ReplicaSpec(name=name, index=i, service=svc, cluster=file.cluster, config=config)
     return out
 
 
-def _bundle(spec: dict) -> dict:
-    b = {"CPU": float(spec.get("cpus", 1))}
-    if spec["kind"] in ("ziren-gpu", "app", "hold"):
-        b["GPU"] = float(spec.get("gpus", 1))
-    if spec.get("memory_gb"):
-        b["memory"] = float(spec["memory_gb"]) * 2**30
-    if spec.get("machine"):
+def bundle(spec: ReplicaSpec) -> Bundle:
+    svc = spec.service
+    pin = None
+    if svc.machine:
         # Ray's per-node resource: the replica can only be placed on that machine.
         from .runs import _machine_resource
 
-        b[_machine_resource(spec["machine"])] = 0.001
-    return b
+        pin = _machine_resource(svc.machine)
+    return Bundle(cpu=float(svc.cpus), gpu=float(svc.gpus) if svc.kind.takes_gpus else 0,
+                  memory=svc.memory_gb * 2**30 if svc.memory_gb else None, pin=pin)
 
 
-def _running() -> dict[str, ray.actor.ActorHandle]:
+def running() -> dict[str, ActorHandle[Any]]:
     names = [a["name"] for a in ray.util.list_named_actors(all_namespaces=True) if a["namespace"] == NAMESPACE]
     out = {}
     for n in names:
@@ -94,29 +103,35 @@ def _running() -> dict[str, ray.actor.ActorHandle]:
     return out
 
 
+def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> Health:
+    h = ray.get(actor.health.remote(), timeout=timeout_s)
+    return h if isinstance(h, Health) else Health.load(h)
+
+
 def _pg_name(actor: str) -> str:
     return f"pg-{actor}"
 
 
-def start(spec: dict, ready_timeout_s: float = 900) -> ray.actor.ActorHandle:
-    pg = placement_group([_bundle(spec)], strategy="STRICT_PACK", name=_pg_name(spec["name"]), lifetime="detached")
+def start(spec: ReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any]:
+    b = bundle(spec)
+    pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
     ray.get(pg.ready(), timeout=ready_timeout_s)
-    cls = KINDS[spec["kind"]]
-    b = _bundle(spec)
-    actor = cls.options(
-        name=spec["name"],
+    actor: ActorHandle[Any] = ACTORS[spec.kind].options(
+        name=spec.name,
         namespace=NAMESPACE,
         lifetime="detached",
-        num_cpus=b["CPU"],
-        num_gpus=b.get("GPU", 0),
-        memory=b.get("memory"),
+        max_restarts=-1,
+        max_task_retries=0,
+        num_cpus=b.cpu,
+        num_gpus=b.gpu,
+        memory=b.memory,
         scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
     ).remote(spec)
-    ray.get(actor.health.remote(), timeout=ready_timeout_s)
+    health_of(actor, ready_timeout_s)
     return actor
 
 
-def stop(name: str):
+def stop(name: str) -> None:
     """Kills the actor, then removes what it owned on its machine. The kill comes first:
     an actor asked to shut down and left alive restarts itself (max_restarts=-1) when
     its watcher sees the container gone, and the restart races the replacement."""
@@ -125,11 +140,9 @@ def stop(name: str):
     except ValueError:
         actor = None
     if actor is not None:
-        node_id = None
-        try:  # from the GCS (the dashboard API is off)
-            node_id = ray._private.state.actors(actor_id=actor._actor_id.hex())["Address"]["NodeID"]
-        except Exception as e:
-            log.warning("where %s runs: %s", name, e)
+        node_id = actor_node_id(actor)
+        if node_id is None:
+            log.warning("where %s runs is unknown; cleaning up on this machine", name)
         ray.kill(actor, no_restart=True)
         if node_id:
             try:
@@ -145,27 +158,27 @@ def stop(name: str):
         pass
 
 
-class _Scheduler:
+class Scheduler:
     """Drains a prover node through the scheduler's admin API before its actor stops,
     so no proof is cut off: the scheduler sends it nothing new and its job in flight
     finishes; jobs queue meanwhile. Without the admin token (or a reachable
     scheduler) replacing falls back to stopping at once."""
 
-    def __init__(self, cfg: dict):
-        self.url = cfg.get("scheduler_admin", "http://127.0.0.1:9191").rstrip("/") + "/admin"
-        token_file = cfg.get("admin_token_file") or os.path.join(
-            os.path.dirname(cfg.get("cluster_token_file", "/etc/zkm-fleet/x")), "admin.token")
+    def __init__(self, cfg: ClusterConfig) -> None:
+        self.url = cfg.scheduler_admin.rstrip("/") + "/admin"
         try:
-            self.token = open(token_file).read().strip()
+            with open(cfg.admin_token_path) as f:
+                self.token: str | None = f.read().strip()
         except OSError:
             self.token = None
-        self.timeout_s = float(cfg.get("drain_timeout_s", 900))
+        self.timeout_s = cfg.drain_timeout_s
 
-    def _call(self, method: str, path: str):
+    def _call(self, method: str, path: str) -> dict[str, Any]:
         req = urllib.request.Request(self.url + path, method=method, headers={"Authorization": f"Bearer {self.token}"})
         with urllib.request.urlopen(req, timeout=10) as r:
             body = r.read()
-        return json.loads(body) if body.strip().startswith(b"{") else None
+        parsed = json.loads(body) if body.strip().startswith(b"{") else {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def drain(self, name: str) -> bool:
         """True once `name` takes no job and has none running."""
@@ -185,7 +198,7 @@ class _Scheduler:
             log.warning("draining %s: %s; replacing without draining", name, e)
         return False
 
-    def undrain(self, name: str):
+    def undrain(self, name: str) -> None:
         if self.token:
             try:
                 self._call("DELETE", f"/nodes/{name}/drain")
@@ -193,79 +206,92 @@ class _Scheduler:
                 log.warning("undraining %s: %s (run: fleetctl node undrain %s)", name, e, name)
 
 
-def reconcile_once(cfg: dict) -> dict:
-    want = _replica_specs(cfg)
-    have = _running()
-    report = {"started": [], "stopped": [], "replaced": [], "healthy": [], "unhealthy": [], "held": []}
-    report["_scheduler"] = _Scheduler(cfg)
+def reconcile_once(file: ServicesFile, dry_run: bool = False) -> ApplyReport:
+    """Makes the actors match the file. With dry_run nothing changes: `planned` lists
+    what an apply would start, stop or replace."""
+    want = replica_specs(file)
+    have = running()
+    report = ApplyReport()
+    holds: list[PlacementGroup] = []
     try:
-        _reconcile(want, have, report)
+        _reconcile(want, have, report, Scheduler(file.cluster), holds, dry_run)
     finally:
         # Holds only steer which cards the services after them get; release them.
-        for pg in report.pop("_holds", []):
+        for pg in holds:
             remove_placement_group(pg)
-        report.pop("_scheduler", None)
     return report
 
 
-def _reconcile(want: dict, have: dict, report: dict):
-    sched = report["_scheduler"]
+def _replace(name: str, spec: ReplicaSpec, sched: Scheduler, report: ApplyReport, why: str) -> None:
+    log.info("replacing %s (%s): draining first", name, why)
+    drained = sched.drain(name)
+    stop(name)
+    try:
+        start(spec)
+        report.replaced.append(name)
+    except Exception as e:
+        log.error("restarting %s failed: %s", name, e)
+        stop(name)
+        report.unhealthy.append(name)
+    finally:
+        if drained:
+            sched.undrain(name)
+
+
+def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], report: ApplyReport,
+               sched: Scheduler, holds: list[PlacementGroup], dry_run: bool) -> None:
     for name in sorted(set(have) - set(want)):
+        if dry_run:
+            report.planned.append(f"stop {name}")
+            continue
         log.info("stopping %s (no longer wanted)", name)
         drained = sched.drain(name)
         stop(name)
         if drained:
             sched.undrain(name)  # the name is free for a later replica
-        report["stopped"].append(name)
+        report.stopped.append(name)
     # In the order of the services file: on one machine Ray hands out the lowest free
     # cards, so the order decides which service gets which cards.
     names = list(want)
     for i, (name, spec) in enumerate(want.items()):
-        if spec["kind"] == "hold":
+        if spec.kind is ServiceKind.HOLD:
             # A hold takes the next free cards while the services after it start (Ray hands
             # out the lowest free cards), so they land past it; the cards are freed at the
             # end, for one-shot runs. Only when one of those services has to start.
-            later = [n for n in names[i + 1:] if want[n]["kind"] != "hold" and n not in have]
-            if later:
-                pg = placement_group([_bundle(spec)], strategy="STRICT_PACK", name=f"hold-{name}")
+            later = [n for n in names[i + 1:] if want[n].kind is not ServiceKind.HOLD and n not in have]
+            if later and not dry_run:
+                pg = placement_group([bundle(spec).to_ray()], strategy="STRICT_PACK", name=f"hold-{name}")
                 try:
                     ray.get(pg.ready(), timeout=60)
-                    report.setdefault("_holds", []).append(pg)
-                    report["held"].append(name)
+                    holds.append(pg)
+                    report.held.append(name)
                 except Exception as e:
                     log.warning("hold %s not placed (%s); the services after it take the lowest cards", name, e)
                     remove_placement_group(pg)
             continue
         if name not in have:
+            if dry_run:
+                report.planned.append(f"start {name}")
+                continue
             log.info("starting %s", name)
             try:
                 start(spec)
-                report["started"].append(name)
+                report.started.append(name)
             except Exception as e:
                 log.error("starting %s failed: %s", name, e)
                 stop(name)
-                report["unhealthy"].append(name)
+                report.unhealthy.append(name)
             continue
         try:
-            h = ray.get(have[name].health.remote(), timeout=30)
+            h = health_of(have[name])
         except Exception as e:
             log.warning("%s unhealthy (Ray restarts it): %s", name, e)
-            report["unhealthy"].append(name)
+            report.unhealthy.append(name)
             continue
-        if h.get("spec") != spec_hash(spec):
-            log.info("replacing %s (spec changed): draining first", name)
-            drained = sched.drain(name)
-            stop(name)
-            try:
-                start(spec)
-                report["replaced"].append(name)
-            except Exception as e:
-                log.error("restarting %s failed: %s", name, e)
-                stop(name)
-                report["unhealthy"].append(name)
-            finally:
-                if drained:
-                    sched.undrain(name)
+        if h.spec != spec_hash(spec):
+            if dry_run:
+                report.planned.append(f"replace {name} (spec changed: {h.spec} -> {spec_hash(spec)})")
+            else:
+                _replace(name, spec, sched, report, "spec changed")
         else:
-            report["healthy"].append(name)
-    return report
+            report.healthy.append(name)
