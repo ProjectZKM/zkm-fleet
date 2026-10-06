@@ -30,6 +30,13 @@ A failed attempt gets a cause (gpu-oom from the log, host-oom from docker,
 exit-code; with who held the card at that moment). --retry N repeats any failure,
 --restart-on-oom N only out-of-memory ones; FLEET_ATTEMPT tells the job which
 attempt it is, so it can resume from a checkpoint in its out/.
+
+Several machines: RUNS_DIR must be shared storage mounted at the same path on
+all of them (the run's actor writes its record where it lands; the CLI reads it
+wherever it runs), and so must every --mount. The container lives on the run's
+machine: cancel and the lost-run check reach it through a Ray task there. With
+an unshared RUNS_DIR on a multi-machine cluster, runs stay on the submitting
+machine.
 """
 
 from __future__ import annotations
@@ -56,6 +63,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 NAMESPACE = "zkm-fleet"
 TERMINAL = ("succeeded", "failed", "cancelled")
+NETWORK_FS = ("nfs", "cifs", "smb2", "smb3", "ceph", "lustre", "gpfs", "beegfs", "glusterfs", "fuse")
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
                      r"|CUDA error: out of memory", re.I)
 
@@ -222,6 +230,8 @@ class GpuRun:
     def __init__(self, spec: dict, run_dir: str):
         self.spec, self.run_dir = spec, run_dir
         self.gpus = [str(int(g)) for g in ray.get_gpu_ids()]
+        # where the container will live: cancel and status reach it there
+        _write_status(run_dir, machine=socket.gethostname(), node_ip=ray.util.get_node_ip_address())
         threading.Thread(target=self._run, daemon=True).start()
 
     def ping(self) -> dict:
@@ -358,6 +368,30 @@ class RunWaiter:
             os._exit(0)
 
 
+@ray.remote(num_cpus=0, max_retries=0)
+def _on_node(argv: list[str]) -> str:
+    return subprocess.run(argv, capture_output=True, text=True).stdout
+
+
+def _on_run_machine(st: dict, argv: list[str]) -> str | None:
+    """Runs argv on the machine the run landed on (its container is there) and returns
+    its stdout; None when that machine has left the cluster."""
+    ip = st.get("node_ip")
+    if not ip:  # never landed (or a record from before node_ip): only this machine can have it
+        return subprocess.run(argv, capture_output=True, text=True).stdout
+    if not any(n.get("Alive") and n.get("NodeManagerAddress") == ip for n in ray.nodes()):
+        return None
+    try:
+        return ray.get(_on_node.options(resources={f"node:{ip}": 0.001}).remote(argv), timeout=60)
+    except Exception:
+        return None
+
+
+def _shared_storage(path: str) -> bool:
+    fs = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True).stdout.strip()
+    return fs.startswith(NETWORK_FS)
+
+
 def _bundle(spec: dict) -> dict:
     b = {"CPU": float(max(spec["cpus"], 1))}
     if spec["gpus"]:
@@ -450,6 +484,13 @@ def submit(a, cmd: list[str], config: dict) -> dict:
     env = dict(e.split("=", 1) for e in a.env if "=" in e)
     if a.after:
         _run_dir(a.runs_dir, a.after)
+    note = None
+    if len([n for n in ray.nodes() if n.get("Alive")]) > 1 and not _shared_storage(a.runs_dir):
+        here = ray.util.get_node_ip_address()
+        if a.machine and _machine_resource(a.machine) != f"node:{here}":
+            raise SystemExit(f"--machine {a.machine}: the runs dir {a.runs_dir} is not shared storage, "
+                             "so a run can only land on this machine")
+        a.machine, note = here, f"runs dir {a.runs_dir} is not shared storage: the run stays on this machine"
     machine_resource = _machine_resource(a.machine) if a.machine else None
 
     base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40]
@@ -481,10 +522,15 @@ def submit(a, cmd: list[str], config: dict) -> dict:
     _write_status(run_dir, id=run_id, state="waiting_dependency" if a.after else "queued", submitted_at=time.time(),
                   gpus_requested=a.gpus, cpus=a.cpus, gpu_mem_gb=gpu_mem or "whole card", after=a.after, code=code)
     if a.after:
-        RunWaiter.options(name=f"wait-{run_id}", namespace=NAMESPACE, lifetime="detached").remote(spec, run_dir, a.runs_dir)
+        RunWaiter.options(name=f"wait-{run_id}", namespace=NAMESPACE, lifetime="detached",
+                          resources={machine_resource: 0.001} if machine_resource else None,
+                          ).remote(spec, run_dir, a.runs_dir)
     else:
         _launch(spec, run_dir)
-    return {"id": run_id, "state": "waiting_dependency" if a.after else "queued", "dir": run_dir, "out": out}
+    res = {"id": run_id, "state": "waiting_dependency" if a.after else "queued", "dir": run_dir, "out": out}
+    if note:
+        res["note"] = note
+    return res
 
 
 # ── other actions ────────────────────────────────────────────────────────────
@@ -502,10 +548,9 @@ def status(a, run_id: str) -> dict:
     st = _read_status(run_dir)
     if st.get("state") not in TERMINAL and not _alive(f"run-{run_id}") and not _alive(f"wait-{run_id}"):
         # The actor is gone without reporting (a Ray restart): say what the container does.
-        out = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", container_name(run_id)],
-                             capture_output=True, text=True)
+        out = _on_run_machine(st, ["docker", "inspect", "-f", "{{.State.Status}}", container_name(run_id)])
         st["state"] = "lost"
-        st["container"] = out.stdout.strip() or "gone"
+        st["container"] = (out.strip() or "gone") if out is not None else f"unknown: {st.get('machine')} left the cluster"
     with open(os.path.join(run_dir, "spec.json")) as f:
         spec = json.load(f)
     metrics = _last_metrics(spec)
@@ -523,7 +568,8 @@ def cancel(a, run_id: str) -> dict:
             ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
         except ValueError:
             pass
-    subprocess.run(["docker", "rm", "-f", container_name(run_id)], capture_output=True)
+    if _on_run_machine(st, ["docker", "rm", "-f", container_name(run_id)]) is None:
+        st["container"] = f"not removed: {st.get('machine')} left the cluster"
     try:
         remove_placement_group(ray.util.get_placement_group(f"pg-run-{run_id}"))
     except Exception:

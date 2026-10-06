@@ -11,6 +11,8 @@
 #   --cuda LIST           cards Ray may hand out on this machine, e.g. 0,1,2,3 (default: none)
 #   --cpus N              CPUs Ray may hand out here (default: all; leave room on shared machines)
 #   --workdir DIR         this node's workspace: Ray session files, spilled objects, node logs
+#   --runs-dir DIR        one-shot run records (control; default WORKDIR/runs). With several
+#                         machines: shared storage, mounted at the same path on every machine
 #                         (default <prefix>/work; keep it off a root disk that must stay free)
 #   --head IP             Ray head address (node role)
 #   --cluster-token FILE  the control machine's cluster.token (node role)
@@ -38,6 +40,7 @@ while [ $# -gt 0 ]; do
     --cuda) CUDA=$2; shift 2 ;;
     --cpus) CPUS=$2; shift 2 ;;
     --workdir) WORKDIR=$2; shift 2 ;;
+    --runs-dir) RUNS_DIR=$2; shift 2 ;;
     --head) HEAD=$2; shift 2 ;;
     --cluster-token) TOKEN=$2; shift 2 ;;
     --ip) IP=$2; shift 2 ;;
@@ -74,6 +77,7 @@ fi
 for b in fleet-node fleetctl; do [ -x "$BIN/$b" ] || die "$BIN/$b not found: build first (cargo build --release --bins), or pass --bin"; done
 [ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
 [ -n "$WORKDIR" ] || WORKDIR="$PREFIX/work"
+[ -n "${RUNS_DIR:-}" ] || RUNS_DIR="$WORKDIR/runs"
 mkdir -p "$PREFIX" "$ETC" 2>/dev/null || die "cannot create $PREFIX / $ETC: run as root, or pass --prefix and --etc under \$HOME"
 chmod 750 "$ETC"
 
@@ -229,16 +233,16 @@ if [ "$ROLE" = control ]; then
 cd "$PREFIX/bridge" && exec "$PREFIX/venv/bin/python" -m fleet_bridge apply --services "$ETC/services.yaml" --address 127.0.0.1:6379
 EOF
   chmod +x "$PREFIX/deploy/apply.sh"
-  mkdir -p "$WORKDIR/runs"
+  mkdir -p "$RUNS_DIR"
   [ -f "$ETC/runs.yaml" ] || echo "profiles: {}   # one-shot job profiles: see deploy/runs.example.yaml" > "$ETC/runs.yaml"
   cat > "$PREFIX/deploy/run.sh" <<EOF
 #!/bin/bash
 # One-shot GPU jobs (profiles in $ETC/runs.yaml):
 #   run.sh submit --profile NAME [--name N] [--gpus N] [--cpus N] --mount PATH:ro|rw ... [--env K=V ...]
 #              [--log FILE] [--workdir DIR] -- CMD ARG...   (every path the job touches is a --mount)
-#   run.sh status ID | cancel ID | list
+#   run.sh status ID | logs ID [-f] | fetch ID | cancel ID | purge ID | list
 cd "$PREFIX/bridge" && exec "$PREFIX/venv/bin/python" -m fleet_bridge run \\
-  --profiles "$ETC/runs.yaml" --runs-dir "$WORKDIR/runs" "\$@"
+  --profiles "$ETC/runs.yaml" --runs-dir "$RUNS_DIR" "\$@"
 EOF
   chmod +x "$PREFIX/deploy/run.sh"
   "$PREFIX/deploy/apply.sh"
