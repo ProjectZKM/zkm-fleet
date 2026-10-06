@@ -43,7 +43,9 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 `install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL` and `FLEET_ADMIN_TOKEN_FILE`).
 
 ```bash
-fleetctl status                                       # queue, nodes, anchors
+fleetctl status                                       # queue, nodes, anchors, runs going on
+fleetctl ps                                           # proof jobs and runs, newest first (--active, --type proof|run, -n N)
+fleetctl show <id>                                    # one proof job or run
 ```
 
 | task | how |

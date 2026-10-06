@@ -151,7 +151,7 @@ pub fn cell(key: &str, v: &Value) -> String {
             if key.ends_with("_ms") && f > 1e11 {
                 utc((f / 1000.0) as i64)
             } else if key.ends_with("_ms") {
-                format!("{:.1} s", f / 1000.0)
+                duration(f / 1000.0)
             } else if key.ends_with("_at") && f > 1e9 {
                 utc(f as i64)
             } else if key == "bytes" {
@@ -169,6 +169,18 @@ pub fn cell(key: &str, v: &Value) -> String {
             }
         }
         other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// Seconds as people read them: `12.3 s`, `4m 05s`, `2h 07m`.
+fn duration(secs: f64) -> String {
+    let whole = secs as u64;
+    if secs < 120.0 {
+        format!("{secs:.1} s")
+    } else if whole < 7200 {
+        format!("{}m {:02}s", whole / 60, whole % 60)
+    } else {
+        format!("{}h {:02}m", whole / 3600, whole % 3600 / 60)
     }
 }
 
@@ -212,6 +224,8 @@ mod tests {
         assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(utc(1_791_294_000), "2026-10-06 13:40:00 UTC");
         assert_eq!(cell("prove_ms", &json!(15459)), "15.5 s");
+        assert_eq!(cell("took_ms", &json!(245_000)), "4m 05s");
+        assert_eq!(cell("took_ms", &json!(7_620_000)), "2h 07m");
         assert_eq!(cell("created_ms", &json!(1_791_294_000_000u64)), "2026-10-06 13:40:00 UTC");
         assert_eq!(cell("submitted_at", &json!(1_791_294_000.5)), "2026-10-06 13:40:00 UTC");
         assert_eq!(cell("bytes", &json!(3_145_728)), "3.0 MiB");
