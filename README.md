@@ -47,62 +47,18 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 `--cuda` lists the cards Ray may hand out on that machine; leave out cards other systems use. Without root, add `--prefix ~/zkm-fleet --etc ~/zkm-fleet/etc`. The installer is idempotent: it keeps existing secrets and configs, installs a cron watchdog that keeps Ray up, and prints the next steps.
 
-## Add a machine
-
-Every machine runs one Ray node; the control machine's Ray head places work on whichever machine has the cards. A machine joins with one command, and nothing on the control machine changes until something is placed on it.
-
-On the new machine:
-
-1. **Prerequisites:** for a machine with cards, Docker with `nvidia-container-toolkit` and the NVIDIA driver ≥ 570 (the GPU server image is pulled from ghcr.io on first use, no login); Python ≥ 3.10 with `venv`; `cron`. The two binaries, `fleet-ziren-node` and `fleetctl`, built for its OS (one `ubuntu:22.04` build serves every machine of that OS), in `./target/release` or wherever `--bin DIR` points.
-2. **The cluster token:** copy the control machine's `/etc/zkm-fleet/cluster.token` over (0600). It is what lets the machine's prover nodes talk to the scheduler.
-3. **Install:**
-   ```bash
-   deploy/install.sh node --head <control machine's cluster IP> --cluster-token cluster.token --cuda 0,1,2,3 [--cpus N] [--ip <this machine's cluster address>]
-   ```
-   `--cuda` is the cards Ray may hand out here (leave out any used by something else), `--cpus` how many CPUs (default: all). Use the same `--prefix` and `--etc` as on the control machine: `services.yaml` names `node_binary` and `cluster_token_file` by path, and every machine must find them there. The installer puts the binaries, the bridge and a venv with the pinned Ray version in place, starts Ray as a worker of the head (`deploy/ray-start.sh worker`, with fixed ports) and installs the cron watchdog that brings it back after a crash or a reboot.
-4. **Network:** the machine must reach the head on 6379 and the scheduler's control port 51001 (the control machine binds it to its cluster IP, the one given to `install.sh control --ip`); the other machines must reach it on 6380, 6381, 8080, 52365 and 10002-19999 (Ray) and 31000-31099 (its prover nodes). GPU servers and apps bind 127.0.0.1 on their own machine and need nothing.
-5. **Shared storage, for one-shot runs:** the runs dir (`install.sh --runs-dir`, default `<prefix>/work/runs`) must be the same shared path on every machine that runs them, and so must the roots a run app allows: a run's mounts are paths on the machine it lands on.
-
-Check it: on the control machine `/opt/zkm-fleet/venv/bin/ray status` lists the new node with its GPUs and CPUs; `fleetctl node <name>` shows a prover's `machine` once one runs there.
-
-Place work on it:
-
-- **a prover or a GPU app:** a service in `services.yaml` with `machine: <host name or IP>`, then `deploy/apply.sh`. Without `machine:` Ray picks any machine with the cards free; a replica's cards are always on one machine (a GPU server never spans two).
-- **a run:** `fleetctl job submit --machine <host> …`, or `--nodes N` for one run over N machines (`--machine` repeated N times pins them).
-
-Remove a machine: `fleetctl node drain <name>` for each prover on it (it finishes its job), take its services out of `services.yaml` (or their `machine:` pin) and run `deploy/apply.sh`; then on the machine drop the watchdog line from `crontab -e` and run `<prefix>/venv/bin/ray stop`.
-
 ## Operate
 
-`install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL` and `FLEET_ADMIN_TOKEN_FILE`).
+`install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL`, `FLEET_RUNS_URL` and `FLEET_ADMIN_TOKEN_FILE`, through an SSH tunnel to 9191 and 9192). Every command prints a formatted view; `--json` prints the data.
 
 ```bash
-fleetctl app                                          # apps: proof programs (tenant/ELF, the node each is anchored on) and run profiles (runs.yaml), with their jobs
-fleetctl app add <tenant>/<elf id>                    # a proof app: that tenant's program (or <tenant>/ --elf FILE, hashed here)
-fleetctl app add <name> --image I --allow /data ...   # a run app (a runs.yaml profile): --user, --max-gpus, --gpu-mem, --shm-gb, --env K=V
-fleetctl app disable <name> | enable <name>           # no new jobs (the queued and running ones finish) / jobs again
-fleetctl app delete <name> --yes                      # an app, once none of its jobs is queued or running
-fleetctl job                                          # jobs, the instances of apps: every active one, then the newest -n of each type (--active, --type proof|run, --app A, --tenant T)
-fleetctl job <id>                                     # one proof job or run
-fleetctl job submit --app <run app> --gpus 1 -- CMD   # a run (see below); job logs / cancel / purge / fetch act on runs
-fleetctl node                                         # prover nodes: cards, machine, ready, reserved for, busy with
+fleetctl app | app NAME | app add … | app disable NAME | app enable NAME | app delete NAME --yes
+fleetctl job | job ID | job submit --app A --gpus 1 -- CMD | job logs ID -f | job fetch ID --out F | job cancel ID | job purge ID
+fleetctl node | node NAME | node drain NAME | node undrain NAME
+fleetctl credential | credential ADDRESS | credential issue … | credential revoke ADDRESS
 ```
 
-| task | how |
-|---|---|
-| add / change provers | edit `/etc/zkm-fleet/services.yaml` (see `deploy/services.example.yaml`), then `/opt/zkm-fleet/deploy/apply.sh`; a changed spec (e.g. a new image digest) drains and replaces that actor; `python -m fleet_bridge apply --dry-run --services ...` only lists what an apply would start, stop or replace |
-| service kinds | `ziren-gpu` / `ziren-cpu` (a prover node, with its GPU server), `app` (below), `runs-api` (below), `hold` (`gpus: N`, no image: keeps the next free cards from the services listed after it while they start, so on one machine the order of the file decides which cards each gets) |
-| a GPU app (ComfyUI, an inference server) | a `kind: app` service: a container on one card, serving on `port_base` + replica index, its data mounted at the same paths; `python -m fleet_bridge render --services … --actor <name>-0 --gpus <card>` prints the `docker run` to try it by hand |
-| a one-shot GPU job (training) | a profile in `/etc/zkm-fleet/runs.yaml` (see `deploy/runs.example.yaml`), then from any machine that reaches the runs API: `fleetctl job submit --app P --gpus 1 --cpus 16 --gpu-mem 20 --mount PATH:ro -- CMD` (the run app P is a runs.yaml profile) (or `/opt/zkm-fleet/deploy/run.sh submit ...` on the control machine). It queues until a card is free and has the memory, runs capped at its CPUs, writes to its own `{out}`, frees the card on exit. `--gpus 0.5` shares a card, `--nodes N` spreads it over N machines, `--after ID` / `--retry N` / `--restart-on-oom N` sequence and retry, `--code git:REPO@REF` or a `.tar.gz` under the app's allowed roots, or a local `.tar.gz` (fleetctl uploads it), pins the code. `fleetctl job` (the list), `job ID`, `job logs ID -f`, `job fetch ID --out F`, `job cancel ID`, `job purge ID`. States: `waiting_dependency`, `queued`, `waiting_vram`, `running`, `retrying`, then `succeeded` / `failed` / `cancelled`, or `lost` (its actor is gone; `cancel` removes its container) |
-| apps | `fleetctl app` (the list). `app add TENANT/ELF_ID` registers a proof app (`TENANT/ --elf FILE` hashes a local ELF); `app add NAME --image I --allow ROOT …` writes a profile into `runs.yaml` (the file's other text, comments included, stays as it was; the result is re-read before it is written). `app disable NAME` makes the app refuse new jobs while the queued and running ones finish (a proof app: the scheduler answers InvalidParameter; a run app: `disabled: true` in its profile); `app enable NAME` undoes it. `app delete NAME` says what it would delete, `--yes` deletes it once none of its jobs is queued or running: a proof app goes with its job records, inputs and proofs, its anchor and its ELF (unless another tenant uses it); a run app's profile is cut out of `runs.yaml` and its past runs stay. The lower-risk order is disable, wait for the jobs to end, delete |
-| the runs API | a `kind: runs-api` service (on the control machine, `127.0.0.1:9192` by default, the admin token); `fleetctl job` talks to it for runs (`--runs-url` / `FLEET_RUNS_URL`). From another machine: `ssh -N -L 9191:127.0.0.1:9191 -L 9192:127.0.0.1:9192 <control machine>` and the admin token in `~/.config/zkm-fleet/admin.token` |
-| nodes | `fleetctl node` (the list), `node drain <name>` (finishes its job), later `undrain` |
-| output | every `fleetctl` command prints a formatted view; `--json` prints the data as JSON |
-| tenants | `/etc/zkm-fleet/fleet.yaml` (class, anchoring, allowed backends, `nodes` (name prefixes that may run it, for a tenant tied to one prover configuration), queue cap), then `docker compose -p zkm-fleet restart scheduler` |
-| a client | `fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 --tls-dir /etc/zkm-fleet/tls --out ethproofs.env`; the client runs `set -a; . ./ethproofs.env; set +a` and calls the SDK as before |
-| revoke | `fleetctl credential revoke <address>` |
-| logs | `docker compose -p zkm-fleet logs scheduler`; prover nodes: `<workdir>/logs/<actor>.node.log` (`/opt/zkm-fleet/work/logs` by default); GPU servers: `docker logs fleet-gpu-<actor>`; apps: `docker logs fleet-app-<actor>`; runs: `fleetctl job logs ID` |
-| upgrade the scheduler | `git pull`, rebuild, `docker compose -p zkm-fleet up -d --build scheduler`; clients and running proofs ride through it. On start the scheduler brings Postgres to its schema version (one transaction; `fleet_schema` records it); an older scheduler refuses a newer schema, so a downgrade needs the database from before |
+The how-tos are the skills in [`.claude/skills/`](.claude/skills): [fleet-apps](.claude/skills/fleet-apps/SKILL.md) (apps: a job runs only for an existing one; registering a new program before a client uses it), [fleet-jobs](.claude/skills/fleet-jobs/SKILL.md) (runs: submit, watch, fetch, clean up), [fleet-operate](.claude/skills/fleet-operate/SKILL.md) (services, nodes, adding a machine, tenants, credentials, logs, upgrades). Claude Code loads them when working in this repository; they read as documentation too.
 
 ## Data
 
