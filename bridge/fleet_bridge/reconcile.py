@@ -18,13 +18,25 @@ GOAT on 0, EthProofs on 2-7 and leaves 1 for one-shot runs.
 An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
 server): see GpuApp and deploy/services.example.yaml.
 
-Each replica gets its own placement group with one STRICT_PACK bundle, so all
-of a GPU server's cards land on one machine.
+Each replica gets its own placement group with one STRICT_PACK bundle: its
+cards, CPUs and memory all come from ONE machine (Ray never splits a replica's
+cards across machines: two machines with 4 free cards each cannot host an
+8-card replica). Ray picks the machine unless the service names one
+(`machine: <host name or IP>`, pinned through Ray's per-node resource).
+Services start one after another, each waiting for its placement group and its
+health check (`pg.ready()` gives up after 15 min and the next apply retries),
+so the order also decides which cards the later ones get. A `hold` steers card
+choice only on a single machine (Ray hands out the lowest free cards there); it
+is no affinity guarantee across machines.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
+import urllib.request
 
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
@@ -63,6 +75,11 @@ def _bundle(spec: dict) -> dict:
         b["GPU"] = float(spec.get("gpus", 1))
     if spec.get("memory_gb"):
         b["memory"] = float(spec["memory_gb"]) * 2**30
+    if spec.get("machine"):
+        # Ray's per-node resource: the replica can only be placed on that machine.
+        from .runs import _machine_resource
+
+        b[_machine_resource(spec["machine"])] = 0.001
     return b
 
 
@@ -115,23 +132,77 @@ def stop(name: str):
         pass
 
 
+class _Scheduler:
+    """Drains a prover node through the scheduler's admin API before its actor stops,
+    so no proof is cut off: the scheduler sends it nothing new and its job in flight
+    finishes; jobs queue meanwhile. Without the admin token (or a reachable
+    scheduler) replacing falls back to stopping at once."""
+
+    def __init__(self, cfg: dict):
+        self.url = cfg.get("scheduler_admin", "http://127.0.0.1:9191").rstrip("/") + "/admin"
+        token_file = cfg.get("admin_token_file") or os.path.join(
+            os.path.dirname(cfg.get("cluster_token_file", "/etc/zkm-fleet/x")), "admin.token")
+        try:
+            self.token = open(token_file).read().strip()
+        except OSError:
+            self.token = None
+        self.timeout_s = float(cfg.get("drain_timeout_s", 900))
+
+    def _call(self, method: str, path: str):
+        req = urllib.request.Request(self.url + path, method=method, headers={"Authorization": f"Bearer {self.token}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            body = r.read()
+        return json.loads(body) if body.strip().startswith(b"{") else None
+
+    def drain(self, name: str) -> bool:
+        """True once `name` takes no job and has none running."""
+        if not self.token:
+            return False
+        try:
+            self._call("POST", f"/nodes/{name}/drain")
+            deadline = time.time() + self.timeout_s
+            while time.time() < deadline:
+                nodes = {n["name"]: n for n in self._call("GET", "/status").get("nodes", [])}
+                if name not in nodes or not nodes[name].get("busy"):
+                    log.info("%s drained", name)
+                    return True
+                time.sleep(2)
+            log.warning("%s still busy after %.0f s; replacing anyway", name, self.timeout_s)
+        except Exception as e:
+            log.warning("draining %s: %s; replacing without draining", name, e)
+        return False
+
+    def undrain(self, name: str):
+        if self.token:
+            try:
+                self._call("DELETE", f"/nodes/{name}/drain")
+            except Exception as e:
+                log.warning("undraining %s: %s (run: fleetctl node undrain %s)", name, e, name)
+
+
 def reconcile_once(cfg: dict) -> dict:
     want = _replica_specs(cfg)
     have = _running()
     report = {"started": [], "stopped": [], "replaced": [], "healthy": [], "unhealthy": [], "held": []}
+    report["_scheduler"] = _Scheduler(cfg)
     try:
         _reconcile(want, have, report)
     finally:
         # Holds only steer which cards the services after them get; release them.
         for pg in report.pop("_holds", []):
             remove_placement_group(pg)
+        report.pop("_scheduler", None)
     return report
 
 
 def _reconcile(want: dict, have: dict, report: dict):
+    sched = report["_scheduler"]
     for name in sorted(set(have) - set(want)):
         log.info("stopping %s (no longer wanted)", name)
+        drained = sched.drain(name)
         stop(name)
+        if drained:
+            sched.undrain(name)  # the name is free for a later replica
         report["stopped"].append(name)
     # In the order of the services file: on one machine Ray hands out the lowest free
     # cards, so the order decides which service gets which cards.
@@ -169,7 +240,8 @@ def _reconcile(want: dict, have: dict, report: dict):
             report["unhealthy"].append(name)
             continue
         if h.get("spec") != spec_hash(spec):
-            log.info("replacing %s (spec changed)", name)
+            log.info("replacing %s (spec changed): draining first", name)
+            drained = sched.drain(name)
             stop(name)
             try:
                 start(spec)
@@ -178,6 +250,9 @@ def _reconcile(want: dict, have: dict, report: dict):
                 log.error("restarting %s failed: %s", name, e)
                 stop(name)
                 report["unhealthy"].append(name)
+            finally:
+                if drained:
+                    sched.undrain(name)
         else:
             report["healthy"].append(name)
     return report
