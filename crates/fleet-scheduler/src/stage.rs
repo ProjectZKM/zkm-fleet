@@ -71,7 +71,25 @@ impl StageApi {
         let _ = self.fleet.submit(job).await;
     }
 
-    async fn generate(&self, req: GenerateProofRequest) -> GenerateProofResponse {
+    /// The tenant of the client certificate the gateway verified, when the scheduler takes
+    /// identity from it (`client_cert_identity`); Ok(None) when it does not.
+    fn cert_tenant(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<String>, Status> {
+        if !self.fleet.cfg.client_cert_identity {
+            return Ok(None);
+        }
+        let header = md
+            .get(XFCC)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| Status::permission_denied("no client certificate"))?;
+        let cn = cert_subject_cn(header)
+            .ok_or_else(|| Status::permission_denied("the client certificate names no credential"))?;
+        self.fleet
+            .tenant_for_signer(&cn)
+            .map(Some)
+            .ok_or_else(|| Status::permission_denied("the client certificate's credential is unknown or revoked"))
+    }
+
+    async fn generate(&self, req: GenerateProofRequest, cert: Option<String>) -> GenerateProofResponse {
         let id = req.proof_id.clone();
         if !is_safe_id(&id) {
             return self.reject(
@@ -113,6 +131,12 @@ impl StageApi {
                     .ok_or_else(|| fail(StageStatus::InvalidParameter, "permission denied"))?,
                 None => return Err(fail(StageStatus::InvalidParameter, "permission denied")),
             };
+            if cert.as_ref().is_some_and(|c| *c != tenant) {
+                return Err(fail(
+                    StageStatus::InvalidParameter,
+                    "the client certificate and the signature belong to different tenants",
+                ));
+            }
             let tcfg = self
                 .fleet
                 .cfg
@@ -192,14 +216,22 @@ impl StageApi {
         }
     }
 
-    async fn status(&self, id: &str) -> GetStatusResponse {
-        self.fleet
-            .wait_terminal(id, Duration::from_millis(self.fleet.cfg.long_poll_ms))
-            .await;
+    async fn status(&self, id: &str, cert: Option<String>) -> GetStatusResponse {
         let mut resp = GetStatusResponse {
             proof_id: id.to_string(),
             ..Default::default()
         };
+        // Another tenant's proof is answered like an unknown one (and at once, so the
+        // wait does not tell that it exists).
+        if let Some(t) = &cert {
+            if !matches!(self.fleet.job(id).await, Ok(Some(j)) if j.tenant == *t) {
+                resp.status = StageStatus::Unspecified as i32;
+                return resp;
+            }
+        }
+        self.fleet
+            .wait_terminal(id, Duration::from_millis(self.fleet.cfg.long_poll_ms))
+            .await;
         let job = match self.fleet.job(id).await {
             Ok(Some(j)) => j,
             Ok(None) => {
@@ -231,9 +263,10 @@ impl StageApi {
                     resp.step = Step::End as i32;
                     resp.proof_with_public_inputs = proof;
                     resp.public_values_url = format!(
-                        "{}/{}/wrap/public_values.bin",
+                        "{}/{}/wrap/public_values.bin?key={}",
                         self.fleet.cfg.public_url.trim_end_matches('/'),
-                        id
+                        id,
+                        self.fleet.public_values_key(id)
                     );
                     resp.total_steps = job.cycles;
                     resp.proving_time = job.prove_ms;
@@ -255,22 +288,47 @@ impl StageService for StageApi {
         &self,
         request: Request<GenerateProofRequest>,
     ) -> Result<Response<GenerateProofResponse>, Status> {
-        Ok(Response::new(self.generate(request.into_inner()).await))
+        let cert = self.cert_tenant(request.metadata())?;
+        Ok(Response::new(self.generate(request.into_inner(), cert).await))
     }
 
     async fn get_status(
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
+        let cert = self.cert_tenant(request.metadata())?;
         Ok(Response::new(
-            self.status(&request.into_inner().proof_id).await,
+            self.status(&request.into_inner().proof_id, cert).await,
         ))
     }
+}
+
+/// The header the gateway sets from the verified client certificate.
+pub const XFCC: &str = "x-forwarded-client-cert";
+
+/// The CN of the certificate subject in an Envoy `x-forwarded-client-cert` value
+/// (`Hash=...;Subject="CN=0xabc...,O=..."`), lower-cased.
+pub fn cert_subject_cn(header: &str) -> Option<String> {
+    let start = header.find("Subject=\"")? + "Subject=\"".len();
+    let subject = &header[start..start + header[start..].find('"')?];
+    subject
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("CN="))
+        .map(|cn| cn.trim().to_ascii_lowercase())
+        .filter(|cn| !cn.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_certificate_subject_cn_is_read_from_envoys_header() {
+        let h = r#"Hash=3a1b;Subject="CN=0x8080B0BD27ab81883e976cbecdbd63e66f920404,O=zkm-fleet""#;
+        assert_eq!(cert_subject_cn(h).as_deref(), Some("0x8080b0bd27ab81883e976cbecdbd63e66f920404"));
+        assert_eq!(cert_subject_cn("Hash=3a1b").as_deref(), None);
+        assert_eq!(cert_subject_cn(r#"Subject="O=x""#).as_deref(), None);
+    }
 
     #[test]
     fn steps_map_to_kinds_like_the_sdk_sets_them() {

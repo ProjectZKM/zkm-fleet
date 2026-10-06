@@ -290,7 +290,9 @@ enum InitCmd {
         #[arg(long, value_delimiter = ',', default_value = "stage")]
         names: Vec<String>,
     },
-    /// Issue a client certificate signed by the CA in `dir` (credential issue --tls-dir does this too).
+    /// Issue a client certificate signed by the CA in `dir`. The stage API takes a client's
+    /// identity from its certificate's CN, so a certificate for a client is issued with its
+    /// credential (`credential issue --tls-dir`); this one is for other uses.
     TlsClient {
         #[arg(long)]
         dir: PathBuf,
@@ -458,8 +460,9 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
                 ("ZKM_PROOF_POLL_INTERVAL", "100".to_string()),
             ];
             if let Some(dir) = tls_dir {
-                let name = format!("{tenant}-{}", &format!("{address:x}")[..8]);
-                let (cert, key_path) = tls_client(dir, &name)?;
+                // its CN is the credential: the scheduler maps it to the tenant (and a
+                // revoked credential's certificate is refused with it)
+                let (cert, key_path) = tls_client(dir, &format!("{address:#x}"))?;
                 env.push(("CA_CERT_PATH", abs(&dir.join("ca.pem"))?));
                 env.push(("SSL_CERT_PATH", abs(&cert)?));
                 env.push(("SSL_KEY_PATH", abs(&key_path)?));

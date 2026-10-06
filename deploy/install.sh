@@ -151,6 +151,10 @@ if [ "$ROLE" = control ]; then
     awk '/^tls:/{skip=1; next} skip && /^[[:space:]]/{next} {skip=0; print}' "$ETC/fleet.yaml" > "$ETC/fleet.yaml.new"
     mv "$ETC/fleet.yaml.new" "$ETC/fleet.yaml"
   fi
+  if [ "$TLS" = 1 ] && ! grep -q '^client_cert_identity:' "$ETC/fleet.yaml"; then
+    # the gateway verifies client certificates: GetStatus answers only the submitting tenant
+    echo "client_cert_identity: true" >> "$ETC/fleet.yaml"
+  fi
   if [ "$TLS" = 1 ]; then
     STAGE_TLS='          transport_socket:
             name: envoy.transport_sockets.tls

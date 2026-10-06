@@ -62,9 +62,19 @@ fn internal(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
 }
 
-/// Unauthenticated, as the SDK fetches it with a plain GET; the proof id is an unguessable uuid.
-async fn public_values(State(s): State<HttpState>, Path(proof_id): Path<String>) -> Response {
-    if !is_safe_id(&proof_id) {
+#[derive(Deserialize)]
+struct PublicValuesQuery {
+    key: Option<String>,
+}
+
+/// The SDK fetches this with a plain GET of the URL GetStatus gave it, which carries the
+/// proof's key: only the caller GetStatus answered can read it.
+async fn public_values(
+    State(s): State<HttpState>,
+    Path(proof_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PublicValuesQuery>,
+) -> Response {
+    if !is_safe_id(&proof_id) || !s.fleet.public_values_open(&proof_id, q.key.as_deref()).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     match s.fleet.blobs.get(&proof_id, blobs::PUBLIC_VALUES) {

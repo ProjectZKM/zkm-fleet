@@ -43,6 +43,13 @@ pub struct Config {
     /// Tenant for unsigned or unknown requests when `require_signature` is false.
     #[serde(default)]
     pub default_tenant: Option<String>,
+    /// Take the caller's identity from the client certificate the gateway verified and
+    /// forwarded (`x-forwarded-client-cert`, its CN a credential's address): GetStatus
+    /// answers only the tenant that submitted the proof, and a request whose certificate
+    /// and signature name different tenants is refused. Only with the gateway's mutual
+    /// TLS in front (it strips the header from clients), never with the stage port open.
+    #[serde(default)]
+    pub client_cert_identity: bool,
     pub tenants: Vec<TenantConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,

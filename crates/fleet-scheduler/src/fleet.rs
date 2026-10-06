@@ -169,6 +169,29 @@ impl Fleet {
     }
 
     /// Tenant of a request signer: a live credential, else an address listed in the config.
+    /// The key a public values URL carries: an HMAC of the proof id under a secret derived
+    /// from the cluster token, so the URL works only for whoever GetStatus gave it to.
+    pub fn public_values_key(&self, proof_id: &str) -> String {
+        use hmac::Mac;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(
+            format!("zkm-fleet public values\0{}", self.cluster_token).as_bytes(),
+        )
+        .expect("HMAC takes any key length");
+        mac.update(proof_id.as_bytes());
+        hex::encode(&mac.finalize().into_bytes()[..16])
+    }
+
+    /// Whether `key` opens this proof's public values. Proofs finished before this
+    /// scheduler started were handed out without a key and stay readable without one.
+    pub async fn public_values_open(&self, proof_id: &str, key: Option<&str>) -> bool {
+        if let Some(k) = key {
+            use subtle_eq::ConstantTimeEq;
+            return k.as_bytes().ct_eq(self.public_values_key(proof_id).as_bytes());
+        }
+        let started = now_ms().saturating_sub(self.started.elapsed().as_millis() as u64);
+        matches!(self.job(proof_id).await, Ok(Some(j)) if j.finished_ms.is_some_and(|f| f < started))
+    }
+
     pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
         let a = normalize_address(address);
         if let Some(c) = self.creds.lock().get(&a) {
@@ -851,5 +874,17 @@ mod tests {
         assert_eq!(c(tonic::Code::Unknown, "panicked"), Failure::Prover);
         let gpu_gone = "Internal error: io error: CUDA RPC `prove_core_stateless` failed: error sending request for url (http://127.0.0.1:30101/twirp/api.ProverService/ProveCoreStateless)";
         assert_eq!(c(tonic::Code::Internal, gpu_gone), Failure::NotStarted);
+    }
+}
+
+/// Constant-time comparison for keys and tokens.
+mod subtle_eq {
+    pub trait ConstantTimeEq {
+        fn ct_eq(&self, other: &Self) -> bool;
+    }
+    impl ConstantTimeEq for [u8] {
+        fn ct_eq(&self, other: &[u8]) -> bool {
+            self.len() == other.len() && self.iter().zip(other).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+        }
     }
 }

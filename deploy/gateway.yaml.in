@@ -19,6 +19,11 @@ static_resources:
                 stat_prefix: stage
                 codec_type: HTTP2
                 request_timeout: 0s
+                # The verified client certificate's subject goes to the scheduler as
+                # x-forwarded-client-cert (its CN names the credential); a header a client
+                # sends itself is dropped. The scheduler reads it with client_cert_identity.
+                forward_client_cert_details: SANITIZE_SET
+                set_current_client_cert_details: { subject: true }
                 route_config:
                   virtual_hosts:
                     - name: stage

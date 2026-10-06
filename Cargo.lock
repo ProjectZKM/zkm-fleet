@@ -2499,6 +2499,7 @@ dependencies = [
  "clap",
  "fleet-proto",
  "hex",
+ "hmac",
  "k256",
  "parking_lot",
  "serde",

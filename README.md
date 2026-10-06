@@ -66,10 +66,20 @@ fleetctl status                                       # queue, nodes, anchors
 | what | held by | issued by |
 |---|---|---|
 | tenant signing key (`ZKM_PRIVATE_KEY`) | the client | `fleetctl credential issue`: generated on the operator's machine, only the address is registered, revocable |
-| client certificate (`SSL_CERT_PATH` / `SSL_KEY_PATH`) | the client | the same command with `--tls-dir`. The SDK only enables TLS when it has a client certificate, so the stage API runs mutual TLS |
+| client certificate (`SSL_CERT_PATH` / `SSL_KEY_PATH`) | the client | the same command with `--tls-dir`; its CN is the credential's address. The SDK only enables TLS when it has a client certificate, so the stage API runs mutual TLS |
 | stage server certificate + CA | gateway; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl init tls`) |
 | cluster token | scheduler and every node, both directions | `install.sh` (`fleetctl init token`) |
 | admin token | operators | `install.sh` (`fleetctl init token`) |
+
+A proof request is the tenant's by its signature (`ZKM_PRIVATE_KEY`; the SDK signs every
+`GenerateProof`). The SDK's `GetStatus` carries no signature, so with mutual TLS the
+caller is known by its certificate instead: the gateway forwards the verified subject,
+and with `client_cert_identity: true` (set by `install.sh` with TLS) the scheduler
+answers `GetStatus` only for the tenant that submitted the proof, refuses a request
+whose certificate and signature name different tenants, and a revoked credential's
+certificate with it. The public values URL `GetStatus` returns carries a per-proof key.
+Without TLS (a stage port bound to `127.0.0.1`), a proof id is the only thing that
+opens its result.
 
 What the SDK's scheme leaves open: the request signature covers `proof_id&seg_size` only, not the ELF or the input, so mutual TLS is what protects the payload; a proof id is single-use (a resubmission returns the existing job). `GetStatus` and the public-values URL carry no credential, as the SDK sends none there; proof ids are random UUIDs.
 

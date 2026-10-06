@@ -90,6 +90,11 @@ struct Harness {
 }
 
 async fn start() -> Harness {
+    start_with("").await
+}
+
+/// A scheduler with extra top-level config lines (e.g. `client_cert_identity: true`).
+async fn start_with(extra: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("cluster.token"), TOKEN).unwrap();
     std::fs::write(dir.path().join("admin.token"), ADMIN).unwrap();
@@ -107,6 +112,7 @@ max_attempts: 2
 default_tenant: eth
 cluster_token_file: {d}/cluster.token
 admin_token_file: {d}/admin.token
+{extra}
 tenants:
   - name: eth
     class: latency
@@ -248,6 +254,12 @@ async fn a_job_runs_end_to_end_and_its_public_values_are_served() {
         .output()
         .unwrap();
     assert_eq!(pv.stdout, vec![7, 7, 7]);
+    let (keyless, _) = s.public_values_url.split_once('?').unwrap();
+    let wrong = format!("{keyless}?key={}", "0".repeat(32));
+    for url in [keyless, wrong.as_str()] {
+        let st = std::process::Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", url]).output().unwrap();
+        assert_eq!(String::from_utf8(st.stdout).unwrap(), "404", "{url} opened without the proof's key");
+    }
     let again = h
         .stage
         .generate_proof(request("job-1", b"something else"))
@@ -363,4 +375,86 @@ async fn the_control_api_refuses_a_node_without_the_cluster_token() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
+}
+
+const ETH_ADDR: &str = "0x1111111111111111111111111111111111111111";
+const GOAT_ADDR: &str = "0x2222222222222222222222222222222222222222";
+
+fn credential(h: &Harness, tenant: &str, address: &str) {
+    let out = std::process::Command::new("curl")
+        .args(["-sf", "-X", "POST", "-H", &format!("authorization: Bearer {ADMIN}"), "-H", "content-type: application/json"])
+        .args(["-d", &format!(r#"{{"tenant":"{tenant}","address":"{address}"}}"#), &format!("{}/admin/credentials", h.http)])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A request as the gateway forwards it after verifying a client certificate.
+fn with_cert<T>(msg: T, cn: Option<&str>) -> Request<T> {
+    let mut r = Request::new(msg);
+    if let Some(cn) = cn {
+        let v = format!(r#"Hash=ab12;Subject="CN={cn},O=zkm-fleet""#);
+        r.metadata_mut().insert("x-forwarded-client-cert", v.parse().unwrap());
+    }
+    r
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_client_cert_identity_only_the_submitting_tenant_sees_a_proof() {
+    let mut h = start_with("client_cert_identity: true").await;
+    credential(&h, "eth", ETH_ADDR);
+    credential(&h, "goat", GOAT_ADDR);
+    add_node(&h, "gpu-a", 2, false).await;
+    // unsigned requests fall to the default tenant (eth): an eth certificate may send them
+    let r = h.stage.generate_proof(with_cert(request("job-c", b"elf-c"), Some(ETH_ADDR))).await.unwrap().into_inner();
+    assert_eq!(r.status, S::Computing as i32);
+    // a goat certificate on an eth request is refused
+    let mismatch = h.stage.generate_proof(with_cert(request("job-m", b"elf-m"), Some(GOAT_ADDR))).await.unwrap().into_inner();
+    assert_eq!(mismatch.status, S::InvalidParameter as i32);
+    // the owner sees it finish; the other tenant sees nothing; no certificate or an unknown one is refused
+    let mut done = None;
+    for _ in 0..40 {
+        let s = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(ETH_ADDR))).await.unwrap().into_inner();
+        if s.status != S::Computing as i32 {
+            done = Some(s);
+            break;
+        }
+    }
+    let done = done.expect("job-c never finished");
+    assert_eq!(done.status, S::Success as i32);
+    let other = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(GOAT_ADDR))).await.unwrap().into_inner();
+    assert_eq!(other.status, S::Unspecified as i32, "another tenant sees an unknown proof");
+    assert!(other.proof_with_public_inputs.is_empty() && other.public_values_url.is_empty());
+    let none = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, None)).await.unwrap_err();
+    assert_eq!(none.code(), tonic::Code::PermissionDenied);
+    let unknown = h
+        .stage
+        .get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some("0x3333333333333333333333333333333333333333")))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code(), tonic::Code::PermissionDenied);
+    // revoking the credential revokes its certificate
+    let out = std::process::Command::new("curl")
+        .args(["-sf", "-X", "DELETE", "-H", &format!("authorization: Bearer {ADMIN}")])
+        .arg(format!("{}/admin/credentials/{}", h.http, ETH_ADDR.trim_start_matches("0x")))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let revoked = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(ETH_ADDR))).await.unwrap_err();
+    assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_client_cert_identity_a_forged_header_is_ignored() {
+    let mut h = start().await;
+    add_node(&h, "gpu-a", 2, false).await;
+    h.stage.generate_proof(request("job-f", b"elf-f")).await.unwrap();
+    wait_done(&mut h, "job-f").await;
+    let s = h
+        .stage
+        .get_status(with_cert(GetStatusRequest { proof_id: "job-f".into() }, Some(GOAT_ADDR)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(s.status, S::Success as i32);
 }
