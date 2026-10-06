@@ -30,6 +30,7 @@ pub fn router(state: HttpState) -> Router {
             "/credentials/:address",
             axum::routing::delete(revoke_credential),
         )
+        .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -113,15 +114,27 @@ async fn revoke_credential(State(s): State<HttpState>, Path(address): Path<Strin
     }
 }
 
+#[derive(Deserialize)]
+struct JobsQuery {
+    tenant: Option<String>,
+    #[serde(default = "default_jobs_limit")]
+    limit: usize,
+}
+
+fn default_jobs_limit() -> usize {
+    20
+}
+
+async fn jobs(State(s): State<HttpState>, axum::extract::Query(q): axum::extract::Query<JobsQuery>) -> Response {
+    match s.fleet.recent_jobs(q.tenant.as_deref(), q.limit.min(1000)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
 async fn job(State(s): State<HttpState>, Path(id): Path<String>) -> Response {
     match s.fleet.job(&id).await {
-        Ok(Some(j)) => Json(serde_json::json!({
-            "id": j.id, "tenant": j.tenant, "elf_id": j.elf_id, "kind": format!("{:?}", j.kind),
-            "state": format!("{:?}", j.state), "error": j.error, "node": j.node, "attempts": j.attempts,
-            "failed_on": j.failed_on, "cycles": j.cycles, "prove_ms": j.prove_ms,
-            "created_ms": j.created_ms, "started_ms": j.started_ms, "finished_ms": j.finished_ms,
-        }))
-        .into_response(),
+        Ok(Some(j)) => Json(j).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => internal(e),
     }

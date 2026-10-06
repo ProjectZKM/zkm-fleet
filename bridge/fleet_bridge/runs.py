@@ -75,15 +75,16 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .rayapi import alive_nodes, current_placement_group, node_ip, nodes
-from .model import (Attempt, Bundle, CardState, Cause, CodeRecord, GangEnv, Holder, Mount, MountMode, Profile,
-                    RankInfo, Record, RunArgs, RunsConfig, RunSpec, RunState, RunStatus, argparser, from_args,
-                    from_dict, to_env)
+from .model import (Attempt, Bundle, CardState, Cause, CodeRecord, GangEnv, Holder, LogChunk, Mount, MountMode,
+                    Profile, RankInfo, Record, RunArgs, RunsConfig, RunSpec, RunState, RunStatus, argparser,
+                    from_args, from_dict, to_env)
 
 NAMESPACE = "zkm-fleet"
 NETWORK_FS = ("nfs", "cifs", "smb2", "smb3", "ceph", "lustre", "gpfs", "beegfs", "glusterfs", "fuse")
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
                      r"|CUDA error: out of memory", re.I)
 SPEC_FILE, STATUS_FILE, OUT_DIR, CODE_DIR, LOG_FILE, METRICS_FILE = "spec.json", "status.json", "out", "code", "log", "metrics.jsonl"
+UPLOADS_DIR = ".uploads"  # code tarballs sent through the runs API
 
 
 def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -195,16 +196,25 @@ class RunDir:
         return None
 
 
+# Actor names of runs (the run, its other ranks, its --after waiter). The services'
+# reconciler leaves every actor with these prefixes alone, and refuses services named so.
+RUN_ACTOR_PREFIX, WAIT_ACTOR_PREFIX = "run-", "wait-"
+
+
+def is_run_actor(name: str) -> bool:
+    return name.startswith((RUN_ACTOR_PREFIX, WAIT_ACTOR_PREFIX))
+
+
 def container_name(run_id: str, rank: int = 0) -> str:
     return f"fleet-run-{run_id}" + (f"-r{rank}" if rank else "")
 
 
 def actor_name(run_id: str, rank: int = 0) -> str:
-    return f"run-{run_id}" + (f"-r{rank}" if rank else "")
+    return f"{RUN_ACTOR_PREFIX}{run_id}" + (f"-r{rank}" if rank else "")
 
 
 def waiter_name(run_id: str) -> str:
-    return f"wait-{run_id}"
+    return f"{WAIT_ACTOR_PREFIX}{run_id}"
 
 
 def pg_name(run_id: str) -> str:
@@ -774,33 +784,42 @@ def cancel(a: RunArgs, run_id: str) -> RunStatus:
     return st
 
 
+def log_chunk(runs_dir: str, run_id: str, rank: int = 0, offset: int | None = None, lines: int = 50,
+              max_bytes: int = 4 << 20) -> LogChunk:
+    """The run's output: with no offset its last `lines` lines, else what was written
+    after `offset` (at most max_bytes); `offset` of the result is where to go on."""
+    run = RunDir(runs_dir, run_id)
+    log_path = run.spec().rank_log_path(rank)
+    size = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    if offset is None:
+        data = "\n".join(_tail(log_path, 1 << 20).splitlines()[-lines:])
+        data, end = (data + "\n" if data else ""), size
+    else:
+        start = min(offset, size)
+        with open(log_path, "rb") if size else io.BytesIO() as f:
+            f.seek(start)
+            raw = f.read(max_bytes)
+        data, end = raw.decode(errors="replace"), start + len(raw)
+    done = end >= size and (run.state() or RunState.LOST).terminal
+    return LogChunk(data=data, offset=end, done=done)
+
+
 def logs(a: RunArgs, run_id: str) -> None:
     """The run's output: the last -n lines, then with -f everything new until it ends."""
-    run = RunDir(a.runs_dir, run_id)
-    log_path = run.spec().rank_log_path(a.rank)
-    for line in _tail(log_path, 1 << 20).splitlines()[-a.lines:]:
-        print(line)
-    if not a.follow:
-        return
-    pos = os.path.getsize(log_path) if os.path.exists(log_path) else 0
-    while True:
-        if os.path.exists(log_path) and os.path.getsize(log_path) > pos:
-            with open(log_path, "rb") as f:
-                f.seek(pos)
-                chunk = f.read()
-            pos += len(chunk)
-            sys.stdout.write(chunk.decode(errors="replace"))
-            sys.stdout.flush()
-        elif (run.state() or RunState.LOST).terminal:
-            return
-        else:
+    chunk = log_chunk(a.runs_dir, run_id, a.rank, None, a.lines)
+    sys.stdout.write(chunk.data)
+    while a.follow and not chunk.done:
+        chunk = log_chunk(a.runs_dir, run_id, a.rank, chunk.offset)
+        sys.stdout.write(chunk.data)
+        sys.stdout.flush()
+        if not chunk.data:
             time.sleep(1)
 
 
-def fetch(a: RunArgs, run_id: str) -> None:
-    """out/ as a tar.gz on stdout: `ssh box run.sh fetch ID > out.tgz`."""
+def fetch(a: RunArgs, run_id: str, out: Any = None) -> None:
+    """out/ as a tar.gz, to `out` (a binary stream; stdout by default): `run.sh fetch ID > out.tgz`."""
     run = RunDir(a.runs_dir, run_id)
-    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as t:
+    with tarfile.open(fileobj=out or sys.stdout.buffer, mode="w|gz") as t:
         t.add(run.out, arcname=f"{run_id}/{OUT_DIR}")
 
 
@@ -825,8 +844,12 @@ def purge(a: RunArgs, run_id: str | None) -> list[Purged]:
         targets = [RunDir(a.runs_dir, run_id)]
     elif a.older_than is not None:
         cut = time.time() - a.older_than * 86400
-        targets = [RunDir(a.runs_dir, d) for d in os.listdir(a.runs_dir)
-                   if os.path.isdir(os.path.join(a.runs_dir, d)) and os.path.getmtime(os.path.join(a.runs_dir, d)) < cut]
+        targets = [RunDir(a.runs_dir, d) for d in os.listdir(a.runs_dir) if not d.startswith(".")
+                   and os.path.isdir(os.path.join(a.runs_dir, d)) and os.path.getmtime(os.path.join(a.runs_dir, d)) < cut]
+        uploads = os.path.join(a.runs_dir, UPLOADS_DIR)
+        for name in os.listdir(uploads) if os.path.isdir(uploads) else []:
+            if os.path.getmtime(os.path.join(uploads, name)) < cut:
+                os.remove(os.path.join(uploads, name))
     else:
         raise SystemExit("purge ID, or purge --older-than DAYS")
     done = []
@@ -860,7 +883,8 @@ class RunSummary(Record):
 def list_runs(a: RunArgs, n: int = 20) -> list[RunSummary]:
     if not os.path.isdir(a.runs_dir):
         return []
-    ids = sorted(os.listdir(a.runs_dir), key=lambda d: os.path.getmtime(os.path.join(a.runs_dir, d)), reverse=True)
+    ids = sorted((d for d in os.listdir(a.runs_dir) if not d.startswith(".")),
+                 key=lambda d: os.path.getmtime(os.path.join(a.runs_dir, d)), reverse=True)
     out = []
     for i in ids[:n]:
         try:

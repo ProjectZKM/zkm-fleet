@@ -27,6 +27,14 @@ services:
       ZIREN_FUSE_LEAVES: "1"
       ZIREN_REDUCE_OVERLAP: "1"
       TMPDIR: /dev/shm
+  # One-shot runs over HTTP for `fleetctl run` (admin token): on the machine that holds
+  # the profiles file and the runs dir; 127.0.0.1 unless the network is trusted.
+  - name: runs-api
+    kind: runs-api
+    cpus: 1
+    listen: 127.0.0.1:9192
+    profiles: /etc/zkm-fleet/runs.yaml
+    runs_dir: /var/lib/zkm-fleet/runs
   - name: cpu-wrap
     kind: ziren-cpu
     replicas: 1

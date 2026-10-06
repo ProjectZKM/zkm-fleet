@@ -1,6 +1,8 @@
 """python -m fleet_bridge {apply [--dry-run]|status|down} --services services.yaml [--address 127.0.0.1:6379]
    python -m fleet_bridge render --services services.yaml --actor <name>-<i> --gpus 0[,1]
    python -m fleet_bridge run submit|status|cancel|list|render ...   (one-shot jobs: see runs.py)
+   python -m fleet_bridge runs-api --profiles runs.yaml --runs-dir DIR --listen 127.0.0.1:9192 --admin-token-file F
+                                     (the runs HTTP API in the foreground; as a service: kind runs-api)
 
 apply makes the prover actors match the services file (start, stop, replace on a
 spec change); --dry-run only says what it would do. The actors are detached and Ray
@@ -35,6 +37,15 @@ class BridgeArgs(Record):
     gpus: str = field(default="0", metadata={"help": "render: host cards, e.g. 0 or 2,3"})
 
 
+@dataclass(kw_only=True)
+class ServeArgs(Record):
+    profiles: str
+    runs_dir: str
+    admin_token_file: str
+    listen: str = "127.0.0.1:9192"
+    address: str = field(default="127.0.0.1:6379", metadata={"help": "Ray cluster address"})
+
+
 def _services(path: str) -> ServicesFile:
     with open(path) as f:
         return reconcile.load_services(yaml.safe_load(f) or {})
@@ -45,6 +56,12 @@ def main() -> None:
         from . import runs
 
         return runs.main(sys.argv[2:])
+    if len(sys.argv) > 1 and sys.argv[1] == "runs-api":
+        from . import runs_api
+
+        s = from_args(ServeArgs, argparser(ServeArgs, argparse.ArgumentParser(prog="fleet_bridge runs-api")).parse_args(sys.argv[2:]))
+        ray.init(address=s.address, namespace=reconcile.NAMESPACE, log_to_driver=False)
+        return runs_api.serve(s.profiles, s.runs_dir, s.listen, s.admin_token_file)
     a = from_args(BridgeArgs, argparser(BridgeArgs, argparse.ArgumentParser(prog="fleet_bridge")).parse_args())
     if a.command == "render":
         from .actors import app_command

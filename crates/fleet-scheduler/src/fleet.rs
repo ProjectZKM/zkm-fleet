@@ -300,6 +300,11 @@ impl Fleet {
         self.store.get(id).await
     }
 
+    /// The newest jobs (the store has every one), of one tenant or all.
+    pub async fn recent_jobs(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
+        self.store.recent(tenant, limit).await
+    }
+
     /// Waits up to `timeout` for the job to reach a terminal state.
     pub async fn wait_terminal(&self, id: &str, timeout: Duration) {
         let rx = {

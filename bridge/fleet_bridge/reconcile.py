@@ -2,7 +2,7 @@
 
     services:
       - name: ethproofs-gpu        # replica i runs as actor "<name>-<i>"
-        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold
+        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold | runs-api
         replicas: 1
         gpus: 2
         cpus: 48
@@ -19,7 +19,8 @@ hands out the lowest free cards, so `goat (1) / hold (1) / ethproofs (6)` puts
 GOAT on 0, EthProofs on 2-7 and leaves 1 for one-shot runs.
 
 An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
-server): see GpuApp and deploy/services.example.yaml.
+server): see GpuApp and deploy/services.example.yaml. A `runs-api` serves one-shot
+runs over HTTP for `fleetctl run` (runs_api.py).
 
 Each replica gets its own placement group with one STRICT_PACK bundle: its
 cards, CPUs and memory all come from ONE machine (Ray never splits a replica's
@@ -47,6 +48,7 @@ from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
+from .runs_api import RunsApi
 from .model import ApplyReport, Bundle, ClusterConfig, Health, ReplicaSpec, ServiceKind, ServicesFile
 from .rayapi import actor_node_id
 
@@ -54,7 +56,7 @@ NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
 
 ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, ServiceKind.ZIREN_CPU: ZirenCpuProver,
-                                  ServiceKind.APP: GpuApp}
+                                  ServiceKind.APP: GpuApp, ServiceKind.RUNS_API: RunsApi}
 # the cluster settings a replica's hash covers, as the file names them
 _SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
 
@@ -69,8 +71,12 @@ def replica_specs(file: ServicesFile) -> dict[str, ReplicaSpec]:
     covers."""
     raw_services = {s["name"]: s for s in file.raw.get("services", [])}
     shared = {k: file.raw[k] for k in _SHARED_KEYS if k in file.raw}
+    from .runs import is_run_actor
+
     out: dict[str, ReplicaSpec] = {}
     for svc in file.services:
+        if is_run_actor(svc.name):
+            raise ValueError(f"service {svc.name}: the run-/wait- prefixes are one-shot runs' actor names")
         for i in range(svc.replicas):
             name = f"{svc.name}-{i}"
             config = {**shared, **raw_services[svc.name], "name": name, "kind": svc.kind.value}
@@ -93,7 +99,12 @@ def bundle(spec: ReplicaSpec) -> Bundle:
 
 
 def running() -> dict[str, ActorHandle[Any]]:
-    names = [a["name"] for a in ray.util.list_named_actors(all_namespaces=True) if a["namespace"] == NAMESPACE]
+    """The services' actors: every named actor in the namespace except one-shot runs'
+    (those belong to their runs, not to the services file)."""
+    from .runs import is_run_actor
+
+    names = [a["name"] for a in ray.util.list_named_actors(all_namespaces=True)
+             if a["namespace"] == NAMESPACE and not is_run_actor(a["name"])]
     out = {}
     for n in names:
         try:

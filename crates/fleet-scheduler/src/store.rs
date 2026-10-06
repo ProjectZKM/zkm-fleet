@@ -44,13 +44,16 @@ impl JobState {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A job as the admin API shows it: the record itself, its kind and state by name.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Job {
     /// The SDK's proof_id.
     pub id: String,
     pub tenant: String,
     pub elf_id: String,
+    #[serde(serialize_with = "by_debug_name")]
     pub kind: ProofKind,
+    #[serde(serialize_with = "by_debug_name")]
     pub state: JobState,
     pub error: String,
     /// Node name (stable across node restarts) the job runs or ran on.
@@ -63,6 +66,10 @@ pub struct Job {
     pub created_ms: u64,
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
+}
+
+fn by_debug_name<T: std::fmt::Debug, S: serde::Serializer>(v: &T, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{v:?}"))
 }
 
 /// A signing key registered for a tenant: the SDK's `ZKM_PRIVATE_KEY` maps to its address.
@@ -89,6 +96,8 @@ pub trait Store: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<Job>>;
     /// Queued and running jobs, oldest first, for recovery after a restart.
     async fn incomplete(&self) -> anyhow::Result<Vec<Job>>;
+    /// The newest jobs, of one tenant or all.
+    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>>;
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
     /// Marks the credential revoked; returns false when the address is unknown.
@@ -122,6 +131,19 @@ impl Store for MemoryStore {
             .cloned()
             .collect();
         v.sort_by_key(|j| j.created_ms);
+        Ok(v)
+    }
+
+    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
+        let mut v: Vec<Job> = self
+            .jobs
+            .lock()
+            .values()
+            .filter(|j| tenant.is_none_or(|t| j.tenant == t))
+            .cloned()
+            .collect();
+        v.sort_by_key(|j| std::cmp::Reverse(j.created_ms));
+        v.truncate(limit);
         Ok(v)
     }
 
@@ -263,6 +285,17 @@ impl Store for PgStore {
         let rows = sqlx::query("SELECT * FROM fleet_jobs WHERE state < 2 ORDER BY created_ms")
             .fetch_all(&self.pool)
             .await?;
+        rows.iter().map(Self::row_to_job).collect()
+    }
+
+    async fn recent(&self, tenant: Option<&str>, limit: usize) -> anyhow::Result<Vec<Job>> {
+        let rows = sqlx::query(
+            "SELECT * FROM fleet_jobs WHERE ($1::text IS NULL OR tenant = $1) ORDER BY created_ms DESC LIMIT $2",
+        )
+        .bind(tenant)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(Self::row_to_job).collect()
     }
 

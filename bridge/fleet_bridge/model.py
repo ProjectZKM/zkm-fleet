@@ -487,7 +487,10 @@ class GangEnv(Record):
 
 @dataclass(kw_only=True)
 class RunArgs(Record):
-    """`run.sh` command line (one field per argument; see `argparser`)."""
+    """`run.sh` command line (one field per argument; see `argparser`). The fields marked
+    `remote` are what a submit through the runs API may set; the rest belong to the
+    machine that runs the bridge (where the profiles and the runs dir are) or to
+    other actions."""
 
     action: str = field(metadata={"positional": True, "choices": ["submit", "status", "cancel", "list", "logs", "fetch",
                                                                    "purge", "render", "stage-model"]})
@@ -496,28 +499,28 @@ class RunArgs(Record):
     profiles: str = field(default_factory=lambda: os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))
     runs_dir: str = field(default_factory=lambda: os.environ.get("FLEET_RUNS_DIR", "/var/lib/zkm-fleet/runs"))
     address: str = "127.0.0.1:6379"
-    profile: str | None = None
-    name: str | None = None
-    gpus: float = field(default=1, metadata={"help": "cards; a fraction (0.5) shares one card and needs a --gpu-mem"})
-    cpus: int = 8
-    gpu_mem: int = field(default=0, metadata={"help": "GiB free each granted card must have before the job starts "
+    profile: str | None = field(default=None, metadata={"remote": True})
+    name: str | None = field(default=None, metadata={"remote": True})
+    gpus: float = field(default=1, metadata={"remote": True, "help": "cards; a fraction (0.5) shares one card and needs a --gpu-mem"})
+    cpus: int = field(default=8, metadata={"remote": True})
+    gpu_mem: int = field(default=0, metadata={"remote": True, "help": "GiB free each granted card must have before the job starts "
                                                       "(default: the profile's, else the whole card)"})
-    vram_wait: int = field(default=1800, metadata={"help": "seconds to wait for that memory before failing "
+    vram_wait: int = field(default=1800, metadata={"remote": True, "help": "seconds to wait for that memory before failing "
                                                            "(the run shows waiting_vram meanwhile)"})
     machine: list[str] = field(default_factory=list, metadata={
-        "help": "the machine (host name or IP) the run must land on; with --nodes N, repeat for each"})
-    nodes: int = field(default=1, metadata={"help": "spread the run over N machines: --gpus and --cpus on each, one "
+        "remote": True, "help": "the machine (host name or IP) the run must land on; with --nodes N, repeat for each"})
+    nodes: int = field(default=1, metadata={"remote": True, "help": "spread the run over N machines: --gpus and --cpus on each, one "
                                                     "container per machine, ranks wired through FLEET_MASTER_ADDR / "
                                                     "FLEET_NODE_RANK (and torchrun's PET_*)"})
-    after: str | None = field(default=None, metadata={"help": "run only after this run succeeded"})
-    retry: int = field(default=0, metadata={"help": "try a failed run again up to N times"})
-    restart_on_oom: int = field(default=0, metadata={"help": "try again up to N times when an attempt ran out of memory"})
-    code: str | None = field(default=None, metadata={"help": "git:/repo@ref or FILE.tar.gz, captured into the run "
+    after: str | None = field(default=None, metadata={"remote": True, "help": "run only after this run succeeded"})
+    retry: int = field(default=0, metadata={"remote": True, "help": "try a failed run again up to N times"})
+    restart_on_oom: int = field(default=0, metadata={"remote": True, "help": "try again up to N times when an attempt ran out of memory"})
+    code: str | None = field(default=None, metadata={"remote": True, "help": "git:/repo@ref or FILE.tar.gz, captured into the run "
                                                              "(FLEET_CODE, {code})"})
-    mount: list[str] = field(default_factory=list, metadata={"help": "PATH[:ro|:rw], mounted at its own path; repeat"})
-    env: list[str] = field(default_factory=list, metadata={"help": "K=V for the job ({out} / {code} expand); repeat"})
-    log: str | None = field(default=None, metadata={"help": "file the job's output is appended to (default RUNS_DIR/<id>/log)"})
-    workdir: str | None = None
+    mount: list[str] = field(default_factory=list, metadata={"remote": True, "help": "PATH[:ro|:rw], mounted at its own path; repeat"})
+    env: list[str] = field(default_factory=list, metadata={"remote": True, "help": "K=V for the job ({out} / {code} expand); repeat"})
+    log: str | None = field(default=None, metadata={"remote": True, "help": "file the job's output is appended to (default RUNS_DIR/<id>/log)"})
+    workdir: str | None = field(default=None, metadata={"remote": True})
     follow: bool = field(default=False, metadata={"flags": ("-f", "--follow"), "help": "logs: keep printing until the run ends"})
     lines: int = field(default=50, metadata={"flags": ("-n", "--lines"), "help": "logs: lines of history first"})
     rank: int = field(default=0, metadata={"help": "logs: a --nodes run's rank k (its output is log.rank<k>)"})
@@ -530,6 +533,29 @@ class RunArgs(Record):
     def env_map(self) -> dict[str, str]:
         return dict(e.split("=", 1) for e in self.env if "=" in e)
 
+    @classmethod
+    def remote_fields(cls) -> set[str]:
+        return {f.name for f in fields(cls) if f.metadata.get("remote")}
+
+
+@dataclass(kw_only=True)
+class LogChunk(Record):
+    """A piece of a run's output: from `offset` on (or the last lines), the offset to ask
+    for next, and whether the run has ended (no more will come)."""
+
+    data: str
+    offset: int
+    done: bool
+
+
+@dataclass(kw_only=True)
+class Uploaded(Record):
+    """A code tarball sent to the runs API, kept under the runs dir for `--code`."""
+
+    path: str
+    sha256: str
+    bytes: int
+
 
 # ── services ─────────────────────────────────────────────────────────────────
 
@@ -538,10 +564,11 @@ class ServiceKind(str, enum.Enum):
     ZIREN_CPU = "ziren-cpu"
     APP = "app"
     HOLD = "hold"
+    RUNS_API = "runs-api"
 
     @property
     def takes_gpus(self) -> bool:
-        return self is not ServiceKind.ZIREN_CPU
+        return self not in (ServiceKind.ZIREN_CPU, ServiceKind.RUNS_API)
 
 
 @dataclass(kw_only=True)
@@ -590,6 +617,11 @@ class ServiceSpec(Record):
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
+    # the runs API (one-shot runs over HTTP, for `fleetctl run`): where it listens, and the
+    # profiles file and runs dir of this machine (pin it with `machine:` to where they are)
+    listen: str = "127.0.0.1:9192"
+    profiles: str | None = None
+    runs_dir: str | None = None
 
 
 @dataclass(kw_only=True)
