@@ -136,7 +136,8 @@ pub struct ProofApp {
     pub active: u64,
     pub succeeded: u64,
     pub failed: u64,
-    pub last_created_ms: u64,
+    /// When its newest job was submitted; none yet for an app without a job.
+    pub last_created_ms: Option<u64>,
     /// Mean proving time of its succeeded jobs.
     pub mean_prove_ms: Option<f64>,
     /// New jobs are refused (`fleetctl app disable`); the queued and running ones finish.
@@ -245,7 +246,7 @@ impl Store for MemoryStore {
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
         let blank = |tenant: &str, elf_id: &str, created_ms, disabled| ProofApp {
             tenant: tenant.into(), elf_id: elf_id.into(), created_ms, jobs: 0, active: 0, succeeded: 0, failed: 0,
-            last_created_ms: 0, mean_prove_ms: None, disabled,
+            last_created_ms: None, mean_prove_ms: None, disabled,
         };
         let mut apps: HashMap<(String, String), (ProofApp, f64)> = self
             .apps
@@ -259,7 +260,7 @@ impl Store for MemoryStore {
                 .or_insert_with(|| (blank(&j.tenant, &j.elf_id, j.created_ms, false), 0.0));
             a.jobs += 1;
             a.created_ms = a.created_ms.min(j.created_ms);
-            a.last_created_ms = a.last_created_ms.max(j.created_ms);
+            a.last_created_ms = Some(a.last_created_ms.map_or(j.created_ms, |t| t.max(j.created_ms)));
             match j.state {
                 JobState::Queued | JobState::Running => a.active += 1,
                 JobState::Succeeded => {
@@ -278,7 +279,7 @@ impl Store for MemoryStore {
                 a
             })
             .collect();
-        v.sort_by_key(|a| std::cmp::Reverse((a.last_created_ms, a.created_ms)));
+        v.sort_by_key(|a| std::cmp::Reverse((a.last_created_ms.unwrap_or(0), a.created_ms)));
         Ok(v)
     }
 
@@ -666,7 +667,7 @@ impl Store for PgStore {
                     active: r.try_get::<i64, _>("active")? as u64,
                     succeeded: r.try_get::<i64, _>("succeeded")? as u64,
                     failed: r.try_get::<i64, _>("failed")? as u64,
-                    last_created_ms: r.try_get::<Option<i64>, _>("last_created_ms")?.unwrap_or(0) as u64,
+                    last_created_ms: r.try_get::<Option<i64>, _>("last_created_ms")?.map(|v| v as u64),
                     mean_prove_ms: r.try_get("mean_prove_ms")?,
                     disabled: r.try_get("disabled")?,
                 })

@@ -137,7 +137,7 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
         assert!(store.add_app("goat", &bb, 1999).await.unwrap());
         assert!(!store.add_app("goat", &bb, 2000).await.unwrap(), "registered once");
         let fresh_app = store.apps().await.unwrap().into_iter().find(|a| a.elf_id == bb).unwrap();
-        assert_eq!((fresh_app.jobs, fresh_app.created_ms, fresh_app.last_created_ms), (0, 1999, 0), "listed with no job yet");
+        assert_eq!((fresh_app.jobs, fresh_app.created_ms, fresh_app.last_created_ms), (0, 1999, None), "listed with no job yet");
         store.upsert(&job("g1", JobState::Running)).await.unwrap();
         store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();
         store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();

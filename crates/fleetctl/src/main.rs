@@ -479,6 +479,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
                 .map(|x| proof_app(&x[0], &x[1]))
                 .collect();
             n["anchored_apps"] = Value::Array(anchored);
+            n.as_object_mut().map(|o| o.remove("state")); // the list's READY column; the record has ready / draining
             out.record(&n);
         }
         Cmd::Node(NodeArgs { cmd: None | Some(NodeCmd::List), .. }) => {
