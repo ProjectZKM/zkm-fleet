@@ -234,7 +234,8 @@ EOF
   cat > "$PREFIX/deploy/run.sh" <<EOF
 #!/bin/bash
 # One-shot GPU jobs (profiles in $ETC/runs.yaml):
-#   run.sh submit --profile NAME [--name N] [--gpus N] [--cpus N] [--log FILE] [--workdir DIR] -- CMD ARG...
+#   run.sh submit --profile NAME [--name N] [--gpus N] [--cpus N] --mount PATH:ro|rw ... [--env K=V ...]
+#              [--log FILE] [--workdir DIR] -- CMD ARG...   (every path the job touches is a --mount)
 #   run.sh status ID | cancel ID | list
 cd "$PREFIX/bridge" && exec "$PREFIX/venv/bin/python" -m fleet_bridge run \\
   --profiles "$ETC/runs.yaml" --runs-dir "$WORKDIR/runs" "\$@"
