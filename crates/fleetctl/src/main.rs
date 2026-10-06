@@ -54,8 +54,6 @@ enum Cmd {
     /// Proof jobs and one-shot runs: the list (by default), one by its id, or submit /
     /// logs / cancel / purge / fetch a run.
     Job(JobArgs),
-    /// The list of proof jobs and runs (`job` without an id).
-    Ps(PsArgs),
     /// Prover nodes: the list (by default), or drain / undrain one.
     Node(NodeArgs),
     /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY).
@@ -88,14 +86,6 @@ struct ListArgs {
 enum Kind {
     Proof,
     Run,
-}
-
-#[derive(Args)]
-struct PsArgs {
-    #[command(flatten)]
-    list: ListArgs,
-    #[command(flatten)]
-    conn: Conn,
 }
 
 #[derive(Args)]
@@ -305,7 +295,6 @@ fn main() -> anyhow::Result<()> {
     match &cli.cmd {
         Cmd::Init(i) => init(i, &out),
         Cmd::Job(j) => job(j, &out),
-        Cmd::Ps(p) => list(&p.list, &p.conn, &out),
         other => admin(other, &out),
     }
 }
@@ -319,7 +308,7 @@ impl Cmd {
             Cmd::Credential(
                 CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
             ) => conn,
-            Cmd::Init(_) | Cmd::Job(_) | Cmd::Ps(_) => unreachable!("not the scheduler's admin API alone"),
+            Cmd::Init(_) | Cmd::Job(_) => unreachable!("not the scheduler's admin API alone"),
         }
     }
 }
@@ -487,7 +476,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
             out.done(&format!("revoked {address}"), json!({ "revoked": address }));
         }
-        Cmd::Init(_) | Cmd::Job(_) | Cmd::Ps(_) => unreachable!("not the scheduler's admin API alone"),
+        Cmd::Init(_) | Cmd::Job(_) => unreachable!("not the scheduler's admin API alone"),
     }
     Ok(())
 }

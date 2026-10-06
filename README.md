@@ -44,7 +44,7 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ```bash
 fleetctl status                                       # queue, nodes, anchors, runs going on
-fleetctl job                                          # proof jobs and runs, newest first (--active, --type proof|run, --tenant T, -n N); `ps` is the same
+fleetctl job                                          # proof jobs and runs, newest first (--active, --type proof|run, --tenant T, -n N)
 fleetctl job <id>                                     # one proof job or run
 ```
 
