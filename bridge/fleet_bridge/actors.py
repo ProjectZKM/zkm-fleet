@@ -14,20 +14,18 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import re
 import os
 import shlex
 import socket
 import subprocess
 import threading
 import time
-import urllib.error
 import urllib.request
 from typing import Any, Callable
 
 import ray
 
-from .model import Health, Lease, NodeEnv, ReplicaSpec, StreamProvider, StreamReport, StreamTask, to_env
+from .model import Health, NodeEnv, ReplicaSpec, to_env
 from .rayapi import node_ip
 
 NODE_BINARY_NAMES = ("fleet-ziren-node", "fleet-node")  # the current name and the one before it
@@ -386,205 +384,3 @@ class _ZirenCpuProver:
 
 
 ZirenCpuProver = ray.remote(_ZirenCpuProver)
-
-
-# ── stream workers ───────────────────────────────────────────────────────────
-
-def _read_env_file(path: str) -> dict[str, str]:
-    """KEY=VALUE lines (an `export ` prefix and quotes tolerated); comments and blanks skipped."""
-    out: dict[str, str] = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[7:]
-            k, _, v = line.partition("=")
-            out[k.strip()] = v.strip().strip("'\"")
-    return out
-
-
-class _Admin:
-    """The scheduler's admin API, with the admin token read on this machine."""
-
-    def __init__(self, url: str, token_path: str) -> None:
-        self.url = url.rstrip("/") + "/admin"
-        with open(token_path) as f:
-            self.token = f.read().strip()
-
-    def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.url + path, data=data, method=method,
-                                     headers={"Authorization": f"Bearer {self.token}", "content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            text = r.read()
-        return json.loads(text) if text.strip() else None
-
-
-class _Slot:
-    """One task at a time: lease, run the provider's command, report."""
-
-    def __init__(self, worker: "_StreamWorker", index: int) -> None:
-        self.worker, self.index = worker, index
-        self.name = f"{worker.name}/{index}"
-        self.proc: subprocess.Popen[bytes] | None = None
-        self.thread = threading.Thread(target=self.loop, daemon=True)
-        self.thread.start()
-
-    def loop(self) -> None:
-        w = self.worker
-        while not w.stop:
-            try:
-                lease = Lease.load(w.admin.call("POST", f"/streams/{w.stream}/lease",
-                                                {"worker": self.name, "can_fetch": bool(w.provider.fetch)}))
-                w.last_lease = time.time()
-            except Exception as e:
-                w.last_error = f"lease: {e}"
-                time.sleep(10)
-                continue
-            if lease.task is StreamTask.NONE:
-                time.sleep(lease.retry_after_s or 2)
-                continue
-            report = self.run(lease)
-            try:
-                w.admin.call("POST", f"/streams/{w.stream}/report", report.dump())
-            except urllib.error.HTTPError as e:  # a late report (the lease expired): noted, not retried
-                w.last_error = f"report {lease.task.value} {lease.seq}: {e.code} {e.read().decode(errors='replace')[:200]}"
-            except Exception as e:
-                w.last_error = f"report: {e}"
-            if report.ok:
-                w.tasks_done += 1
-            else:
-                w.tasks_failed += 1
-                w.last_error = f"{lease.task.value} {lease.seq}: {report.error[:200]}"
-
-    def _expand(self, text: str, lease: Lease) -> str:
-        p = self.worker.provider
-        fill = {"seq": lease.seq, "stream": self.worker.stream, "work": p.work, "prev_seq": lease.prev_seq,
-                "prev_artifact": lease.prev_artifact, "prev_job_id": lease.prev_job_id}
-        for k, v in fill.items():
-            text = text.replace("{" + k + "}", "" if v is None else str(v))
-        return text
-
-    def _run(self, argv: list[str], lease: Lease, timeout: float, log_path: str | None) -> tuple[int | None, str]:
-        """Runs a command with the provider's env; returns (exit code or None on timeout, output tail)."""
-        p = self.worker.provider
-        cmd = [self._expand(a, lease) for a in argv]
-        env = {**self.worker.env, **{k: self._expand(v, lease) for k, v in p.env.items()}}
-        cwd = self._expand(p.cwd, lease) if p.cwd else None
-        out: io.BufferedWriter | int = open(log_path, "ab") if log_path else subprocess.PIPE
-        self.proc = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=out, stderr=subprocess.STDOUT)
-        try:
-            captured, _ = self.proc.communicate(timeout=timeout)
-            code: int | None = self.proc.returncode
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            captured, _ = self.proc.communicate()
-            code = None
-        finally:
-            if isinstance(out, io.BufferedWriter):
-                out.close()
-            self.proc = None
-        if log_path:
-            with open(log_path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - 4000))
-                tail = f.read().decode(errors="replace")
-        else:
-            tail = (captured or b"")[-4000:].decode(errors="replace")
-        return code, tail
-
-    def run(self, lease: Lease) -> StreamReport:
-        w, p = self.worker, self.worker.provider
-        t0 = time.time()
-        if lease.task is StreamTask.HEAD:
-            code, out = self._run(p.head, lease, lease.timeout_s or 60, None)
-            m = re.findall(r"\d+", out)
-            if code == 0 and m:
-                return StreamReport(worker=self.name, task=lease.task, ok=True, head=int(m[-1]),
-                                    wall_ms=int((time.time() - t0) * 1000))
-            return StreamReport(worker=self.name, task=lease.task, ok=False,
-                                error=f"head command exit {code}: {out[-300:]}")
-        argv = p.fetch if lease.task is StreamTask.FETCH else p.prove
-        log_path = os.path.join(p.work, "logs", f"{lease.task.value}-{lease.seq}.log")
-        code, tail = self._run(argv, lease, lease.timeout_s or 3600, log_path)
-        ok = code == 0
-        report = StreamReport(worker=self.name, task=lease.task, ok=ok, seq=lease.seq,
-                              wall_ms=int((time.time() - t0) * 1000),
-                              error="" if ok else (f"exit {code}: " if code is not None else "timed out: ") + tail[-400:])
-        if lease.task is StreamTask.PROVE:
-            if p.artifact:
-                path = self._expand(p.artifact, lease)
-                if os.path.exists(path):
-                    report = replace_report(report, artifact=path)
-            found = re.search(p.job_id_pattern, tail)
-            if found:
-                report = replace_report(report, job_id=found.group(1))
-            if p.cleanup:
-                self._run(p.cleanup, lease, 120, None)
-        if ok and p.keep_logs != "all" or p.keep_logs == "none":
-            try:
-                os.remove(log_path)
-            except OSError:
-                pass
-        return report
-
-    def kill(self) -> None:
-        if self.proc is not None:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
-
-
-def replace_report(r: StreamReport, **changes: Any) -> StreamReport:
-    return r.merged(**changes)
-
-
-class _StreamWorker:
-    """Executes a stream's provider commands for the scheduler's stream runner: each
-    slot leases a task (head probe, fetch, prove), runs it on this machine with the
-    provider's environment, and reports. The policy (order, parallelism, retries,
-    the cursor) is the scheduler's; a worker that dies loses only its leases' time."""
-
-    def __init__(self, spec: ReplicaSpec) -> None:
-        self.spec = spec
-        self.name = spec.name
-        svc = spec.service
-        if not svc.stream or svc.provider is None:
-            raise RuntimeError(f"{self.name}: a stream service needs `stream` and `provider`")
-        self.stream: str = svc.stream
-        self.provider: StreamProvider = svc.provider
-        self.admin = _Admin(spec.cluster.scheduler_admin, spec.cluster.admin_token_path)
-        self.env = dict(os.environ)
-        if self.provider.env_file:
-            self.env.update(_read_env_file(self.provider.env_file))
-        self.env.pop("CUDA_VISIBLE_DEVICES", None)
-        os.makedirs(os.path.join(self.provider.work, "logs"), exist_ok=True)
-        self.stop = False
-        self.tasks_done = self.tasks_failed = 0
-        self.last_lease: float | None = None
-        self.last_error: str | None = None
-        self.slots = [_Slot(self, i) for i in range(max(svc.slots, 1))]
-        _watch(lambda: all(s.thread.is_alive() for s in self.slots), self.shutdown)
-
-    def health(self) -> dict[str, Any]:
-        if _stopping():
-            return Health(name=self.name, stopping=True).dump()
-        if not all(s.thread.is_alive() for s in self.slots):
-            self.shutdown()
-            os._exit(1)
-        return Health(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname(), stream=self.stream,
-                      slots=len(self.slots), tasks_done=self.tasks_done, tasks_failed=self.tasks_failed,
-                      last_lease_age_s=round(time.time() - self.last_lease, 1) if self.last_lease else None,
-                      last_error=self.last_error).dump()
-
-    def shutdown(self) -> None:
-        _STOPPING["on"] = True
-        self.stop = True
-        for s in self.slots:
-            s.kill()
-
-
-StreamWorker = ray.remote(_StreamWorker)

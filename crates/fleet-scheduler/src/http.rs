@@ -15,13 +15,11 @@ use serde::Deserialize;
 
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::Fleet;
-use crate::streams::{LeaseRequest, Report, Streams};
 use crate::token;
 
 #[derive(Clone)]
 pub struct HttpState {
     pub fleet: Arc<Fleet>,
-    pub streams: Arc<Streams>,
     pub admin_token: Arc<String>,
 }
 
@@ -36,12 +34,6 @@ pub fn router(state: HttpState) -> Router {
         .route("/elfs", post(put_elf))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
-        .route("/streams", get(streams_status))
-        .route("/streams/:name/steps", get(stream_steps))
-        .route("/streams/:name/lease", post(stream_lease))
-        .route("/streams/:name/report", post(stream_report))
-        .route("/streams/:name/pause", post(stream_pause).delete(stream_resume))
-        .route("/streams/:name/seek", post(stream_seek))
         .layer(DefaultBodyLimit::max(512 << 20))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -163,80 +155,4 @@ async fn drain(State(s): State<HttpState>, Path(name): Path<String>) -> Response
 async fn undrain(State(s): State<HttpState>, Path(name): Path<String>) -> Response {
     s.fleet.set_drain(&name, false);
     StatusCode::NO_CONTENT.into_response()
-}
-
-// ------------------------------------------------------------------ streams
-
-async fn streams_status(State(s): State<HttpState>) -> Response {
-    Json(s.streams.status()).into_response()
-}
-
-#[derive(Deserialize)]
-struct StepsQuery {
-    #[serde(default = "default_steps_limit")]
-    limit: usize,
-    /// From the store rather than memory (every step ever, newest first).
-    #[serde(default)]
-    all: bool,
-}
-
-fn default_steps_limit() -> usize {
-    50
-}
-
-async fn stream_steps(
-    State(s): State<HttpState>,
-    Path(name): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<StepsQuery>,
-) -> Response {
-    if q.all {
-        return match s.streams.stored_steps(&name, q.limit).await {
-            Ok(v) => Json(v).into_response(),
-            Err(e) => internal(e),
-        };
-    }
-    match s.streams.steps(&name, q.limit) {
-        Some(v) => Json(v).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such stream").into_response(),
-    }
-}
-
-async fn stream_lease(State(s): State<HttpState>, Path(name): Path<String>, Json(req): Json<LeaseRequest>) -> Response {
-    match s.streams.lease(&name, &req).await {
-        Ok(lease) => Json(lease).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
-    }
-}
-
-async fn stream_report(State(s): State<HttpState>, Path(name): Path<String>, Json(r): Json<Report>) -> Response {
-    match s.streams.report(&name, &r).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::CONFLICT, format!("{e:#}")).into_response(),
-    }
-}
-
-async fn stream_pause(State(s): State<HttpState>, Path(name): Path<String>) -> Response {
-    match s.streams.set_paused(&name, true).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
-    }
-}
-
-async fn stream_resume(State(s): State<HttpState>, Path(name): Path<String>) -> Response {
-    match s.streams.set_paused(&name, false).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct Seek {
-    seq: i64,
-}
-
-async fn stream_seek(State(s): State<HttpState>, Path(name): Path<String>, Json(q): Json<Seek>) -> Response {
-    match s.streams.seek(&name, q.seq).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
-    }
 }

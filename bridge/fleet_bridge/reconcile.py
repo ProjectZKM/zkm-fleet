@@ -2,7 +2,7 @@
 
     services:
       - name: ethproofs-gpu        # replica i runs as actor "<name>-<i>"
-        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold | stream
+        kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold
         replicas: 1
         gpus: 2
         cpus: 48
@@ -19,9 +19,7 @@ hands out the lowest free cards, so `goat (1) / hold (1) / ethproofs (6)` puts
 GOAT on 0, EthProofs on 2-7 and leaves 1 for one-shot runs.
 
 An `app` is any GPU container serving on a port of its own (ComfyUI, an inference
-server): see GpuApp and deploy/services.example.yaml. A `stream` worker (no card)
-runs a stream's provider commands for the scheduler's stream runner: see
-StreamWorker and the scheduler's `streams:`.
+server): see GpuApp and deploy/services.example.yaml.
 
 Each replica gets its own placement group with one STRICT_PACK bundle: its
 cards, CPUs and memory all come from ONE machine (Ray never splits a replica's
@@ -48,7 +46,7 @@ from ray.util.placement_group import PlacementGroup, placement_group, remove_pla
 from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
-from .actors import GpuApp, StreamWorker, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
+from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
 from .model import ApplyReport, Bundle, ClusterConfig, Health, ReplicaSpec, ServiceKind, ServicesFile
 from .rayapi import actor_node_id
 
@@ -56,7 +54,7 @@ NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
 
 ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, ServiceKind.ZIREN_CPU: ZirenCpuProver,
-                                  ServiceKind.APP: GpuApp, ServiceKind.STREAM: StreamWorker}
+                                  ServiceKind.APP: GpuApp}
 # the cluster settings a replica's hash covers, as the file names them
 _SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
 

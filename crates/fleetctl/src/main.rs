@@ -53,32 +53,6 @@ enum Cmd {
     /// Prover nodes.
     #[command(subcommand)]
     Node(NodeCmd),
-    /// Proof sequences driven from a cursor (see the scheduler's `streams:`).
-    #[command(subcommand)]
-    Stream(StreamCmd),
-}
-
-#[derive(Subcommand)]
-enum StreamCmd {
-    /// Every stream: head, cursor, lag, open steps, workers.
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Recent steps of a stream, newest first.
-    Steps {
-        name: String,
-        #[arg(long, default_value_t = 30)]
-        limit: usize,
-        /// From the store (every step ever) rather than the scheduler's memory.
-        #[arg(long)]
-        all: bool,
-    },
-    /// Hand out no more work (leases in flight finish).
-    Pause { name: String },
-    Resume { name: String },
-    /// Move the cursor: planning continues from this sequence number.
-    Seek { name: String, seq: i64 },
 }
 
 #[derive(Subcommand)]
@@ -328,52 +302,6 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/nodes/{name}/drain")))?;
             println!("{name} takes jobs again");
         }
-        Cmd::Stream(StreamCmd::List { json }) => {
-            let v = a.send(a.req(M::GET, "/streams"))?.unwrap_or_default();
-            if *json {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else {
-                print_streams(&v);
-            }
-        }
-        Cmd::Stream(StreamCmd::Steps { name, limit, all }) => {
-            let v = a
-                .send(a.req(M::GET, &format!("/streams/{name}/steps?limit={limit}&all={all}")))?
-                .unwrap_or_default();
-            println!(
-                "{:>12} {:<9} {:>3} {:>8} {:<22} {:<40}",
-                "SEQ", "STATE", "TRY", "WALL S", "WORKER", "ERROR / ARTIFACT"
-            );
-            for s in v.as_array().into_iter().flatten() {
-                let wall = s["wall_ms"].as_u64().map(|w| format!("{:.1}", w as f64 / 1000.0)).unwrap_or_default();
-                let note = if s["error"].as_str().unwrap_or("").is_empty() {
-                    s["artifact"].as_str().unwrap_or("").to_string()
-                } else {
-                    s["error"].as_str().unwrap_or("").chars().take(40).collect()
-                };
-                println!(
-                    "{:>12} {:<9} {:>3} {:>8} {:<22} {:<40}",
-                    s["seq"],
-                    s["state"].as_str().unwrap_or(""),
-                    s["attempts"],
-                    wall,
-                    s["worker"].as_str().unwrap_or("-"),
-                    note,
-                );
-            }
-        }
-        Cmd::Stream(StreamCmd::Pause { name }) => {
-            a.send(a.req(M::POST, &format!("/streams/{name}/pause")))?;
-            println!("{name} paused: no new work is handed out");
-        }
-        Cmd::Stream(StreamCmd::Resume { name }) => {
-            a.send(a.req(M::DELETE, &format!("/streams/{name}/pause")))?;
-            println!("{name} resumed");
-        }
-        Cmd::Stream(StreamCmd::Seek { name, seq }) => {
-            a.send(a.req(M::POST, &format!("/streams/{name}/seek")).json(&serde_json::json!({ "seq": seq })))?;
-            println!("{name} continues from {seq}");
-        }
         Cmd::Token(_) | Cmd::Tls(_) => unreachable!(),
     }
     Ok(())
@@ -392,43 +320,6 @@ fn default_admin_token() -> Option<PathBuf> {
     dirs.into_iter()
         .map(|d| d.join("admin.token"))
         .find(|p| p.exists())
-}
-
-fn print_streams(v: &Value) {
-    println!(
-        "{:<16} {:<7} {:>12} {:>6} {:>12} {:>12} {:>6} {:>7} {:>7} {:>7} {:<24}",
-        "STREAM", "MODE", "HEAD", "AGE S", "NEXT", "LAST DONE", "LAG", "DONE", "FAILED", "SKIPPED", "OPEN"
-    );
-    for s in v.as_array().into_iter().flatten() {
-        let open = s["open"]
-            .as_object()
-            .map(|o| o.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "))
-            .unwrap_or_default();
-        let mode = if s["paused"].as_bool() == Some(true) {
-            "paused"
-        } else if s["chained"].as_bool() == Some(true) {
-            "chained"
-        } else {
-            "indep"
-        };
-        println!(
-            "{:<16} {:<7} {:>12} {:>6} {:>12} {:>12} {:>6} {:>7} {:>7} {:>7} {:<24}",
-            s["name"].as_str().unwrap_or(""),
-            mode,
-            s["head"],
-            s["head_age_s"],
-            s["next_seq"],
-            s["last_done"],
-            s["lag"],
-            s["done"],
-            s["failed"],
-            s["skipped"],
-            open,
-        );
-        for w in s["workers"].as_array().into_iter().flatten() {
-            println!("    worker {} seen {} s ago", w["name"].as_str().unwrap_or(""), w["seen_age_s"]);
-        }
-    }
 }
 
 fn print_status(v: &Value) {

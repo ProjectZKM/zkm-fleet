@@ -9,8 +9,6 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
 
-use crate::streams::{Step, StepState, StreamRow};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Queued,
@@ -86,7 +84,7 @@ pub fn normalize_address(a: &str) -> String {
 }
 
 #[async_trait]
-pub trait Store: StreamStore + Send + Sync {
+pub trait Store: Send + Sync {
     async fn upsert(&self, job: &Job) -> anyhow::Result<()>;
     async fn get(&self, id: &str) -> anyhow::Result<Option<Job>>;
     /// Queued and running jobs, oldest first, for recovery after a restart.
@@ -96,25 +94,10 @@ pub trait Store: StreamStore + Send + Sync {
     /// Marks the credential revoked; returns false when the address is unknown.
     async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool>;
     async fn credentials(&self) -> anyhow::Result<Vec<Credential>>;
-
-}
-
-/// Stream cursors and steps (see `streams.rs`); every `Store` provides it.
-#[async_trait]
-pub trait StreamStore: Send + Sync {
-    async fn upsert_stream(&self, s: &StreamRow) -> anyhow::Result<()>;
-    async fn streams(&self) -> anyhow::Result<Vec<StreamRow>>;
-    async fn upsert_step(&self, s: &Step) -> anyhow::Result<()>;
-    /// Steps not yet done, failed or skipped, lowest first.
-    async fn open_steps(&self, stream: &str) -> anyhow::Result<Vec<Step>>;
-    /// The newest steps of a stream, highest seq first.
-    async fn recent_steps(&self, stream: &str, limit: usize) -> anyhow::Result<Vec<Step>>;
 }
 
 #[derive(Default)]
 pub struct MemoryStore {
-    streams: Mutex<HashMap<String, StreamRow>>,
-    steps: Mutex<HashMap<(String, i64), Step>>,
     jobs: Mutex<HashMap<String, Job>>,
     creds: Mutex<HashMap<String, Credential>>,
 }
@@ -168,44 +151,6 @@ impl Store for MemoryStore {
     }
 }
 
-#[async_trait]
-impl StreamStore for MemoryStore {
-    async fn upsert_stream(&self, s: &StreamRow) -> anyhow::Result<()> {
-        self.streams.lock().insert(s.name.clone(), s.clone());
-        Ok(())
-    }
-    async fn streams(&self) -> anyhow::Result<Vec<StreamRow>> {
-        Ok(self.streams.lock().values().cloned().collect())
-    }
-    async fn upsert_step(&self, s: &Step) -> anyhow::Result<()> {
-        self.steps.lock().insert((s.stream.clone(), s.seq), s.clone());
-        Ok(())
-    }
-    async fn open_steps(&self, stream: &str) -> anyhow::Result<Vec<Step>> {
-        let mut v: Vec<Step> = self
-            .steps
-            .lock()
-            .values()
-            .filter(|s| s.stream == stream && s.state.is_open())
-            .cloned()
-            .collect();
-        v.sort_by_key(|s| s.seq);
-        Ok(v)
-    }
-    async fn recent_steps(&self, stream: &str, limit: usize) -> anyhow::Result<Vec<Step>> {
-        let mut v: Vec<Step> = self
-            .steps
-            .lock()
-            .values()
-            .filter(|s| s.stream == stream)
-            .cloned()
-            .collect();
-        v.sort_by_key(|s| std::cmp::Reverse(s.seq));
-        v.truncate(limit);
-        Ok(v)
-    }
-}
-
 pub struct PgStore {
     pool: PgPool,
 }
@@ -229,35 +174,6 @@ CREATE TABLE IF NOT EXISTS fleet_jobs (
     finished_ms BIGINT
 );
 CREATE INDEX IF NOT EXISTS fleet_jobs_incomplete ON fleet_jobs (state) WHERE state < 2;
-CREATE TABLE IF NOT EXISTS fleet_streams (
-    name        TEXT PRIMARY KEY,
-    next_seq    BIGINT,
-    head        BIGINT,
-    head_ms     BIGINT,
-    paused      BOOLEAN NOT NULL DEFAULT FALSE,
-    done        BIGINT NOT NULL DEFAULT 0,
-    failed      BIGINT NOT NULL DEFAULT 0,
-    skipped     BIGINT NOT NULL DEFAULT 0,
-    updated_ms  BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS fleet_stream_steps (
-    stream        TEXT   NOT NULL,
-    seq           BIGINT NOT NULL,
-    state         INT    NOT NULL,
-    attempts      INT    NOT NULL DEFAULT 0,
-    worker        TEXT,
-    leased_ms     BIGINT,
-    not_before_ms BIGINT,
-    created_ms    BIGINT NOT NULL,
-    started_ms    BIGINT,
-    finished_ms   BIGINT,
-    wall_ms       BIGINT,
-    error         TEXT   NOT NULL DEFAULT '',
-    artifact      TEXT,
-    job_id        TEXT,
-    PRIMARY KEY (stream, seq)
-);
-CREATE INDEX IF NOT EXISTS fleet_stream_steps_open ON fleet_stream_steps (stream, state) WHERE state < 4;
 CREATE TABLE IF NOT EXISTS fleet_credentials (
     address    TEXT PRIMARY KEY,
     tenant     TEXT NOT NULL,
@@ -385,118 +301,5 @@ impl Store for PgStore {
                 })
             })
             .collect()
-    }
-}
-
-fn opt_u64(row: &sqlx::postgres::PgRow, col: &str) -> anyhow::Result<Option<u64>> {
-    Ok(row.try_get::<Option<i64>, _>(col)?.map(|v| v as u64))
-}
-
-fn row_to_step(row: &sqlx::postgres::PgRow) -> anyhow::Result<Step> {
-    Ok(Step {
-        stream: row.try_get("stream")?,
-        seq: row.try_get("seq")?,
-        state: StepState::from_db(row.try_get("state")?),
-        attempts: row.try_get::<i32, _>("attempts")? as u32,
-        worker: row.try_get("worker")?,
-        leased_ms: opt_u64(row, "leased_ms")?,
-        not_before_ms: opt_u64(row, "not_before_ms")?,
-        created_ms: row.try_get::<i64, _>("created_ms")? as u64,
-        started_ms: opt_u64(row, "started_ms")?,
-        finished_ms: opt_u64(row, "finished_ms")?,
-        wall_ms: opt_u64(row, "wall_ms")?,
-        error: row.try_get("error")?,
-        artifact: row.try_get("artifact")?,
-        job_id: row.try_get("job_id")?,
-    })
-}
-
-#[async_trait]
-impl StreamStore for PgStore {
-    async fn upsert_stream(&self, s: &StreamRow) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO fleet_streams (name, next_seq, head, head_ms, paused, done, failed, skipped, updated_ms)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-             ON CONFLICT (name) DO UPDATE SET next_seq = $2, head = $3, head_ms = $4, paused = $5, done = $6,
-             failed = $7, skipped = $8, updated_ms = $9",
-        )
-        .bind(&s.name)
-        .bind(s.next_seq)
-        .bind(s.head)
-        .bind(s.head_ms.map(|v| v as i64))
-        .bind(s.paused)
-        .bind(s.done as i64)
-        .bind(s.failed as i64)
-        .bind(s.skipped as i64)
-        .bind(s.updated_ms as i64)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn streams(&self) -> anyhow::Result<Vec<StreamRow>> {
-        let rows = sqlx::query("SELECT * FROM fleet_streams ORDER BY name")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(StreamRow {
-                    name: row.try_get("name")?,
-                    next_seq: row.try_get("next_seq")?,
-                    head: row.try_get("head")?,
-                    head_ms: opt_u64(row, "head_ms")?,
-                    paused: row.try_get("paused")?,
-                    done: row.try_get::<i64, _>("done")? as u64,
-                    failed: row.try_get::<i64, _>("failed")? as u64,
-                    skipped: row.try_get::<i64, _>("skipped")? as u64,
-                    updated_ms: row.try_get::<i64, _>("updated_ms")? as u64,
-                })
-            })
-            .collect()
-    }
-
-    async fn upsert_step(&self, s: &Step) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO fleet_stream_steps (stream, seq, state, attempts, worker, leased_ms, not_before_ms, created_ms,
-             started_ms, finished_ms, wall_ms, error, artifact, job_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-             ON CONFLICT (stream, seq) DO UPDATE SET state = $3, attempts = $4, worker = $5, leased_ms = $6,
-             not_before_ms = $7, started_ms = $9, finished_ms = $10, wall_ms = $11, error = $12, artifact = $13,
-             job_id = $14",
-        )
-        .bind(&s.stream)
-        .bind(s.seq)
-        .bind(s.state as i32)
-        .bind(s.attempts as i32)
-        .bind(&s.worker)
-        .bind(s.leased_ms.map(|v| v as i64))
-        .bind(s.not_before_ms.map(|v| v as i64))
-        .bind(s.created_ms as i64)
-        .bind(s.started_ms.map(|v| v as i64))
-        .bind(s.finished_ms.map(|v| v as i64))
-        .bind(s.wall_ms.map(|v| v as i64))
-        .bind(&s.error)
-        .bind(&s.artifact)
-        .bind(&s.job_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn open_steps(&self, stream: &str) -> anyhow::Result<Vec<Step>> {
-        let rows = sqlx::query("SELECT * FROM fleet_stream_steps WHERE stream = $1 AND state < 4 ORDER BY seq")
-            .bind(stream)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_step).collect()
-    }
-
-    async fn recent_steps(&self, stream: &str, limit: usize) -> anyhow::Result<Vec<Step>> {
-        let rows = sqlx::query("SELECT * FROM fleet_stream_steps WHERE stream = $1 ORDER BY seq DESC LIMIT $2")
-            .bind(stream)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(row_to_step).collect()
     }
 }
