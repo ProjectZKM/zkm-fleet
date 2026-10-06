@@ -99,14 +99,14 @@ ln -sf "$FLEETCTL" "$LINKDIR/fleetctl"
 
 # ------------------------------------------------------------------ secrets
 if [ "$ROLE" = control ]; then
-  [ -f "$ETC/cluster.token" ] || "$FLEETCTL" token new --out "$ETC/cluster.token" > /dev/null
-  [ -f "$ETC/admin.token" ] || "$FLEETCTL" token new --out "$ETC/admin.token" > /dev/null
+  [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" > /dev/null
+  [ -f "$ETC/admin.token" ] || "$FLEETCTL" init token --out "$ETC/admin.token" > /dev/null
   if [ ! -f "$ETC/pg_password" ]; then
     (umask 077; head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/pg_password")
   fi
   (umask 077; echo "postgres://fleet:$(cat "$ETC/pg_password")@postgres:5432/fleet" > "$ETC/database_url")
   if [ "$TLS" = 1 ] && [ ! -f "$ETC/tls/ca.pem" ]; then
-    "$FLEETCTL" tls init --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname)}" > /dev/null
+    "$FLEETCTL" init tls --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname)}" > /dev/null
   fi
 else
   install -m 600 "$TOKEN" "$ETC/cluster.token"

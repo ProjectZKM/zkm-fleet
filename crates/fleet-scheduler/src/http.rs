@@ -4,8 +4,7 @@
 use std::sync::Arc;
 
 use axum::{
-    body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,10 +30,8 @@ pub fn router(state: HttpState) -> Router {
             "/credentials/:address",
             axum::routing::delete(revoke_credential),
         )
-        .route("/elfs", post(put_elf))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
-        .layer(DefaultBodyLimit::max(512 << 20))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -112,16 +109,6 @@ async fn revoke_credential(State(s): State<HttpState>, Path(address): Path<Strin
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => internal(e),
-    }
-}
-
-async fn put_elf(State(s): State<HttpState>, body: Bytes) -> Response {
-    if body.is_empty() {
-        return (StatusCode::BAD_REQUEST, "empty body").into_response();
-    }
-    match s.fleet.blobs.put_elf(&body) {
-        Ok(id) => Json(serde_json::json!({ "elf_id": id, "bytes": body.len() })).into_response(),
         Err(e) => internal(e),
     }
 }

@@ -54,7 +54,6 @@ fleetctl status                                       # queue, nodes, anchors
 | tenants | `/etc/zkm-fleet/fleet.yaml` (class, anchoring, allowed backends, `nodes` (name prefixes that may run it, for a tenant tied to one prover configuration), queue cap), then `docker compose -p zkm-fleet restart scheduler` |
 | a client | `fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 --tls-dir /etc/zkm-fleet/tls --out ethproofs.env`; the client runs `set -a; . ./ethproofs.env; set +a` and calls the SDK as before |
 | revoke | `fleetctl credential revoke <address>` |
-| a program sent by `elf_id` only | `fleetctl elf put guest.elf` once |
 | take a node out | `fleetctl node drain <name>` (finishes its job), later `undrain` |
 | one job | `fleetctl job <proof_id>` |
 | logs | `docker compose -p zkm-fleet logs scheduler`; node logs in `/opt/zkm-fleet/logs`; GPU servers: `docker logs fleet-gpu-<name>` |
@@ -66,9 +65,9 @@ fleetctl status                                       # queue, nodes, anchors
 |---|---|---|
 | tenant signing key (`ZKM_PRIVATE_KEY`) | the client | `fleetctl credential issue`: generated on the operator's machine, only the address is registered, revocable |
 | client certificate (`SSL_CERT_PATH` / `SSL_KEY_PATH`) | the client | the same command with `--tls-dir`. The SDK only enables TLS when it has a client certificate, so the stage API runs mutual TLS |
-| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl tls init`) |
-| cluster token | scheduler and every node, both directions | `install.sh` (`fleetctl token new`) |
-| admin token | operators | `install.sh` (`fleetctl token new`) |
+| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl init tls`) |
+| cluster token | scheduler and every node, both directions | `install.sh` (`fleetctl init token`) |
+| admin token | operators | `install.sh` (`fleetctl init token`) |
 
 What the SDK's scheme leaves open: the request signature covers `proof_id&seg_size` only, not the ELF or the input, so mutual TLS is what protects the payload; a proof id is single-use (a resubmission returns the existing job). `GetStatus` and the public-values URL carry no credential, as the SDK sends none there; proof ids are random UUIDs.
 

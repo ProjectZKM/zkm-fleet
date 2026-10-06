@@ -8,25 +8,26 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 
 #[derive(Parser)]
 #[command(about = "Operate a zkm-fleet cluster and issue its credentials")]
 struct Cli {
-    /// Scheduler HTTP base URL (admin API under /admin).
-    #[arg(
-        long,
-        env = "FLEET_URL",
-        default_value = "http://127.0.0.1:9191",
-        global = true
-    )]
-    url: String,
-    /// File holding the admin token (default: admin.token in FLEET_ETC, ~/.config/zkm-fleet or /etc/zkm-fleet).
-    #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE", global = true)]
-    admin_token_file: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Where the scheduler's admin API is, and the token it takes: every command that
+/// talks to a running scheduler has these (the `init` ones work offline and do not).
+#[derive(Args, Clone)]
+struct Conn {
+    /// Scheduler HTTP base URL (admin API under /admin).
+    #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9191")]
+    url: String,
+    /// File holding the admin token (default: admin.token in FLEET_ETC, ~/.config/zkm-fleet or /etc/zkm-fleet).
+    #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE")]
+    admin_token_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -35,24 +36,25 @@ enum Cmd {
     Status {
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        conn: Conn,
     },
-    /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY).
-    #[command(subcommand)]
-    Credential(CredentialCmd),
-    /// Random tokens: the cluster token (scheduler <-> nodes) and the admin token.
-    #[command(subcommand)]
-    Token(TokenCmd),
-    /// Certificates for the stage API (server) and its clients (mutual TLS).
-    #[command(subcommand)]
-    Tls(TlsCmd),
-    /// Guest programs.
-    #[command(subcommand)]
-    Elf(ElfCmd),
     /// One job's record.
-    Job { id: String },
+    Job {
+        id: String,
+        #[command(flatten)]
+        conn: Conn,
+    },
     /// Prover nodes.
     #[command(subcommand)]
     Node(NodeCmd),
+    /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY).
+    #[command(subcommand)]
+    Credential(CredentialCmd),
+    /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
+    /// certificates (install.sh runs these; no scheduler is needed).
+    #[command(subcommand)]
+    Init(InitCmd),
 }
 
 #[derive(Subcommand)]
@@ -69,7 +71,7 @@ enum CredentialCmd {
         /// Stage API endpoint clients use, e.g. https://fleet.example:51000.
         #[arg(long)]
         endpoint: String,
-        /// Directory of `fleetctl tls init`: issue a client certificate for this credential too.
+        /// Directory of `fleetctl init tls`: issue a client certificate for this credential too.
         /// The SDK only enables TLS when it has a client certificate (mutual TLS), so a
         /// stage API reachable from outside needs this.
         #[arg(long)]
@@ -77,45 +79,43 @@ enum CredentialCmd {
         /// Server name in the stage certificate, when it is not the SDK's default "stage".
         #[arg(long)]
         domain_name: Option<String>,
+        #[command(flatten)]
+        conn: Conn,
     },
-    List,
+    List {
+        #[command(flatten)]
+        conn: Conn,
+    },
     Revoke {
         address: String,
+        #[command(flatten)]
+        conn: Conn,
     },
 }
 
 #[derive(Subcommand)]
-enum TokenCmd {
-    /// Write a new random token (48 bytes, hex) to a 0600 file.
-    New {
+enum InitCmd {
+    /// Write a new random token (48 bytes, hex) to a 0600 file: the cluster token
+    /// (scheduler <-> nodes) or the admin token.
+    Token {
         #[arg(long)]
         out: PathBuf,
     },
-}
-
-#[derive(Subcommand)]
-enum TlsCmd {
-    /// Create a CA and the stage server certificate.
-    Init {
+    /// Create a CA and the stage API's server certificate.
+    Tls {
         #[arg(long)]
         dir: PathBuf,
         /// Names the server certificate covers. The SDK verifies DOMAIN_NAME, "stage" by default.
         #[arg(long, value_delimiter = ',', default_value = "stage")]
         names: Vec<String>,
     },
-    /// Issue a client certificate signed by the CA in `dir`.
-    Client {
+    /// Issue a client certificate signed by the CA in `dir` (credential issue --tls-dir does this too).
+    TlsClient {
         #[arg(long)]
         dir: PathBuf,
         #[arg(long)]
         name: String,
     },
-}
-
-#[derive(Subcommand)]
-enum ElfCmd {
-    /// Upload an ELF; requests may then carry only its elf_id.
-    Put { file: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -123,23 +123,27 @@ enum NodeCmd {
     /// Stop placing new jobs on a node (it finishes the current one).
     Drain {
         name: String,
+        #[command(flatten)]
+        conn: Conn,
     },
     Undrain {
         name: String,
+        #[command(flatten)]
+        conn: Conn,
     },
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match &cli.cmd {
-        Cmd::Token(TokenCmd::New { out }) => {
+        Cmd::Init(InitCmd::Token { out }) => {
             let mut bytes = [0u8; 48];
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
             write_secret(out, format!("{}\n", hex::encode(bytes)).as_bytes())?;
             println!("wrote {}", out.display());
         }
-        Cmd::Tls(TlsCmd::Init { dir, names }) => tls_init(dir, names)?,
-        Cmd::Tls(TlsCmd::Client { dir, name }) => {
+        Cmd::Init(InitCmd::Tls { dir, names }) => tls_init(dir, names)?,
+        Cmd::Init(InitCmd::TlsClient { dir, name }) => {
             let (c, k) = tls_client(dir, name)?;
             println!(
                 "client certificate: SSL_CERT_PATH={} SSL_KEY_PATH={}",
@@ -147,9 +151,23 @@ fn main() -> anyhow::Result<()> {
                 k.display()
             );
         }
-        _ => admin(&cli)?,
+        _ => admin(&cli.cmd)?,
     }
     Ok(())
+}
+
+impl Cmd {
+    /// The connection of a command that talks to the scheduler.
+    fn conn(&self) -> &Conn {
+        match self {
+            Cmd::Status { conn, .. } | Cmd::Job { conn, .. } => conn,
+            Cmd::Node(NodeCmd::Drain { conn, .. } | NodeCmd::Undrain { conn, .. }) => conn,
+            Cmd::Credential(
+                CredentialCmd::Issue { conn, .. } | CredentialCmd::List { conn } | CredentialCmd::Revoke { conn, .. },
+            ) => conn,
+            Cmd::Init(_) => unreachable!("init commands work offline"),
+        }
+    }
 }
 
 struct Admin {
@@ -159,8 +177,8 @@ struct Admin {
 }
 
 impl Admin {
-    fn new(cli: &Cli) -> anyhow::Result<Self> {
-        let path = match &cli.admin_token_file {
+    fn new(conn: &Conn) -> anyhow::Result<Self> {
+        let path = match &conn.admin_token_file {
             Some(p) => p.clone(),
             None => default_admin_token()
                 .context("no admin token: pass --admin-token-file or set FLEET_ADMIN_TOKEN_FILE")?,
@@ -170,7 +188,7 @@ impl Admin {
             .trim()
             .to_string();
         Ok(Self {
-            url: cli.url.trim_end_matches('/').to_string(),
+            url: conn.url.trim_end_matches('/').to_string(),
             token,
             http: reqwest::blocking::Client::new(),
         })
@@ -197,11 +215,11 @@ impl Admin {
     }
 }
 
-fn admin(cli: &Cli) -> anyhow::Result<()> {
-    let a = Admin::new(cli)?;
+fn admin(cmd: &Cmd) -> anyhow::Result<()> {
+    let a = Admin::new(cmd.conn())?;
     use reqwest::Method as M;
-    match &cli.cmd {
-        Cmd::Status { json } => {
+    match cmd {
+        Cmd::Status { json, .. } => {
             let v = a.send(a.req(M::GET, "/status"))?.unwrap_or_default();
             if *json {
                 println!("{}", serde_json::to_string_pretty(&v)?);
@@ -216,6 +234,7 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
             endpoint,
             tls_dir,
             domain_name,
+            ..
         }) => {
             if out.exists() {
                 bail!(
@@ -257,7 +276,7 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             }
         }
-        Cmd::Credential(CredentialCmd::List) => {
+        Cmd::Credential(CredentialCmd::List { .. }) => {
             let v = a.send(a.req(M::GET, "/credentials"))?.unwrap_or_default();
             println!(
                 "{:<44} {:<14} {:<20} {}",
@@ -278,31 +297,26 @@ fn admin(cli: &Cli) -> anyhow::Result<()> {
                 );
             }
         }
-        Cmd::Credential(CredentialCmd::Revoke { address }) => {
+        Cmd::Credential(CredentialCmd::Revoke { address, .. }) => {
             a.send(a.req(
                 M::DELETE,
                 &format!("/credentials/{}", address.trim_start_matches("0x")),
             ))?;
             println!("revoked {address}");
         }
-        Cmd::Elf(ElfCmd::Put { file }) => {
-            let bytes = std::fs::read(file)?;
-            let v = a.send(a.req(M::POST, "/elfs").body(bytes))?;
-            println!("{}", serde_json::to_string_pretty(&v.unwrap_or_default())?);
-        }
-        Cmd::Job { id } => {
+        Cmd::Job { id, .. } => {
             let v = a.send(a.req(M::GET, &format!("/jobs/{id}")))?;
             println!("{}", serde_json::to_string_pretty(&v.unwrap_or_default())?);
         }
-        Cmd::Node(NodeCmd::Drain { name }) => {
+        Cmd::Node(NodeCmd::Drain { name, .. }) => {
             a.send(a.req(M::POST, &format!("/nodes/{name}/drain")))?;
             println!("draining {name}");
         }
-        Cmd::Node(NodeCmd::Undrain { name }) => {
+        Cmd::Node(NodeCmd::Undrain { name, .. }) => {
             a.send(a.req(M::DELETE, &format!("/nodes/{name}/drain")))?;
             println!("{name} takes jobs again");
         }
-        Cmd::Token(_) | Cmd::Tls(_) => unreachable!(),
+        Cmd::Init(_) => unreachable!("init commands work offline"),
     }
     Ok(())
 }

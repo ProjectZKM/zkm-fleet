@@ -135,7 +135,7 @@ impl StageApi {
                 if !self.fleet.blobs.has_elf(&given) {
                     return Err(fail(
                         StageStatus::InvalidParameter,
-                        "elf_id not found: upload the ELF once (fleetctl elf put)",
+                        "elf_id not found: send the ELF itself once; later requests may carry only its elf_id",
                     ));
                 }
                 given
