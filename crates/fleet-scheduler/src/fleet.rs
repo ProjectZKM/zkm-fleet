@@ -353,6 +353,15 @@ impl Fleet {
                 .max_encoding_message_size(1 << 30);
         let id = uuid::Uuid::new_v4().to_string();
         let mut inner = self.inner.lock();
+        let fresh = Duration::from_secs(2 * self.cfg.heartbeat_secs.max(1) as u64);
+        if let Some(other) = inner.nodes.values().find(|n| {
+            n.info.name == info.name
+                && n.info.endpoint != info.endpoint
+                && n.last_heartbeat.elapsed() < fresh
+        }) {
+            tracing::warn!(node = %info.name, live = %other.info.endpoint, new = %info.endpoint,
+                "two live processes claim this node name; the newer registration replaces the older");
+        }
         inner.nodes.retain(|_, n| n.info.name != info.name);
         tracing::info!(node = %info.name, endpoint = %info.endpoint, backend = %info.backend, gpus = info.gpus, "node registered");
         inner.nodes.insert(

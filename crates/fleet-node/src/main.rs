@@ -62,6 +62,10 @@ pub struct Args {
     /// Seconds to wait for the GPU server's Ready at start.
     #[arg(long, env = "FLEET_READY_TIMEOUT", default_value_t = 600)]
     ready_timeout: u64,
+    /// Exit when the process that started this node goes away (a Ray actor): an orphan
+    /// would keep its name registered and point it at a GPU server port another node reuses.
+    #[arg(long, env = "FLEET_EXIT_WITH_PARENT", default_value_t = false)]
+    exit_with_parent: bool,
 }
 
 #[tokio::main]
@@ -95,8 +99,24 @@ async fn main() -> anyhow::Result<()> {
         r = server => r?,
         r = control => r??,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
+        _ = parent_gone(args.exit_with_parent) => tracing::warn!("the process that started this node is gone; exiting"),
     }
     Ok(())
+}
+
+/// Resolves when the parent process changes (it died and the node was re-parented);
+/// never, unless asked to watch.
+async fn parent_gone(watch: bool) {
+    if !watch {
+        return std::future::pending().await;
+    }
+    let parent = std::os::unix::process::parent_id();
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if std::os::unix::process::parent_id() != parent {
+            return;
+        }
+    }
 }
 
 /// Binds the first free port of `lo-hi`.

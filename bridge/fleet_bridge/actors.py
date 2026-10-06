@@ -75,9 +75,37 @@ def _watch(alive, cleanup, every_s: float = 5.0):
     threading.Thread(target=loop, daemon=True).start()
 
 
+def _kill_orphans(name: str):
+    """Kills fleet-node processes left by an earlier actor of this name (`ray stop` takes
+    the actor but not its children; nodes since then exit with their parent): an orphan
+    keeps the name registered and points it at a GPU server port a new container may reuse.
+    Names are unique per actor, so any such process is stale."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "fleet-node":
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                if f"FLEET_NODE_NAME={name}".encode() not in f.read().split(b"\0"):
+                    continue
+        except OSError:
+            continue
+        os.kill(int(pid), 15)
+        for _ in range(20):
+            if not os.path.exists(f"/proc/{pid}"):
+                break
+            time.sleep(0.5)
+        else:
+            os.kill(int(pid), 9)
+
+
 class _NodeProcess:
     def __init__(self, binary: str, env: dict, log_path: str):
+        _kill_orphans(env["FLEET_NODE_NAME"])
         self.log = open(log_path, "ab")
+        env = {**env, "FLEET_EXIT_WITH_PARENT": "true"}
         self.proc = subprocess.Popen([binary], env=env, stdout=self.log, stderr=subprocess.STDOUT)
 
     def alive(self) -> bool:
