@@ -7,6 +7,7 @@ pub mod http;
 pub mod placement;
 pub mod stage;
 pub mod store;
+pub mod streams;
 pub mod token;
 
 use std::future::IntoFuture;
@@ -44,9 +45,12 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let fleet = fleet::Fleet::new(cfg.clone(), store, blobs, cluster_token.clone());
     let creds = fleet.load_credentials().await?;
     let recovered = fleet.recover().await?;
+    let streams = streams::Streams::new(&cfg.streams, fleet.store.clone());
+    let loaded_streams = streams.load().await?;
     tracing::info!(
         credentials = creds,
         recovered_jobs = recovered,
+        streams = loaded_streams,
         "scheduler state loaded"
     );
 
@@ -94,6 +98,7 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
 
     let http = http::router(http::HttpState {
         fleet: fleet.clone(),
+        streams,
         admin_token: Arc::new(admin_token),
     });
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;

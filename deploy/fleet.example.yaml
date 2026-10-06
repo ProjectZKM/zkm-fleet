@@ -27,3 +27,24 @@ tenants:
     class: batch
     anchor: shared
     max_queued: 64
+# Proof sequences the scheduler drives from a cursor. The policy is here; the
+# provider's commands are on the stream worker (services.yaml, kind: stream).
+streams:
+  - name: goat                    # independent blocks: several at once, skips ahead when far behind
+    chained: false
+    step: 2                       # every other block
+    behind: 2                     # stay 2 blocks behind the head
+    max_lag: 200                  # further behind than 200 steps: jump to the head
+    parallel: 5                   # proofs in flight
+    prefetch: 3                   # inputs fetched ahead of the proofs
+    period_s: 6                   # head probe period
+    attempts: 2                   # per step; a failed step is refetched and retried after retry_backoff_s * attempt
+    retry_backoff_s: 20
+    fetch_timeout_s: 300
+    prove_timeout_s: 900
+  - name: goat-state              # a chain: step n+1 verifies step n's proof, one in flight, never skipped
+    chained: true
+    step: 40
+    behind: 0
+    period_s: 30
+    prove_timeout_s: 3600

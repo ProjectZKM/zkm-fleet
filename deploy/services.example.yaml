@@ -32,6 +32,27 @@ services:
     replicas: 1
     cpus: 16
     memory_gb: 64
+  # A stream worker: runs a stream's provider commands on its machine (no card) for
+  # the scheduler's stream runner (fleet.yaml `streams:`). It leases `head`, `fetch`
+  # and `prove` tasks and reports; `{seq}`, `{work}`, `{prev_seq}`, `{prev_artifact}`
+  # and `{prev_job_id}` expand in the commands and env. The prove command proves
+  # through the SDK against this scheduler (env_file = the tenant's credential).
+  - name: goat-stream
+    kind: stream
+    stream: goat
+    cpus: 4
+    slots: 6                       # tasks at once on this worker; the stream's parallel/prefetch bound them
+    provider:
+      work: /var/lib/zkm-fleet/goat
+      env_file: /etc/zkm-fleet/goat.env
+      env:
+        RPC_48816: https://rpc.example
+        RUST_LOG: info
+      head: [bash, -c, "curl -s -m 10 -H 'content-type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_blockNumber\",\"params\":[]}' $RPC_48816 | python3 -c 'import json,sys;print(int(json.load(sys.stdin)[\"result\"],16))'"]
+      fetch: [/opt/goat/host, --block-number, "{seq}", --chain-id, "48816", --cache-dir, "{work}/cache"]
+      prove: [/opt/goat/host, --block-number, "{seq}", --chain-id, "48816", --cache-dir, "{work}/cache", --prove]
+      cleanup: [bash, -c, "rm -f {work}/cache/input/48816/{seq}.bin"]
+      keep_logs: failed            # failed | all | none
   # A GPU app on its own port: ComfyUI from a tree on the host. Replica i serves on
   # port_base + i; volumes are mounted at the same path inside, so the tree's venv,
   # model links and database URLs work unchanged (`:ro`, `:rslave` for NFS).

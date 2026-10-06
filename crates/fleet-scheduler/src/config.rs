@@ -44,6 +44,9 @@ pub struct Config {
     #[serde(default)]
     pub default_tenant: Option<String>,
     pub tenants: Vec<TenantConfig>,
+    /// Proof sequences the scheduler drives from a cursor; see `streams.rs`.
+    #[serde(default)]
+    pub streams: Vec<StreamConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// Shared secret between the scheduler and its prover nodes, both directions
@@ -97,6 +100,72 @@ pub enum Anchor {
     Shared,
     /// As `shared`, and the anchor node serves this tenant only.
     Exclusive,
+}
+
+/// A stream's policy. The provider's commands belong to the worker that runs them
+/// (the bridge's `kind: stream` service); here is only what the scheduler decides.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamConfig {
+    pub name: String,
+    /// Step n+1 needs step n's proof: one in flight, in order, never skipped.
+    #[serde(default)]
+    pub chained: bool,
+    /// Sequence increment (2: every other block).
+    #[serde(default = "default_step")]
+    pub step: i64,
+    /// Stay this many sequence numbers behind the head.
+    #[serde(default)]
+    pub behind: i64,
+    /// An independent stream further behind than this many steps skips to the head; 0 never skips.
+    #[serde(default)]
+    pub max_lag: i64,
+    /// Steps proving at once (an independent stream).
+    #[serde(default = "default_parallel")]
+    pub parallel: usize,
+    /// Inputs fetched ahead of the proofs, when the worker has a fetch command.
+    #[serde(default = "default_prefetch")]
+    pub prefetch: usize,
+    /// How often the head is probed.
+    #[serde(default = "default_period_s")]
+    pub period_s: u64,
+    /// Attempts per step before an independent stream gives it up.
+    #[serde(default = "default_attempts")]
+    pub attempts: u32,
+    /// Wait between attempts, times the attempt number.
+    #[serde(default = "default_backoff_s")]
+    pub retry_backoff_s: u64,
+    #[serde(default = "default_fetch_timeout_s")]
+    pub fetch_timeout_s: u64,
+    #[serde(default = "default_prove_timeout_s")]
+    pub prove_timeout_s: u64,
+    /// First sequence number when the stream has no cursor yet (default: the head's target).
+    #[serde(default)]
+    pub start: Option<i64>,
+}
+
+fn default_step() -> i64 {
+    1
+}
+fn default_parallel() -> usize {
+    1
+}
+fn default_prefetch() -> usize {
+    1
+}
+fn default_period_s() -> u64 {
+    10
+}
+fn default_attempts() -> u32 {
+    3
+}
+fn default_backoff_s() -> u64 {
+    30
+}
+fn default_fetch_timeout_s() -> u64 {
+    600
+}
+fn default_prove_timeout_s() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +232,13 @@ impl Config {
             );
         }
         anyhow::ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
+        let mut names = std::collections::HashSet::new();
+        for s in &self.streams {
+            anyhow::ensure!(names.insert(s.name.as_str()), "stream {} declared twice", s.name);
+            anyhow::ensure!(s.step >= 1, "stream {}: step must be at least 1", s.name);
+            anyhow::ensure!(s.parallel >= 1, "stream {}: parallel must be at least 1", s.name);
+            anyhow::ensure!(s.attempts >= 1, "stream {}: attempts must be at least 1", s.name);
+        }
         Ok(())
     }
 

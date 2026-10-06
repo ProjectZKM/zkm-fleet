@@ -538,10 +538,32 @@ class ServiceKind(str, enum.Enum):
     ZIREN_CPU = "ziren-cpu"
     APP = "app"
     HOLD = "hold"
+    STREAM = "stream"
 
     @property
     def takes_gpus(self) -> bool:
-        return self is not ServiceKind.ZIREN_CPU
+        return self not in (ServiceKind.ZIREN_CPU, ServiceKind.STREAM)
+
+
+@dataclass(kw_only=True)
+class StreamProvider(Record):
+    """The commands a stream worker runs for its stream. `{seq}`, `{stream}`, `{work}`,
+    `{prev_seq}`, `{prev_artifact}` and `{prev_job_id}` expand in them and in env.
+    `head` prints the head sequence number; `fetch` (optional) readies seq's input;
+    `prove` proves seq (through the SDK, against the scheduler); `cleanup` (optional)
+    runs after a prove ended either way."""
+
+    head: list[str]
+    prove: list[str]
+    fetch: list[str] = field(default_factory=list)
+    cleanup: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    env_file: str | None = None  # KEY=VALUE lines read on the worker's machine (secrets stay there)
+    work: str = "/tmp/zkm-fleet/stream"
+    cwd: str | None = None
+    artifact: str | None = None  # path a prove leaves, recorded with the step when it exists
+    keep_logs: str = "failed"  # failed | all | none
+    job_id_pattern: str = r"(?:job|proof)[ _=:]+([0-9a-f]{8}-[0-9a-f-]{27})"
 
 
 @dataclass(kw_only=True)
@@ -590,6 +612,10 @@ class ServiceSpec(Record):
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
+    # stream workers
+    stream: str | None = None
+    slots: int = 1  # tasks this worker runs at once (the scheduler bounds the stream's parallelism)
+    provider: StreamProvider | None = None
 
 
 @dataclass(kw_only=True)
@@ -686,6 +712,48 @@ class Health(Record):
     ready: bool | None = None
     stopping: bool = False
     error: str | None = None
+    # stream workers
+    stream: str | None = None
+    slots: int | None = None
+    tasks_done: int | None = None
+    tasks_failed: int | None = None
+    last_lease_age_s: float | None = None
+    last_error: str | None = None
+
+
+class StreamTask(str, enum.Enum):
+    HEAD = "head"
+    FETCH = "fetch"
+    PROVE = "prove"
+    NONE = "none"
+
+
+@dataclass(kw_only=True)
+class Lease(Record):
+    """What the scheduler hands a stream worker."""
+
+    task: StreamTask
+    seq: int | None = None
+    prev_seq: int | None = None
+    prev_artifact: str | None = None
+    prev_job_id: str | None = None
+    timeout_s: float | None = None
+    retry_after_s: float | None = None
+
+
+@dataclass(kw_only=True)
+class StreamReport(Record):
+    """How a leased task went."""
+
+    worker: str
+    task: StreamTask
+    ok: bool
+    seq: int | None = None
+    error: str = ""
+    wall_ms: int | None = None
+    artifact: str | None = None
+    job_id: str | None = None
+    head: int | None = None
 
 
 @dataclass(kw_only=True)
