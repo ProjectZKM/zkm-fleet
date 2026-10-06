@@ -40,9 +40,9 @@ import urllib.request
 
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
-from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, spec_hash
+from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
 
 NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
@@ -117,15 +117,28 @@ def start(spec: dict, ready_timeout_s: float = 900) -> ray.actor.ActorHandle:
 
 
 def stop(name: str):
+    """Kills the actor, then removes what it owned on its machine. The kill comes first:
+    an actor asked to shut down and left alive restarts itself (max_restarts=-1) when
+    its watcher sees the container gone, and the restart races the replacement."""
     try:
         actor = ray.get_actor(name, namespace=NAMESPACE)
-        try:
-            ray.get(actor.shutdown.remote(), timeout=60)
-        except Exception as e:  # the actor may already be gone
-            log.warning("shutdown of %s: %s", name, e)
-        ray.kill(actor, no_restart=True)
     except ValueError:
-        pass
+        actor = None
+    if actor is not None:
+        node_id = None
+        try:  # from the GCS (the dashboard API is off)
+            node_id = ray._private.state.actors(actor_id=actor._actor_id.hex())["Address"]["NodeID"]
+        except Exception as e:
+            log.warning("where %s runs: %s", name, e)
+        ray.kill(actor, no_restart=True)
+        if node_id:
+            try:
+                task = clean_after.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False))
+                ray.get(task.remote(name), timeout=120)
+            except Exception as e:
+                log.warning("cleaning up after %s: %s", name, e)
+        else:  # the actor's machine is unknown: clean here, which is right on one machine
+            ray.get(clean_after.remote(name), timeout=120)
     try:
         remove_placement_group(ray.util.get_placement_group(_pg_name(name)))
     except Exception:

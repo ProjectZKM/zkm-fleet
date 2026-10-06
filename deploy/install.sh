@@ -7,7 +7,7 @@
 # Options:
 #   --prefix DIR          install directory           (default /opt/zkm-fleet)
 #   --etc DIR             config and secrets          (default /etc/zkm-fleet)
-#   --bin DIR             where fleet-node and fleetctl were built (default ./target/release)
+#   --bin DIR             where fleet-ziren-node and fleetctl were built (default ./target/release)
 #   --cuda LIST           cards Ray may hand out on this machine, e.g. 0,1,2,3 (default: none)
 #   --cpus N              CPUs Ray may hand out here (default: all; leave room on shared machines)
 #   --workdir DIR         this node's workspace: Ray session files, spilled objects, node logs
@@ -74,7 +74,7 @@ if [ -n "$CUDA" ]; then
 fi
 [ "$ROLE" = control ] && { docker compose version > /dev/null 2>&1 || die "docker compose v2 is not installed"; }
 [ "$ROLE" = node ] && { [ -n "$HEAD" ] || die "--head is required for a node"; [ -f "$TOKEN" ] || die "--cluster-token FILE is required for a node"; }
-for b in fleet-node fleetctl; do [ -x "$BIN/$b" ] || die "$BIN/$b not found: build first (cargo build --release --bins), or pass --bin"; done
+for b in fleet-ziren-node fleetctl; do [ -x "$BIN/$b" ] || die "$BIN/$b not found: build first (cargo build --release --bins), or pass --bin"; done
 [ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
 [ -n "$WORKDIR" ] || WORKDIR="$PREFIX/work"
 [ -n "${RUNS_DIR:-}" ] || RUNS_DIR="$WORKDIR/runs"
@@ -84,7 +84,7 @@ chmod 750 "$ETC"
 # ----------------------------------------------------------- files and venv
 say "installing into $PREFIX (config in $ETC)"
 mkdir -p "$PREFIX/bin" "$WORKDIR/logs"
-install -m 755 "$BIN/fleet-node" "$BIN/fleetctl" "$PREFIX/bin/"
+install -m 755 "$BIN/fleet-ziren-node" "$BIN/fleetctl" "$PREFIX/bin/"
 rm -rf "$PREFIX/bridge" "$PREFIX/deploy"
 cp -r "$SRC/bridge" "$SRC/deploy" "$PREFIX/"
 if ! "$PREFIX/venv/bin/python" -c "import ray, yaml, sys; sys.exit(ray.__version__ != '$RAY_VERSION')" 2>/dev/null; then
@@ -222,7 +222,7 @@ if [ "$ROLE" = control ]; then
     {
       echo "scheduler: http://$IP:51001"
       echo "cluster_token_file: $ETC/cluster.token"
-      echo "node_binary: $PREFIX/bin/fleet-node"
+      echo "node_binary: $PREFIX/bin/fleet-ziren-node"
       echo "log_dir: $WORKDIR/logs"
       echo "services: []            # add ziren-gpu / ziren-cpu services, then: $PREFIX/deploy/apply.sh"
     } > "$ETC/services.yaml"

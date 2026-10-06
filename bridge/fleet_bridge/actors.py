@@ -2,7 +2,7 @@
 
 A ZirenGpuProver owns one GPU server: the container on exactly the cards Ray
 granted the actor (all on one machine: the server's per-card workers share
-memory and keep state on the cards), plus a fleet-node process that proves
+memory and keep state on the cards), plus a fleet-ziren-node process that proves
 through the Ziren SDK against it and registers with the scheduler.
 
 If either process dies, the actor exits and Ray restarts it (max_restarts=-1).
@@ -74,21 +74,40 @@ def _warn_foreign(name: str, gpus: list[str]):
             print(f"WARNING {name}: card {idx} granted by Ray already holds {held}", flush=True)
 
 
+# Set by a deliberate shutdown (one actor per process): the watcher and health() then
+# leave the process to Ray's kill instead of exiting, which Ray would answer with a
+# restart (max_restarts=-1) racing the replacement for the container name and port.
+_STOPPING = {"on": False}  # a dict, not an Event: Ray pickles the class with this global
+
+
 def _watch(alive, cleanup, every_s: float = 5.0):
     """Exits the actor process when what it owns dies, so Ray restarts the actor."""
 
     def loop():
-        while True:
+        while not _STOPPING["on"]:
             time.sleep(every_s)
-            if not alive():
+            if _STOPPING["on"]:
+                return
+            if not alive() and not _STOPPING["on"]:  # a deliberate stop takes what it owns away too
                 cleanup()
                 os._exit(1)
 
     threading.Thread(target=loop, daemon=True).start()
 
 
+@ray.remote(num_cpus=0, max_retries=0)
+def clean_after(name: str):
+    """Removes what an actor of this name owned on this machine (its containers and
+    node process), after the actor itself was killed: nothing of it then survives to
+    race its replacement for the container name or the GPU server port."""
+    for c in (f"fleet-gpu-{name}", f"fleet-app-{name}"):
+        subprocess.run(["docker", "rm", "-f", c], capture_output=True)
+    _kill_orphans(name)
+    return socket.gethostname()
+
+
 def _kill_orphans(name: str):
-    """Kills fleet-node processes left by an earlier actor of this name (`ray stop` takes
+    """Kills fleet-ziren-node processes left by an earlier actor of this name (`ray stop` takes
     the actor but not its children; nodes since then exit with their parent): an orphan
     keeps the name registered and points it at a GPU server port a new container may reuse.
     Names are unique per actor, so any such process is stale."""
@@ -97,7 +116,8 @@ def _kill_orphans(name: str):
             continue
         try:
             with open(f"/proc/{pid}/comm") as f:
-                if f.read().strip() != "fleet-node":
+                # comm holds the first 15 bytes of the binary's name (fleet-node = the old name)
+                if f.read().strip() not in ("fleet-ziren-node"[:15], "fleet-node"):
                     continue
             with open(f"/proc/{pid}/environ", "rb") as f:
                 if f"FLEET_NODE_NAME={name}".encode() not in f.read().split(b"\0"):
@@ -203,6 +223,8 @@ class ZirenGpuProver:
     def health(self) -> dict:
         container = self._container_running()
         node = self.node.alive()
+        if _STOPPING["on"]:
+            return {"name": self.name, "stopping": True}
         if not (container and node):
             self.shutdown()
             os._exit(1)  # Ray restarts the actor
@@ -216,6 +238,7 @@ class ZirenGpuProver:
         }
 
     def shutdown(self):
+        _STOPPING["on"] = True
         self.node.stop()
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
 
@@ -299,6 +322,8 @@ class GpuApp:
         return out.stdout.strip() == "true"
 
     def health(self) -> dict:
+        if _STOPPING["on"]:
+            return {"name": self.name, "stopping": True}
         if not self._container_running():
             self.shutdown()
             os._exit(1)
@@ -312,13 +337,14 @@ class GpuApp:
         }
 
     def shutdown(self):
+        _STOPPING["on"] = True
         subprocess.run(["docker", "stop", "-t", str(self.spec.get("stop_timeout_s", 30)), self.container], capture_output=True)
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
 
 
 @ray.remote(max_restarts=-1, max_task_retries=0)
 class ZirenCpuProver:
-    """A native (CPU) prover node: the Ziren SDK's CPU prover in fleet-node."""
+    """A native (CPU) prover node: the Ziren SDK's CPU prover in fleet-ziren-node."""
 
     def __init__(self, spec: dict):
         self.spec = spec
@@ -336,9 +362,12 @@ class ZirenCpuProver:
         _watch(self.node.alive, self.shutdown)
 
     def health(self) -> dict:
+        if _STOPPING["on"]:
+            return {"name": self.name, "stopping": True}
         if not self.node.alive():
             os._exit(1)
         return {"name": self.name, "spec": spec_hash(self.spec), "machine": socket.gethostname()}
 
     def shutdown(self):
+        _STOPPING["on"] = True
         self.node.stop()

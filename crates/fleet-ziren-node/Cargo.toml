@@ -1,11 +1,11 @@
 [package]
-name = "fleet-node"
+name = "fleet-ziren-node"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "fleet-node"
+name = "fleet-ziren-node"
 path = "src/main.rs"
 
 [dependencies]

@@ -3,7 +3,7 @@
 One scheduler for the GPU / CPU workloads on our machines. Phase 1 runs Ziren proofs: EthProofs and GOAT submit through the Ziren SDK's network prover (`ZKM_PROVER=network`, unchanged), the scheduler places each job on a prover node, and the nodes run as Ray actors next to the GPU servers. Design and discussion: ProjectZKM/Projects#5.
 
 ```
-SDK network prover ──mTLS──▶ gateway ──▶ fleet-scheduler ──cluster token──▶ fleet-node ──loopback──▶ GPU server container
+SDK network prover ──mTLS──▶ gateway ──▶ fleet-scheduler ──cluster token──▶ fleet-ziren-node ──loopback──▶ GPU server container
   (EthProofs, GOAT)         :51000 stage                                     (Ray actor)              (ziren-gpu image)
                                          control :51001 ◀──register/heartbeat──┘
 fleetctl ──admin token──▶   :9191 http (/admin, public values)
@@ -18,7 +18,7 @@ Restarting or upgrading the scheduler does not fail the proofs in flight:
 
 ## Install
 
-Build once (`fleet-node` links the Ziren SDK: build it for the machines' OS, e.g. in an `ubuntu:22.04` container with Rust, `protoc` and Go 1.22):
+Build once (`fleet-ziren-node` links the Ziren SDK: build it for the machines' OS, e.g. in an `ubuntu:22.04` container with Rust, `protoc` and Go 1.22):
 
 ```bash
 cargo build --release --bins
@@ -50,7 +50,7 @@ fleetctl status                                       # queue, nodes, anchors
 |---|---|
 | add / change provers | edit `/etc/zkm-fleet/services.yaml` (see `deploy/services.example.yaml`), then `/opt/zkm-fleet/deploy/apply.sh`; a changed spec (e.g. a new image digest) replaces that actor |
 | a GPU app (ComfyUI, an inference server) | a `kind: app` service: a container on one card, serving on `port_base` + replica index, its data mounted at the same paths; `python -m fleet_bridge render --services … --actor <name>-0 --gpus <card>` prints the `docker run` to try it by hand |
-| a one-shot GPU job (training) | a profile in `/etc/zkm-fleet/runs.yaml` (see `deploy/runs.example.yaml`), then `/opt/zkm-fleet/deploy/run.sh submit --profile P --gpus 1 --cpus 16 --gpu-mem 20 --mount PATH:ro -- CMD`; it queues until a card is free and has the memory (`waiting_vram` names who holds it), runs capped at its CPUs, writes to its own `{out}`, frees the card on exit. `--gpus 0.5` shares a card, `--after ID` / `--retry N` / `--restart-on-oom N` sequence and retry, `--code git:REPO@REF` pins the code, `--machine HOST` pins the machine. `run.sh status ID` (state, cause, latest metric), `logs ID -f`, `fetch ID > out.tgz`, `cancel ID`, `purge ID`, `list`; `stage-model REPO` downloads a Hugging Face repo into `model_store` |
+| a one-shot GPU job (training) | a profile in `/etc/zkm-fleet/runs.yaml` (see `deploy/runs.example.yaml`), then `/opt/zkm-fleet/deploy/run.sh submit --profile P --gpus 1 --cpus 16 --gpu-mem 20 --mount PATH:ro -- CMD`; it queues until a card is free and has the memory (`waiting_vram` names who holds it), runs capped at its CPUs, writes to its own `{out}`, frees the card on exit. `--gpus 0.5` shares a card, `--after ID` / `--retry N` / `--restart-on-oom N` sequence and retry, `--code git:REPO@REF` pins the code, `--machine HOST` pins the machine, `--nodes N` spreads one run over N machines (one container per machine, `--gpus`/`--cpus` on each, wired through `FLEET_MASTER_ADDR`/`FLEET_NODE_RANK` and torchrun's `PET_*`; needs a shared runs dir, `install.sh --runs-dir`). `run.sh status ID` (state, cause, latest metric), `logs ID -f`, `fetch ID > out.tgz`, `cancel ID`, `purge ID`, `list`; `stage-model REPO` downloads a Hugging Face repo into `model_store` |
 | tenants | `/etc/zkm-fleet/fleet.yaml` (class, anchoring, allowed backends, `nodes` (name prefixes that may run it, for a tenant tied to one prover configuration), queue cap), then `docker compose -p zkm-fleet restart scheduler` |
 | a client | `fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 --tls-dir /etc/zkm-fleet/tls --out ethproofs.env`; the client runs `set -a; . ./ethproofs.env; set +a` and calls the SDK as before |
 | revoke | `fleetctl credential revoke <address>` |
@@ -79,7 +79,7 @@ What the SDK's scheme leaves open: the request signature covers `proof_id&seg_si
 | 51000 stage (gRPC) | external, mTLS, on the gateway | SDK clients |
 | 9191 http | external, on the gateway | public values (SDK), `/admin` (admin token), `/healthz` |
 | 51001 control (gRPC) | cluster interface | nodes (cluster token) |
-| 31000-31099 fleet-node | cluster | the scheduler (cluster token) |
+| 31000-31099 fleet-ziren-node | cluster | the scheduler (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
 | app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |

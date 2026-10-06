@@ -1,11 +1,11 @@
 """One-shot jobs ("runs"): a command in a container, on cards Ray grants, until it exits.
 
     run.sh submit --profile NAME [--name N] [--gpus N] [--cpus N] [--gpu-mem GiB]
-                  [--vram-wait S] [--machine HOST] [--after ID] [--retry N]
+                  [--vram-wait S] [--nodes N] [--machine HOST]... [--after ID] [--retry N]
                   [--restart-on-oom N] [--code git:REPO@REF | --code FILE.tar.gz]
                   [--mount PATH:ro|rw]... [--env K=V]... [--log FILE] [--workdir DIR]
                   -- CMD ARG...
-    run.sh status|cancel|logs [-f] [-n N]|fetch|purge ID     run.sh list     run.sh purge --older-than DAYS
+    run.sh status|cancel|logs [-f] [-n N] [--rank K]|fetch|purge ID     run.sh list     run.sh purge --older-than DAYS
     run.sh stage-model REPO [--revision R] [--include GLOB]...
 
 A run's record is RUNS_DIR/<id>/: spec.json, status.json, log (its output),
@@ -18,7 +18,13 @@ existing, under the profile's `allow` roots). The profile (runs.yaml) fixes the
 image, the user, a GPU cap, base env and default_gpu_mem_gb.
 
 Placement: one STRICT_PACK bundle per run, so its cards and CPUs come from one
-machine (--machine pins which). `--gpus 0.5` asks for half a card: runs whose
+machine (--machine pins which). --nodes N spreads a run over N machines (STRICT_SPREAD:
+one bundle of --gpus cards and --cpus CPUs on each of N different machines, --machine
+repeated N times pins them): one container per machine, started together, all
+ended when one fails; every container sees FLEET_NNODES / FLEET_NODE_RANK /
+FLEET_MASTER_ADDR / FLEET_MASTER_PORT (and MASTER_ADDR, MASTER_PORT, NODE_RANK,
+NNODES and torchrun's PET_* so `torchrun train.py` joins the gang as is), rank
+k's output goes to log.rank<k>. `--gpus 0.5` asks for half a card: runs whose
 fractions fit share it, each started only if its --gpu-mem is free then (the
 check is at start; size --gpu-mem for the job's peak). While none can take it the run is queued. Ray's
 grant is logical, so before starting the actor checks the cards' real free memory
@@ -46,6 +52,7 @@ import hashlib
 import io
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
@@ -146,18 +153,18 @@ def _run_dir(runs_dir: str, run_id: str) -> str:
     return d
 
 
-def container_name(run_id: str) -> str:
-    return f"fleet-run-{run_id}"
+def container_name(run_id: str, rank: int = 0) -> str:
+    return f"fleet-run-{run_id}" + (f"-r{rank}" if rank else "")
 
 
 def _expand(text: str, spec: dict) -> str:
     return text.replace("{out}", spec["out"]).replace("{code}", spec.get("code_dir") or "{code}")
 
 
-def docker_command(spec: dict, gpus: list[str], attempt: int = 1) -> list[str]:
-    """The `docker run` for a run on the given host cards."""
+def docker_command(spec: dict, gpus: list[str], attempt: int = 1, rank: int = 0, gang: dict | None = None) -> list[str]:
+    """The `docker run` for a run (or one rank of it) on the given host cards."""
     p = spec["profile"]
-    cmd = ["docker", "run", "-d", "--name", container_name(spec["id"]), "--network", "host",
+    cmd = ["docker", "run", "-d", "--name", container_name(spec["id"], rank), "--network", "host",
            f"--shm-size={p.get('shm_gb', 16)}g", "--label", "zkm-fleet=run", "--label", f"zkm-fleet.run={spec['id']}"]
     if gpus:
         cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"', "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
@@ -174,7 +181,7 @@ def docker_command(spec: dict, gpus: list[str], attempt: int = 1) -> list[str]:
         cmd += ["-v", f"{spec['code_dir']}:{spec['code_dir']}:ro"]
     env = {"PYTHONUNBUFFERED": "1", **p.get("env", {}), **spec.get("env", {}),
            "FLEET_RUN_ID": spec["id"], "FLEET_OUT": spec["out"], "FLEET_METRICS": os.path.join(spec["out"], "metrics.jsonl"),
-           "FLEET_ATTEMPT": str(attempt)}
+           "FLEET_ATTEMPT": str(attempt), **(gang or {})}
     if spec.get("code_dir"):
         env["FLEET_CODE"] = spec["code_dir"]
     for k, v in env.items():
@@ -222,56 +229,63 @@ def _last_metrics(spec: dict) -> dict | None:
 
 # ── the actors ───────────────────────────────────────────────────────────────
 
-@ray.remote(max_restarts=0, max_task_retries=0)
-class GpuRun:
-    """Runs one job to completion (with its retries). Not restarted by Ray: a run that
-    dies is reported, not silently repeated."""
+class _Rank:
+    """One machine's share of a run: the cards Ray granted there and one container.
+    Rank 0 lives inside the run's actor; on a run over several machines (--nodes)
+    every other rank is a RankActor on its own machine."""
 
-    def __init__(self, spec: dict, run_dir: str):
-        self.spec, self.run_dir = spec, run_dir
+    def __init__(self, spec: dict, run_dir: str, rank: int = 0):
+        self.spec, self.run_dir, self.rank = spec, run_dir, rank
         self.gpus = [str(int(g)) for g in ray.get_gpu_ids()]
-        # where the container will live: cancel and status reach it there
-        _write_status(run_dir, machine=socket.gethostname(), node_ip=ray.util.get_node_ip_address())
-        threading.Thread(target=self._run, daemon=True).start()
+        self.name = container_name(spec["id"], rank)
+        base = spec.get("log") or os.path.join(run_dir, "log")
+        self.log_path = base if rank == 0 else f"{base}.rank{rank}"
+        self.follower, self.log, self.offset = None, None, 0
 
-    def ping(self) -> dict:
-        return {"id": self.spec["id"], "gpus": self.gpus, "machine": socket.gethostname()}
+    def info(self) -> dict:
+        return {"rank": self.rank, "machine": socket.gethostname(), "node_ip": ray.util.get_node_ip_address(),
+                "gpus": self.gpus, "container": self.name}
 
-    def _wait_vram(self, need: int | None) -> bool:
-        deadline = time.time() + int(self.spec.get("vram_wait_s", 1800))
-        while self.gpus:
-            short = vram_shortfall(self.gpus, need)
-            if not short:
-                return True
-            if time.time() > deadline:
-                _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
-                              error="cards not free in time: " + "; ".join(short))
-                return False
-            _write_status(self.run_dir, state="waiting_vram", gpus=self.gpus, detail="; ".join(short))
-            time.sleep(15)
-        return True
+    def check(self, need: int | None) -> str | None:
+        """Why this machine cannot run the job at all (None when it can)."""
+        missing = missing_mounts(self.spec)
+        if missing:
+            return f"mounts missing on {socket.gethostname()}: {missing}"
+        too_big = [f"card {i}: {c['total_mib']} MiB in all, the job asks {need} MiB"
+                   for i, c in card_memory(self.gpus).items() if need and need > c["total_mib"]]
+        return "--gpu-mem exceeds the card: " + "; ".join(too_big) if too_big else None
 
-    def _attempt(self, attempt: int, log_path: str) -> dict:
-        """One container run; returns {exit_code, cause, ...}."""
-        name = container_name(self.spec["id"])
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-        out = subprocess.run(docker_command(self.spec, self.gpus, attempt), capture_output=True, text=True)
+    def shortfall(self, need: int | None) -> list[str]:
+        return vram_shortfall(self.gpus, need) if self.gpus else []
+
+    def start(self, attempt: int, gang: dict) -> str | None:
+        """Starts the container; returns docker's error, or None."""
+        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+        env = dict(gang)
+        if gang:
+            env.update(FLEET_NODE_RANK=self.rank, NODE_RANK=self.rank, PET_NODE_RANK=self.rank)
+        out = subprocess.run(docker_command(self.spec, self.gpus, attempt, self.rank, env), capture_output=True, text=True)
         if out.returncode != 0:
-            return {"exit_code": None, "cause": "docker-run", "error": out.stderr.strip()[:500]}
-        _write_status(self.run_dir, state="running", gpus=self.gpus, machine=socket.gethostname(),
-                      container=name, attempt=attempt, started_at=time.time(), detail=None)
-        offset = os.path.getsize(log_path) if os.path.exists(log_path) else 0
-        with open(log_path, "ab") as log:
-            follower = subprocess.Popen(["docker", "logs", "-f", name], stdout=log, stderr=subprocess.STDOUT)
-            waited = subprocess.run(["docker", "wait", name], capture_output=True, text=True)
-            time.sleep(1)  # let the follower drain the last lines
-            follower.terminate()
+            return out.stderr.strip()[:500]
+        self.offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
+        self.log = open(self.log_path, "ab")
+        self.follower = subprocess.Popen(["docker", "logs", "-f", self.name], stdout=self.log, stderr=subprocess.STDOUT)
+        return None
+
+    def wait(self) -> dict:
+        """Waits for the container to end; returns {exit_code, cause, ...}."""
+        waited = subprocess.run(["docker", "wait", self.name], capture_output=True, text=True)
+        time.sleep(1)  # let the follower drain the last lines
+        if self.follower:
+            self.follower.terminate()
+            self.log.close()
         code = int(waited.stdout.strip()) if waited.stdout.strip().lstrip("-").isdigit() else None
         result = {"exit_code": code}
         if code != 0:
-            insp = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}}", name], capture_output=True, text=True)
-            with open(log_path, "rb") as f:
-                f.seek(offset)
+            insp = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}}", self.name],
+                                  capture_output=True, text=True)
+            with open(self.log_path, "rb") as f:
+                f.seek(self.offset)
                 this_attempt = f.read()[-65536:].decode(errors="replace")
             m = GPU_OOM.search(this_attempt)
             if m:
@@ -280,32 +294,135 @@ class GpuRun:
                 result.update(cause="host-oom", evidence="docker: OOMKilled")
             else:
                 result.update(cause="exit-code")
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
         return result
+
+    def kill(self):
+        subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
+
+
+# kill() must reach a rank while it blocks in wait()
+RankActor = ray.remote(max_restarts=0, max_task_retries=0, max_concurrency=4)(_Rank)
+
+
+@ray.remote(max_restarts=0, max_task_retries=0)
+class GpuRun:
+    """Runs one job to completion (with its retries). Not restarted by Ray: a run that
+    dies is reported, not silently repeated. With --nodes N it is rank 0 and starts
+    one RankActor per other bundle of its placement group (one per machine); every
+    attempt starts all ranks together, and the first rank to fail ends the others."""
+
+    def __init__(self, spec: dict, run_dir: str):
+        self.spec, self.run_dir = spec, run_dir
+        self.ranks = [_Rank(spec, run_dir, 0)]
+        self.gpus = self.ranks[0].gpus
+        if int(spec.get("nodes", 1)) > 1:
+            pg = ray.util.get_current_placement_group()
+            for i in range(1, int(spec["nodes"])):
+                b = _bundle(spec, i)
+                self.ranks.append(RankActor.options(
+                    name=f"run-{spec['id']}-r{i}", namespace=NAMESPACE, num_cpus=b["CPU"], num_gpus=b.get("GPU", 0),
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=i),
+                ).remote(spec, run_dir, i))
+        # where the containers will live: cancel and status reach them there
+        info = self.ranks[0].info()
+        _write_status(run_dir, machine=info["machine"], node_ip=info["node_ip"])
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def ping(self) -> dict:
+        return {"id": self.spec["id"], "gpus": self.gpus, "machine": socket.gethostname()}
+
+    def _all(self, method: str, *args) -> list:
+        """Calls a method on every rank (the others in parallel), results in rank order."""
+        refs = [getattr(r, method).remote(*args) for r in self.ranks[1:]]
+        return [getattr(self.ranks[0], method)(*args)] + ray.get(refs, timeout=300)
+
+    def _label(self, i: int) -> str:
+        return f"rank {i} ({self.infos[i]['machine']}): " if len(self.ranks) > 1 else ""
+
+    def _wait_vram(self, need: int | None) -> bool:
+        deadline = time.time() + int(self.spec.get("vram_wait_s", 1800))
+        while True:
+            short = [self._label(i) + s for i, ss in enumerate(self._all("shortfall", need)) for s in ss]
+            if not short:
+                return True
+            if time.time() > deadline:
+                _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
+                              error="cards not free in time: " + "; ".join(short))
+                return False
+            _write_status(self.run_dir, state="waiting_vram", gpus=self.gpus, detail="; ".join(short))
+            time.sleep(15)
+
+    def _gang_env(self) -> dict:
+        """Where the ranks meet: rank 0's machine and a port free there. Also as torchrun's
+        PET_* variables, so a plain `torchrun train.py` joins the gang."""
+        if len(self.ranks) == 1:
+            return {}
+        with socket.socket() as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        n, addr, per = len(self.ranks), self.infos[0]["node_ip"], max(len(self.gpus), 1)
+        return {"FLEET_NNODES": n, "FLEET_MASTER_ADDR": addr, "FLEET_MASTER_PORT": port,
+                "MASTER_ADDR": addr, "MASTER_PORT": port, "NNODES": n,
+                "PET_NNODES": n, "PET_MASTER_ADDR": addr, "PET_MASTER_PORT": port, "PET_NPROC_PER_NODE": per}
+
+    def _attempt(self, attempt: int) -> dict:
+        """One start of every rank; returns {exit_code, cause, ...} of the first that failed."""
+        n = len(self.ranks)
+        errors = self._all("start", attempt, self._gang_env())
+        bad = [(i, e) for i, e in enumerate(errors) if e]
+        if bad:
+            self._kill_all()
+            return {"exit_code": None, "cause": "docker-run", "error": "; ".join(self._label(i) + e for i, e in bad)}
+        _write_status(self.run_dir, state="running", gpus=self.gpus, container=self.ranks[0].name,
+                      attempt=attempt, started_at=time.time(), detail=None)
+        done: queue.Queue = queue.Queue()
+
+        def wait(i: int):
+            try:
+                res = self.ranks[0].wait() if i == 0 else ray.get(self.ranks[i].wait.remote())
+            except Exception as e:  # its machine or actor died
+                res = {"exit_code": None, "cause": "rank-lost", "error": repr(e)[:300]}
+            done.put((i, res))
+
+        for i in range(n):
+            threading.Thread(target=wait, args=(i,), daemon=True).start()
+        failed = None
+        for _ in range(n):
+            i, res = done.get()
+            if res.get("exit_code") != 0 and failed is None:
+                failed = (i, res)
+                if n > 1:
+                    self._kill_all()  # a gang without one rank only hangs
+        if failed is None:
+            return {"exit_code": 0}
+        i, res = failed
+        return {**res, "rank": i, "machine": self.infos[i]["machine"]} if n > 1 else res
+
+    def _kill_all(self):
+        self.ranks[0].kill()
+        for r in self.ranks[1:]:
+            r.kill.remote()
 
     def _run(self):
         code = None
         try:
-            missing = missing_mounts(self.spec)
-            if missing:
-                _write_status(self.run_dir, state="failed", error=f"mounts missing on {socket.gethostname()}: {missing}",
-                              finished_at=time.time())
-                return
             need = int(self.spec.get("gpu_mem_gb") or 0) * 1024 or None
-            too_big = [f"card {i}: {c['total_mib']} MiB in all, the job asks {need} MiB"
-                       for i, c in card_memory(self.gpus).items() if need and need > c["total_mib"]]
-            if too_big:
+            self.infos = self._all("info")
+            if len(self.ranks) > 1:
+                _write_status(self.run_dir, ranks=self.infos)
+            problems = [self._label(i) + p for i, p in enumerate(self._all("check", need)) if p]
+            if problems:
                 _write_status(self.run_dir, state="failed", gpus=self.gpus, finished_at=time.time(),
-                              error="--gpu-mem exceeds the card: " + "; ".join(too_big))
+                              error="; ".join(problems))
                 return
-            log_path = self.spec.get("log") or os.path.join(self.run_dir, "log")
             retries, oom_restarts, attempts = int(self.spec.get("retry", 0)), int(self.spec.get("restart_on_oom", 0)), []
             attempt = 0
             while True:
                 attempt += 1
                 if not self._wait_vram(need):
                     return
-                result = self._attempt(attempt, log_path)
+                result = self._attempt(attempt)
                 attempts.append(result)
                 code = result.get("exit_code")
                 if code == 0:
@@ -328,8 +445,9 @@ class GpuRun:
         except Exception as e:  # report, never hang the cards
             _write_status(self.run_dir, state="failed", error=repr(e), finished_at=time.time())
         finally:
-            subprocess.run(["docker", "rm", "-f", container_name(self.spec["id"])], capture_output=True)
             try:
+                self._kill_all()
+                time.sleep(2)  # let the other ranks' kills land before their actors go with the group
                 remove_placement_group(ray.util.get_placement_group(f"pg-run-{self.spec['id']}"))
             finally:
                 os._exit(0 if code == 0 else 1)
@@ -388,22 +506,31 @@ def _on_run_machine(st: dict, argv: list[str]) -> str | None:
 
 
 def _shared_storage(path: str) -> bool:
+    """Whether every machine sees path (a network file system; FLEET_RUNS_SHARED=1 says
+    so for one the type check does not know, e.g. a bind mount of one)."""
+    if os.environ.get("FLEET_RUNS_SHARED") == "1":
+        return True
     fs = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True).stdout.strip()
     return fs.startswith(NETWORK_FS)
 
 
-def _bundle(spec: dict) -> dict:
+def _bundle(spec: dict, rank: int = 0) -> dict:
+    """One machine's share: --gpus cards and --cpus CPUs (per machine with --nodes)."""
     b = {"CPU": float(max(spec["cpus"], 1))}
     if spec["gpus"]:
         b["GPU"] = float(spec["gpus"])
-    if spec.get("machine_resource"):
-        b[spec["machine_resource"]] = 0.001
+    pins = spec.get("machine_resources") or ([spec["machine_resource"]] if spec.get("machine_resource") else [])
+    if pins:
+        b[pins[rank]] = 0.001
     return b
 
 
 def _launch(spec: dict, run_dir: str):
+    n = int(spec.get("nodes", 1))
     b = _bundle(spec)
-    pg = placement_group([b], strategy="STRICT_PACK", name=f"pg-run-{spec['id']}", lifetime="detached")
+    # one bundle per machine; several only on DIFFERENT machines
+    pg = placement_group([_bundle(spec, i) for i in range(n)], strategy="STRICT_SPREAD" if n > 1 else "STRICT_PACK",
+                         name=f"pg-run-{spec['id']}", lifetime="detached")
     GpuRun.options(
         name=f"run-{spec['id']}", namespace=NAMESPACE, lifetime="detached",
         num_cpus=b["CPU"], num_gpus=b.get("GPU", 0),
@@ -485,13 +612,26 @@ def submit(a, cmd: list[str], config: dict) -> dict:
     if a.after:
         _run_dir(a.runs_dir, a.after)
     note = None
-    if len([n for n in ray.nodes() if n.get("Alive")]) > 1 and not _shared_storage(a.runs_dir):
+    nodes = int(a.nodes)
+    alive = len([n for n in ray.nodes() if n.get("Alive")])
+    if nodes < 1:
+        raise SystemExit("--nodes: at least 1")
+    if nodes > alive:
+        raise SystemExit(f"--nodes {nodes}: the cluster has {alive} machine(s)")
+    if a.machine and len(a.machine) not in (0, nodes):
+        raise SystemExit(f"--machine: give one per node ({nodes}) or none")
+    if alive > 1 and not _shared_storage(a.runs_dir):
         here = ray.util.get_node_ip_address()
-        if a.machine and _machine_resource(a.machine) != f"node:{here}":
-            raise SystemExit(f"--machine {a.machine}: the runs dir {a.runs_dir} is not shared storage, "
+        if nodes > 1:
+            raise SystemExit(f"--nodes {nodes}: the runs dir {a.runs_dir} is not shared storage")
+        if a.machine and _machine_resource(a.machine[0]) != f"node:{here}":
+            raise SystemExit(f"--machine {a.machine[0]}: the runs dir {a.runs_dir} is not shared storage, "
                              "so a run can only land on this machine")
-        a.machine, note = here, f"runs dir {a.runs_dir} is not shared storage: the run stays on this machine"
-    machine_resource = _machine_resource(a.machine) if a.machine else None
+        a.machine, note = [here], f"runs dir {a.runs_dir} is not shared storage: the run stays on this machine"
+    machine_resources = [_machine_resource(m) for m in a.machine] if a.machine else []
+    if len(set(machine_resources)) != len(machine_resources):
+        raise SystemExit("--machine: the nodes of one run are different machines")
+    machine_resource = machine_resources[0] if machine_resources else None
 
     base = re.sub(r"[^A-Za-z0-9_.-]", "-", a.name or a.profile)[:40]
     run_id = f"{base}-{uuid.uuid4().hex[:8]}"
@@ -513,14 +653,16 @@ def submit(a, cmd: list[str], config: dict) -> dict:
             "cpus": a.cpus, "mounts": mounts, "env": env, "log": a.log, "workdir": a.workdir, "out": out,
             "code_dir": os.path.join(run_dir, "code") if code else None, "code": code,
             "gpu_mem_gb": gpu_mem, "vram_wait_s": a.vram_wait, "retry": a.retry, "restart_on_oom": a.restart_on_oom,
-            "after": a.after, "machine": a.machine, "machine_resource": machine_resource}
+            "after": a.after, "machine": a.machine[0] if a.machine else None, "machine_resource": machine_resource,
+            "nodes": nodes, "machines": a.machine or None, "machine_resources": machine_resources or None}
     if a.workdir and not _inside(_expand(a.workdir, spec), [p for p, _ in mounts] + [out] + ([spec["code_dir"]] if code else [])):
         shutil.rmtree(run_dir)
         raise SystemExit(f"--workdir {a.workdir} is outside the run's mounts")
     with open(os.path.join(run_dir, "spec.json"), "w") as f:
         json.dump(spec, f, indent=2)
     _write_status(run_dir, id=run_id, state="waiting_dependency" if a.after else "queued", submitted_at=time.time(),
-                  gpus_requested=a.gpus, cpus=a.cpus, gpu_mem_gb=gpu_mem or "whole card", after=a.after, code=code)
+                  gpus_requested=a.gpus, cpus=a.cpus, gpu_mem_gb=gpu_mem or "whole card", after=a.after, code=code,
+                  **({"nodes": nodes} if nodes > 1 else {}))
     if a.after:
         RunWaiter.options(name=f"wait-{run_id}", namespace=NAMESPACE, lifetime="detached",
                           resources={machine_resource: 0.001} if machine_resource else None,
@@ -548,9 +690,8 @@ def status(a, run_id: str) -> dict:
     st = _read_status(run_dir)
     if st.get("state") not in TERMINAL and not _alive(f"run-{run_id}") and not _alive(f"wait-{run_id}"):
         # The actor is gone without reporting (a Ray restart): say what the container does.
-        out = _on_run_machine(st, ["docker", "inspect", "-f", "{{.State.Status}}", container_name(run_id)])
         st["state"] = "lost"
-        st["container"] = (out.strip() or "gone") if out is not None else f"unknown: {st.get('machine')} left the cluster"
+        st["container"] = _container_states(st, run_id)
     with open(os.path.join(run_dir, "spec.json")) as f:
         spec = json.load(f)
     metrics = _last_metrics(spec)
@@ -560,16 +701,34 @@ def status(a, run_id: str) -> dict:
     return st
 
 
+def _rank_places(st: dict, run_id: str) -> list[tuple[dict, str]]:
+    """(where, container name) for every rank of the run."""
+    ranks = st.get("ranks") or [{"rank": 0, "node_ip": st.get("node_ip"), "machine": st.get("machine")}]
+    return [(r, container_name(run_id, r["rank"])) for r in ranks]
+
+
+def _container_states(st: dict, run_id: str) -> str:
+    states = []
+    for r, name in _rank_places(st, run_id):
+        out = _on_run_machine(r, ["docker", "inspect", "-f", "{{.State.Status}}", name])
+        state = (out.strip() or "gone") if out is not None else f"unknown ({r.get('machine')} left the cluster)"
+        states.append(f"rank {r['rank']} {state}" if st.get("ranks") else state)
+    return "; ".join(states)
+
+
 def cancel(a, run_id: str) -> dict:
     run_dir = _run_dir(a.runs_dir, run_id)
     st = _write_status(run_dir, state="cancelled", finished_at=time.time())
-    for name in (f"run-{run_id}", f"wait-{run_id}"):
+    names = [f"run-{run_id}", f"wait-{run_id}"] + [f"run-{run_id}-r{i}" for i in range(1, int(st.get("nodes") or 1))]
+    for name in names:
         try:
             ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
         except ValueError:
             pass
-    if _on_run_machine(st, ["docker", "rm", "-f", container_name(run_id)]) is None:
-        st["container"] = f"not removed: {st.get('machine')} left the cluster"
+    gone = [r.get("machine") for r, name in _rank_places(st, run_id)
+            if _on_run_machine(r, ["docker", "rm", "-f", name]) is None]
+    if gone:
+        st["container"] = f"not removed: {', '.join(map(str, gone))} left the cluster"
     try:
         remove_placement_group(ray.util.get_placement_group(f"pg-run-{run_id}"))
     except Exception:
@@ -582,6 +741,8 @@ def logs(a, run_id: str):
     run_dir = _run_dir(a.runs_dir, run_id)
     with open(os.path.join(run_dir, "spec.json")) as f:
         log_path = json.load(f).get("log") or os.path.join(run_dir, "log")
+    if a.rank:
+        log_path += f".rank{a.rank}"
     for line in _tail(log_path, 1 << 20).splitlines()[-a.lines:]:
         print(line)
     if not a.follow:
@@ -631,7 +792,8 @@ def purge(a, run_id: str | None) -> list[dict]:
         except (OSError, ValueError):
             st = {}
         state = st.get("state")
-        if state not in TERMINAL and (_alive(f"run-{os.path.basename(d)}") or _alive(f"wait-{os.path.basename(d)}")):
+        rid = os.path.basename(d)
+        if state not in TERMINAL and (_alive(f"run-{rid}") or _alive(f"wait-{rid}")):
             done.append({"id": os.path.basename(d), "purged": False, "reason": f"still {state}: cancel it first"})
             continue
         size = _dir_bytes(d)
@@ -675,7 +837,7 @@ def stage_model(a, config: dict) -> dict:
                                     + ([f"{os.path.dirname(token_file)}:ro"] if token_file else []),
                                     "env": [f"HF_TOKEN_FILE={token_file}"] if token_file else [], "log": None,
                                     "workdir": None, "after": None, "retry": 2, "restart_on_oom": 0,
-                                    "code": None, "machine": a.machine})
+                                    "code": None, "machine": a.machine, "nodes": 1})
     stage_cmd = ["python3", "{code}/stage_model.py", a.repo, a.revision, dest] + [f"--include={g}" for g in a.include]
     # the stager travels as the run's pinned code
     tgz = io.BytesIO()
@@ -714,7 +876,10 @@ def main(argv: list[str]):
                    help="GiB free each granted card must have before the job starts (default: the profile's, else the whole card)")
     p.add_argument("--vram-wait", type=int, default=1800,
                    help="seconds to wait for that memory before failing (the run shows waiting_vram meanwhile)")
-    p.add_argument("--machine", help="the machine (host name or IP) the run must land on")
+    p.add_argument("--machine", action="append", help="the machine (host name or IP) the run must land on; with --nodes N, repeat for each")
+    p.add_argument("--nodes", type=int, default=1,
+                   help="spread the run over N machines: --gpus and --cpus on each, one container per machine, "
+                        "ranks wired through FLEET_MASTER_ADDR / FLEET_NODE_RANK (and torchrun's PET_*)")
     p.add_argument("--after", help="run only after this run succeeded")
     p.add_argument("--retry", type=int, default=0, help="try a failed run again up to N times")
     p.add_argument("--restart-on-oom", type=int, default=0, help="try again up to N times when an attempt ran out of memory")
@@ -725,6 +890,7 @@ def main(argv: list[str]):
     p.add_argument("--workdir")
     p.add_argument("-f", "--follow", action="store_true", help="logs: keep printing until the run ends")
     p.add_argument("-n", "--lines", type=int, default=50, help="logs: lines of history first")
+    p.add_argument("--rank", type=int, default=0, help="logs: a --nodes run's rank k (its output is log.rank<k>)")
     p.add_argument("--older-than", type=float, help="purge: finished runs older than this many days")
     p.add_argument("--revision", default="main", help="stage-model: branch, tag or commit")
     p.add_argument("--include", action="append", default=[], help="stage-model: only files matching this glob; repeat")

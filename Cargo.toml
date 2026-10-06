@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fleet-proto", "crates/fleet-scheduler", "crates/fleet-node", "crates/fleetctl"]
+members = ["crates/fleet-proto", "crates/fleet-scheduler", "crates/fleet-ziren-node", "crates/fleetctl"]
 resolver = "2"
 
 [workspace.package]

@@ -1,10 +1,10 @@
 # Prover actors: edit, then deploy/apply.sh (written by install.sh).
 scheduler: http://10.0.0.1:51001
 cluster_token_file: /etc/zkm-fleet/cluster.token
-node_binary: /opt/zkm-fleet/bin/fleet-node
+node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
-node_port_range: [31000, 31099]    # fleet-node, cluster network
+node_port_range: [31000, 31099]    # fleet-ziren-node, cluster network
 services:
   # Ray hands out the lowest free cards in file order; a hold keeps a card free for
   # one-shot runs (deploy/run.sh) by taking it while the services after it start.
