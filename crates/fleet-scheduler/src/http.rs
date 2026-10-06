@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -32,6 +32,7 @@ pub fn router(state: HttpState) -> Router {
             axum::routing::delete(revoke_credential),
         )
         .route("/apps", get(apps).delete(delete_app))
+        .route("/apps/disabled", put(disable_app).delete(enable_app))
         .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
@@ -154,16 +155,44 @@ struct AppKey {
     elf_id: Option<String>,
 }
 
-async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
-    let (Some(tenant), Some(elf_id)) = (k.tenant, k.elf_id) else {
-        return (StatusCode::BAD_REQUEST, "give tenant and elf_id (the full id, as GET /admin/apps lists it)").into_response();
-    };
-    match s.fleet.delete_app(&tenant, &elf_id).await {
+impl AppKey {
+    fn parts(self) -> Result<(String, String), Response> {
+        match (self.tenant, self.elf_id) {
+            (Some(t), Some(e)) => Ok((t, e)),
+            _ => Err((StatusCode::BAD_REQUEST, "give tenant and elf_id (the full id, as GET /admin/apps lists it)").into_response()),
+        }
+    }
+}
+
+/// An app action's outcome: its JSON, a refusal with its status, or 500.
+fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
+    match r {
         Ok(v) => Json(v).into_response(),
         Err(e) => match e.downcast_ref::<crate::fleet::Refusal>() {
             Some(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST), r.message.clone()).into_response(),
             None => internal(e),
         },
+    }
+}
+
+async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+    match k.parts() {
+        Ok((t, e)) => app_outcome(s.fleet.delete_app(&t, &e).await),
+        Err(r) => r,
+    }
+}
+
+async fn disable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+    match k.parts() {
+        Ok((t, e)) => app_outcome(s.fleet.set_app_disabled(&t, &e, true).await),
+        Err(r) => r,
+    }
+}
+
+async fn enable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+    match k.parts() {
+        Ok((t, e)) => app_outcome(s.fleet.set_app_disabled(&t, &e, false).await),
+        Err(r) => r,
     }
 }
 

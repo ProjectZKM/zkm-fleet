@@ -120,6 +120,8 @@ pub struct Fleet {
     inner: Mutex<Inner>,
     /// address -> credential, mirrored from the store.
     creds: Mutex<HashMap<String, Credential>>,
+    /// (tenant, elf_id) of the apps refusing new jobs, mirrored from the store.
+    disabled: Mutex<HashSet<(String, String)>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -186,11 +188,44 @@ impl Fleet {
             cluster_token,
             inner: Mutex::new(Inner::default()),
             creds: Mutex::new(HashMap::new()),
+            disabled: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
             app_ops: tokio::sync::RwLock::new(()),
         })
+    }
+
+    /// Which apps are disabled, from the store; the number of them.
+    pub async fn load_apps(&self) -> anyhow::Result<usize> {
+        let set: HashSet<_> = self.store.disabled_apps().await?.into_iter().collect();
+        let n = set.len();
+        *self.disabled.lock() = set;
+        Ok(n)
+    }
+
+    /// Whether the app refuses new jobs.
+    pub fn app_disabled(&self, tenant: &str, elf_id: &str) -> bool {
+        self.disabled.lock().contains(&(tenant.to_string(), elf_id.to_string()))
+    }
+
+    /// Disables an app (its new jobs are refused; queued and running ones finish) or
+    /// enables it again. The app must exist (have had a job).
+    pub async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool) -> anyhow::Result<serde_json::Value> {
+        let _ops = self.app_ops.write().await;
+        let apps = self.store.apps().await?;
+        if !apps.iter().any(|a| a.tenant == tenant && a.elf_id == elf_id) {
+            return Err(refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id))));
+        }
+        self.store.set_app_disabled(tenant, elf_id, disabled, now_ms()).await?;
+        let key = (tenant.to_string(), elf_id.to_string());
+        if disabled {
+            self.disabled.lock().insert(key);
+        } else {
+            self.disabled.lock().remove(&key);
+        }
+        tracing::info!(app = %app_name(tenant, elf_id), disabled, "app setting changed");
+        Ok(serde_json::json!({ "app": app_name(tenant, elf_id), "disabled": disabled }))
     }
 
     pub async fn load_credentials(&self) -> anyhow::Result<usize> {
@@ -397,6 +432,8 @@ impl Fleet {
             )));
         }
         let ids = self.store.delete_app(tenant, elf_id).await?;
+        self.store.set_app_disabled(tenant, elf_id, false, now_ms()).await?;
+        self.disabled.lock().remove(&(tenant.to_string(), elf_id.to_string()));
         {
             let mut inner = self.inner.lock();
             for id in &ids {

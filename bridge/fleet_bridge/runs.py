@@ -711,6 +711,8 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
     if a.profile is None or a.profile not in config.profiles:
         raise SystemExit(f"unknown profile {a.profile!r} (have: {', '.join(config.profiles) or 'none'})")
     profile = config.profiles[a.profile]
+    if profile.disabled:
+        raise Conflict(f"run app {a.profile} is disabled: it takes no new runs (fleetctl app enable {a.profile})")
     if not cmd:
         raise SystemExit("no command after --")
     if a.gpus > profile.max_gpus:
@@ -970,14 +972,13 @@ class RunApp(Record):
     failed: int = 0  # failed or lost
     cancelled: int = 0
     last_submitted_at: float | None = None
+    disabled: bool = False  # takes no new runs
     removed: bool = False  # no longer in runs.yaml: only its past runs are left
 
 
 def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
     """Every profile, with the runs submitted under it (the runs dir is scanned once)."""
-    by_name = {name: RunApp(name=name, image=p.image, user=p.user, max_gpus=p.max_gpus,
-                            default_gpu_mem_gb=p.default_gpu_mem_gb, allow=p.allow)
-               for name, p in config.profiles.items()}
+    by_name = {name: _run_app(name, p) for name, p in config.profiles.items()}
     for d in os.listdir(a.runs_dir) if os.path.isdir(a.runs_dir) else []:
         if d.startswith("."):
             continue
@@ -988,10 +989,7 @@ def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
             continue
         app = by_name.get(spec.profile_name)
         if app is None:  # a profile since removed from runs.yaml (or model staging's own)
-            p = spec.profile
-            app = by_name[spec.profile_name] = RunApp(name=spec.profile_name, image=p.image, user=p.user,
-                                                      max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
-                                                      allow=p.allow, removed=True)
+            app = by_name[spec.profile_name] = _run_app(spec.profile_name, spec.profile, removed=True)
         state = _state(d, st)
         app.jobs += 1
         app.active += state.active
@@ -1009,31 +1007,162 @@ class AppDeleted(Record):
     runs_kept: int  # its past runs stay listed (under an app that no longer exists)
 
 
-def _without_profile(text: str, name: str) -> str:
-    """runs.yaml's text with one profile's block cut out, the rest (comments included)
-    as it was: from its `name:` line (and the comment right above it) to the next line
-    at its indentation or less."""
-    lines = text.splitlines(keepends=True)
+# A run app's name: it heads its runs' ids, so it is one too.
+APP_NAME = RUN_ID
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_text(line: str) -> bool:
+    body = line.strip()
+    return bool(body) and not body.startswith("#")
+
+
+def _profiles_top(lines: list[str]) -> int:
     top = next((i for i, l in enumerate(lines) if re.match(r"profiles:\s*(#.*)?$", l)), None)
     if top is None:
-        raise SystemExit("runs.yaml: no block-style `profiles:` mapping to remove it from")
+        raise SystemExit("runs.yaml: no block-style `profiles:` mapping to edit")
+    return top
+
+
+def _profile_span(lines: list[str], name: str) -> tuple[int, int, int]:
+    """(profiles line, first line, line after the last) of one profile's block in
+    runs.yaml's text: from its `name:` line (and the comment right above it) to the next
+    line at its indentation or less. Comments heading the next entry are left to it."""
+    top = _profiles_top(lines)
     key = re.compile(rf"""(\s+)(?:{re.escape(name)}|"{re.escape(name)}"|'{re.escape(name)}'):\s*(#.*)?$""")
     start = next((i for i in range(top + 1, len(lines)) if key.match(lines[i].rstrip("\n"))), None)
     if start is None:
         raise SystemExit(f"runs.yaml: profile {name} is not written as a block under `profiles:`; edit it by hand")
-    indent = len(lines[start]) - len(lines[start].lstrip(" "))
+    indent = _indent(lines[start])
     end = start + 1
-    while end < len(lines):
-        l = lines[end]
-        body = l.strip()
-        if body and not body.startswith("#") and (len(l) - len(l.lstrip(" "))) <= indent:
-            break
+    while end < len(lines) and not (_is_text(lines[end]) and _indent(lines[end]) <= indent):
         end += 1
-    while end > start + 1 and lines[end - 1].strip().startswith("#"):  # comments heading the next entry
+    while end > start + 1 and lines[end - 1].strip().startswith("#"):
         end -= 1
-    while start - 1 > top and lines[start - 1].startswith(" " * indent + "#"):  # its own heading comment
+    while start - 1 > top and lines[start - 1].startswith(" " * indent + "#"):
         start -= 1
-    return "".join(lines[:start] + lines[end:])
+    return top, start, end
+
+
+def _without_profile(text: str, name: str) -> str:
+    """runs.yaml's text with one profile's block cut out, the rest (comments included)
+    as it was."""
+    lines = text.splitlines(keepends=True)
+    _, start, end = _profile_span(lines, name)
+    rest = lines[:start] + lines[end:]
+    # the blank line that set the block apart, now doubled or at the end
+    if start > 0 and not rest[start - 1].strip() and (start >= len(rest) or not rest[start].strip()):
+        del rest[start - 1]
+    return "".join(rest)
+
+
+def _with_profile_disabled(text: str, name: str, disabled: bool) -> str:
+    """runs.yaml's text with `disabled: true` as the profile's first line, or without
+    any `disabled:` line of its own."""
+    lines = text.splitlines(keepends=True)
+    _, start, end = _profile_span(lines, name)
+    key = next(i for i in range(start, end) if _is_text(lines[i]))  # past its heading comment
+    inner = next((_indent(lines[i]) for i in range(key + 1, end) if _is_text(lines[i])), _indent(lines[key]) + 2)
+    block = [l for l in lines[key + 1:end] if not (_indent(l) == inner and re.match(r"\s*disabled\s*:", l))]
+    if disabled:
+        block.insert(0, " " * inner + "disabled: true\n")
+    return "".join(lines[:key + 1] + block + lines[end:])
+
+
+def _profile_mapping(profile: Profile) -> dict[str, Any]:
+    """The profile as runs.yaml writes it: its fields, less the ones at their defaults."""
+    return {k: v for k, v in profile.dump().items()
+            if v not in (None, [], {}, False) and not (k == "default_gpu_mem_gb" and v == 0)}
+
+
+def _with_profile_added(text: str, name: str, profile: Profile) -> str:
+    """runs.yaml's text with a profile's block appended under `profiles:` (before the
+    next top-level key), written the way the file writes the others."""
+    lines = text.splitlines(keepends=True)
+    top = _profiles_top(lines)
+    end = next((i for i in range(top + 1, len(lines)) if _is_text(lines[i]) and _indent(lines[i]) == 0), len(lines))
+    inner = next((_indent(lines[i]) for i in range(top + 1, end) if _is_text(lines[i])), 2)
+    rendered = yaml.safe_dump({name: _profile_mapping(profile)}, sort_keys=False, default_flow_style=False,
+                              allow_unicode=True)
+    block = [" " * inner + l + "\n" for l in rendered.splitlines()]
+    while end > top + 1 and not lines[end - 1].strip():
+        end -= 1
+    if lines[end - 1] and not lines[end - 1].endswith("\n"):
+        lines[end - 1] += "\n"
+    sep = ["\n"] if end > top + 1 else []
+    tail = lines[end:]
+    if tail and _is_text(tail[0]):
+        tail = ["\n"] + tail
+    return "".join(lines[:end] + sep + block + tail)
+
+
+def _write_profiles(path: str, text: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+
+
+def _edit_profiles(a: RunArgs, edit: Callable[[str], str], expect: Callable[[dict[str, Any]], dict[str, Any]],
+                   what: str) -> RunsConfig:
+    """Applies a text edit to runs.yaml, writes it only when the parsed result is exactly
+    `expect(before)` (nothing else moved), and returns the new config."""
+    with open(a.profiles) as f:
+        text = f.read()
+    new = edit(text)
+    before, after = yaml.safe_load(text) or {}, yaml.safe_load(new) or {}
+    if after != expect(before):
+        raise SystemExit(f"runs.yaml: {what} would change more than that; edit it by hand")
+    config = RunsConfig.load(after)  # what the scheduler will read: refused before writing if it does not load
+    _write_profiles(a.profiles, new)
+    return config
+
+
+def _run_app(name: str, p: Profile, **counts: Any) -> RunApp:
+    return RunApp(name=name, image=p.image, user=p.user, max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
+                  allow=p.allow, disabled=p.disabled, **counts)
+
+
+def add_app(a: RunArgs, name: str, body: dict[str, Any]) -> RunApp:
+    """Adds a run app: a new profile in runs.yaml, from the request's fields (strictly
+    Profile's). Every allowed root is an absolute path."""
+    if not APP_NAME.fullmatch(name):
+        raise SystemExit(f"not an app name: {name!r} (letters, digits, _ . -; it heads its runs' ids)")
+    config = load_config(a.profiles)
+    if name in config.profiles:
+        raise Conflict(f"run app {name} exists (fleetctl app lists it); delete it first to replace it")
+    profile = from_dict(Profile, body, strict=True, where="app")
+    if not profile.image:
+        raise SystemExit("image: the container image a run gets")
+    bad = [r for r in profile.allow if not os.path.isabs(r)]
+    if bad:
+        raise SystemExit(f"allow: absolute paths on the server ({', '.join(bad)})")
+    _edit_profiles(a, lambda t: _with_profile_added(t, name, profile),
+                   lambda b: {**b, "profiles": {**b.get("profiles", {}), name: _profile_mapping(profile)}},
+                   f"adding {name}")
+    print(f"run app {name} added", flush=True)
+    return _run_app(name, load_config(a.profiles).profiles[name])
+
+
+def set_app_disabled(a: RunArgs, name: str, disabled: bool) -> RunApp:
+    """Disables a run app (its new runs are refused; the ones going finish) or enables
+    it again: `disabled: true` in its profile."""
+    config = load_config(a.profiles)
+    if name not in config.profiles:
+        raise NotFound(f"no run app {name} in runs.yaml (have: {', '.join(config.profiles) or 'none'})")
+
+    def expect(b: dict[str, Any]) -> dict[str, Any]:
+        p = {k: v for k, v in b["profiles"][name].items() if k != "disabled"}
+        return {**b, "profiles": {**b["profiles"], name: {**p, "disabled": True} if disabled else p}}
+
+    config = _edit_profiles(a, lambda t: _with_profile_disabled(t, name, disabled), expect,
+                            f"{'disabling' if disabled else 'enabling'} {name}")
+    print(f"run app {name} {'disabled' if disabled else 'enabled'}", flush=True)
+    return _run_app(name, config.profiles[name])
 
 
 def delete_app(a: RunArgs, name: str) -> AppDeleted:
@@ -1048,18 +1177,9 @@ def delete_app(a: RunArgs, name: str) -> AppDeleted:
     if going:
         raise Conflict(f"{name} has {len(going)} run(s) queued or running ({', '.join(going[:5])}): "
                        "delete it when they are done, or cancel them")
-    with open(a.profiles) as f:
-        text = f.read()
-    new = _without_profile(text, name)
-    before, after = yaml.safe_load(text) or {}, yaml.safe_load(new) or {}
-    expect = {**before, "profiles": {k: v for k, v in before["profiles"].items() if k != name}}
-    if after != expect:
-        raise SystemExit(f"runs.yaml: removing {name}'s block would change more than that profile; edit it by hand")
-    tmp = f"{a.profiles}.tmp"
-    with open(tmp, "w") as f:
-        f.write(new)
-    shutil.copymode(a.profiles, tmp)
-    os.replace(tmp, a.profiles)
+    _edit_profiles(a, lambda t: _without_profile(t, name),
+                   lambda b: {**b, "profiles": {k: v for k, v in b["profiles"].items() if k != name}},
+                   f"removing {name}")
     kept = len(list_runs(a, 1 << 30, profile=name))
     print(f"run app {name} deleted ({kept} past runs kept)", flush=True)
     return AppDeleted(app=name, profiles=a.profiles, runs_kept=kept)
@@ -1080,6 +1200,8 @@ def stage_model(a: RunArgs, config: RunsConfig) -> Submitted:
     base_name = config.stage_profile or a.profile or next(iter(config.profiles), None)
     if base_name is None or base_name not in config.profiles:
         raise SystemExit(f"stage-model: no profile to run in (have: {', '.join(config.profiles) or 'none'})")
+    if config.profiles[base_name].disabled:
+        raise Conflict(f"stage-model: run app {base_name} is disabled")
     token_dir = os.path.dirname(token_file) if token_file else None
     profile = replace(config.profiles[base_name], allow=[dest] + ([token_dir] if token_dir else []), default_gpu_mem_gb=0)
     staging = replace(a, profile="_stage", name=f"stage-{repo.replace('/', '-')}", gpus=0, cpus=2, gpu_mem=0,

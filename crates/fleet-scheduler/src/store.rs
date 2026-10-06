@@ -136,6 +136,8 @@ pub struct ProofApp {
     pub last_created_ms: u64,
     /// Mean proving time of its succeeded jobs.
     pub mean_prove_ms: Option<f64>,
+    /// New jobs are refused (`fleetctl app disable`); the queued and running ones finish.
+    pub disabled: bool,
 }
 
 /// A signing key registered for a tenant: the SDK's `ZKM_PRIVATE_KEY` maps to its address.
@@ -168,6 +170,9 @@ pub trait Store: Send + Sync {
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>>;
     /// Deletes an app's finished jobs; returns their ids.
     async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<Vec<String>>;
+    /// The apps whose new jobs are refused.
+    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>>;
+    async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()>;
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
     /// Marks the credential revoked; returns false when the address is unknown.
@@ -198,6 +203,7 @@ impl JobFilter {
 pub struct MemoryStore {
     jobs: Mutex<HashMap<String, Job>>,
     creds: Mutex<HashMap<String, Credential>>,
+    disabled: Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 #[async_trait]
@@ -235,7 +241,8 @@ impl Store for MemoryStore {
         for j in self.jobs.lock().values() {
             let (a, prove_sum) = apps.entry((j.tenant.clone(), j.elf_id.clone())).or_insert_with(|| {
                 (ProofApp { tenant: j.tenant.clone(), elf_id: j.elf_id.clone(), jobs: 0, active: 0, succeeded: 0,
-                            failed: 0, last_created_ms: 0, mean_prove_ms: None }, 0.0)
+                            failed: 0, last_created_ms: 0, mean_prove_ms: None,
+                            disabled: self.disabled.lock().contains(&(j.tenant.clone(), j.elf_id.clone())) }, 0.0)
             });
             a.jobs += 1;
             a.last_created_ms = a.last_created_ms.max(j.created_ms);
@@ -272,6 +279,23 @@ impl Store for MemoryStore {
         Ok(ids)
     }
 
+    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut v: Vec<_> = self.disabled.lock().iter().cloned().collect();
+        v.sort();
+        Ok(v)
+    }
+
+    async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, _at_ms: u64) -> anyhow::Result<()> {
+        let key = (tenant.to_string(), elf_id.to_string());
+        let mut set = self.disabled.lock();
+        if disabled {
+            set.insert(key);
+        } else {
+            set.remove(&key);
+        }
+        Ok(())
+    }
+
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {
         let mut creds = self.creds.lock();
         anyhow::ensure!(
@@ -303,15 +327,21 @@ pub struct PgStore {
 }
 
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
     names.into_iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
 }
 
-/// The tables (schema 1). Names, not numbers: a state, kind or stage status reads the
-/// same in the database as in the admin API, and the CHECKs list what may be there.
+/// Every table, as a new database gets them.
 fn schema() -> String {
+    format!("{}{}", jobs_and_credentials(), apps())
+}
+
+/// Jobs and credentials (schema 1). Names, not numbers: a state, kind or stage status
+/// reads the same in the database as in the admin API, and the CHECKs list what may be
+/// there.
+fn jobs_and_credentials() -> String {
     let kinds = quoted(all::<ProofKind>().into_iter().map(kind_name));
     let statuses = quoted(all::<StageStatus>().into_iter().map(status_name));
     let states = quoted(STATES.map(String::from));
@@ -361,21 +391,37 @@ COMMENT ON COLUMN fleet_credentials.address IS 'Lower-case hex address without 0
     )
 }
 
+/// What a proof app carries beyond its jobs (schema 2): a row while it is disabled.
+fn apps() -> String {
+    r#"
+CREATE TABLE fleet_apps (
+    tenant      TEXT   NOT NULL,
+    elf_id      TEXT   NOT NULL,
+    disabled_ms BIGINT NOT NULL,
+    PRIMARY KEY (tenant, elf_id)
+);
+COMMENT ON TABLE fleet_apps IS 'Proof apps that are disabled (new jobs refused): a row while that holds, with when it was set.';
+"#
+    .to_string()
+}
+
 /// A script that ends by recording the version it brought the database to.
-fn applying(body: String) -> String {
+fn applying(body: String, version: i32) -> String {
     format!(
         "{body}\nINSERT INTO fleet_schema (version, applied_ms) \
-         VALUES ({SCHEMA_VERSION}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
+         VALUES ({version}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint);\n"
     )
 }
 
 // the scripts, made once (a query's text must outlive the connection's future)
-static CREATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(schema()));
-static MIGRATE_0_TO_1: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(migrate_0_to_1()));
+static CREATE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| applying(schema(), SCHEMA_VERSION));
+/// MIGRATIONS[v] takes a schema-v database to v + 1; a fresh one gets `schema()` at once.
+static MIGRATIONS: std::sync::LazyLock<Vec<String>> =
+    std::sync::LazyLock::new(|| vec![applying(migrate_0_to_1(), 1), applying(apps(), 2)]);
 
 /// Schema 0 (numbers for state, stage status and kind; failed_on comma-joined) into 1:
 /// both tables rebuilt from the old ones, so a migrated database has the same tables,
-/// constraints and indexes as a new one.
+/// constraints and indexes as a new one (tests/pg.rs checks that, through every step).
 fn migrate_0_to_1() -> String {
     let case = |col: &str, pairs: Vec<(i32, String)>, default: &str| {
         let arms: String = pairs.iter().map(|(n, name)| format!(" WHEN {n} THEN '{name}'")).collect();
@@ -404,7 +450,7 @@ INSERT INTO fleet_credentials SELECT address, tenant, label, created_ms, revoked
 DROP TABLE fleet_jobs_v0;
 DROP TABLE fleet_credentials_v0;
 "#,
-        schema = schema()
+        schema = jobs_and_credentials()
     )
 }
 
@@ -415,9 +461,10 @@ impl PgStore {
         Ok(Self { pool })
     }
 
-    /// Brings the database to SCHEMA_VERSION: creates the tables in a new database,
-    /// rebuilds a schema-0 one. A script is one query, which Postgres runs as one
-    /// transaction; fleet_schema's key refuses a second scheduler doing it at once.
+    /// Brings the database to SCHEMA_VERSION: creates the tables in a new database, runs
+    /// the migrations an older one lacks, one after another. Each script is one query,
+    /// which Postgres runs as one transaction; fleet_schema's key refuses a second
+    /// scheduler doing the same step at once.
     async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS fleet_schema (version INT PRIMARY KEY, applied_ms BIGINT NOT NULL);
@@ -427,17 +474,26 @@ impl PgStore {
         .await?;
         let have: Option<i32> = sqlx::query_scalar("SELECT max(version) FROM fleet_schema").fetch_one(pool).await?;
         let jobs_table: bool = sqlx::query_scalar("SELECT to_regclass('fleet_jobs') IS NOT NULL").fetch_one(pool).await?;
-        let script = match have {
-            Some(v) if v == SCHEMA_VERSION => return Ok(()),
+        let mut v = match have {
             Some(v) if v > SCHEMA_VERSION => {
                 anyhow::bail!("the database has schema {v}, newer than this scheduler's {SCHEMA_VERSION}")
             }
-            Some(v) => anyhow::bail!("no migration from schema {v}"),
-            None if jobs_table => MIGRATE_0_TO_1.as_str(),
-            None => CREATE.as_str(),
+            Some(v) => v,
+            None if jobs_table => 0,
+            None => {
+                sqlx::raw_sql(CREATE.as_str()).execute(pool).await?;
+                tracing::info!(schema = SCHEMA_VERSION, "database created");
+                return Ok(());
+            }
         };
-        sqlx::raw_sql(script).execute(pool).await?;
-        tracing::info!(from = ?have.or(jobs_table.then_some(0)), to = SCHEMA_VERSION, "database schema migrated");
+        let from = v;
+        while v < SCHEMA_VERSION {
+            sqlx::raw_sql(MIGRATIONS[v as usize].as_str()).execute(pool).await?;
+            v += 1;
+        }
+        if from != v {
+            tracing::info!(from, to = v, "database schema migrated");
+        }
         Ok(())
     }
 
@@ -527,11 +583,13 @@ impl Store for PgStore {
 
     async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
         let rows = sqlx::query(
-            "SELECT tenant, elf_id, count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active,
+            "SELECT j.tenant, j.elf_id, count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active,
                     count(*) FILTER (WHERE state = 'succeeded') AS succeeded,
                     count(*) FILTER (WHERE state = 'failed') AS failed, max(created_ms) AS last_created_ms,
-                    avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms
-             FROM fleet_jobs GROUP BY tenant, elf_id ORDER BY last_created_ms DESC",
+                    avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms,
+                    bool_or(a.tenant IS NOT NULL) AS disabled
+             FROM fleet_jobs j LEFT JOIN fleet_apps a ON a.tenant = j.tenant AND a.elf_id = j.elf_id
+             GROUP BY j.tenant, j.elf_id ORDER BY last_created_ms DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -546,6 +604,7 @@ impl Store for PgStore {
                     failed: r.try_get::<i64, _>("failed")? as u64,
                     last_created_ms: r.try_get::<i64, _>("last_created_ms")? as u64,
                     mean_prove_ms: r.try_get("mean_prove_ms")?,
+                    disabled: r.try_get("disabled")?,
                 })
             })
             .collect()
@@ -558,6 +617,23 @@ impl Store for PgStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(|r| Ok(r.try_get("id")?)).collect()
+    }
+
+    async fn disabled_apps(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT tenant, elf_id FROM fleet_apps ORDER BY tenant, elf_id")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(|r| Ok((r.try_get("tenant")?, r.try_get("elf_id")?))).collect()
+    }
+
+    async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()> {
+        let sql = if disabled {
+            "INSERT INTO fleet_apps (tenant, elf_id, disabled_ms) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+        } else {
+            "DELETE FROM fleet_apps WHERE tenant = $1 AND elf_id = $2 AND $3 >= 0"
+        };
+        sqlx::query(sql).bind(tenant).bind(elf_id).bind(at_ms as i64).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {

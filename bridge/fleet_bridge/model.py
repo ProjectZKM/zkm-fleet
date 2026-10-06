@@ -317,6 +317,7 @@ class Profile(Record):
     shm_gb: int = 16
     allow: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
+    disabled: bool = False  # takes no new runs (fleetctl app disable); the ones going finish
 
 
 @dataclass(kw_only=True)

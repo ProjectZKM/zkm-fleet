@@ -103,7 +103,7 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
     // a second start finds schema 1 and leaves it
     PgStore::connect(&in_schema(&url, "migrated")).await.unwrap();
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM migrated.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![1]);
+    assert_eq!(versions, vec![1, 2], "every step is recorded");
 
     let get = |id: &'static str| {
         let m = &migrated;
@@ -137,6 +137,12 @@ async fn schema_0_migrates_to_what_a_new_database_has() {
         let apps = store.apps().await.unwrap();
         let goat = apps.iter().find(|a| a.tenant == "goat").unwrap();
         assert_eq!((goat.jobs, goat.active, goat.failed), (2, 1, 1));
+        store.set_app_disabled("goat", "bb", true, 5).await.unwrap();
+        store.set_app_disabled("goat", "bb", true, 6).await.unwrap(); // again: still one row
+        assert_eq!(store.disabled_apps().await.unwrap(), vec![("goat".to_string(), "bb".to_string())]);
+        assert!(store.apps().await.unwrap().iter().find(|a| a.tenant == "goat").unwrap().disabled);
+        store.set_app_disabled("goat", "bb", false, 7).await.unwrap();
+        assert!(store.disabled_apps().await.unwrap().is_empty());
         assert_eq!(store.delete_app("goat", "bb").await.unwrap(), vec!["g2".to_string()], "the running one stays");
         assert_eq!(store.incomplete().await.unwrap().iter().filter(|j| j.id == "g1").count(), 1);
     }

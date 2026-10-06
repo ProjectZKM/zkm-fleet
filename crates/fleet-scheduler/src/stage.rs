@@ -164,6 +164,12 @@ impl StageApi {
                 }
                 given
             };
+            if self.fleet.app_disabled(&tenant, &elf_id) {
+                return Err(fail(
+                    StageStatus::InvalidParameter,
+                    &format!("app {} is disabled: it takes no new jobs", crate::fleet::app_name(&tenant, &elf_id)),
+                ));
+            }
             let stdin: Vec<Vec<u8>> = if req.private_input_stream.is_empty() {
                 Vec::new()
             } else {

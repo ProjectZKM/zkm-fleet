@@ -76,6 +76,16 @@ struct AppArgs {
 
 #[derive(Subcommand)]
 enum AppCmd {
+    /// Add a run app: a profile in the server's runs.yaml (a proof app is not added: it
+    /// comes into being when a tenant first submits a proof with its ELF).
+    Add {
+        #[command(flatten)]
+        add: AddApp,
+    },
+    /// The app takes no new jobs; the queued and running ones finish. Its history stays.
+    Disable { name: String },
+    /// The app takes jobs again.
+    Enable { name: String },
     /// Delete an app, refused while any of its jobs is queued or running. A proof app
     /// (tenant/<elf>) goes with its jobs' records, inputs and proofs, its anchor, and its
     /// ELF when no other tenant uses it; a run app's profile leaves runs.yaml and its past
@@ -251,6 +261,40 @@ struct Submit {
     /// The command, after `--`.
     #[arg(last = true, required = true)]
     command: Vec<String>,
+}
+
+/// A run app to add: the command line and the request body are this one struct (its
+/// field names are the profile's); unset flags take the server's defaults.
+#[derive(Args, Serialize)]
+struct AddApp {
+    /// The app's name (letters, digits, _ . -): it heads its runs' ids.
+    name: String,
+    /// The container image its runs get.
+    #[arg(long)]
+    image: String,
+    /// UID[:GID] the container runs as (default: the image's).
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    /// Cards a run may ask for (default 8).
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_gpus: Option<u32>,
+    /// GiB a run needs free on its card unless it says --gpu-mem (default: the whole card).
+    #[arg(long = "gpu-mem")]
+    #[serde(rename = "default_gpu_mem_gb", skip_serializing_if = "Option::is_none")]
+    gpu_mem: Option<u32>,
+    /// /dev/shm size in GiB (default 16).
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shm_gb: Option<u32>,
+    /// A root (an absolute path on the server) a run may mount under; repeat. Nothing else can be mounted.
+    #[arg(long, required = true)]
+    allow: Vec<String>,
+    /// K=V every run gets; repeat.
+    #[arg(long)]
+    #[serde(skip)]
+    env: Vec<String>,
 }
 
 /// What can be done to a run (a proof job is the scheduler's and its client's).
@@ -693,6 +737,7 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 const APP_COLS: &[out::Col] = &[
     col("TYPE", "type"),
     col("APP", "name"),
+    col("ENABLED", "enabled"),
     col("ACTIVE", "active"),
     col("JOBS", "jobs"),
     col("OK", "succeeded"),
@@ -701,32 +746,95 @@ const APP_COLS: &[out::Col] = &[
     col("DETAIL", "detail"),
 ];
 
+/// The one proof app a name means: as the list names it, or `tenant/<full elf id>`.
+fn proof_app_named(a: &Admin, name: &str, tenant: &str) -> anyhow::Result<Value> {
+    let apps = a.get("/apps")?;
+    let found: Vec<&Value> = apps
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| {
+            x["name"].as_str() == Some(name)
+                || (x["tenant"].as_str() == Some(tenant) && name.split_once('/').map(|(_, e)| e) == x["elf_id"].as_str())
+        })
+        .collect();
+    match found.as_slice() {
+        [] => bail!("no proof app {name} (fleetctl app --type proof lists them)"),
+        [one] => Ok((*one).clone()),
+        many => bail!(
+            "{name} names {} programs; give the full elf id: {}",
+            many.len(),
+            many.iter().map(|x| format!("{}/{}", tenant, x["elf_id"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// The run app of that name, from the list.
+fn run_app_named(a: &Admin, name: &str) -> anyhow::Result<Value> {
+    let apps = a.get("/apps")?;
+    apps.as_array()
+        .into_iter()
+        .flatten()
+        .find(|x| x["name"].as_str() == Some(name) && x["removed"].as_bool() != Some(true))
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no run app {name} (fleetctl app --type run lists them)"))
+}
+
+/// Disables or enables an app.
+fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let method = if disabled { reqwest::Method::PUT } else { reqwest::Method::DELETE };
+    let v = match AppRef::parse(name) {
+        AppRef::Proof { tenant, .. } => {
+            let a = Admin::new(conn)?;
+            let app = proof_app_named(&a, name, &tenant)?;
+            let key = [("tenant", app["tenant"].as_str().unwrap_or("")), ("elf_id", app["elf_id"].as_str().unwrap_or(""))];
+            a.send(a.req(method, "/apps/disabled").query(&key))?
+        }
+        AppRef::Run(_) => {
+            let a = Admin::runs(conn)?;
+            run_app_named(&a, name)?;
+            a.send(a.req(method, &format!("/apps/{name}/disabled")))?
+        }
+    };
+    let text = if disabled {
+        format!("{name} disabled: it takes no new jobs; the queued and running ones finish")
+    } else {
+        format!("{name} enabled: it takes jobs again")
+    };
+    out.done(&text, v);
+    Ok(())
+}
+
+/// Adds a run app.
+fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let mut body = serde_json::to_value(add)?;
+    let mut env = serde_json::Map::new();
+    for kv in &add.env {
+        let Some((k, v)) = kv.split_once('=') else { bail!("--env {kv}: K=V") };
+        env.insert(k.into(), json!(v));
+    }
+    if !env.is_empty() {
+        body["env"] = Value::Object(env);
+    }
+    let a = Admin::runs(conn)?;
+    let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
+    let gpus = v["max_gpus"].as_u64().unwrap_or(0);
+    out.done(
+        &format!("added run app {}: image {}, up to {gpus} GPU{}, mounts under {}", add.name,
+                 v["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" },
+                 v["allow"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+        v,
+    );
+    Ok(())
+}
+
 /// Deletes an app (after showing what goes with it, until --yes).
 fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     use reqwest::Method as M;
     match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
             let a = Admin::new(conn)?;
-            let apps = a.get("/apps")?;
-            let found: Vec<&Value> = apps
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|x| {
-                    x["name"].as_str() == Some(name)
-                        || (x["tenant"].as_str() == Some(&tenant)
-                            && name.split_once('/').map(|(_, e)| e) == x["elf_id"].as_str())
-                })
-                .collect();
-            let app = match found.as_slice() {
-                [] => bail!("no proof app {name} (fleetctl app --type proof lists them)"),
-                [one] => *one,
-                many => bail!(
-                    "{name} names {} programs; give the full elf id: {}",
-                    many.len(),
-                    many.iter().map(|x| format!("{}/{}", tenant, x["elf_id"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
-                ),
-            };
+            let app = proof_app_named(&a, name, &tenant)?;
             let elf = app["elf_id"].as_str().unwrap_or("");
             if !yes {
                 let rest = if elf.is_empty() {
@@ -749,10 +857,7 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
         }
         AppRef::Run(_) => {
             let a = Admin::runs(conn)?;
-            let apps = a.get("/apps")?;
-            let Some(app) = apps.as_array().into_iter().flatten().find(|x| x["name"].as_str() == Some(name)) else {
-                bail!("no run app {name} (fleetctl app --type run lists them)");
-            };
+            let app = run_app_named(&a, name)?;
             if !yes {
                 bail!(
                     "would remove run app {name} (its profile) from runs.yaml; its {} past run(s) \
@@ -769,8 +874,12 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
 
 /// Proof apps from the scheduler and run apps from the runs API, most recently used first.
 fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
-    if let Some(AppCmd::Delete { name, yes }) = &p.cmd {
-        return delete_app(name, *yes, &p.conn, out);
+    match &p.cmd {
+        Some(AppCmd::Delete { name, yes }) => return delete_app(name, *yes, &p.conn, out),
+        Some(AppCmd::Disable { name }) => return set_app_disabled(name, true, &p.conn, out),
+        Some(AppCmd::Enable { name }) => return set_app_disabled(name, false, &p.conn, out),
+        Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
+        None => {}
     }
     let mut rows: Vec<Value> = Vec::new();
     let mut raw = serde_json::Map::new();
@@ -784,7 +893,8 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
                     let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
                     let detail: Vec<String> = [anchored, mean].into_iter().flatten().collect();
                     rows.push(json!({
-                        "type": "proof", "name": a["name"], "active": a["active"], "jobs": a["jobs"],
+                        "type": "proof", "name": a["name"], "enabled": a["disabled"].as_bool() != Some(true),
+                        "active": a["active"], "jobs": a["jobs"],
                         "succeeded": a["succeeded"], "failed": a["failed"],
                         "last_at": a["last_created_ms"].as_f64().map(|ms| ms / 1000.0), "detail": detail.join(", "),
                     }));
@@ -799,10 +909,12 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
             Ok(v) => {
                 reached += 1;
                 for a in v.as_array().into_iter().flatten() {
+                    let removed = a["removed"].as_bool() == Some(true);
                     rows.push(json!({
-                        "type": "run", "name": a["name"], "active": a["active"], "jobs": a["jobs"],
+                        "type": "run", "name": a["name"], "enabled": !removed && a["disabled"].as_bool() != Some(true),
+                        "active": a["active"], "jobs": a["jobs"],
                         "succeeded": a["succeeded"], "failed": a["failed"], "last_at": a["last_submitted_at"],
-                        "detail": if a["removed"].as_bool() == Some(true) {
+                        "detail": if removed {
                             "removed from runs.yaml: only its past runs are left".to_string()
                         } else {
                             let gpus = a["max_gpus"].as_u64().unwrap_or(0);

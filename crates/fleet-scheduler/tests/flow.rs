@@ -465,23 +465,51 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     add_node(&h, "gpu-a", 2, false).await;
     h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
-    let curl = |args: &[&str]| {
-        let out = std::process::Command::new("curl")
-            .args(["-s", "-H", &format!("authorization: Bearer {ADMIN}")])
-            .args(args)
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout).unwrap()
-    };
-    let apps: serde_json::Value = serde_json::from_str(&curl(&[&format!("{}/admin/apps", h.http)])).unwrap();
-    let app = apps.as_array().unwrap().iter().find(|a| a["tenant"] == "eth").unwrap().clone();
+    let app = proof_app(&h, "eth");
     let elf = app["elf_id"].as_str().unwrap();
     assert_eq!(app["jobs"], 1);
-    let gone = curl(&["-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
+    let gone = admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
     let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
     assert_eq!((gone["jobs_deleted"].as_u64(), gone["elf_removed"].as_bool()), (Some(1), Some(true)));
     let s = h.stage.get_status(GetStatusRequest { proof_id: "job-d".into() }).await.unwrap().into_inner();
     assert_eq!(s.status, S::Unspecified as i32, "the deleted app's job is gone");
-    let again = curl(&["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
+    let again = admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE", &format!("{}/admin/apps?tenant=eth&elf_id={elf}", h.http)]);
     assert_eq!(again, "404");
+}
+
+/// The admin API through curl (what fleetctl does), as text.
+fn admin_curl(h: &Harness, args: &[&str]) -> String {
+    let out = std::process::Command::new("curl")
+        .args(["-s", "-H", &format!("authorization: Bearer {ADMIN}")])
+        .args(args)
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// A tenant's (only) proof app, from the list.
+fn proof_app(h: &Harness, tenant: &str) -> serde_json::Value {
+    let apps: serde_json::Value = serde_json::from_str(&admin_curl(h, &[&format!("{}/admin/apps", h.http)])).unwrap();
+    apps.as_array().unwrap().iter().find(|a| a["tenant"] == tenant).unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disabled_app_refuses_new_jobs_until_it_is_enabled() {
+    let mut h = start().await;
+    add_node(&h, "gpu-a", 2, false).await;
+    h.stage.generate_proof(request("job-e1", b"elf-e")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-e1").await.status, S::Success as i32);
+    let elf = proof_app(&h, "eth")["elf_id"].as_str().unwrap().to_string();
+    let key = format!("{}/admin/apps/disabled?tenant=eth&elf_id={elf}", h.http);
+    let off: serde_json::Value = serde_json::from_str(&admin_curl(&h, &["-X", "PUT", &key])).unwrap();
+    assert_eq!(off["disabled"], true);
+    assert_eq!(proof_app(&h, "eth")["disabled"], true, "the list says so");
+    h.stage.generate_proof(request("job-e2", b"elf-e")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-e2").await.status, S::InvalidParameter as i32, "refused while disabled");
+    admin_curl(&h, &["-X", "DELETE", &key]);
+    assert_eq!(proof_app(&h, "eth")["disabled"], false);
+    h.stage.generate_proof(request("job-e3", b"elf-e")).await.unwrap();
+    assert_eq!(wait_done(&mut h, "job-e3").await.status, S::Success as i32, "runs again once enabled");
+    let unknown = admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", &format!("{}/admin/apps/disabled?tenant=nobody&elf_id=ff", h.http)]);
+    assert_eq!(unknown, "404");
 }

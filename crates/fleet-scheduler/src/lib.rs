@@ -43,9 +43,11 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let blobs = blobs::Blobs::new(&cfg.data_dir)?;
     let fleet = fleet::Fleet::new(cfg.clone(), store, blobs, cluster_token.clone());
     let creds = fleet.load_credentials().await?;
+    let disabled = fleet.load_apps().await?;
     let recovered = fleet.recover().await?;
     tracing::info!(
         credentials = creds,
+        disabled_apps = disabled,
         recovered_jobs = recovered,
         "scheduler state loaded"
     );

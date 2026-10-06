@@ -4,6 +4,8 @@ the admin token, so runs can be submitted from any machine that reaches the port
     POST   /runs                     submit (JSON: the RunArgs fields marked `remote`, plus "command")
     GET    /runs?n=N[&active=1][&profile=P]  the newest runs (only the active ones, one app's)
     GET    /apps                     the run apps (runs.yaml profiles) and their runs
+    POST   /apps                     add a run app (JSON: "name" and the profile's fields: image, allow, ...)
+    PUT    /apps/{name}/disabled     the app takes no new runs (the ones going finish); DELETE enables it again
     DELETE /apps/{name}              remove a run app (its profile), refused while it has runs going
     GET    /runs/{id}                status
     GET    /runs/{id}/logs           ?rank=K&lines=N (the tail) or &offset=O (what came after O)
@@ -74,6 +76,17 @@ class Api:
     def delete_app(self, name: str) -> Record:
         with self.lock:
             return runs.delete_app(self.args(), name)
+
+    def add_app(self, body: dict[str, Any]) -> Record:
+        name = body.pop("name", None)
+        if not isinstance(name, str):
+            raise ApiError(400, "name: the app's name")
+        with self.lock:
+            return runs.add_app(self.args(), name, body)
+
+    def set_app_disabled(self, name: str, disabled: bool) -> Record:
+        with self.lock:
+            return runs.set_app_disabled(self.args(), name, disabled)
 
     def upload(self, data: bytes) -> Uploaded:
         if not data:
@@ -194,7 +207,7 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._send(401, b"missing or wrong admin token", "text/plain")
             try:
                 self._route(method, parts, q)
-            except Exception as e:
+            except (Exception, SystemExit) as e:  # a refusal is a SystemExit (what run.sh prints), not an Exception
                 if self.streaming:  # a broken stream: close it without its last chunk
                     print(f"{self.path}: stream broken off: {type(e).__name__}: {e}", flush=True)
                     self.close_connection = True
@@ -217,8 +230,12 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._json(201, api.submit(self._json_body()))
             if (method, head, n) == ("GET", "apps", 1):
                 return self._json(200, runs.apps(api.args(), runs.load_config(api.profiles)))
+            if (method, head, n) == ("POST", "apps", 1):
+                return self._json(201, api.add_app(self._json_body()))
             if (method, head, n) == ("DELETE", "apps", 2):
                 return self._json(200, api.delete_app(parts[1]))
+            if (head, n) == ("apps", 3) and parts[2] == "disabled" and method in ("PUT", "DELETE"):
+                return self._json(200, api.set_app_disabled(parts[1], method == "PUT"))
             if (method, head, n) == ("GET", "runs", 1):
                 return self._json(200, runs.list_runs(api.args(), _int(q, "n", 20) or 0, active=_flag(q, "active"),
                                                       profile=q.get("profile")))
