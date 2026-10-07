@@ -5,7 +5,8 @@
                   [--restart-on-oom N] [--code git:REPO@REF | --code FILE.tar.gz]
                   [--mount PATH:ro|rw]... [--env K=V]... [--log FILE] [--workdir DIR]
                   -- CMD ARG...
-    run.sh status|cancel|logs [-f] [-n N] [--rank K]|fetch|purge ID     run.sh list     run.sh purge --older-than DAYS
+    run.sh status|cancel|preempt|logs [-f] [-n N] [--rank K]|fetch|purge ID     run.sh list
+    run.sh purge --older-than DAYS
     run.sh stage-model REPO [--revision R] [--include GLOB]...
 
 A run's record is RUNS_DIR/<id>/: spec.json (a RunSpec), status.json (a RunStatus),
@@ -37,6 +38,12 @@ A failed attempt gets a Cause (gpu-oom from the log, host-oom from docker,
 exit-code; with who held the card at that moment). --retry N repeats any failure,
 --restart-on-oom N only out-of-memory ones; FLEET_ATTEMPT tells the job which
 attempt it is, so it can resume from a checkpoint in its out/.
+
+Cancel and preemption stop a job with grace: SIGTERM, then SIGKILL its app's
+stop_timeout_s later, time to checkpoint. A service that needs cards a run holds
+preempts it (see "preemption" below): the run queues again with the same id and
+out/, FLEET_ATTEMPT counting on, and spends no --retry; `preempt ID` does the same
+by hand.
 
 Several machines: RUNS_DIR must be shared storage mounted at the same path on
 all of them (the run's actor writes its record where it lands; the CLI reads it
@@ -182,15 +189,19 @@ class RunDir:
     def status(self) -> RunStatus:
         return RunStatus.read(self.status_path)
 
-    def update(self, **changes: Any) -> RunStatus:
-        """Merges typed changes into status.json, under the run's lock (the actor and a
-        cancel write it). Once the run has ended, a late report from the actor that it is
-        going (or ended otherwise) is dropped: a cancel wins."""
+    def update(self, *, force: bool = False, **changes: Any) -> RunStatus:
+        """Merges typed changes into status.json, under the run's lock (the actor, a
+        cancel and a preemption write it). Once the run has ended, a late report from the
+        actor that it is going (or ended otherwise) is dropped: a cancel wins. While it
+        is being preempted, so is everything but a cancel and the preemption's own
+        writes (force): the actor being stopped reports nothing more."""
         with open(os.path.join(self.path, ".lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             st = self.status()
             new_state = changes.get("state")
             if st.state.terminal and new_state not in (None, st.state):
+                return st
+            if st.state is RunState.PREEMPTED and not force and new_state is not RunState.CANCELLED:
                 return st
             st = st.merged(**changes)
             st.write(self.status_path)
@@ -359,6 +370,12 @@ class _Rank:
         _sh(["docker", "rm", "-f", self.name])
 
 
+def stop_command(run_id: str, rank: int, grace_s: int) -> list[str]:
+    """SIGTERM to the job, SIGKILL grace_s later (docker stop): a cancel or a preemption
+    gives it the time to checkpoint into out/ (FLEET_ATTEMPT tells the next attempt)."""
+    return ["docker", "stop", "-t", str(grace_s), container_name(run_id, rank)]
+
+
 RankActor = ray.remote(_Rank)
 
 
@@ -408,6 +425,8 @@ class _GpuRun:
     def _wait_vram(self, need: int | None) -> bool:
         deadline = time.time() + self.spec.vram_wait_s
         while True:
+            if self.dir.state() in (RunState.CANCELLED, RunState.PREEMPTED):
+                return False
             short = [self._label(i) + s for i, ss in enumerate(self._all("shortfall", need)) for s in ss]
             if not short:
                 return True
@@ -477,9 +496,11 @@ class _GpuRun:
             if problems:
                 self.dir.update(state=RunState.FAILED, gpus=self.gpus, finished_at=time.time(), error="; ".join(problems))
                 return
-            retries, oom_restarts = self.spec.retry, self.spec.restart_on_oom
-            attempts: list[Attempt] = []
-            attempt = 0
+            # a run queued again after a preemption goes on from its record: FLEET_ATTEMPT
+            # counts on, and the budgets are what its earlier attempts left
+            attempts: list[Attempt] = list(self.dir.status().attempts)
+            attempt = len(attempts)
+            retries, oom_restarts = budgets(self.spec, attempts)
             while True:
                 attempt += 1
                 if not self._wait_vram(need):
@@ -490,8 +511,8 @@ class _GpuRun:
                 if result.ok:
                     self.dir.update(state=RunState.SUCCEEDED, exit_code=0, attempts=attempts, finished_at=time.time())
                     return
-                if self.dir.state() is RunState.CANCELLED:
-                    return
+                if self.dir.state() in (RunState.CANCELLED, RunState.PREEMPTED):
+                    return  # the canceller or the preemption records how it ended
                 if result.cause is not None and result.cause.oom and oom_restarts > 0:
                     oom_restarts -= 1
                 elif retries > 0:
@@ -515,6 +536,20 @@ class _GpuRun:
 
 
 GpuRun = ray.remote(_GpuRun)
+
+
+def budgets(spec: RunSpec, attempts: list[Attempt]) -> tuple[int, int]:
+    """--retry and --restart-on-oom left after these attempts: an out-of-memory failure
+    spends a restart first, any other failure a retry; a preempted attempt spends none."""
+    retries, oom_restarts = spec.retry, spec.restart_on_oom
+    for a in attempts:
+        if a.ok or a.cause is Cause.PREEMPTED:
+            continue
+        if a.cause is not None and a.cause.oom and oom_restarts > 0:
+            oom_restarts -= 1
+        else:
+            retries -= 1
+    return retries, oom_restarts
 
 
 class _RunWaiter:
@@ -559,7 +594,7 @@ def _on_node(argv: list[str]) -> str:
     return _sh(argv).stdout
 
 
-def _on_run_machine(place: RankInfo, argv: list[str]) -> str | None:
+def _on_run_machine(place: RankInfo, argv: list[str], timeout_s: float = 60) -> str | None:
     """Runs argv on the machine a rank landed on (its container is there) and returns
     its stdout; None when that machine has left the cluster."""
     if not place.node_ip:  # never landed (or a record from before node_ip): only this machine can have it
@@ -567,9 +602,19 @@ def _on_run_machine(place: RankInfo, argv: list[str]) -> str | None:
     if not any(n.get("NodeManagerAddress") == place.node_ip for n in alive_nodes()):
         return None
     try:
-        return str(ray.get(_on_node.options(resources={f"node:{place.node_ip}": 0.001}).remote(argv), timeout=60))
+        return str(ray.get(_on_node.options(resources={f"node:{place.node_ip}": 0.001}).remote(argv), timeout=timeout_s))
     except Exception:
         return None
+
+
+def _stop_ranks(st: RunStatus, run_id: str, grace_s: int) -> None:
+    """Every rank's container stopped with grace, all at once (a gang's ranks end together)."""
+    threads = [threading.Thread(target=_on_run_machine, args=(r, stop_command(run_id, r.rank, grace_s), grace_s + 60))
+               for r in st.places()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
 
 def _shared_storage(path: str) -> bool:
@@ -772,6 +817,11 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
 # ── other actions ────────────────────────────────────────────────────────────
 
 def _alive(name: str) -> bool:
+    """Whether the actor exists. Without a connection to the cluster nobody can tell:
+    then it counts as alive (a run is not called lost for that), and get_actor is not
+    asked, which would start a Ray instance of its own on this machine."""
+    if not ray.is_initialized():
+        return True
     try:
         ray.get_actor(name, namespace=NAMESPACE)
         return True
@@ -784,8 +834,11 @@ def _going(run_id: str) -> bool:
 
 
 def _state(run_id: str, st: RunStatus) -> RunState:
-    """The state as it is: a run that has not ended but has no actor any more is lost."""
-    return RunState.LOST if not st.state.terminal and not _going(run_id) else st.state
+    """The state as it is: a run that has not ended but has no actor any more is lost
+    (one being preempted has none for a moment, between its stop and its requeue)."""
+    if st.state.terminal or st.state is RunState.PREEMPTED:
+        return st.state
+    return RunState.LOST if not _going(run_id) else st.state
 
 
 def status(a: RunArgs, run_id: str) -> RunStatus:
@@ -811,12 +864,9 @@ def cancel(a: RunArgs, run_id: str) -> RunStatus:
     st = run.update(state=RunState.CANCELLED, finished_at=time.time())
     if st.state is not RunState.CANCELLED:
         raise Conflict(f"{run_id} already {st.state.value}: nothing to cancel")
-    names = [actor_name(run_id), waiter_name(run_id)] + [actor_name(run_id, i) for i in range(1, st.nodes)]
-    for name in names:
-        try:
-            ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
-        except ValueError:
-            pass
+    if st.container or st.ranks:  # it started: SIGTERM first, so the job can save its work
+        _stop_ranks(st, run_id, run.spec().profile.stop_timeout_s)
+    _end_actors(run_id, st.nodes)
     gone = [r.machine for r in st.places()
             if _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)]) is None]
     if gone:
@@ -826,6 +876,146 @@ def cancel(a: RunArgs, run_id: str) -> RunStatus:
     except Exception:
         pass
     return st
+
+
+def _end_actors(run_id: str, nodes: int) -> None:
+    names = [actor_name(run_id), waiter_name(run_id)] + [actor_name(run_id, i) for i in range(1, nodes)]
+    for name in names:
+        try:
+            ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
+        except ValueError:
+            pass
+    # the names are free once the kills land (a run queued again reuses them)
+    deadline = time.time() + 30
+    while any(_alive(n) for n in names) and time.time() < deadline:
+        time.sleep(0.5)
+
+
+# ── preemption ───────────────────────────────────────────────────────────────
+#
+# A service that needs cards a run holds takes them (reconcile.start): the run is
+# stopped with grace (SIGTERM, SIGKILL its app's stop_timeout_s later), its attempt
+# recorded as preempted, and it queues again for cards with the same id, out/ and
+# FLEET_ATTEMPT counting on; a preemption spends no --retry. Only runs of a
+# `preemptible` app that have run its min_runtime_s are taken (one still waiting
+# for card memory at any time: it has nothing to lose), the newest first, on the
+# machine where the fewest of them free enough (Slurm's REQUEUE with PreemptExemptTime;
+# Kueue's "most recently admitted first").
+
+PREEMPTIBLE = (RunState.RUNNING, RunState.WAITING_VRAM, RunState.RETRYING)
+
+
+@dataclass(kw_only=True)
+class Candidate(Record):
+    """A run's share of one machine, as a preemption sees it."""
+
+    id: str
+    node_ip: str
+    gpus: float
+    cpus: float
+    started_at: float | None  # its attempt's start; None while it waits for card memory
+    preemptible: bool
+    min_runtime_s: int
+
+    def takeable(self, now: float) -> bool:
+        return self.preemptible and (self.started_at is None or now - self.started_at >= self.min_runtime_s)
+
+
+@dataclass(kw_only=True)
+class Victims(Record):
+    """Where a service fits once these runs are preempted (none: it fits as is)."""
+
+    node_ip: str
+    runs: list[str] = field(default_factory=list)
+
+
+def choose_victims(need_gpus: float, need_cpus: float, free: dict[str, tuple[float, float]],
+                   candidates: list[Candidate], now: float, pin: str | None = None) -> Victims | None:
+    """The machine (node IP -> free GPUs, CPUs) where the fewest takeable runs free
+    enough for a bundle, and those runs: ones not started yet first, then the newest.
+    None when no machine can (the service waits, as it did before preemption)."""
+    best: Victims | None = None
+    for ip, (gpus, cpus) in sorted(free.items()):
+        if pin is not None and ip != pin:
+            continue
+        if gpus >= need_gpus and cpus >= need_cpus:
+            return Victims(node_ip=ip)
+        pool = sorted((c for c in candidates if c.node_ip == ip and c.takeable(now)),
+                      key=lambda c: (c.started_at is not None, -(c.started_at or 0)))
+        picked: list[str] = []
+        for c in pool:
+            if gpus >= need_gpus and cpus >= need_cpus:
+                break
+            picked.append(c.id)
+            gpus, cpus = gpus + c.gpus, cpus + c.cpus
+        if gpus >= need_gpus and cpus >= need_cpus and (best is None or len(picked) < len(best.runs)):
+            best = Victims(node_ip=ip, runs=picked)
+    return best
+
+
+def candidates(runs_dir: str) -> list[Candidate]:
+    """Every run holding cards or CPUs now (its actor placed), per machine it is on."""
+    out = []
+    for i in os.listdir(runs_dir) if os.path.isdir(runs_dir) else []:
+        if i.startswith("."):
+            continue
+        try:
+            run = RunDir(runs_dir, i)
+            st, spec = run.status(), run.spec()
+        except (SystemExit, OSError, ValueError):
+            continue
+        if st.state not in PREEMPTIBLE or not _alive(actor_name(i)):
+            continue
+        started = st.started_at if st.state is RunState.RUNNING else None
+        for r in st.places():
+            if r.node_ip:
+                out.append(Candidate(id=i, node_ip=r.node_ip, gpus=float(spec.gpus), cpus=float(max(spec.cpus, 1)),
+                                     started_at=started, preemptible=spec.profile.preemptible,
+                                     min_runtime_s=spec.profile.min_runtime_s))
+    return out
+
+
+def preempt(runs_dir: str, run_id: str, reason: str, requeue: bool = True) -> RunStatus:
+    """Stops a run with grace so its cards free, records the attempt as preempted and,
+    with requeue, queues it again at once (else the caller does, with `requeue_run`,
+    once what needed the cards has them)."""
+    run = RunDir(runs_dir, run_id)
+    spec = run.spec()
+    before = run.status()
+    if before.state not in PREEMPTIBLE or not _alive(actor_name(run_id)):
+        raise Conflict(f"{run_id} is {_state(run_id, before).value}: it holds no card to preempt")
+    st = run.update(state=RunState.PREEMPTED, detail=f"preempted: {reason}")
+    if st.state is not RunState.PREEMPTED:
+        raise Conflict(f"{run_id} is {st.state.value}: nothing to preempt")
+    try:
+        running = before.state is RunState.RUNNING
+        if running:
+            _stop_ranks(st, run_id, spec.profile.stop_timeout_s)
+        _end_actors(run_id, st.nodes)
+        for r in st.places():
+            _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)])
+        try:
+            remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
+        except Exception:
+            pass
+        attempts = list(st.attempts)
+        if running:
+            attempts.append(Attempt(exit_code=None, cause=Cause.PREEMPTED, evidence=reason))
+        st = run.update(force=True, state=RunState.QUEUED, attempts=attempts, preemptions=st.preemptions + 1,
+                        started_at=None, container=None, detail=f"preempted ({reason}): waiting for cards again")
+        if requeue:
+            launch(spec, run.path)
+        return st
+    except Exception as e:  # report, never leave it preempted with nothing running it
+        return run.update(force=True, state=RunState.FAILED, finished_at=time.time(),
+                          error=f"preempted ({reason}), then could not be queued again: {e!r}"[:500])
+
+
+def requeue_run(runs_dir: str, run_id: str) -> None:
+    """Queues a run that `preempt(..., requeue=False)` stopped."""
+    run = RunDir(runs_dir, run_id)
+    if run.state() is RunState.QUEUED and not _going(run_id):
+        launch(run.spec(), run.path)
 
 
 def log_chunk(runs_dir: str, run_id: str, rank: int = 0, offset: int | None = None, lines: int = 50,
@@ -1248,10 +1438,16 @@ def main(argv: list[str]) -> None:
         "submit": lambda: _emit(submit(a, cmd, config), compact=True),
         "status": lambda: _emit(status(a, a.run_id or "")),
         "cancel": lambda: _emit(cancel(a, a.run_id or "")),
+        "preempt": lambda: _emit(preempt(a.runs_dir, a.run_id or "", "by the operator")),
         "purge": lambda: _emit(purge(a, a.run_id)),
         "stage-model": lambda: _emit(stage_model(a, config), compact=True),
     }
-    if a.action not in ("render", "list", "logs", "fetch"):
+    if a.action in ("list", "logs"):  # they read files; the cluster only says which runs are lost
+        try:
+            ray.init(address=a.address, namespace=NAMESPACE, log_to_driver=False, logging_level=logging.ERROR)
+        except Exception:
+            pass
+    elif a.action not in ("render", "fetch"):
         ray.init(address=a.address, namespace=NAMESPACE, log_to_driver=False, logging_level=logging.ERROR)
     actions[a.action]()
     sys.stdout.flush()

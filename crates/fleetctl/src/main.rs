@@ -332,8 +332,11 @@ enum JobCmd {
         #[arg(long, default_value_t = 0)]
         rank: usize,
     },
-    /// Stop a run (its containers are removed, its cards freed).
+    /// Stop a run (SIGTERM, SIGKILL its app's stop_timeout_s later; its cards freed).
     Cancel { id: String },
+    /// Stop a run as a service needing its cards would: it queues again (same id and
+    /// out/, FLEET_ATTEMPT counting on) and spends no --retry.
+    Preempt { id: String },
     /// Delete a finished run's record (out/ included), or every finished run older than --older-than days.
     Purge {
         id: Option<String>,
@@ -1089,6 +1092,7 @@ fn run_action(cmd: &JobCmd, conn: &Conn, out: &Out) -> anyhow::Result<()> {
             out.record(&v);
         }
         JobCmd::Cancel { id } => out.record(&a.send(a.req(M::POST, &format!("/runs/{id}/cancel")))?),
+        JobCmd::Preempt { id } => out.record(&a.send(a.req(M::POST, &format!("/runs/{id}/preempt")))?),
         JobCmd::Purge { id, older_than } => {
             let path = match (id, older_than) {
                 (Some(id), _) => format!("/runs/{id}"),

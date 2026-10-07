@@ -9,7 +9,8 @@ the admin token, so runs can be submitted from any machine that reaches the port
     DELETE /apps/{name}              remove a run app (its profile), refused while it has runs going
     GET    /runs/{id}                status
     GET    /runs/{id}/logs           ?rank=K&lines=N (the tail) or &offset=O (what came after O)
-    POST   /runs/{id}/cancel
+    POST   /runs/{id}/cancel           SIGTERM, SIGKILL the app's stop_timeout_s later; the run ends
+    POST   /runs/{id}/preempt          the same stop, then the run queues again (its cards go to others meanwhile)
     DELETE /runs/{id}                purge one finished run
     DELETE /runs?older_than=DAYS     purge finished runs older than that
     GET    /runs/{id}/out.tar.gz     the run's out/
@@ -247,6 +248,8 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._json(200, runs.purge(api.args(), parts[1]))
             if (method, head, n) == ("POST", "runs", 3) and parts[2] == "cancel":
                 return self._json(200, runs.cancel(api.args(), parts[1]))
+            if (method, head, n) == ("POST", "runs", 3) and parts[2] == "preempt":
+                return self._json(200, runs.preempt(api.runs_dir, parts[1], "by the operator (fleetctl job preempt)"))
             if (method, head, n) == ("GET", "runs", 3):
                 return self._logs_or_out(parts, q)
             if (method, head, n) == ("PUT", "uploads", 1):

@@ -22,6 +22,12 @@ An `app` is any GPU container serving on a port of its own (ComfyUI, an inferenc
 server): see GpuApp and deploy/services.example.yaml. A `runs-api` serves one-shot
 runs over HTTP for `fleetctl job` (runs_api.py).
 
+A service that cannot get its cards because one-shot runs hold them preempts
+those runs (runs.py, "preemption"): they stop with grace and queue again once the
+service has started. `apply --only NAME` (a service or a replica; repeat) leaves
+every other actor as it is: to start one service without restarting others that
+were stopped on purpose.
+
 Each replica gets its own placement group with one STRICT_PACK bundle: its
 cards, CPUs and memory all come from ONE machine (Ray never splits a replica's
 cards across machines: two machines with 4 free cards each cannot host an
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import urllib.request
 from typing import Any, Mapping
@@ -50,15 +57,22 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, Place
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
 from .runs_api import RunsApi
 from .model import ApplyReport, Bundle, ClusterConfig, Health, ReplicaSpec, ServiceKind, ServicesFile
-from .rayapi import actor_node_id
+from .rayapi import actor_node_id, free_by_node_ip
 
 NAMESPACE = "zkm-fleet"
 log = logging.getLogger("fleet_bridge")
 
 ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, ServiceKind.ZIREN_CPU: ZirenCpuProver,
                                   ServiceKind.APP: GpuApp, ServiceKind.RUNS_API: RunsApi}
+PREEMPT_AFTER_S = 20  # a service's cards not granted this long: runs hold them
 # the cluster settings a replica's hash covers, as the file names them
 _SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
+
+
+def service_of(replica: str) -> str:
+    """ethproofs-gpu-0 -> ethproofs-gpu (a replica is named <service>-<index>)."""
+    base, _, index = replica.rpartition("-")
+    return base if base and index.isdigit() else replica
 
 
 def load_services(data: Mapping[str, Any]) -> ServicesFile:
@@ -123,10 +137,29 @@ def _pg_name(actor: str) -> str:
     return f"pg-{actor}"
 
 
-def start(spec: ReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any]:
+def start(spec: ReplicaSpec, ready_timeout_s: float = 900, runs_dir: str | None = None) -> ActorHandle[Any]:
+    """Starts a replica once its cards and CPUs are granted. Not granted within
+    PREEMPT_AFTER_S and one-shot runs (in runs_dir) hold them: those runs are
+    preempted, and queued again once the replica has its grant."""
     b = bundle(spec)
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
-    ray.get(pg.ready(), timeout=ready_timeout_s)
+    requeue: list[str] = []
+    try:
+        try:
+            ray.get(pg.ready(), timeout=PREEMPT_AFTER_S)
+        except ray.exceptions.GetTimeoutError:
+            if runs_dir:
+                requeue = _preempt_runs_for(spec, b, runs_dir)
+            ray.get(pg.ready(), timeout=ready_timeout_s)
+    finally:
+        if requeue:
+            from .runs import requeue_run
+
+            for run_id in requeue:
+                try:
+                    requeue_run(runs_dir or "", run_id)
+                except Exception as e:
+                    log.error("queueing %s again failed: %s (it is queued in its record; cancel it)", run_id, e)
     actor: ActorHandle[Any] = ACTORS[spec.kind].options(
         name=spec.name,
         namespace=NAMESPACE,
@@ -140,6 +173,30 @@ def start(spec: ReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any]:
     ).remote(spec)
     health_of(actor, ready_timeout_s)
     return actor
+
+
+def _preempt_runs_for(spec: ReplicaSpec, b: Bundle, runs_dir: str) -> list[str]:
+    """Preempts the runs that keep a replica's bundle from its machine; returns their ids
+    (queued again by the caller, after the replica got the cards)."""
+    from .runs import candidates, choose_victims, preempt
+
+    pin = b.pin.split(":", 1)[1] if b.pin else None
+    victims = choose_victims(b.gpu, b.cpu, free_by_node_ip(), candidates(runs_dir), time.time(), pin)
+    if victims is None:
+        log.warning("%s: its %g card(s) and %g CPUs are not free and no run can be preempted for them; waiting",
+                    spec.name, b.gpu, b.cpu)
+        return []
+    if not victims.runs:  # they freed up meanwhile: Ray places it
+        return []
+    done = []
+    for run_id in victims.runs:
+        log.info("preempting run %s on %s for %s", run_id, victims.node_ip, spec.name)
+        try:
+            preempt(runs_dir, run_id, f"service {spec.name} needs its cards", requeue=False)
+            done.append(run_id)
+        except SystemExit as e:  # it ended meanwhile
+            log.info("run %s not preempted: %s", run_id, e)
+    return done
 
 
 def stop(name: str) -> None:
@@ -217,15 +274,34 @@ class Scheduler:
                 log.warning("undraining %s: %s (run: fleetctl node undrain %s)", name, e, name)
 
 
-def reconcile_once(file: ServicesFile, dry_run: bool = False) -> ApplyReport:
+def _runs_dir(file: ServicesFile) -> str | None:
+    """Where one-shot runs keep their records: the runs API's, else FLEET_RUNS_DIR."""
+    for svc in file.services:
+        if svc.kind is ServiceKind.RUNS_API and svc.runs_dir:
+            return svc.runs_dir
+    return os.environ.get("FLEET_RUNS_DIR")
+
+
+def reconcile_once(file: ServicesFile, dry_run: bool = False, only: list[str] | None = None) -> ApplyReport:
     """Makes the actors match the file. With dry_run nothing changes: `planned` lists
-    what an apply would start, stop or replace."""
+    what an apply would start, stop or replace. With `only` (service or replica names),
+    every other actor is left as it is (holds still steer the cards of what starts)."""
     want = replica_specs(file)
     have = running()
+    if only:
+        unknown = set(only) - set(want) - {service_of(n) for n in want} - set(have) - {service_of(n) for n in have}
+        if unknown:
+            raise SystemExit(f"--only: no service or replica {sorted(unknown)} in the file or running")
+
+        def picked(n: str) -> bool:
+            return n in only or service_of(n) in only
+
+        want = {n: s for n, s in want.items() if picked(n) or s.kind is ServiceKind.HOLD}
+        have = {n: a for n, a in have.items() if picked(n)}
     report = ApplyReport()
     holds: list[PlacementGroup] = []
     try:
-        _reconcile(want, have, report, Scheduler(file.cluster), holds, dry_run)
+        _reconcile(want, have, report, Scheduler(file.cluster), holds, dry_run, _runs_dir(file))
     finally:
         # Holds only steer which cards the services after them get; release them.
         for pg in holds:
@@ -233,12 +309,13 @@ def reconcile_once(file: ServicesFile, dry_run: bool = False) -> ApplyReport:
     return report
 
 
-def _replace(name: str, spec: ReplicaSpec, sched: Scheduler, report: ApplyReport, why: str) -> None:
+def _replace(name: str, spec: ReplicaSpec, sched: Scheduler, report: ApplyReport, why: str,
+             runs_dir: str | None) -> None:
     log.info("replacing %s (%s): draining first", name, why)
     drained = sched.drain(name)
     stop(name)
     try:
-        start(spec)
+        start(spec, runs_dir=runs_dir)
         report.replaced.append(name)
     except Exception as e:
         log.error("restarting %s failed: %s", name, e)
@@ -250,7 +327,7 @@ def _replace(name: str, spec: ReplicaSpec, sched: Scheduler, report: ApplyReport
 
 
 def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], report: ApplyReport,
-               sched: Scheduler, holds: list[PlacementGroup], dry_run: bool) -> None:
+               sched: Scheduler, holds: list[PlacementGroup], dry_run: bool, runs_dir: str | None) -> None:
     for name in sorted(set(have) - set(want)):
         if dry_run:
             report.planned.append(f"stop {name}")
@@ -286,7 +363,7 @@ def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], 
                 continue
             log.info("starting %s", name)
             try:
-                start(spec)
+                start(spec, runs_dir=runs_dir)
                 report.started.append(name)
             except Exception as e:
                 log.error("starting %s failed: %s", name, e)
@@ -303,6 +380,6 @@ def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], 
             if dry_run:
                 report.planned.append(f"replace {name} (spec changed: {h.spec} -> {spec_hash(spec)})")
             else:
-                _replace(name, spec, sched, report, "spec changed")
+                _replace(name, spec, sched, report, "spec changed", runs_dir)
         else:
             report.healthy.append(name)

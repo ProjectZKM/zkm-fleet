@@ -18,6 +18,8 @@ fleetctl ──admin token──▶   :9191 http (/admin, public values)
 
 The scheduler, its Postgres and the gateway run under docker compose. Every machine runs a Ray node; the service actors (provers, apps, the runs API) are detached, so Ray restarts them on failure, and `apply` reconciles them with `services.yaml` when it changes.
 
+**Who gets a card.** Services keep their cards; one-shot runs take what is free, and a service that needs cards a run holds preempts it (the run stops with grace and queues again, spending no retry).
+
 **Apps and jobs.** An *app* is what can run: a proof app is a tenant's program (named `tenant/<first 8 hex of the ELF id>`), a run app is a profile in `runs.yaml` (image, user, GPU cap, the roots a run may mount). A *job* is one instance of an app: a proof job, or a run. **A job runs only for an existing app:** the scheduler refuses a proof whose program is not registered for its tenant, and the runs API refuses a run whose profile is not in `runs.yaml`. A proof app is registered with `fleetctl app add tenant/<elf id>` (the tenant is in `fleet.yaml` and holds a credential; the ELF itself arrives with the first job); a run app with `fleetctl app add NAME --image … --allow …` (or by editing `runs.yaml`). `fleetctl app` lists the apps with their job counts, `fleetctl job` the jobs of both types. Either kind can be disabled (new jobs refused, history kept) and deleted.
 
 Restarting or upgrading the scheduler does not fail the proofs in flight:
@@ -53,7 +55,7 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ```bash
 fleetctl app | app NAME | app add … | app disable NAME | app enable NAME | app delete NAME --yes
-fleetctl job | job ID | job submit --app A --gpus 1 -- CMD | job logs ID -f | job fetch ID --out F | job cancel ID | job purge ID
+fleetctl job | job ID | job submit --app A --gpus 1 -- CMD | job logs ID -f | job fetch ID --out F | job cancel ID | job preempt ID | job purge ID
 fleetctl node | node NAME | node drain NAME | node undrain NAME
 fleetctl credential | credential ADDRESS | credential issue … | credential revoke ADDRESS
 ```

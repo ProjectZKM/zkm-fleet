@@ -253,6 +253,7 @@ class RunState(str, enum.Enum):
     WAITING_VRAM = "waiting_vram"
     RUNNING = "running"
     RETRYING = "retrying"
+    PREEMPTED = "preempted"  # being stopped so a service gets its cards; it queues again
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -276,6 +277,7 @@ class Cause(str, enum.Enum):
     EXIT_CODE = "exit-code"
     DOCKER_RUN = "docker-run"
     RANK_LOST = "rank-lost"
+    PREEMPTED = "preempted"  # a service took the cards; spends no --retry
 
     @property
     def oom(self) -> bool:
@@ -318,6 +320,12 @@ class Profile(Record):
     allow: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     disabled: bool = False  # takes no new runs (fleetctl app disable); the ones going finish
+    # A service that needs the cards may stop a run of this app once it has run
+    # min_runtime_s; the run queues again (FLEET_ATTEMPT goes on) and spends no --retry.
+    preemptible: bool = True
+    min_runtime_s: int = 300
+    # SIGTERM, then SIGKILL this much later: on cancel and on preemption (time to checkpoint).
+    stop_timeout_s: int = 30
 
 
 @dataclass(kw_only=True)
@@ -461,6 +469,7 @@ class RunStatus(Record):
     container: str | None = None
     attempt: int | None = None
     attempts: list[Attempt] = field(default_factory=list)
+    preemptions: int = 0
     started_at: float | None = None
     finished_at: float | None = None
     exit_code: int | None = None
@@ -498,8 +507,8 @@ class RunArgs(Record):
     machine that runs the bridge (where the profiles and the runs dir are) or to
     other actions."""
 
-    action: str = field(metadata={"positional": True, "choices": ["submit", "status", "cancel", "list", "logs", "fetch",
-                                                                   "purge", "render", "stage-model"]})
+    action: str = field(metadata={"positional": True, "choices": ["submit", "status", "cancel", "preempt", "list", "logs",
+                                                                   "fetch", "purge", "render", "stage-model"]})
     run_id: str | None = field(default=None, metadata={"positional": True,
                                                        "help": "a run id (stage-model: the Hugging Face repo)"})
     profiles: str = field(default_factory=lambda: os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))

@@ -76,7 +76,11 @@ fit, `--gpus 0` is CPU-only, `--cpus N` caps the job. `--after ID` starts only a
 that run succeeded (fails otherwise, with the reason): use it for train then eval.
 `--retry N` retries any failure, `--restart-on-oom N` only out-of-memory ones;
 `$FLEET_ATTEMPT` (1, 2, …) tells the job which attempt it is, so it checkpoints into
-`{out}` and resumes when `FLEET_ATTEMPT > 1`. Metrics: one JSON object per line
+`{out}` and resumes when `FLEET_ATTEMPT > 1`. **Handle SIGTERM:** cancel and preemption
+send it, then SIGKILL the app's `stop_timeout_s` (default 30 s) later; save a checkpoint
+then. A service that needs the cards preempts a run of a `preemptible` app once it has
+run `min_runtime_s`: the run queues again with the same id and `out/`, `FLEET_ATTEMPT`
+counts on, and no `--retry` is spent. Metrics: one JSON object per line
 appended to `$FLEET_METRICS` (`{out}/metrics.jsonl`); the record shows the latest.
 Output is unbuffered. `--machine HOST` pins the machine; `--nodes N` spreads one run
 over N machines (`--gpus`/`--cpus` on each, one container per machine, started together,
@@ -94,14 +98,16 @@ a memory figure, an unknown `--after` run, a bad `--code`.
 fleetctl job ID                 # record: state, cards, attempts, cause, metrics, out dir
 fleetctl job logs ID -f         # follow the output until the run ends
 fleetctl job fetch ID --out F   # the run's out/ as a tar.gz (a transfer that breaks off is an error)
-fleetctl job cancel ID          # containers removed, cards freed (a finished run: 409)
+fleetctl job cancel ID          # SIGTERM, SIGKILL stop_timeout_s later; cards freed (a finished run: 409)
+fleetctl job preempt ID         # the same stop, then it queues again (as a service needing the cards does)
 fleetctl job purge ID           # delete a finished run's record, out/ included
 fleetctl job purge --older-than DAYS
 ```
 
 States: `waiting_dependency` (its `--after`), `queued` (no card yet), `waiting_vram`,
-`running`, `retrying`, then `succeeded` / `failed` (`cause`: `gpu-oom`, `host-oom`,
-`exit-code`, per-attempt records) / `cancelled`, or `lost` (its actor is gone, e.g.
+`running`, `retrying`, `preempted` (being stopped; then `queued` again, `preemptions`
+counts them, the attempt's `cause` is `preempted`), then `succeeded` / `failed` (`cause`:
+`gpu-oom`, `host-oom`, `exit-code`, per-attempt records) / `cancelled`, or `lost` (its actor is gone, e.g.
 Ray restarted; `container` says whether the job still runs; `cancel` removes it; a lost
 run whose container still runs cannot be purged until then). Don't poll faster than
 about 15 s; `logs -f` is the way to watch progress.

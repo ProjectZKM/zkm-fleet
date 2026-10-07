@@ -61,6 +61,10 @@ refuses and lists them.
   it only when nothing else in the file changed; comments and the other profiles stay as
   they were. Every `--allow` root is an absolute path on the machine runs land on.
   Omitted flags take the server's defaults (max_gpus 8, shm 16 GiB, the whole card).
+  Preemption is set in the profile (`runs.yaml`): `preemptible` (default true: a service
+  that needs the cards may stop a run, which queues again), `min_runtime_s` (default 300:
+  not before it ran this long), `stop_timeout_s` (default 30: SIGTERM to SIGKILL, on
+  cancel and preemption).
 - `disable` is `disabled: true` in the profile (a submit answers 409); `enable` removes it.
 - `delete` cuts the profile out of `runs.yaml`; its past runs stay listed (under a name
   that is no longer an app, shown as "removed") with their logs and outputs.

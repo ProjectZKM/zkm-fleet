@@ -26,3 +26,9 @@ profiles:
       - /tmp/train_jobs
     env:
       HOME: /home/ubuntu
+    # A service that needs the cards may preempt a run of this app once it has run
+    # min_runtime_s: SIGTERM, SIGKILL stop_timeout_s later (also on cancel), then the
+    # run queues again with the same id and out/, FLEET_ATTEMPT counting on, no --retry spent.
+    preemptible: true
+    min_runtime_s: 300
+    stop_timeout_s: 30

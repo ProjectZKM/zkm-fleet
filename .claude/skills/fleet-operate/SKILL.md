@@ -19,7 +19,10 @@ view; `--json` prints the data.
 long-running services; `/opt/zkm-fleet/deploy/apply.sh` makes the Ray actors match it
 (start, stop, replace on a spec change such as a new image digest; a replaced prover is
 drained first). `python -m fleet_bridge apply --dry-run --services …` only lists what an
-apply would do; run it before an apply on a live cluster.
+apply would do; run it before an apply on a live cluster. `apply --only NAME` (a service
+or a replica, repeatable) touches only that one and leaves every other actor as it is: to
+start or replace one service while others are stopped on purpose (a full apply would
+start them again).
 
 | kind | what it is |
 |---|---|
@@ -27,6 +30,11 @@ apply would do; run it before an apply on a live cluster.
 | `app` | any GPU container serving on a port (`port_base` + replica index; ComfyUI, an inference server); `python -m fleet_bridge render --services … --actor <name>-0 --gpus <card>` prints its `docker run` to try by hand |
 | `runs-api` | the one-shot runs API (`listen`, `profiles`, `runs_dir`), on the control machine |
 | `hold` | `gpus: N`, no image: keeps the next free cards from the services listed after it while they start, so on one machine the file's order decides which cards each gets (Ray hands out the lowest free cards) |
+
+**Who gets a card.** A service that cannot get its cards within 20 s because one-shot
+runs hold them preempts them (`preemptible` apps, after their `min_runtime_s`; the newest
+first, on the machine where fewest are needed): they stop with grace and queue again
+once the service has its grant. A service never preempts another service.
 
 A replica's cards, CPUs and memory come from one machine; `machine: <host name or IP>`
 pins it. Actors are detached: Ray restarts them on failure; after a head restart the

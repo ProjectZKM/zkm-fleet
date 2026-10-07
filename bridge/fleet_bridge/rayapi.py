@@ -36,3 +36,13 @@ def actor_node_id(actor: Any) -> str | None:
         return str(info["Address"]["NodeID"])
     except Exception:
         return None
+
+
+def free_by_node_ip() -> dict[str, tuple[float, float]]:
+    """Each live machine's unclaimed GPUs and CPUs (node IP -> (GPUs, CPUs)), from the GCS."""
+    per_node = ray._private.state.available_resources_per_node()  # type: ignore[no-untyped-call]
+    out = {}
+    for n in alive_nodes():
+        free = per_node.get(n["NodeID"], {})
+        out[str(n["NodeManagerAddress"])] = (float(free.get("GPU", 0)), float(free.get("CPU", 0)))
+    return out

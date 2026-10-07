@@ -1,11 +1,12 @@
-"""python -m fleet_bridge {apply [--dry-run]|status|down} --services services.yaml [--address 127.0.0.1:6379]
+"""python -m fleet_bridge {apply [--dry-run] [--only NAME]...|status|down} --services services.yaml [--address 127.0.0.1:6379]
    python -m fleet_bridge render --services services.yaml --actor <name>-<i> --gpus 0[,1]
    python -m fleet_bridge run submit|status|cancel|list|render ...   (one-shot jobs: see runs.py)
    python -m fleet_bridge runs-api --profiles runs.yaml --runs-dir DIR --listen 127.0.0.1:9192 --admin-token-file F
                                      (the runs HTTP API in the foreground; as a service: kind runs-api)
 
 apply makes the prover actors match the services file (start, stop, replace on a
-spec change); --dry-run only says what it would do. The actors are detached and Ray
+spec change); --dry-run only says what it would do; --only NAME (a service or a
+replica, repeatable) touches that and leaves every other actor as it is. The actors are detached and Ray
 restarts them itself, so nothing needs to keep running between applies. render
 prints the `docker run` an app replica would get on the given cards, without Ray:
 to debug it, or to try it out by hand.
@@ -33,6 +34,7 @@ class BridgeArgs(Record):
     services: str = "services.yaml"
     address: str = field(default="127.0.0.1:6379", metadata={"help": "Ray cluster address"})
     dry_run: bool = field(default=False, metadata={"help": "apply: only report what would change"})
+    only: list[str] = field(default_factory=list, metadata={"help": "apply: only this service or replica; repeat"})
     actor: str | None = field(default=None, metadata={"help": "render: replica name, e.g. comfyui-0"})
     gpus: str = field(default="0", metadata={"help": "render: host cards, e.g. 0 or 2,3"})
 
@@ -76,7 +78,8 @@ def main() -> None:
     ray.init(address=a.address, namespace=reconcile.NAMESPACE, log_to_driver=False)
 
     if a.command == "apply":
-        print(json.dumps(reconcile.reconcile_once(_services(a.services), dry_run=a.dry_run).dump(), indent=2))
+        report = reconcile.reconcile_once(_services(a.services), dry_run=a.dry_run, only=a.only or None)
+        print(json.dumps(report.dump(), indent=2))
     elif a.command == "status":
         out = {}
         for name, actor in sorted(reconcile.running().items()):
