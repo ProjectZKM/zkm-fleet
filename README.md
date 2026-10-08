@@ -107,3 +107,13 @@ The admin API (`/admin` on 9191) and the runs API take the admin token as a bear
 | app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |
 | 172.28.250.0/24 | docker network on the control machine | scheduler (fixed at .10), Postgres, gateway; `install.sh --subnet` if it collides |
+
+Persistent GPU apps use the existing `run` app type, with `persistent: true`
+in their records. Apps in `services.yaml` are also listed by `fleetctl app` when the
+file is next to the runs API's `runs.yaml`. Names must be distinct from run profiles.
+`fleetctl app disable comfyui` persists `disabled: true` in that service entry and
+stops its replicas, containers, and Ray GPU reservations (interrupting generation).
+`fleetctl app enable comfyui` starts its configured replicas again. The change is
+applied only to the named service; unrelated stopped provers stay stopped. A later
+apply or Ray head restart respects the saved disabled state. The API retains comments and unrelated formatting in block YAML service entries. Proof apps and run
+profiles keep their existing disable behavior: reject new jobs and finish existing ones.

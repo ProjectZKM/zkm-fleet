@@ -34,6 +34,9 @@ import socket
 import threading
 import urllib.parse
 import uuid
+import tempfile
+
+import yaml
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -85,9 +88,71 @@ class Api:
         with self.lock:
             return runs.add_app(self.args(), name, body)
 
-    def set_app_disabled(self, name: str, disabled: bool) -> Record:
+    def service_apps(self) -> list[dict[str, Any]]:
+        path = os.path.join(os.path.dirname(self.profiles), "services.yaml")
+        if not os.path.exists(path):
+            return []
+        from . import reconcile
+        from .model import ServiceKind
+        with open(path) as f:
+            cfg = reconcile.load_services(yaml.safe_load(f) or {})
+        return [{"name": s.name, "type": "run", "persistent": True, "disabled": s.disabled,
+                 "image": s.image, "max_gpus": s.gpus * s.replicas,
+                 "replicas": s.replicas} for s in cfg.services if s.kind is ServiceKind.APP]
+
+    def apps(self) -> list[Any]:
+        profiles = runs.apps(self.args(), runs.load_config(self.profiles))
+        services = self.service_apps()
+        if {p.name for p in profiles} & {s["name"] for s in services}:
+            raise ApiError(409, "run profile and persistent service have the same name")
+        return [p.dump() for p in profiles] + services
+
+    def set_app_disabled(self, name: str, disabled: bool) -> Any:
         with self.lock:
-            return runs.set_app_disabled(self.args(), name, disabled)
+            services = self.service_apps()
+            if not any(s["name"] == name for s in services):
+                return runs.set_app_disabled(self.args(), name, disabled)
+            if any(p.name == name for p in runs.apps(self.args(), runs.load_config(self.profiles))):
+                raise ApiError(409, "run profile and persistent service have the same name")
+            from . import reconcile
+            path = os.path.join(os.path.dirname(self.profiles), "services.yaml")
+            with open(path) as f:
+                text = f.read()
+            data = yaml.safe_load(text)
+            for svc in data["services"]:
+                if svc["name"] == name:
+                    svc["disabled"] = disabled
+            cfg = reconcile.load_services(data)
+            # Persist first: a watchdog or future apply must respect the disabled state.
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".services-")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    # Edit only the scalar/entry, retaining comments and unrelated formatting.
+                    root = yaml.compose(text)
+                    sequence = next(v for k, v in root.value if k.value == "services")
+                    entry = next(node for node in sequence.value
+                                 if any(k.value == "name" and v.value == name for k, v in node.value))
+                    if entry.flow_style:
+                        raise ApiError(409, "persistent app entries must use block YAML for enable/disable")
+                    value = next((v for k, v in entry.value if k.value == "disabled"), None)
+                    scalar = "true" if disabled else "false"
+                    if value is not None:
+                        text = text[:value.start_mark.index] + scalar + text[value.end_mark.index:]
+                    else:
+                        pos = entry.start_mark.index
+                        text = text[:pos] + f"disabled: {scalar}\n" + " " * entry.start_mark.column + text[pos:]
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, os.stat(path).st_mode & 0o777)
+                os.replace(tmp, path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            report = reconcile.reconcile_once(cfg, only=[name])
+            if report.unhealthy:
+                raise ApiError(503, f"{name}: reconciliation failed; desired state saved")
+            return {"name": name, "type": "run", "persistent": True, "disabled": disabled, "report": report.dump()}
 
     def upload(self, data: bytes) -> Uploaded:
         if not data:
@@ -178,7 +243,7 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _json(self, status: int, value: Any) -> None:
-            data = value.dump() if isinstance(value, Record) else [v.dump() for v in value] if isinstance(value, list) else value
+            data = value.dump() if isinstance(value, Record) else [v.dump() if isinstance(v, Record) else v for v in value] if isinstance(value, list) else value
             self._send(status, json.dumps(data, indent=2).encode())
 
         def _body(self) -> bytes:
@@ -230,7 +295,7 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
             if (method, head, n) == ("POST", "runs", 1):
                 return self._json(201, api.submit(self._json_body()))
             if (method, head, n) == ("GET", "apps", 1):
-                return self._json(200, runs.apps(api.args(), runs.load_config(api.profiles)))
+                return self._json(200, api.apps())
             if (method, head, n) == ("POST", "apps", 1):
                 return self._json(201, api.add_app(self._json_body()))
             if (method, head, n) == ("DELETE", "apps", 2):

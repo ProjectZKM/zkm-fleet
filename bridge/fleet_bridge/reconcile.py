@@ -89,6 +89,8 @@ def replica_specs(file: ServicesFile) -> dict[str, ReplicaSpec]:
 
     out: dict[str, ReplicaSpec] = {}
     for svc in file.services:
+        if svc.disabled:
+            continue
         if is_run_actor(svc.name):
             raise ValueError(f"service {svc.name}: the run-/wait- prefixes are one-shot runs' actor names")
         for i in range(svc.replicas):
@@ -289,7 +291,7 @@ def reconcile_once(file: ServicesFile, dry_run: bool = False, only: list[str] | 
     want = replica_specs(file)
     have = running()
     if only:
-        unknown = set(only) - set(want) - {service_of(n) for n in want} - set(have) - {service_of(n) for n in have}
+        unknown = set(only) - {s.name for s in file.services} - set(want) - {service_of(n) for n in want} - set(have) - {service_of(n) for n in have}
         if unknown:
             raise SystemExit(f"--only: no service or replica {sorted(unknown)} in the file or running")
 

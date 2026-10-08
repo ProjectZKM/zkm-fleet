@@ -46,7 +46,7 @@ struct Conn {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Apps: proof programs (a tenant's ELF) and run profiles (runs.yaml), with their jobs.
+    /// Apps: proof programs and run apps (one-shot profiles or persistent apps).
     App(AppArgs),
     /// Jobs, the instances of apps (proof jobs and runs): the list (by default), one by
     /// its id, or submit / logs / cancel / purge / fetch a run.
@@ -85,7 +85,7 @@ enum AppCmd {
         #[command(flatten)]
         add: AddApp,
     },
-    /// The app takes no new jobs; the queued and running ones finish. Its history stays.
+    /// Persistent apps stop and release GPUs; proof/run apps refuse new jobs and finish existing jobs.
     Disable { name: String },
     /// The app takes jobs again.
     Enable { name: String },
@@ -836,10 +836,13 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
         AppRef::Run(_) => {
             let a = Admin::runs(conn)?;
             run_app_named(&a, name)?;
-            a.send(a.req(method, &format!("/apps/{name}/disabled")))?
+            a.send(a.req(method, &format!("/apps/{name}/disabled")).timeout(Duration::from_secs(1800)))?
         }
     };
-    let text = if disabled {
+    let text = if v["persistent"].as_bool() == Some(true) {
+        if disabled { format!("{name} disabled: stopped; GPU reservations released") }
+        else { format!("{name} enabled: service started") }
+    } else if disabled {
         format!("{name} disabled: it takes no new jobs; the queued and running ones finish")
     } else {
         format!("{name} enabled: it takes jobs again")
@@ -905,7 +908,10 @@ fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 fn describe_app(name: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     let (kind, mut rec) = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => (Kind::Proof, with_type("proof", &proof_app_named(&Admin::new(conn)?, name, &tenant)?)),
-        AppRef::Run(_) => (Kind::Run, with_type("run", &run_app_named(&Admin::runs(conn)?, name)?)),
+        AppRef::Run(_) => {
+            let app = run_app_named(&Admin::runs(conn)?, name)?;
+            (Kind::Run, with_type(app["type"].as_str().unwrap_or("run"), &app))
+        },
     };
     let full = rec["name"].as_str().unwrap_or(name).to_string();
     let jobs = fetch_rows(kind, conn, &Want { limit: 5, active: false, tenant: None, app: Some(&full) })?;
@@ -1014,8 +1020,8 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
                         "detail": if removed {
                             "removed from runs.yaml: only its past runs are left".to_string()
                         } else {
-                            let gpus = a["max_gpus"].as_u64().unwrap_or(0);
-                            format!("image {}, up to {gpus} GPU{}", a["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" })
+                            let gpus = a["max_gpus"].as_f64().unwrap_or(0.0);
+                            format!("image {}, up to {gpus} GPU{}", a["image"].as_str().unwrap_or("?"), if gpus == 1.0 { "" } else { "s" })
                         },
                     }));
                 }

@@ -613,6 +613,7 @@ class ServiceSpec(Record):
     name: str
     kind: ServiceKind = ServiceKind.ZIREN_GPU
     replicas: int = 1
+    disabled: bool = False  # persistent app: release resources until enabled
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
