@@ -46,6 +46,8 @@ services:
   # Image: deploy/images/comfyui (Ubuntu 22.04 userland matching the venv).
   - name: comfyui
     kind: app
+    namespace: system                  # existing namespace; creation is admin-only
+    priority: 100                      # may displace lower-priority runs in this namespace
     replicas: 2
     gpus: 1
     cpus: 8

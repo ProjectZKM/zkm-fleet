@@ -27,6 +27,8 @@ struct Cli {
     json: bool,
     #[command(subcommand)]
     cmd: Cmd,
+    #[command(flatten)]
+    _conn: Conn,
 }
 
 /// Where the scheduler's admin API and the runs API are, and the token both take: every
@@ -42,6 +44,15 @@ struct Conn {
     /// File holding the admin token (default: admin.token in FLEET_ETC, ~/.config/zkm-fleet or /etc/zkm-fleet).
     #[arg(long, env = "FLEET_ADMIN_TOKEN_FILE", global = true)]
     admin_token_file: Option<PathBuf>,
+    /// User API token file. Takes precedence over the operator admin token.
+    #[arg(long, env = "FLEET_TOKEN_FILE", global = true)]
+    token_file: Option<PathBuf>,
+    /// User namespace selector (inferred from user credentials; operators may select one).
+    #[arg(long, env = "FLEET_NAMESPACE", global = true)]
+    namespace: Option<String>,
+    /// Optional tag within the namespace; inferred from user credentials.
+    #[arg(long = "tag", env = "FLEET_TAG", global = true)]
+    tag: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -56,6 +67,8 @@ enum Cmd {
     /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY): the list (by default), one by its
     /// address, or issue / revoke one.
     Credential(CredentialArgs),
+    /// Create, inspect, suspend or resume stable user namespaces (administrator only).
+    Namespace(NamespaceArgs),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
     /// certificates (install.sh runs these; no scheduler is needed).
     #[command(subcommand)]
@@ -87,6 +100,8 @@ enum AppCmd {
     },
     /// Persistent apps stop and release GPUs; proof/run apps refuse new jobs and finish existing jobs.
     Disable { name: String },
+    /// Set the priority inherited by new jobs (higher values run first).
+    Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
     /// The app takes jobs again.
     Enable { name: String },
     /// Delete an app, refused while any of its jobs is queued or running. A proof app
@@ -162,6 +177,44 @@ struct CredentialArgs {
     conn: Conn,
 }
 
+#[derive(Args)]
+struct NamespaceArgs {
+    #[command(subcommand)]
+    cmd: Option<NamespaceCmd>,
+    #[command(flatten)]
+    conn: Conn,
+}
+
+#[derive(Subcommand)]
+enum NamespaceCmd {
+    Create { name: String, #[command(flatten)] quota: QuotaArgs },
+    /// Replace concurrent GPU/CPU caps for the namespace, or for its optional --tag.
+    Quota { name: String, #[command(flatten)] quota: QuotaArgs },
+    Get { name: String },
+    List,
+    Suspend { name: String },
+    Resume { name: String },
+}
+
+#[derive(Args)]
+struct QuotaArgs {
+    /// Concurrent GPU units for proofs and runs combined; fractions are allowed.
+    #[arg(long)]
+    gpus: Option<f64>,
+    /// Concurrent CPU units for proofs and runs combined.
+    #[arg(long)]
+    cpus: Option<f64>,
+}
+
+impl QuotaArgs {
+    fn value(&self) -> anyhow::Result<Value> {
+        if [self.gpus, self.cpus].into_iter().flatten().any(|v| !v.is_finite() || v < 0.0) {
+            bail!("GPU/CPU caps must be finite and non-negative");
+        }
+        Ok(json!({"gpus": self.gpus, "cpus": self.cpus}))
+    }
+}
+
 #[derive(Subcommand)]
 enum NodeCmd {
     /// Every prover node: backend, cards, machine, ready, reserved for, busy with (the default).
@@ -174,12 +227,33 @@ enum NodeCmd {
 
 #[derive(Subcommand)]
 enum CredentialCmd {
-    /// Generate a key for a tenant, register its address, write the client env file.
+    /// Issue scoped proof/run access: register a signing address and token hash, write a client bundle.
     Issue {
         #[arg(long)]
         tenant: String,
+        /// Approved app (repeat): run profile name or tenant/full-ELF-id. Required for user access.
+        #[arg(long = "app", required = true)]
+        apps: Vec<String>,
         #[arg(long, default_value = "")]
         label: String,
+        #[command(flatten)]
+        bundle: CredentialBundle,
+    },
+    /// Issue a replacement in the same namespace with the same grants; revoke the old key after verification.
+    #[command(alias = "rotate")]
+    Refresh {
+        address: String,
+        #[command(flatten)]
+        bundle: CredentialBundle,
+    },
+    /// Every registered key: address, tenant, label, active or revoked (the default).
+    List,
+    /// Refuse a key's requests from now on.
+    Revoke { address: String },
+}
+
+#[derive(Args)]
+struct CredentialBundle {
         /// Env file for the client (0600): ZKM_PROVER, ENDPOINT, ZKM_PRIVATE_KEY, TLS paths.
         #[arg(long)]
         out: PathBuf,
@@ -194,12 +268,7 @@ enum CredentialCmd {
         /// Server name in the stage certificate, when it is not the SDK's default "stage".
         #[arg(long)]
         domain_name: Option<String>,
-    },
-    /// Every registered key: address, tenant, label, active or revoked (the default).
-    List,
-    /// Refuse a key's requests from now on.
-    Revoke { address: String },
-}
+ }
 
 /// A submit: the command line and the request body are this one struct (its field
 /// names are the API's), so nothing is assigned by hand. Unset flags are left out and
@@ -275,6 +344,10 @@ struct Submit {
 /// struct (its field names are the profile's); unset flags take the server's defaults.
 #[derive(Args, Serialize)]
 struct AddApp {
+    /// Priority inherited by new jobs (default 0; higher values run first).
+    #[arg(long, allow_hyphen_values = true)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<i32>,
     /// A proof app: TENANT/<elf id> (64 hex), or TENANT/ with --elf. A run app: its name
     /// (letters, digits, _ . -; it heads its runs' ids).
     name: String,
@@ -395,6 +468,7 @@ impl Cmd {
         match self {
             Cmd::Node(n) => &n.conn,
             Cmd::Credential(c) => &c.conn,
+            Cmd::Namespace(n) => &n.conn,
             Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
         }
     }
@@ -405,15 +479,23 @@ struct Admin {
     base: String,
     token: String,
     http: reqwest::blocking::Client,
+    namespace: Option<String>,
+    tag: Option<String>,
 }
 
 impl Admin {
     fn new(conn: &Conn) -> anyhow::Result<Self> {
-        Self::at(&format!("{}/admin", conn.url.trim_end_matches('/')), &conn.admin_token_file)
+        let mut client = Self::at(&format!("{}/admin", conn.url.trim_end_matches('/')), &conn.token_file.clone().or_else(|| conn.admin_token_file.clone()))?;
+        client.namespace = conn.namespace.clone();
+        client.tag = conn.tag.clone().filter(|t| !t.is_empty());
+        Ok(client)
     }
 
     fn runs(conn: &Conn) -> anyhow::Result<Self> {
-        Self::at(conn.runs_url.trim_end_matches('/'), &conn.admin_token_file)
+        let mut client = Self::at(conn.runs_url.trim_end_matches('/'), &conn.token_file.clone().or_else(|| conn.admin_token_file.clone()))?;
+        client.namespace = conn.namespace.clone();
+        client.tag = conn.tag.clone().filter(|t| !t.is_empty());
+        Ok(client)
     }
 
     fn at(base: &str, token_file: &Option<PathBuf>) -> anyhow::Result<Self> {
@@ -428,6 +510,8 @@ impl Admin {
             .to_string();
         Ok(Self {
             base: base.to_string(),
+            namespace: None,
+            tag: None,
             token,
             http: reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -436,9 +520,9 @@ impl Admin {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
-        self.http
-            .request(method, format!("{}{path}", self.base))
-            .bearer_auth(&self.token)
+        let request = self.http.request(method, format!("{}{path}", self.base)).bearer_auth(&self.token);
+        let request = match &self.namespace { Some(n) => request.query(&[("namespace", n)]), None => request };
+        match &self.tag { Some(g) => request.query(&[("tag", g)]), None => request }
     }
 
     /// The answer as JSON (Null for an empty one); a failure status is an error with its body.
@@ -498,47 +582,31 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             a.send(a.req(M::DELETE, &format!("/nodes/{name}/drain")))?;
             out.done(&format!("{name} takes jobs again"), json!({ "node": name, "draining": false }));
         }
-        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Issue { tenant, label, out: env_file, endpoint, tls_dir, domain_name }), .. }) => {
-            if env_file.exists() {
-                bail!("{} exists; refusing to overwrite a credential", env_file.display());
+        Cmd::Namespace(n) => match &n.cmd {
+            None | Some(NamespaceCmd::List) => {
+                let all = a.get("/namespaces")?;
+                out.table(all.as_array().unwrap_or(&vec![]), &[col("NAME", "name"), col("ID", "id"), col("SUSPENDED", "suspended_ms")], Some(&all));
             }
-            if tls_dir.is_none() && endpoint.starts_with("https") {
-                bail!("an https endpoint needs --tls-dir: the SDK only speaks TLS with a client certificate");
-            }
-            let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
-            let address = alloy_primitives::Address::from_private_key(&key);
-            let registered = a.send(a.req(M::POST, "/credentials").json(&json!({
-                "tenant": tenant, "address": format!("{address:#x}"), "label": label,
-            })))?;
-            let mut env = vec![
-                ("ZKM_PROVER", "network".to_string()),
-                ("ENDPOINT", endpoint.clone()),
-                ("ZKM_PRIVATE_KEY", hex::encode(key.to_bytes())),
-                ("ZKM_PROOF_POLL_INTERVAL", "100".to_string()),
-            ];
-            if let Some(dir) = tls_dir {
-                // its CN is the credential: the scheduler maps it to the tenant (and a
-                // revoked credential's certificate is refused with it)
-                let (cert, key_path) = tls_client(dir, &format!("{address:#x}"))?;
-                env.push(("CA_CERT_PATH", abs(&dir.join("ca.pem"))?));
-                env.push(("SSL_CERT_PATH", abs(&cert)?));
-                env.push(("SSL_KEY_PATH", abs(&key_path)?));
-                if let Some(d) = domain_name {
-                    env.push(("DOMAIN_NAME", d.clone()));
-                }
-            }
-            let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-            write_secret(env_file, text.as_bytes())?;
-            let result = json!({
-                "address": format!("{address:#x}"), "tenant": tenant, "label": label,
-                "env_file": env_file.display().to_string(), "endpoint": endpoint,
-                "registered": registered,
-            });
-            if out.json {
-                out.record(&result);
-            } else {
-                println!("issued {address:#x} for tenant {tenant}; client env in {} (0600)", env_file.display());
-            }
+            Some(NamespaceCmd::Create { name, quota }) => out.record(&a.send(a.req(M::POST, "/namespaces").json(&json!({"name": name, "quota": quota.value()?})))?),
+            Some(NamespaceCmd::Quota { name, quota }) => out.record(&a.send(a.req(M::PUT, &format!("/namespaces/{name}/quota")).json(&quota.value()?))?),
+            Some(NamespaceCmd::Get { name }) => out.record(&a.get(&format!("/namespaces/{name}"))?),
+            Some(NamespaceCmd::Suspend { name }) => out.record(&a.send(a.req(M::PUT, &format!("/namespaces/{name}/suspended")))?),
+            Some(NamespaceCmd::Resume { name }) => out.record(&a.send(a.req(M::DELETE, &format!("/namespaces/{name}/suspended")))?),
+        },
+        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Issue { tenant, apps, label, bundle }), .. }) => {
+            let namespace = cmd.conn().namespace.as_deref().context("credential issue requires --namespace (create it with fleetctl namespace create NAME)")?;
+            issue_credential(&a, cmd.conn(), out, namespace, a.tag.as_deref(), tenant, apps, label, bundle)?;
+        }
+        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Refresh { address, bundle }), .. }) => {
+            let all = a.get("/credentials")?;
+            let normalized = address.trim_start_matches("0x").to_ascii_lowercase();
+            let old = all.as_array().into_iter().flatten().find(|c| c["address"].as_str() == Some(&normalized))
+                .context("no such credential")?;
+            let namespace = old["namespace"].as_str().context("credential refresh requires an explicit namespace")?;
+            let apps: Vec<String> = serde_json::from_value(old["apps"].clone())?;
+            issue_credential(&a, cmd.conn(), out, namespace, old["tag"].as_str(), old["tenant"].as_str().context("credential has no tenant")?, &apps,
+                old["label"].as_str().unwrap_or_default(), bundle)?;
+            if !out.json { println!("old credential {address} remains active; revoke it after verifying the replacement"); }
         }
         Cmd::Credential(CredentialArgs { cmd: None, address: Some(address), .. }) => {
             let want = format!("0x{}", address.trim_start_matches("0x").to_ascii_lowercase());
@@ -561,6 +629,76 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn issue_credential(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Option<&str>, tenant: &str, apps: &[String], label: &str, bundle: &CredentialBundle) -> anyhow::Result<()> {
+    let CredentialBundle { out: env_file, endpoint, tls_dir, domain_name } = bundle;
+    let token_file = env_file.with_extension("token");
+    let ca_file = env_file.with_extension("ca.pem");
+    let cert_file = env_file.with_extension("client.pem");
+    let key_file = env_file.with_extension("client.key");
+    let mut bundle = vec![env_file.clone(), token_file.clone()];
+    if tls_dir.is_some() { bundle.extend([ca_file.clone(), cert_file.clone(), key_file.clone()]); }
+    for (i, path) in bundle.iter().enumerate() {
+        if bundle[..i].contains(path) { bail!("--out must use a distinct env filename, such as user.env"); }
+        if path.exists() { bail!("{} exists; refusing to overwrite a credential", path.display()); }
+    }
+    if tls_dir.is_none() && endpoint.starts_with("https") {
+        bail!("an https endpoint needs --tls-dir: the SDK only speaks TLS with a client certificate");
+    }
+    if apps.iter().any(|a| a.contains('/')) && tls_dir.is_none() {
+        bail!("proof user credentials require --tls-dir and the mTLS gateway");
+    }
+    use sha2::Digest;
+    let mut random = [0u8; 48];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
+    let user_token = hex::encode(random);
+    let token_hash = hex::encode(sha2::Sha256::digest(user_token.as_bytes()));
+    let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+    let address = alloy_primitives::Address::from_private_key(&key);
+    let registered = a.send(a.req(reqwest::Method::POST, "/credentials").json(&json!({
+        "tenant": tenant, "address": format!("{address:#x}"), "label": label,
+        "apps": apps, "token_hash": token_hash, "namespace": namespace, "tag":tag,
+    })))?;
+    write_secret(&token_file, user_token.as_bytes())?;
+    let mut env = vec![
+        ("FLEET_TOKEN_FILE", abs(&token_file)?),
+        ("FLEET_NAMESPACE", namespace.to_string()),
+        ("FLEET_TAG", tag.unwrap_or_default().to_string()),
+        ("FLEET_URL", conn.url.clone()),
+        ("FLEET_RUNS_URL", conn.runs_url.clone()),
+        ("ZKM_PROVER", "network".to_string()),
+        ("ENDPOINT", endpoint.clone()),
+        ("ZKM_PRIVATE_KEY", hex::encode(key.to_bytes())),
+        ("ZKM_PROOF_POLL_INTERVAL", "100".to_string()),
+    ];
+    if let Some(dir) = tls_dir {
+        // its CN is the credential: the scheduler maps it to the tenant (and a
+        // revoked credential's certificate is refused with it)
+        let (cert, key_path) = tls_client(dir, &format!("{address:#x}"))?;
+        write_secret(&ca_file, &std::fs::read(dir.join("ca.pem"))?)?;
+        write_secret(&cert_file, &std::fs::read(cert)?)?;
+        write_secret(&key_file, &std::fs::read(key_path)?)?;
+        env.push(("CA_CERT_PATH", abs(&ca_file)?));
+        env.push(("SSL_CERT_PATH", abs(&cert_file)?));
+        env.push(("SSL_KEY_PATH", abs(&key_file)?));
+        if let Some(d) = domain_name {
+            env.push(("DOMAIN_NAME", d.clone()));
+        }
+    }
+    let text: String = env.iter().map(|(k, v)| format!("{k}='{}'\n", v.replace('\'', "'\\''"))).collect();
+    write_secret(env_file, text.as_bytes())?;
+    let result = json!({
+        "address": format!("{address:#x}"), "tenant": tenant, "label": label,
+        "env_file": env_file.display().to_string(), "token_file": token_file.display().to_string(), "endpoint": endpoint,
+        "registered": registered,
+    });
+    if out.json {
+        out.record(&result);
+    } else {
+        println!("issued {address:#x} for tenant {tenant}; client env in {} (0600)", env_file.display());
+    }
+    Ok(())
+}
+
 const NODE_COLS: &[out::Col] = &[
     col("NODE", "name"),
     col("BACKEND", "backend"),
@@ -572,7 +710,7 @@ const NODE_COLS: &[out::Col] = &[
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
 const CREDENTIAL_COLS: &[out::Col] =
-    &[col("ADDRESS", "address"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
+    &[col("ADDRESS", "address"), col("NAMESPACE","namespace"), col("TAG","tag"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
 const PURGE_COLS: &[out::Col] =
     &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
 
@@ -583,6 +721,7 @@ fn credential_rows(v: &Value) -> Vec<Value> {
         .flatten()
         .map(|c| {
             let mut r = c.clone();
+            r["tag"] = c["tag"].clone();
             r["address"] = json!(format!("0x{}", c["address"].as_str().unwrap_or("")));
             r["state"] = json!(if c["revoked_ms"].is_null() { "active" } else { "revoked" });
             r
@@ -613,6 +752,9 @@ fn node_rows(status: &Value) -> Vec<Value> {
 const PS_COLS: &[out::Col] = &[
     col("TYPE", "type"),
     col("APP", "app"),
+    col("NAMESPACE", "namespace"),
+    col("PRIORITY", "priority"),
+    col("TAG", "tag"),
     col("ID", "id"),
     col("STATE", "state"),
     col("WHERE", "where"),
@@ -621,7 +763,7 @@ const PS_COLS: &[out::Col] = &[
 ];
 
 /// States that are not over yet, in both vocabularies.
-const ACTIVE: &[&str] = &["queued", "running", "waiting_vram", "waiting_dependency", "retrying"];
+const ACTIVE: &[&str] = &["queued", "running", "waiting_vram", "waiting_dependency", "waiting_quota", "retrying"];
 
 fn is_active(row: &Value) -> bool {
     ACTIVE.contains(&row["state"].as_str().unwrap_or(""))
@@ -652,8 +794,8 @@ fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
 fn proof_row(j: &Value) -> Value {
     let secs = |k: &str| j[k].as_f64().map(|ms| ms / 1000.0);
     json!({
-        "type": "proof", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "owner": j["tenant"],
-        "state": j["state"], "where": j["node"],
+        "type": "proof", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "client_id": j["client_id"], "namespace": j["namespace"], "tag": j["tag"], "owner": j["tenant"],
+        "state": j["state"], "priority": j["priority"], "where": j["node"],
         "created_at": secs("created_ms"), "started_at": secs("started_ms"), "finished_at": secs("finished_ms"),
         "took_ms": took_ms(secs("started_ms"), secs("finished_ms")), "record": j,
     })
@@ -663,7 +805,7 @@ fn proof_row(j: &Value) -> Value {
 fn run_row(r: &Value) -> Value {
     let cards = r["gpus"].as_array().map(|g| g.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","));
     json!({
-        "type": "run", "app": r["profile"], "id": r["id"], "owner": Value::Null, "state": r["state"],
+        "type": "run", "app": r["profile"], "id": r["id"], "namespace": r["namespace"], "tag": r["tag"], "owner": Value::Null, "state": r["state"], "priority": r["priority"],
         "where": cards.filter(|c| !c.is_empty()).map(|c| format!("cards {c}")),
         "created_at": r["submitted_at"], "started_at": r["started_at"], "finished_at": r["finished_at"],
         "took_ms": took_ms(r["started_at"].as_f64(), r["finished_at"].as_f64()), "record": r,
@@ -780,6 +922,8 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 const APP_COLS: &[out::Col] = &[
     col("TYPE", "type"),
     col("APP", "name"),
+    col("NAMESPACE", "namespace"),
+    col("PRIORITY", "priority"),
     col("ENABLED", "enabled"),
     col("ACTIVE", "active"),
     col("JOBS", "jobs"),
@@ -805,7 +949,7 @@ fn proof_app_named(a: &Admin, name: &str, tenant: &str) -> anyhow::Result<Value>
         [] => bail!("no proof app {name} (fleetctl app --type proof lists them)"),
         [one] => Ok((*one).clone()),
         many => bail!(
-            "{name} names {} programs; give the full elf id: {}",
+            "{name} matches {} registrations; select --namespace NAME and give the full elf id: {}",
             many.len(),
             many.iter().map(|x| format!("{}/{}", tenant, x["elf_id"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
         ),
@@ -828,8 +972,9 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
     let method = if disabled { reqwest::Method::PUT } else { reqwest::Method::DELETE };
     let v = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let a = Admin::new(conn)?;
+            let mut a = Admin::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
+            a.namespace = app["namespace"].as_str().map(str::to_string);
             let key = [("tenant", app["tenant"].as_str().unwrap_or("")), ("elf_id", app["elf_id"].as_str().unwrap_or(""))];
             a.send(a.req(method, "/apps/disabled").query(&key))?
         }
@@ -851,8 +996,34 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
     Ok(())
 }
 
+/// Changes app policy; accepted jobs retain their inherited priority.
+fn set_app_priority(name: &str, priority: i32, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    let v = match AppRef::parse(name) {
+        AppRef::Proof { tenant, .. } => {
+            let mut a = Admin::new(conn)?;
+            let app = proof_app_named(&a, name, &tenant)?;
+            a.namespace = app["namespace"].as_str().map(str::to_owned);
+            a.send(a.req(reqwest::Method::PUT, "/apps/priority").query(&[
+                ("tenant", app["tenant"].as_str().unwrap_or("")),
+                ("elf_id", app["elf_id"].as_str().unwrap_or("")),
+                ("priority", &priority.to_string()),
+            ]))?
+        }
+        AppRef::Run(_) => {
+            let a = Admin::runs(conn)?;
+            run_app_named(&a, name)?;
+            a.send(a.req(reqwest::Method::PUT, &format!("/apps/{name}/priority")).json(&json!({"priority":priority})))?
+        }
+    };
+    out.done(&format!("{name}: priority {priority}; new jobs inherit this priority"), v);
+    Ok(())
+}
+
 /// Adds an app: a tenant's program (registered with the scheduler) or a run profile.
 fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+    if conn.namespace.as_deref().is_none_or(str::is_empty) {
+        bail!("app creation requires --namespace NAME; an administrator must create the namespace first");
+    }
     if let AppRef::Proof { tenant, elf } = AppRef::parse(&add.name) {
         if add.image.is_some() || !add.allow.is_empty() || !add.env.is_empty() || add.user.is_some() || add.max_gpus.is_some() {
             bail!("{}: a proof app takes --elf at most; --image, --allow, --user, --max-gpus, --env are a run app's", add.name);
@@ -871,7 +1042,7 @@ fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
             (None, _) => bail!("give TENANT/<elf id>, or TENANT/ with --elf FILE"),
         };
         let a = Admin::new(conn)?;
-        let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str())]))?;
+        let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str()), ("priority", &add.priority.unwrap_or(0).to_string())]))?;
         out.done(
             &format!("added proof app {}: tenant {tenant}, program {elf_id} (its jobs are accepted from now on{})",
                      v["app"].as_str().unwrap_or(&add.name),
@@ -933,8 +1104,9 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
     use reqwest::Method as M;
     match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let a = Admin::new(conn)?;
+            let mut a = Admin::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
+            a.namespace = app["namespace"].as_str().map(str::to_string);
             let elf = app["elf_id"].as_str().unwrap_or("");
             if !yes {
                 let rest = if elf.is_empty() {
@@ -979,6 +1151,7 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
         Some(AppCmd::Disable { name }) => return set_app_disabled(name, true, &p.conn, out),
         Some(AppCmd::Enable { name }) => return set_app_disabled(name, false, &p.conn, out),
         Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
+        Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         None => {}
     }
     if let Some(name) = &p.name {
@@ -996,8 +1169,8 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
                     let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
                     let detail: Vec<String> = [anchored, mean].into_iter().flatten().collect();
                     rows.push(json!({
-                        "type": "proof", "name": a["name"], "enabled": a["disabled"].as_bool() != Some(true),
-                        "active": a["active"], "jobs": a["jobs"],
+                        "type": "proof", "name": a["name"], "namespace": a["namespace"], "enabled": a["disabled"].as_bool() != Some(true),
+                        "active": a["active"], "jobs": a["jobs"], "priority": a["priority"],
                         "succeeded": a["succeeded"], "failed": a["failed"],
                         "last_at": a["last_created_ms"].as_f64().map(|ms| ms / 1000.0), "detail": detail.join(", "),
                     }));
@@ -1014,8 +1187,8 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
                 for a in v.as_array().into_iter().flatten() {
                     let removed = a["removed"].as_bool() == Some(true);
                     rows.push(json!({
-                        "type": "run", "name": a["name"], "enabled": !removed && a["disabled"].as_bool() != Some(true),
-                        "active": a["active"], "jobs": a["jobs"],
+                        "type": "run", "name": a["name"], "namespace": a["namespace"], "enabled": !removed && a["disabled"].as_bool() != Some(true),
+                        "active": a["active"], "jobs": a["jobs"], "priority": a["priority"],
                         "succeeded": a["succeeded"], "failed": a["failed"], "last_at": a["last_submitted_at"],
                         "detail": if removed {
                             "removed from runs.yaml: only its past runs are left".to_string()

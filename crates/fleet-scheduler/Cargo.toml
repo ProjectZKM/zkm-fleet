@@ -31,5 +31,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true

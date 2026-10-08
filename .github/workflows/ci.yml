@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-tests:
+    name: Rust tests and Postgres schema
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fleet
+          POSTGRES_PASSWORD: fleet-ci
+          POSTGRES_DB: fleet_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fleet -d fleet_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: '1'
+      FLEET_TEST_PG_URL: postgres://fleet:fleet-ci@127.0.0.1:5432/fleet_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - name: Test protocol, scheduler, and CLI
+        run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleetctl
+
+  prover-check:
+    name: Prover node compilation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev pkg-config libssl-dev
+      - uses: actions/setup-go@v5
+        with:
+          # Required by the pinned Ziren gnark-ffi module.
+          go-version: '1.25.4'
+          cache: false
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            target
+          key: ${{ runner.os }}-prover-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-prover-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - name: Check prover node and test targets (no GPU required)
+        run: cargo check --locked -p fleet-ziren-node --all-targets
+
+  bridge-tests:
+    name: Python bridge (${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: bridge/pyproject.toml
+      - name: Install bridge and test dependencies
+        run: python -m pip install ./bridge pytest
+      - name: Test bridge
+        run: python -m pytest -q bridge/tests

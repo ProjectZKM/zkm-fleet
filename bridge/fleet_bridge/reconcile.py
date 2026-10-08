@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import urllib.request
 from typing import Any, Mapping
 
@@ -143,6 +144,8 @@ def start(spec: ReplicaSpec, ready_timeout_s: float = 900, runs_dir: str | None 
     """Starts a replica once its cards and CPUs are granted. Not granted within
     PREEMPT_AFTER_S and one-shot runs (in runs_dir) hold them: those runs are
     preempted, and queued again once the replica has its grant."""
+    if spec.kind is ServiceKind.APP:
+        Scheduler(spec.cluster).require_namespace(spec.service.namespace)
     b = bundle(spec)
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
     requeue: list[str] = []
@@ -182,8 +185,9 @@ def _preempt_runs_for(spec: ReplicaSpec, b: Bundle, runs_dir: str) -> list[str]:
     (queued again by the caller, after the replica got the cards)."""
     from .runs import candidates, choose_victims, preempt
 
+    namespace = Scheduler(spec.cluster).require_namespace(spec.service.namespace)
     pin = b.pin.split(":", 1)[1] if b.pin else None
-    victims = choose_victims(b.gpu, b.cpu, free_by_node_ip(), candidates(runs_dir), time.time(), pin)
+    victims = choose_victims(b.gpu, b.cpu, free_by_node_ip(), candidates(runs_dir), time.time(), pin, namespace=namespace, priority=spec.service.priority)
     if victims is None:
         log.warning("%s: its %g card(s) and %g CPUs are not free and no run can be preempted for them; waiting",
                     spec.name, b.gpu, b.cpu)
@@ -194,7 +198,8 @@ def _preempt_runs_for(spec: ReplicaSpec, b: Bundle, runs_dir: str) -> list[str]:
     for run_id in victims.runs:
         log.info("preempting run %s on %s for %s", run_id, victims.node_ip, spec.name)
         try:
-            preempt(runs_dir, run_id, f"service {spec.name} needs its cards", requeue=False)
+            preempt(runs_dir, run_id, f"service {spec.name} (priority {spec.service.priority}) needs resources",
+                    requeue=True, defer_requeue=True, namespace=namespace, priority=spec.service.priority)
             done.append(run_id)
         except SystemExit as e:  # it ended meanwhile
             log.info("run %s not preempted: %s", run_id, e)
@@ -249,6 +254,14 @@ class Scheduler:
             body = r.read()
         parsed = json.loads(body) if body.strip().startswith(b"{") else {}
         return parsed if isinstance(parsed, dict) else {}
+
+    def require_namespace(self, reference: str) -> str:
+        if not self.token:
+            raise ValueError("app namespace validation requires the administrator token")
+        namespace = self._call("GET", "/namespaces/" + urllib.parse.quote(reference, safe=""))
+        if not namespace.get("id") or namespace.get("suspended_ms") is not None:
+            raise ValueError("app requires an existing, active namespace created by an administrator")
+        return str(namespace["id"])
 
     def drain(self, name: str) -> bool:
         """True once `name` takes no job and has none running."""

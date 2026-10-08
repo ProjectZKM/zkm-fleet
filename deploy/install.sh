@@ -265,7 +265,9 @@ if [ "$ROLE" = control ]; then
   apps, jobs:  fleetctl app; fleetctl job; fleetctl node   (fleetctl is in $LINKDIR; --json for JSON)
   a run:       fleetctl job submit --app P --gpus 1 -- CMD   (run apps are the profiles in $ETC/runs.yaml)
   provers:     edit $ETC/services.yaml, then $PREFIX/deploy/apply.sh
-  a client:    fleetctl credential issue --tenant ethproofs --label poller --endpoint https://<host>:51000 \\
+  proof app:   fleetctl app add ethproofs/ --elf PROGRAM.elf
+  a namespace: fleetctl namespace create ethproofs-user
+  a client:    fleetctl credential issue --namespace ethproofs-user --tenant ethproofs --label poller --app ethproofs/FULL_ELF_SHA256 --endpoint https://127.0.0.1:51000 --domain-name stage \\
                  --tls-dir $ETC/tls --out ethproofs.env
   a new node:  copy $ETC/cluster.token to it, then
                deploy/install.sh node --head $IP --cluster-token cluster.token --cuda 0,1,2,3

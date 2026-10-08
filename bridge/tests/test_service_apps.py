@@ -97,3 +97,53 @@ def test_stop_kills_actor_without_restart_and_removes_reservation(monkeypatch):
     kill.assert_called_once_with(actor, no_restart=True)
     reconcile.clean_after.remote.assert_called_once_with("comfyui-0")
     remove.assert_called_once_with(pg)
+
+
+def test_persistent_app_checks_namespace_before_reserving_resources(monkeypatch):
+    cfg = reconcile.load_services({"services": [{"name": "comfyui", "kind": "app", "namespace": "alice"}]})
+    spec = reconcile.replica_specs(cfg)["comfyui-0"]
+    reserve = Mock()
+    monkeypatch.setattr(reconcile, "placement_group", reserve)
+    def missing(self, reference):
+        assert reference == "alice"
+        raise ValueError("unknown namespace")
+    monkeypatch.setattr(reconcile.Scheduler, "require_namespace", missing)
+    with pytest.raises(ValueError, match="unknown namespace"):
+        reconcile.start(spec)
+    reserve.assert_not_called()
+
+
+def test_priority_edit_preserves_actor_identity_and_does_not_reconcile(api, monkeypatch):
+    from fleet_bridge.actors import spec_hash
+    path = api.profiles.replace("runs.yaml", "services.yaml")
+    text = "services:\n- name: comfyui # keep comment\n  kind: app\n  priority: 1 # scheduling only\n"
+    with open(path, "w") as f:
+        f.write(text)
+    before = reconcile.replica_specs(reconcile.load_services(yaml.safe_load(text)))["comfyui-0"]
+    apply = Mock()
+    monkeypatch.setattr(reconcile, "reconcile_once", apply)
+    assert api.set_app_priority("comfyui", 100)["priority"] == 100
+    with open(path) as f:
+        updated = f.read()
+    assert updated == text.replace("priority: 1 #", "priority: 100 #")
+    after = reconcile.replica_specs(reconcile.load_services(yaml.safe_load(updated)))["comfyui-0"]
+    assert spec_hash(before) == spec_hash(after)
+    assert api.apps()[0]["priority"] == 100
+    apply.assert_not_called()
+
+
+def test_starting_service_preempts_only_lower_priority_runs_in_its_namespace(monkeypatch):
+    from fleet_bridge import runs
+    cfg = reconcile.load_services({"services":[{"name":"comfyui","kind":"app","namespace":"alice","priority":10,"gpus":1,"cpus":1}]})
+    spec = reconcile.replica_specs(cfg)["comfyui-0"]
+    monkeypatch.setattr(reconcile.Scheduler, "require_namespace", lambda self, ref: "1"*32)
+    monkeypatch.setattr(reconcile, "free_by_node_ip", lambda: {"worker":(0,8)})
+    pool = [runs.Candidate(id=id, namespace=ns, priority=p, node_ip="worker", gpus=1, cpus=1,
+                          started_at=1, preemptible=True, min_runtime_s=0)
+            for id,ns,p in [("other", "2"*32, -10), ("equal", "1"*32, 10), ("low", "1"*32, 0)]]
+    monkeypatch.setattr(runs, "candidates", lambda _: pool)
+    preempt = Mock()
+    monkeypatch.setattr(runs, "preempt", preempt)
+    assert reconcile._preempt_runs_for(spec, reconcile.bundle(spec), "/runs") == ["low"]
+    assert preempt.call_args.args[1] == "low"
+    assert preempt.call_args.kwargs == {"requeue":True,"defer_requeue":True,"namespace":"1"*32,"priority":10}

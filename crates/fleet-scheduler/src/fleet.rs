@@ -15,9 +15,10 @@ use fleet_proto::fleet::v1::{node_service_client::NodeServiceClient, NodeInfo, P
 use fleet_proto::stage::v1::Status as StageStatus;
 
 use crate::blobs::{self, Blobs};
-use crate::config::{Anchor, Class, Config};
+use crate::config::{Anchor, Config};
 use crate::placement::{self, Choice, NodeView};
-use crate::store::{normalize_address, Credential, Job, JobState, Store};
+use crate::quota::{Allocation, Quota, Usage};
+use crate::store::{normalize_address, Namespace, Credential, Job, JobState, Store};
 use crate::token;
 
 pub type NodeClient = NodeServiceClient<InterceptedService<Channel, token::Attach>>;
@@ -114,15 +115,20 @@ struct Inner {
 
 pub struct Fleet {
     pub cfg: Config,
+    pub stage_submissions: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
     pub blobs: Blobs,
     cluster_token: String,
     inner: Mutex<Inner>,
     /// address -> credential, mirrored from the store.
     creds: Mutex<HashMap<String, Credential>>,
-    /// The registered proof apps, (tenant, elf_id) -> disabled, mirrored from the store.
+    namespaces: Mutex<HashMap<String, Namespace>>,
+    allocations: Mutex<HashMap<String, Allocation>>,
+    quota_ops: tokio::sync::Mutex<()>,
+    /// The registered proof apps, (namespace, tenant, elf_id) -> disabled, mirrored from the store.
     /// A job runs only for one of them.
-    apps: Mutex<HashMap<(String, String), bool>>,
+    apps: Mutex<HashMap<(String, String, String), bool>>,
+    priorities: Mutex<HashMap<(String, String, String), i32>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -183,13 +189,18 @@ impl Fleet {
         cluster_token: String,
     ) -> Arc<Self> {
         Arc::new(Self {
+            stage_submissions: tokio::sync::Mutex::new(()),
             cfg,
             store,
             blobs,
             cluster_token,
             inner: Mutex::new(Inner::default()),
             creds: Mutex::new(HashMap::new()),
+            namespaces: Mutex::new(HashMap::new()),
+            allocations: Mutex::new(HashMap::new()),
+            quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
+            priorities: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -199,58 +210,83 @@ impl Fleet {
 
     /// The registered apps, from the store; how many there are.
     pub async fn load_apps(&self) -> anyhow::Result<usize> {
-        let map: HashMap<_, _> = self.store.registered_apps().await?.into_iter().map(|(t, e, d)| ((t, e), d)).collect();
+        let map: HashMap<_, _> = self.store.registered_apps().await?.into_iter().map(|(n, t, e, d)| ((n, t, e), d)).collect();
         let n = map.len();
         *self.apps.lock() = map;
+        *self.priorities.lock() = self.store.apps().await?.into_iter().map(|a| ((a.namespace, a.tenant, a.elf_id), a.priority)).collect();
         Ok(n)
     }
 
     /// Whether the program is a registered app of the tenant.
-    pub fn app_known(&self, tenant: &str, elf_id: &str) -> bool {
-        self.apps.lock().contains_key(&(tenant.to_string(), elf_id.to_string()))
+    pub fn app_known(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
+        self.apps.lock().contains_key(&(namespace.to_string(), tenant.to_string(), elf_id.to_string()))
     }
 
     /// Whether the app refuses new jobs.
-    pub fn app_disabled(&self, tenant: &str, elf_id: &str) -> bool {
-        self.apps.lock().get(&(tenant.to_string(), elf_id.to_string())).copied().unwrap_or(false)
+    pub fn app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
+        self.apps.lock().get(&(namespace.to_string(), tenant.to_string(), elf_id.to_string())).copied().unwrap_or(false)
+    }
+
+    pub fn app_priority(&self, namespace: &str, tenant: &str, elf_id: &str) -> i32 {
+        self.priorities.lock().get(&(namespace.into(), tenant.into(), elf_id.into())).copied().unwrap_or(0)
+    }
+
+    pub async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32) -> anyhow::Result<serde_json::Value> {
+        let _ops = self.app_ops.write().await;
+        anyhow::ensure!(self.app_known(namespace, tenant, elf_id), "unknown proof app");
+        self.store.set_app_priority(namespace, tenant, elf_id, priority).await?;
+        self.priorities.lock().insert((namespace.into(), tenant.into(), elf_id.into()), priority);
+        Ok(serde_json::json!({"namespace":namespace,"tenant":tenant,"elf_id":elf_id,"priority":priority}))
     }
 
     /// Registers a tenant's program as an app: from then on its jobs are accepted (the
     /// ELF itself arrives with the first one).
-    pub async fn add_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn add_app(&self, reference: &str, tenant: &str, elf_id: &str, priority: i32) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         if self.cfg.tenant(tenant).is_none() {
             return Err(refuse(404, format!("unknown tenant {tenant:?}: tenants are configured in fleet.yaml")));
         }
+        let namespace = self.namespace(reference).ok_or_else(|| refuse(404, "unknown namespace; an administrator must create it first".into()))?;
+        if namespace.suspended_ms.is_some() { return Err(refuse(403, "namespace is suspended".into())); }
         let elf_id = elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
         if elf_id.len() != 64 || !elf_id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into()));
         }
-        if !self.store.add_app(tenant, &elf_id, now_ms()).await? {
+        if !self.store.add_app(&namespace.id, tenant, &elf_id, now_ms(), priority).await? {
             return Err(refuse(409, format!("app {} exists", app_name(tenant, &elf_id))));
         }
-        self.apps.lock().insert((tenant.to_string(), elf_id.clone()), false);
+        self.apps.lock().insert((namespace.id.clone(), tenant.to_string(), elf_id.clone()), false);
+        self.priorities.lock().insert((namespace.id.clone(), tenant.into(), elf_id.clone()), priority);
         tracing::info!(app = %app_name(tenant, &elf_id), "app registered");
         Ok(serde_json::json!({
-            "app": app_name(tenant, &elf_id), "tenant": tenant, "elf_id": elf_id, "elf_stored": self.blobs.has_elf(&elf_id),
+            "priority": priority, "namespace": namespace.id, "app": app_name(tenant, &elf_id), "tenant": tenant, "elf_id": elf_id, "elf_stored": self.blobs.has_elf(&elf_id),
         }))
     }
 
     /// Disables an app (its new jobs are refused; queued and running ones finish) or
     /// enables it again.
-    pub async fn set_app_disabled(&self, tenant: &str, elf_id: &str, disabled: bool) -> anyhow::Result<serde_json::Value> {
+    pub async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
-        let key = (tenant.to_string(), elf_id.to_string());
+        let key = (namespace.to_string(), tenant.to_string(), elf_id.to_string());
         if !self.apps.lock().contains_key(&key) {
             return Err(refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id))));
         }
-        self.store.set_app_disabled(tenant, elf_id, disabled, now_ms()).await?;
+        self.store.set_app_disabled(namespace, tenant, elf_id, disabled, now_ms()).await?;
         self.apps.lock().insert(key, disabled);
         tracing::info!(app = %app_name(tenant, elf_id), disabled, "app setting changed");
         Ok(serde_json::json!({ "app": app_name(tenant, elf_id), "disabled": disabled }))
     }
 
     pub async fn load_credentials(&self) -> anyhow::Result<usize> {
+        let mut allocations = self.store.allocations().await?;
+        for a in &allocations {
+            if let Some(id) = a.id.strip_prefix("proof:") {
+                if self.store.get(id).await?.is_none_or(|j| j.state.is_terminal()) { self.store.release(&a.id).await?; }
+            }
+        }
+        allocations = self.store.allocations().await?;
+        *self.allocations.lock() = allocations.into_iter().map(|a| (a.id.clone(), a)).collect();
+        *self.namespaces.lock() = self.store.namespaces().await?.into_iter().map(|n| (n.id.clone(), n)).collect();
         let all = self.store.credentials().await?;
         let n = all.len();
         *self.creds.lock() = all.into_iter().map(|c| (c.address.clone(), c)).collect();
@@ -276,16 +312,215 @@ impl Fleet {
         key.is_some_and(|k| k.as_bytes().ct_eq(self.public_values_key(proof_id).as_bytes()))
     }
 
+    pub fn namespace(&self, reference: &str) -> Option<Namespace> {
+        self.namespaces.lock().values().find(|n| n.id == reference || n.name == reference).cloned()
+    }
+
+    pub fn namespaces(&self) -> Vec<Namespace> {
+        let mut all: Vec<_> = self.namespaces.lock().values().cloned().collect();
+        all.sort_by(|a, b| a.name.cmp(&b.name));
+        all
+    }
+
+    pub async fn create_namespace(&self, name: &str, quota: Quota) -> anyhow::Result<Namespace> {
+        quota.validate()?;
+        anyhow::ensure!(!name.is_empty() && name.len() <= 63
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !matches!(name, "system" | "admin"), "invalid or reserved namespace name");
+        let n = Namespace { quota, tag_quotas: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), name: name.into(), created_ms: now_ms(), suspended_ms: None };
+        self.store.add_namespace(&n).await?;
+        self.namespaces.lock().insert(n.id.clone(), n.clone());
+        Ok(n)
+    }
+
+    pub fn tags(&self, namespace: &str) -> Vec<String> {
+        let mut tags = std::collections::BTreeSet::new();
+        if let Some(n) = self.namespace(namespace) { tags.extend(n.tag_quotas.keys().filter(|t|!t.is_empty()).cloned()); }
+        tags.extend(self.creds.lock().values().filter(|c|c.namespace.as_deref()==Some(namespace)).filter_map(|c|c.tag.clone()));
+        tags.extend(self.allocations.lock().values().filter(|a|a.namespace==namespace).filter_map(|a|a.tag.clone()));
+        tags.into_iter().collect()
+    }
+    pub fn validate_tag(tag: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!tag.is_empty() && tag.len() <= 63 && tag.as_bytes()[0].is_ascii_lowercase()
+            && tag.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'), "invalid tag");
+        Ok(())
+    }
+    pub async fn set_tag_quota(&self, namespace: &str, tag: &str, quota: Quota) -> anyhow::Result<Namespace> {
+        let _ops = self.quota_ops.lock().await;
+        quota.validate()?;
+        if !tag.is_empty() { Self::validate_tag(tag)?; }
+        let mut n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        self.store.set_tag_quota(&n.id,tag,&quota).await?;
+        n.tag_quotas.insert(tag.into(),quota);
+        self.namespaces.lock().insert(n.id.clone(),n.clone());
+        self.wake.notify_one(); Ok(n)
+    }
+    pub fn tag_usage(&self, namespace: &str, tag: Option<&str>) -> Usage {
+        self.allocations.lock().values().filter(|a| a.namespace == namespace && a.tag.as_deref() == tag)
+            .fold(Usage::default(), |mut u,a| {u.gpus+=a.gpus; u.cpus+=a.cpus;u})
+    }
+
+    pub async fn suspend_namespace(&self, reference: &str, suspended: bool) -> anyhow::Result<Namespace> {
+        let _ops = self.quota_ops.lock().await;
+        let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        n.suspended_ms = suspended.then(now_ms);
+        self.store.suspend_namespace(&n.id, n.suspended_ms).await?;
+        self.namespaces.lock().insert(n.id.clone(), n.clone());
+        Ok(n)
+    }
+
+    pub async fn set_quota(&self, reference: &str, quota: Quota) -> anyhow::Result<Namespace> {
+        let _ops = self.quota_ops.lock().await;
+        quota.validate()?;
+        let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        self.store.set_quota(&n.id, &quota).await?;
+        n.quota = quota;
+        self.namespaces.lock().insert(n.id.clone(), n.clone());
+        self.wake.notify_one();
+        Ok(n)
+    }
+
+    pub fn usage(&self, namespace: &str) -> Usage {
+        let mut usage = Usage::default();
+        for a in self.allocations.lock().values().filter(|a| a.namespace == namespace) {
+            usage.gpus += a.gpus;
+            usage.cpus += a.cpus;
+        }
+        usage
+    }
+
+    pub fn allocations(&self, namespace: &str) -> Vec<Allocation> {
+        self.allocations.lock().values().filter(|a| a.namespace == namespace).cloned().collect()
+    }
+
+    fn fits_quota(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64) -> bool {
+        let Some(n) = self.namespace(namespace) else { return false; };
+        let tag_quota = n.tag_quotas.get(tag.unwrap_or("")).cloned().unwrap_or_default();
+        let all = self.allocations.lock();
+        if all.get(id).is_some_and(|a| a.namespace == namespace && a.tag.as_deref() == tag && a.gpus == gpus && a.cpus == cpus) { return true; }
+        let (used_gpus, used_cpus) = all.values().filter(|a| a.namespace == namespace && a.id != id)
+            .fold((0.0, 0.0), |(g,c), a| (g + a.gpus, c + a.cpus));
+        let (tag_gpus, tag_cpus) = all.values().filter(|a| a.namespace == namespace && a.tag.as_deref() == tag && a.id != id)
+            .fold((0.0,0.0), |(g,c),a| (g+a.gpus,c+a.cpus));
+        n.quota.fits(used_gpus + gpus, used_cpus + cpus) && tag_quota.fits(tag_gpus+gpus,tag_cpus+cpus)
+    }
+
+    /// In-memory admission is atomic across proof dispatch and runs API requests.
+    fn allocate(&self, a: Allocation, restore: bool) -> anyhow::Result<()> {
+        a.validate().map_err(|e| refuse(400, e.to_string()))?;
+        let n = self.namespace(&a.namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        if let Some(tag) = &a.tag { Self::validate_tag(tag).map_err(|e|refuse(400,e.to_string()))?; }
+        let tag_quota = n.tag_quotas.get(a.tag.as_deref().unwrap_or("")).cloned().unwrap_or_default();
+        let mut all = self.allocations.lock();
+        if let Some(old) = all.get(&a.id) {
+            if old.namespace != a.namespace || old.tag != a.tag { return Err(refuse(409, "allocation belongs to another namespace or tag".into())); }
+            if old.gpus == a.gpus && old.cpus == a.cpus { return Ok(()); }
+        }
+        if !restore {
+            if !n.quota.fits(a.gpus, a.cpus) || !tag_quota.fits(a.gpus, a.cpus) { return Err(refuse(422, "job exceeds the namespace or tag GPU/CPU quota".into())); }
+            let (used_gpus, used_cpus) = all.values().filter(|v| v.namespace == a.namespace && v.id != a.id)
+                .fold((0.0, 0.0), |(g,c), v| (g + v.gpus, c + v.cpus));
+            let (tag_gpus,tag_cpus) = all.values().filter(|v| v.namespace == a.namespace && v.tag == a.tag && v.id != a.id)
+                .fold((0.0,0.0), |(g,c),v| (g+v.gpus,c+v.cpus));
+            if !n.quota.fits(used_gpus + a.gpus, used_cpus + a.cpus) || !tag_quota.fits(tag_gpus+a.gpus,tag_cpus+a.cpus) {
+                return Err(refuse(429, "namespace or tag GPU/CPU quota is occupied; waiting for resources".into()));
+            }
+        }
+        all.insert(a.id.clone(), a);
+        Ok(())
+    }
+
+    pub async fn reserve_run(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64, restore: bool) -> anyhow::Result<Allocation> {
+        let _ops = self.quota_ops.lock().await;
+        anyhow::ensure!(blobs::is_safe_id(id), "invalid run id");
+        let n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        let a = Allocation { id: format!("run:{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus };
+        let previous = self.allocations.lock().get(&a.id).cloned();
+        self.allocate(a.clone(), restore)?;
+        if let Err(e) = self.store.reserve(&a).await {
+            let mut all = self.allocations.lock();
+            if let Some(old) = previous { all.insert(old.id.clone(), old); } else { all.remove(&a.id); }
+            return Err(e);
+        }
+        Ok(a)
+    }
+
+    pub async fn release_run(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
+        let _ops = self.quota_ops.lock().await;
+        let key = format!("run:{id}");
+        anyhow::ensure!(self.allocations.lock().get(&key).is_none_or(|a| a.namespace == namespace), "allocation belongs to another namespace or tag");
+        self.release_quota(&key).await
+    }
+
+    async fn release_quota(&self, id: &str) -> anyhow::Result<()> {
+        self.store.release(id).await?;
+        self.allocations.lock().remove(id);
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    fn allocate_proof(&self, job: &Job, node: &Node, restore: bool) -> bool {
+        self.allocate(Allocation { id: format!("proof:{}", job.id), namespace: job.namespace.clone(),
+            tag: (!job.tag.is_empty()).then(|| job.tag.clone()),
+            gpus: node.info.gpus as f64, cpus: node.info.cpus as f64 }, restore).is_ok()
+    }
+
+    fn credential_active(&self, c: &Credential) -> bool {
+        c.revoked_ms.is_none() && match &c.namespace {
+            Some(id) => self.namespace(id).is_some_and(|n| n.suspended_ms.is_none()),
+            None => c.apps.is_none(),
+        }
+    }
+    pub fn access_record(&self, c: &Credential) -> serde_json::Value {
+        let mut v = serde_json::to_value(c).expect("credential serialization");
+        if let Some(n) = c.namespace.as_ref().and_then(|id| self.namespace(id)) {
+            v["namespace_name"] = serde_json::json!(n.name);
+            v["quota"] = serde_json::json!(n.quota);
+            v["usage"] = serde_json::json!(self.usage(&n.id));
+            v["tag_quota"] = serde_json::json!(n.tag_quotas.get(c.tag.as_deref().unwrap_or("")).cloned().unwrap_or_default());
+        }
+        v
+    }
+
     pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
         let a = normalize_address(address);
-        if let Some(c) = self.creds.lock().get(&a) {
-            return if c.revoked_ms.is_none() {
-                Some(c.tenant.clone())
-            } else {
-                None
-            };
+        let registered = self.creds.lock().get(&a).cloned();
+        if let Some(c) = registered {
+            return self.credential_active(&c).then_some(c.tenant);
         }
         self.cfg.tenant_for_address(&a).map(|t| t.name.clone())
+    }
+
+    pub fn credential_for_signer(&self, address: &str) -> Option<Credential> {
+        let c = self.creds.lock().get(&normalize_address(address)).cloned()?;
+        self.credential_active(&c).then_some(c)
+    }
+
+    pub fn credential_for_token(&self, header: Option<&str>) -> Option<Credential> {
+        use sha2::Digest;
+        use subtle_eq::ConstantTimeEq;
+        let token = header?.strip_prefix("Bearer ")?;
+        if token.len() < 64 { return None; }
+        let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+        let c = self.creds.lock().values().find(|c| c.apps.is_some()
+            && c.token_hash.as_ref().is_some_and(|h| h.as_bytes().ct_eq(hash.as_bytes()))).cloned()?;
+        self.credential_active(&c).then_some(c)
+    }
+
+    pub async fn namespace_job(&self, namespace: &str, tag: Option<&str>, client_id: &str) -> anyhow::Result<Option<Job>> {
+        self.store.namespace_job(namespace, tag, client_id).await
+    }
+
+    /// Namespaced proof ids never collide with another user's client ids.
+    pub fn internal_proof_id(namespace: &str, tag: Option<&str>, client_id: &str) -> String {
+        use sha2::Digest;
+        let tag = tag.unwrap_or("");
+        format!("p-{}", hex::encode(sha2::Sha256::digest(format!("{namespace}\0{tag}\0{client_id}"))))
+    }
+
+    pub fn public_values_key_for(&self, id: &str, issuer: &str) -> String {
+        self.public_values_key(&format!("{id}\0{issuer}"))
     }
 
     pub async fn add_credential(
@@ -294,7 +529,43 @@ impl Fleet {
         address: &str,
         label: &str,
     ) -> anyhow::Result<Credential> {
+        self.add_user_credential(tenant, address, label, None, None, None, None).await
+    }
+
+    pub async fn add_user_credential(&self, tenant: &str, address: &str, label: &str,
+        apps: Option<Vec<String>>, token_hash: Option<String>, namespace: Option<String>, tag: Option<String>) -> anyhow::Result<Credential> {
         anyhow::ensure!(self.cfg.tenant(tenant).is_some(), "unknown tenant {tenant}");
+        let namespace = match namespace {
+            Some(reference) => {
+                let n = self.namespace(&reference).ok_or_else(|| anyhow::anyhow!("unknown namespace; create it first"))?;
+                anyhow::ensure!(n.suspended_ms.is_none(), "namespace is suspended");
+                Some(n.id)
+            }
+            None => None,
+        };
+        if let Some(tag) = &tag {
+            anyhow::ensure!(namespace.is_some(), "tag requires namespace");
+            Self::validate_tag(tag)?;
+        }
+        anyhow::ensure!(apps.is_none() || namespace.is_some(), "user credentials require an existing namespace");
+        anyhow::ensure!(apps.is_none() || namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved for operator-managed apps");
+        anyhow::ensure!(apps.is_some() || namespace.is_none(), "namespaced credentials require explicit app grants");
+
+        anyhow::ensure!(token_hash.is_none() || apps.is_some(), "user token requires explicit app grants");
+        if let Some(hash) = &token_hash {
+            anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");
+        }
+        if let Some(grants) = &apps {
+            for app in grants {
+                if let Some((t, elf)) = app.split_once('/') {
+                    anyhow::ensure!(self.cfg.client_cert_identity, "proof user access requires client_cert_identity and mTLS");
+                    anyhow::ensure!(t == tenant && elf.len() == 64 && elf.bytes().all(|b| b.is_ascii_hexdigit())
+                        && self.app_known(namespace.as_deref().expect("user namespace"), t, elf), "proof grant must name a registered program in this namespace and tenant with its full ELF id");
+                } else {
+                    anyhow::ensure!(!app.is_empty() && app.len() <= 128 && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "invalid run app name");
+                }
+            }
+        }
         let address = normalize_address(address);
         anyhow::ensure!(
             address.len() == 40 && address.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -306,6 +577,10 @@ impl Fleet {
             label: label.into(),
             created_ms: now_ms(),
             revoked_ms: None,
+            apps,
+            namespace,
+            tag,
+            token_hash: token_hash.map(|s| s.to_ascii_lowercase()),
         };
         self.store.add_credential(&c).await?;
         self.creds.lock().insert(address, c.clone());
@@ -381,6 +656,8 @@ impl Fleet {
 
     /// Records a new job. A known id is left as it is (the SDK may resubmit).
     pub async fn submit(&self, job: Job) -> anyhow::Result<bool> {
+        job.validate()?;
+        anyhow::ensure!(self.namespace(&job.namespace).is_some(), "job namespace does not exist");
         let _ops = self.app_ops.read().await;
         if !job.state.is_terminal() && !self.blobs.has_elf(&job.elf_id) {
             anyhow::bail!("program {} is not stored (its app was deleted): send the ELF itself again", job.elf_id);
@@ -432,19 +709,19 @@ impl Fleet {
 
     /// Deletes a proof app: its registration, its jobs' records and files, its anchor, and
     /// its ELF when no other app uses it. Refused while any of its jobs is queued or running.
-    pub async fn delete_app(&self, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
+    pub async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         let apps = self.store.apps().await?;
         let app = apps
             .iter()
-            .find(|a| a.tenant == tenant && a.elf_id == elf_id)
+            .find(|a| a.namespace == namespace && a.tenant == tenant && a.elf_id == elf_id)
             .ok_or_else(|| refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id))))?;
         let live = self
             .inner
             .lock()
             .jobs
             .values()
-            .filter(|e| e.job.tenant == tenant && e.job.elf_id == elf_id && !e.job.state.is_terminal())
+            .filter(|e| e.job.namespace.as_str() == namespace && e.job.tenant == tenant && e.job.elf_id == elf_id && !e.job.state.is_terminal())
             .count() as u64;
         if app.active > 0 || live > 0 {
             return Err(refuse(409, format!(
@@ -453,19 +730,21 @@ impl Fleet {
                 app.active.max(live)
             )));
         }
-        let ids = self.store.delete_app(tenant, elf_id).await?;
-        self.apps.lock().remove(&(tenant.to_string(), elf_id.to_string()));
+        let ids = self.store.delete_app(namespace, tenant, elf_id).await?;
+        self.apps.lock().remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string()));
+        self.priorities.lock().remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string()));
         {
             let mut inner = self.inner.lock();
             for id in &ids {
                 inner.jobs.remove(id);
             }
-            if let Some(node) = inner.anchors.remove(&(tenant.to_string(), elf_id.to_string())) {
-                // an exclusive anchor reserved its node for the tenant: free it unless
-                // another of the tenant's programs is anchored there
-                let still = inner.anchors.iter().any(|((t, _), n)| t == tenant && *n == node);
-                if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
-                    inner.reserved.remove(&node);
+            if !apps.iter().any(|a| a.namespace != namespace && a.tenant == tenant && a.elf_id == elf_id) {
+                if let Some(node) = inner.anchors.remove(&(tenant.to_string(), elf_id.to_string())) {
+                    // Keep a shared physical anchor until its last namespace registration is gone.
+                    let still = inner.anchors.iter().any(|((t, _), n)| t == tenant && *n == node);
+                    if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
+                        inner.reserved.remove(&node);
+                    }
                 }
             }
         }
@@ -475,7 +754,7 @@ impl Fleet {
                 files_failed += 1;
             }
         }
-        let shared = apps.iter().any(|a| a.elf_id == elf_id && a.tenant != tenant)
+        let shared = apps.iter().any(|a| a.elf_id == elf_id && (a.tenant != tenant || a.namespace != namespace))
             || self.inner.lock().jobs.values().any(|e| e.job.elf_id == elf_id);
         let elf_removed = !elf_id.is_empty() && !shared && self.blobs.remove_elf(elf_id).unwrap_or(false);
         tracing::info!(app = %app_name(tenant, elf_id), jobs = ids.len(), elf_removed, "app deleted");
@@ -700,24 +979,19 @@ impl Fleet {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
-    /// One placement pass: latency jobs first, then oldest first.
+    /// One placement pass: app priority, then oldest first.
     fn assign(&self) -> Vec<(String, String)> {
         if self.stopping.load(Ordering::SeqCst) {
             return Vec::new();
         }
         let mut inner = self.inner.lock();
-        let mut queued: Vec<(u8, u64, String)> = inner
+        let mut queued: Vec<(std::cmp::Reverse<i32>, u64, String)> = inner
             .jobs
             .values()
             .filter(|e| e.job.state == JobState::Queued)
             .map(|e| {
-                let class = self
-                    .cfg
-                    .tenant(&e.job.tenant)
-                    .map(|t| t.class)
-                    .unwrap_or_default();
                 (
-                    if class == Class::Latency { 0 } else { 1 },
+                    std::cmp::Reverse(e.job.priority),
                     e.job.created_ms,
                     e.job.id.clone(),
                 )
@@ -751,6 +1025,7 @@ impl Fleet {
                     |b: &Option<String>| b.is_none() || b.as_deref() == Some(mine.as_str());
                 match at {
                     Some((node_id, true, b)) if free_or_ours(&b) => {
+                        if !self.allocate_proof(&job, &inner.nodes[&node_id], job.started_ms.is_some()) { continue; }
                         tracing::info!(job = %job_id, node = %hint, "resuming on the node that was running it");
                         self.commit(&mut inner, tenant, &job_id, &node_id);
                         out.push((job_id, node_id));
@@ -761,6 +1036,12 @@ impl Fleet {
                         continue
                     }
                     _ => {}
+                }
+                // A disconnected namespaced proof may still be running. Its reservation
+                // belongs to that execution, so only the original prover may resolve it.
+                if job.started_ms.is_some()
+                    && self.allocations.lock().contains_key(&format!("proof:{}", job.id)) {
+                    continue;
                 }
                 inner.jobs.get_mut(&job_id).unwrap().job.node = None;
             }
@@ -774,7 +1055,8 @@ impl Fleet {
                         backend: n.info.backend.clone(),
                         gpus: n.info.gpus,
                         zkm_version: n.info.zkm_version.clone(),
-                        ready: n.ready && !inner.draining.contains(&n.info.name),
+                        ready: n.ready && !inner.draining.contains(&n.info.name)
+                            && self.fits_quota(&job.namespace, (!job.tag.is_empty()).then_some(job.tag.as_str()), &format!("proof:{}", job.id), n.info.gpus as f64, n.info.cpus as f64),
                         busy: n.busy.is_some(),
                         reserved_for: inner.reserved.get(&n.info.name).cloned(),
                         has_elf: n.cached.contains(&job.elf_id),
@@ -786,6 +1068,7 @@ impl Fleet {
             match placement::choose(tenant, &job.failed_on, anchor.as_deref(), &views) {
                 Choice::Run(i) => {
                     let node_id = ids[i].clone();
+                    if !self.allocate_proof(&job, &inner.nodes[&node_id], false) { continue; }
                     self.commit(&mut inner, tenant, &job_id, &node_id);
                     out.push((job_id, node_id));
                 }
@@ -845,6 +1128,21 @@ impl Fleet {
             return;
         };
         self.persist(Some(job.clone())).await;
+        let allocation = self.allocations.lock().get(&format!("proof:{job_id}")).cloned();
+        if let Some(a) = allocation {
+            if let Err(e) = self.store.reserve(&a).await {
+                self.allocations.lock().remove(&a.id);
+                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
+                self.release(&node_id, None);
+                let j = self.update_job(&job_id, |j| {
+                    j.state = JobState::Failed(StageStatus::InternalError);
+                    j.error = format!("persisting namespace allocation: {e:#}");
+                    j.finished_ms = Some(now_ms());
+                });
+                self.persist(j).await;
+                return;
+            }
+        }
         let found = self
             .inner
             .lock()
@@ -864,6 +1162,7 @@ impl Fleet {
         let request = match self.build_request(&job, !has_elf) {
             Ok(r) => r,
             Err(e) => {
+                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
                 self.release(&node_id, None);
                 let j = self.update_job(&job_id, |j| {
                     j.state = JobState::Failed(StageStatus::InternalError);
@@ -900,6 +1199,7 @@ impl Fleet {
                         self.blobs
                             .put(&job_id, blobs::PUBLIC_VALUES, &resp.public_values)
                     });
+                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
                 self.release(&node_id, Some(&job.elf_id));
                 let j = self.update_job(&job_id, |j| {
                     match &written {
@@ -956,6 +1256,25 @@ impl Fleet {
     /// connection, is marked not ready together with the other nodes on its machine (the
     /// machine is likely gone); the next heartbeat of a live node marks it ready again.
     async fn fail_attempt(&self, job_id: &str, node_id: &str, msg: &str, failure: Failure) {
+        let uncertain = matches!(failure, Failure::Lost | Failure::NotStarted)
+            && self.inner.lock().jobs.contains_key(job_id);
+        if uncertain {
+            // Provers detach execution from the RPC. An unavailable response does not
+            // establish whether the request started; preserve both units and node hint.
+            if let Some(n) = self.inner.lock().nodes.get_mut(node_id) {
+                n.ready = false;
+                n.busy = Some(reported(job_id));
+            }
+            let j = self.update_job(job_id, |j| {
+                j.state = JobState::Queued;
+                j.attempts = j.attempts.saturating_sub(1);
+                j.error = format!("awaiting original prover confirmation: {msg}");
+            });
+            self.persist(j).await;
+            self.wake.notify_one();
+            return;
+        }
+        if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
         if failure == Failure::Busy {
             // Busy with a proof from before a restart: keep the node out until its heartbeat
             // says it is free, and place the job again as if it had not been tried.

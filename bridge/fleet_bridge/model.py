@@ -249,6 +249,7 @@ class Record:
 
 class RunState(str, enum.Enum):
     WAITING_DEPENDENCY = "waiting_dependency"
+    WAITING_QUOTA = "waiting_quota"
     QUEUED = "queued"
     WAITING_VRAM = "waiting_vram"
     RUNNING = "running"
@@ -313,6 +314,10 @@ class Profile(Record):
     """A runs.yaml profile: what a request may ask for, and the container it gets."""
 
     image: str
+    # Operator-managed YAML defaults to the reserved system namespace.
+    # New API registrations must supply an existing namespace explicitly.
+    namespace: str = "00000000000000000000000000000000"
+    priority: int = 0
     user: str | None = None
     max_gpus: int = 8
     default_gpu_mem_gb: int = 0
@@ -320,12 +325,16 @@ class Profile(Record):
     allow: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     disabled: bool = False  # takes no new runs (fleetctl app disable); the ones going finish
-    # A service that needs the cards may stop a run of this app once it has run
+    # A higher-priority requester in this namespace may stop a run once it has run
     # min_runtime_s; the run queues again (FLEET_ATTEMPT goes on) and spends no --retry.
     preemptible: bool = True
     min_runtime_s: int = 300
     # SIGTERM, then SIGKILL this much later: on cancel and on preemption (time to checkpoint).
     stop_timeout_s: int = 30
+
+    def __post_init__(self) -> None:
+        if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
+            raise ModelError("priority must be a signed 32-bit integer")
 
 
 @dataclass(kw_only=True)
@@ -357,6 +366,10 @@ class RunSpec(Record):
 
     id: str
     profile_name: str
+    owner: str | None = None
+    namespace: str | None = None
+    tag: str | None = None
+    quota_managed: bool = False  # new API waiters; existing Ray dependency waiters are recovered in place
     profile: Profile
     command: list[str]
     gpus: float
@@ -455,6 +468,12 @@ class RunStatus(Record):
 
     id: str
     state: RunState
+    namespace: str | None = None
+    tag: str | None = None
+    priority: int = 0  # inherited from the app at submission
+    preempt_requeue: bool = False  # durable restart intent after confirmed cleanup
+    launch_pending: bool = False  # durable intent, acknowledged by the actor before execution
+    quota_released: bool = False  # terminal cleanup is recorded once, across API restarts
     submitted_at: float
     gpus_requested: float
     cpus: int
@@ -514,6 +533,10 @@ class RunArgs(Record):
     profiles: str = field(default_factory=lambda: os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))
     runs_dir: str = field(default_factory=lambda: os.environ.get("FLEET_RUNS_DIR", "/var/lib/zkm-fleet/runs"))
     address: str = "127.0.0.1:6379"
+    owner: str | None = None  # submitting credential for audit, never a remote field
+    namespace: str | None = None
+    namespace_all_tags: bool = False
+    tag: str | None = None
     profile: str | None = field(default=None, metadata={"remote": True})
     name: str | None = field(default=None, metadata={"remote": True})
     gpus: float = field(default=1, metadata={"remote": True, "help": "cards; a fraction (0.5) shares one card and needs a --gpu-mem"})
@@ -611,6 +634,8 @@ class ServiceSpec(Record):
     """One entry of `services:`."""
 
     name: str
+    namespace: str = "00000000000000000000000000000000"
+    priority: int = 0
     kind: ServiceKind = ServiceKind.ZIREN_GPU
     replicas: int = 1
     disabled: bool = False  # persistent app: release resources until enabled
@@ -638,6 +663,11 @@ class ServiceSpec(Record):
     listen: str = "127.0.0.1:9192"
     profiles: str | None = None
     runs_dir: str | None = None
+
+
+    def __post_init__(self) -> None:
+        if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
+            raise ModelError("priority must be a signed 32-bit integer")
 
 
 @dataclass(kw_only=True)

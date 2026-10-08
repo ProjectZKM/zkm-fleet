@@ -33,8 +33,9 @@ NODE_BINARY_NAMES = ("fleet-ziren-node", "fleet-node")  # the current name and t
 
 def spec_hash(spec: ReplicaSpec) -> str:
     """Over the replica's own mapping from the services file: a bridge upgrade never
-    replaces a running service by itself, an edit of the file does."""
-    return hashlib.sha256(json.dumps(spec.config, sort_keys=True).encode()).hexdigest()[:16]
+    replaces a running service by itself. Priority is scheduling metadata and
+    does not require restarting a container."""
+    return hashlib.sha256(json.dumps({k: v for k, v in spec.config.items() if k != "priority"}, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:

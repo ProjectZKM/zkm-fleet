@@ -14,7 +14,7 @@ use fleet_proto::stage::v1::{
 use crate::auth;
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::{now_ms, Fleet};
-use crate::store::{Job, JobState};
+use crate::store::{normalize_address, Job, JobState};
 
 pub struct StageApi {
     pub fleet: Arc<Fleet>,
@@ -48,14 +48,22 @@ impl StageApi {
 
     /// Records a rejected request as a failed job, because the SDK only looks at the
     /// proof id of `GenerateProof` and learns the outcome from `GetStatus`.
-    async fn record_rejection(&self, proof_id: &str, status: StageStatus, msg: &str) {
+    async fn record_rejection(&self, proof_id: &str, client_id: &str, status: StageStatus, msg: &str, identity: (String, String)) {
         if !is_safe_id(proof_id) {
             return;
         }
+        let credential = self.fleet.credential_for_signer(&identity.1);
+        let tag = credential.as_ref().and_then(|c| c.tag.clone());
+        let namespace = credential.and_then(|c| c.namespace);
         let job = Job {
             id: proof_id.to_string(),
-            tenant: String::new(),
+            client_id: client_id.to_string(),
+            namespace: namespace.unwrap_or_else(|| crate::store::SYSTEM_NAMESPACE.into()),
+            tag: tag.unwrap_or_default(),
+            tenant: identity.0,
+            owner: identity.1,
             elf_id: String::new(),
+            priority: 0,
             kind: ProofKind::Unspecified,
             state: JobState::Failed(status),
             error: msg.to_string(),
@@ -73,7 +81,7 @@ impl StageApi {
 
     /// The tenant of the client certificate the gateway verified, when the scheduler takes
     /// identity from it (`client_cert_identity`); Ok(None) when it does not.
-    fn cert_tenant(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<String>, Status> {
+    fn cert_tenant(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<(String, String)>, Status> {
         if !self.fleet.cfg.client_cert_identity {
             return Ok(None);
         }
@@ -85,11 +93,11 @@ impl StageApi {
             .ok_or_else(|| Status::permission_denied("the client certificate names no credential"))?;
         self.fleet
             .tenant_for_signer(&cn)
-            .map(Some)
+            .map(|tenant| Some((tenant, normalize_address(&cn))))
             .ok_or_else(|| Status::permission_denied("the client certificate's credential is unknown or revoked"))
     }
 
-    async fn generate(&self, req: GenerateProofRequest, cert: Option<String>) -> GenerateProofResponse {
+    async fn generate(&self, req: GenerateProofRequest, cert: Option<(String, String)>) -> GenerateProofResponse {
         let id = req.proof_id.clone();
         if !is_safe_id(&id) {
             return self.reject(
@@ -98,12 +106,48 @@ impl StageApi {
                 "proof_id must be 1-128 of [A-Za-z0-9_-]",
             );
         }
-        if let Ok(Some(_)) = self.fleet.job(&id).await {
-            return GenerateProofResponse {
-                proof_id: id,
-                status: StageStatus::Computing as i32,
-                ..Default::default()
+        // Serialize id reservation and blob writes: another credential cannot race a
+        // submission with the same id and replace its input or ownership.
+        let _submission = self.fleet.stage_submissions.lock().await;
+        if cert.as_ref().is_some_and(|(_, a)| self.fleet.tenant_for_signer(a).is_none()) {
+            return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
+        }
+        let recovered = auth::recover_signer(&req.signature, &id, req.block_no, req.seg_size).ok();
+        let owner = recovered.as_ref().map(|a| normalize_address(&a.to_string())).or_else(|| cert.as_ref().map(|(_, a)| a.clone()));
+        if owner.is_none() {
+            return self.reject(&id, StageStatus::InvalidParameter, "an authenticated job owner is required");
+        }
+        let credential = owner.as_ref().and_then(|a| self.fleet.credential_for_signer(a));
+        let cert_credential = cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a));
+        let scoped = credential.as_ref().is_some_and(|c| c.apps.is_some())
+            || cert_credential.as_ref().is_some_and(|c| c.apps.is_some());
+        if scoped && (recovered.is_none() || credential.is_none() || cert.as_ref().is_none_or(|(_, a)| owner.as_ref() != Some(a))) {
+            return self.reject(&id, StageStatus::InvalidParameter, "the client certificate must match the signing credential");
+        }
+        if !req.signature.is_empty() && owner.as_ref().is_none_or(|a| self.fleet.tenant_for_signer(a).is_none()) {
+            return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
+        }
+        let tag = credential.as_ref().and_then(|c| c.tag.clone());
+        let namespace = credential.as_ref().and_then(|c| c.namespace.clone());
+        let job_id = if let Some(n) = &namespace {
+            match self.fleet.namespace_job(n, tag.as_deref(), &id).await {
+                Ok(Some(j)) => j.id,
+                Ok(None) => Fleet::internal_proof_id(n, tag.as_deref(), &id),
+                Err(e) => return self.reject(&id, StageStatus::InternalError, &format!("{e:#}")),
+            }
+        } else { id.clone() };
+        if let Ok(Some(job)) = self.fleet.job(&job_id).await {
+            let signed_tenant = owner.as_ref().and_then(|a| self.fleet.tenant_for_signer(a));
+            let allowed = if scoped {
+                namespace.is_some() && namespace.as_deref() == Some(job.namespace.as_str()) && job.tag == tag.as_deref().unwrap_or("")
+            } else {
+                signed_tenant.as_ref().is_some_and(|t| t == &job.tenant)
+                    && cert.as_ref().is_none_or(|(t, _)| t == &job.tenant)
             };
+            if !allowed && (self.fleet.cfg.require_signature || credential.is_some() || cert.is_some()) {
+                return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
+            }
+            return GenerateProofResponse { proof_id: id, status: StageStatus::Computing as i32, ..Default::default() };
         }
         let fail = |status, msg: &str| (status, msg.to_string());
         let outcome: Result<Job, (StageStatus, String)> = async {
@@ -131,7 +175,7 @@ impl StageApi {
                     .ok_or_else(|| fail(StageStatus::InvalidParameter, "permission denied"))?,
                 None => return Err(fail(StageStatus::InvalidParameter, "permission denied")),
             };
-            if cert.as_ref().is_some_and(|c| *c != tenant) {
+            if cert.as_ref().is_some_and(|(t, _)| *t != tenant) {
                 return Err(fail(
                     StageStatus::InvalidParameter,
                     "the client certificate and the signature belong to different tenants",
@@ -154,10 +198,13 @@ impl StageApi {
             } else {
                 req.elf_id.clone().unwrap_or_default().trim_start_matches("0x").to_ascii_lowercase()
             };
-            if !self.fleet.app_known(&tenant, &elf_id) {
+            if credential.as_ref().is_some_and(|c| c.apps.as_ref().is_some_and(|g| !g.contains(&format!("{tenant}/{elf_id}")))) {
+                return Err(fail(StageStatus::InvalidParameter, "app is not granted to this credential"));
+            }
+            if !self.fleet.app_known(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id) {
                 return Err(fail(
                     StageStatus::InvalidParameter,
-                    &format!("program {elf_id} is not an app of tenant {tenant}: register it first (fleetctl app add {tenant}/{elf_id})"),
+                    &format!("program {elf_id} is not an app of tenant {tenant}: register it in the submitting namespace first (fleetctl --namespace NAME app add {tenant}/{elf_id})"),
                 ));
             }
             let elf_id = if !req.elf_data.is_empty() {
@@ -175,7 +222,7 @@ impl StageApi {
                 }
                 given
             };
-            if self.fleet.app_disabled(&tenant, &elf_id) {
+            if self.fleet.app_disabled(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id) {
                 return Err(fail(
                     StageStatus::InvalidParameter,
                     &format!("app {} is disabled: it takes no new jobs", crate::fleet::app_name(&tenant, &elf_id)),
@@ -192,14 +239,19 @@ impl StageApi {
                 })?
             };
             let receipts: Vec<Vec<u8>> = req.receipts.clone();
-            let put = |name, bytes: Vec<u8>| self.fleet.blobs.put(&id, name, &bytes);
+            let put = |name, bytes: Vec<u8>| self.fleet.blobs.put(&job_id, name, &bytes);
             put(blobs::STDIN, bincode::serialize(&stdin).unwrap())
                 .and_then(|_| put(blobs::RECEIPTS, bincode::serialize(&receipts).unwrap()))
                 .map_err(|e| fail(StageStatus::InternalError, &format!("{e:#}")))?;
             Ok(Job {
-                id: id.clone(),
-                tenant,
-                elf_id,
+                id: job_id.clone(),
+                namespace: namespace.clone().unwrap_or_else(|| crate::store::SYSTEM_NAMESPACE.into()),
+                tag: tag.clone().unwrap_or_default(),
+                client_id: id.clone(),
+                tenant: tenant.clone(),
+                owner: owner.clone().expect("authenticated owner checked above"),
+                elf_id: elf_id.clone(),
+                priority: self.fleet.app_priority(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id),
                 kind,
                 state: JobState::Queued,
                 error: String::new(),
@@ -227,28 +279,47 @@ impl StageApi {
                 }
             }
             Err((status, msg)) => {
-                self.record_rejection(&id, status, &msg).await;
+                if let Some(identity) = owner.as_ref().and_then(|a| self.fleet.tenant_for_signer(a).map(|t| (t, a.clone()))) {
+                    self.record_rejection(&job_id, &id, status, &msg, identity).await;
+                }
                 self.reject(&id, status, &msg)
             }
         }
     }
 
-    async fn status(&self, id: &str, cert: Option<String>) -> GetStatusResponse {
+    async fn status(&self, id: &str, cert: Option<(String, String)>) -> GetStatusResponse {
         let mut resp = GetStatusResponse {
             proof_id: id.to_string(),
             ..Default::default()
         };
-        // Another tenant's proof is answered like an unknown one (and at once, so the
-        // wait does not tell that it exists).
-        if let Some(t) = &cert {
-            if !matches!(self.fleet.job(id).await, Ok(Some(j)) if j.tenant == *t) {
-                resp.status = StageStatus::Unspecified as i32;
+        let internal = if let Some(c) = cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a)).filter(|c| c.namespace.is_some()) {
+            match self.fleet.namespace_job(c.namespace.as_deref().unwrap(), c.tag.as_deref(), id).await {
+                Ok(Some(j)) => j.id,
+                _ => { resp.status = StageStatus::Unspecified as i32; return resp; }
+            }
+        } else { id.to_string() };
+        let id = internal.as_str();
+        let allowed = match self.fleet.job(id).await {
+            Ok(Some(j)) => match j.namespace.as_str() {
+                n if n != crate::store::SYSTEM_NAMESPACE => cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a))
+                    .is_some_and(|c| c.namespace.as_deref() == Some(n) && c.tag.as_deref().unwrap_or("") == j.tag),
+                _ => cert.as_ref().is_none_or(|(t, a)| j.tenant == *t && self.fleet.credential_for_signer(a).is_none_or(|c| c.apps.is_none())),
+            },
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!(proof_id = id, "status lookup: {e:#}");
+                resp.status = StageStatus::InternalError as i32;
                 return resp;
             }
-        }
+        };
+        if !allowed { resp.status = StageStatus::Unspecified as i32; return resp; }
         self.fleet
             .wait_terminal(id, Duration::from_millis(self.fleet.cfg.long_poll_ms))
             .await;
+        if cert.as_ref().is_some_and(|(_, a)| self.fleet.tenant_for_signer(a).is_none()) {
+            resp.status = StageStatus::Unspecified as i32;
+            return resp;
+        }
         let job = match self.fleet.job(id).await {
             Ok(Some(j)) => j,
             Ok(None) => {
@@ -279,12 +350,15 @@ impl StageApi {
                     resp.status = StageStatus::Success as i32;
                     resp.step = Step::End as i32;
                     resp.proof_with_public_inputs = proof;
-                    resp.public_values_url = format!(
-                        "{}/{}/wrap/public_values.bin?key={}",
-                        self.fleet.cfg.public_url.trim_end_matches('/'),
-                        id,
-                        self.fleet.public_values_key(id)
-                    );
+                    resp.public_values_url = if job.namespace != crate::store::SYSTEM_NAMESPACE {
+                        let issuer = &cert.as_ref().expect("namespaced status requires mTLS").1;
+                        format!("{}/{}/wrap/public_values.bin?credential={}&key={}",
+                            self.fleet.cfg.public_url.trim_end_matches('/'), id, issuer,
+                            self.fleet.public_values_key_for(id, issuer))
+                    } else {
+                        format!("{}/{}/wrap/public_values.bin?key={}",
+                            self.fleet.cfg.public_url.trim_end_matches('/'), id, self.fleet.public_values_key(id))
+                    };
                     resp.total_steps = job.cycles;
                     resp.proving_time = job.prove_ms;
                     resp.elf_id = job.elf_id.into_bytes();

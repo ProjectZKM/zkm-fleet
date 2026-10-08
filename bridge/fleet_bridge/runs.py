@@ -93,6 +93,7 @@ GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_F
                      r"|CUDA error: out of memory", re.I)
 SPEC_FILE, STATUS_FILE, OUT_DIR, CODE_DIR, LOG_FILE, METRICS_FILE = "spec.json", "status.json", "out", "code", "log", "metrics.jsonl"
 UPLOADS_DIR = ".uploads"  # code tarballs sent through the runs API
+QUOTA_ACTIVE_DIR = ".quota-active"
 
 
 def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:
@@ -189,7 +190,7 @@ class RunDir:
     def status(self) -> RunStatus:
         return RunStatus.read(self.status_path)
 
-    def update(self, *, force: bool = False, **changes: Any) -> RunStatus:
+    def update(self, *, force: bool = False, expected_state: RunState | None = None, **changes: Any) -> RunStatus:
         """Merges typed changes into status.json, under the run's lock (the actor, a
         cancel and a preemption write it). Once the run has ended, a late report from the
         actor that it is going (or ended otherwise) is dropped: a cancel wins. While it
@@ -198,14 +199,37 @@ class RunDir:
         with open(os.path.join(self.path, ".lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             st = self.status()
+            if expected_state is not None and st.state is not expected_state:
+                raise Conflict(f"{self.id}: state changed during preemption")
             new_state = changes.get("state")
             if st.state.terminal and new_state not in (None, st.state):
                 return st
             if st.state is RunState.PREEMPTED and not force and new_state is not RunState.CANCELLED:
                 return st
+            if new_state is not None and new_state.terminal:
+                changes.setdefault("preempt_requeue", False)
+            if new_state is not None and new_state != st.state and not new_state.terminal:
+                changes.setdefault("quota_released", False)
             st = st.merged(**changes)
+            # Publish membership before state, so a crash cannot lose active work.
+            if st.namespace is not None or (os.path.isfile(self.spec_path) and self.spec().owner):
+                self.track_quota()
             st.write(self.status_path)
+            if st.quota_released and (st.state.terminal or (st.state is RunState.PREEMPTED and not st.preempt_requeue)):
+                self.untrack_quota()
             return st
+
+    def track_quota(self) -> None:
+        directory = os.path.join(os.path.dirname(self.path), QUOTA_ACTIVE_DIR)
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, self.id), "a"):
+            pass
+
+    def untrack_quota(self) -> None:
+        try:
+            os.unlink(os.path.join(os.path.dirname(self.path), QUOTA_ACTIVE_DIR, self.id))
+        except FileNotFoundError:
+            pass
 
     def state(self) -> RunState | None:
         try:
@@ -252,7 +276,7 @@ def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int =
                    gang: GangEnv | None = None) -> list[str]:
     """The `docker run` for a run (or one rank of it) on the given host cards."""
     p = spec.profile
-    cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", "host",
+    cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", "none" if spec.namespace or spec.owner else "host",
            f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=run", "--label", f"zkm-fleet.run={spec.id}"]
     if gpus:
         cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"', "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
@@ -331,11 +355,16 @@ class _Rank:
 
     def start(self, attempt: int, gang: GangEnv | None) -> str | None:
         """Starts the container; returns docker's error, or None."""
-        _sh(["docker", "rm", "-f", self.name])
-        mine = replace(gang, node_rank=self.rank) if gang else None
-        out = _sh(docker_command(self.spec, self.gpus, attempt, self.rank, mine))
-        if out.returncode != 0:
-            return out.stderr.strip()[:500]
+        with open(os.path.join(os.path.dirname(self.spec.out), ".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            st = RunStatus.read(os.path.join(os.path.dirname(self.spec.out), STATUS_FILE))
+            if st.state.terminal or st.state is RunState.PREEMPTED:
+                return "run stopped before container creation"
+            _sh(["docker", "rm", "-f", self.name])
+            mine = replace(gang, node_rank=self.rank) if gang else None
+            out = _sh(docker_command(self.spec, self.gpus, attempt, self.rank, mine))
+            if out.returncode != 0:
+                return out.stderr.strip()[:500]
         self.offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         self.log = open(self.log_path, "ab")
         self.follower = subprocess.Popen(["docker", "logs", "-f", self.name], stdout=self.log, stderr=subprocess.STDOUT)
@@ -404,7 +433,7 @@ class _GpuRun:
                 ).remote(spec, i))
         # where the containers will live: cancel and status reach them there
         info = self.local.info()
-        self.dir.update(machine=info.machine, node_ip=info.node_ip)
+        self.dir.update(machine=info.machine, node_ip=info.node_ip, launch_pending=False)
         threading.Thread(target=self._run, daemon=True).start()
 
     @property
@@ -488,6 +517,8 @@ class _GpuRun:
     def _run(self) -> None:
         code: int | None = None
         try:
+            if self.dir.status().state.terminal or self.dir.state() is RunState.PREEMPTED:
+                return
             need = self.spec.need_mib
             self.infos = self._all("info")
             if self.n > 1:
@@ -631,14 +662,39 @@ def bundle(spec: RunSpec, rank: int = 0) -> Bundle:
                   pin=spec.machine_resources[rank] if spec.machine_resources else None)
 
 
+def run_placement(spec: RunSpec) -> Any:
+    """Stable placement identity lets a launch intent survive an API crash."""
+    try:
+        return ray.util.get_placement_group(pg_name(spec.id))
+    except ValueError:
+        return placement_group([bundle(spec, i).to_ray() for i in range(spec.nodes)],
+                               strategy="STRICT_SPREAD" if spec.nodes > 1 else "STRICT_PACK",
+                               name=pg_name(spec.id), lifetime="detached")
+
+
+def discard_placement(run_id: str) -> None:
+    try:
+        remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
+    except ValueError:
+        pass
+
+
+def prepare_launch(spec: RunSpec) -> bool:
+    """Claim actual capacity first; a blocked run must not occupy namespace units."""
+    pg = run_placement(spec)
+    ready, _ = ray.wait([pg.ready()], timeout=0.05)
+    if ready:
+        return True
+    discard_placement(spec.id)
+    return False
+
+
 def launch(spec: RunSpec, run_dir: str) -> None:
     b = bundle(spec)
-    # one bundle per machine; several only on DIFFERENT machines
-    pg = placement_group([bundle(spec, i).to_ray() for i in range(spec.nodes)],
-                         strategy="STRICT_SPREAD" if spec.nodes > 1 else "STRICT_PACK",
-                         name=pg_name(spec.id), lifetime="detached")
+    pg = run_placement(spec)
     GpuRun.options(
         name=actor_name(spec.id), namespace=NAMESPACE, lifetime="detached", num_cpus=b.cpu, num_gpus=b.gpu,
+        get_if_exists=True,
         max_restarts=0, max_task_retries=0,
         scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
     ).remote(spec, run_dir)
@@ -747,6 +803,7 @@ def _placement(a: RunArgs) -> Placement:
 class Submitted(Record):
     id: str
     state: RunState
+    priority: int = 0
     dir: str
     out: str
     note: str | None = None
@@ -756,6 +813,8 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
     if a.profile is None or a.profile not in config.profiles:
         raise SystemExit(f"unknown profile {a.profile!r} (have: {', '.join(config.profiles) or 'none'})")
     profile = config.profiles[a.profile]
+    if a.namespace is not None and profile.namespace != a.namespace:
+        raise Conflict("run app belongs to another namespace")
     if profile.disabled:
         raise Conflict(f"run app {a.profile} is disabled: it takes no new runs (fleetctl app enable {a.profile})")
     if not cmd:
@@ -792,7 +851,7 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
             shutil.rmtree(run.path)
             raise
     gpu_mem = a.gpu_mem or profile.default_gpu_mem_gb
-    spec = RunSpec(id=run.id, profile_name=a.profile, profile=profile, command=cmd, gpus=gpus, cpus=a.cpus,
+    spec = RunSpec(id=run.id, owner=a.owner, namespace=a.namespace, tag=a.tag, quota_managed=a.namespace is not None, profile_name=a.profile, profile=profile, command=cmd, gpus=gpus, cpus=a.cpus,
                    mounts=mounts, env=a.env_map, log=a.log, workdir=a.workdir, out=run.out,
                    code_dir=run.code if code else None, code=code, gpu_mem_gb=gpu_mem, vram_wait_s=a.vram_wait,
                    retry=a.retry, restart_on_oom=a.restart_on_oom, after=a.after, nodes=place.nodes,
@@ -802,16 +861,20 @@ def submit(a: RunArgs, cmd: list[str], config: RunsConfig) -> Submitted:
         shutil.rmtree(run.path)
         raise SystemExit(f"--workdir {a.workdir} is outside the run's mounts")
     spec.write(run.spec_path)
-    state = RunState.WAITING_DEPENDENCY if a.after else RunState.QUEUED
-    RunStatus(id=run.id, state=state, submitted_at=time.time(), gpus_requested=gpus, cpus=a.cpus,
+    if a.namespace:
+        run.track_quota()
+    state = RunState.WAITING_DEPENDENCY if a.after else RunState.WAITING_QUOTA if a.namespace else RunState.QUEUED
+    RunStatus(id=run.id, state=state, priority=profile.priority, namespace=a.namespace, tag=a.tag, quota_released=bool(a.namespace), submitted_at=time.time(), gpus_requested=gpus, cpus=a.cpus,
               gpu_mem_gb=gpu_mem or None, after=a.after, code=code, nodes=place.nodes).write(run.status_path)
+    if a.namespace:
+        return Submitted(id=run.id, state=state, priority=profile.priority, dir=run.path, out=run.out, note=place.note)
     if a.after:
         pin = place.machine_resources[0] if place.machine_resources else None
         RunWaiter.options(name=waiter_name(run.id), namespace=NAMESPACE, lifetime="detached", num_cpus=0,
                           max_restarts=0, resources={pin: 0.001} if pin else None).remote(spec, run.path, a.runs_dir)
     else:
         launch(spec, run.path)
-    return Submitted(id=run.id, state=state, dir=run.path, out=run.out, note=place.note)
+    return Submitted(id=run.id, state=state, priority=profile.priority, dir=run.path, out=run.out, note=place.note)
 
 
 # ── other actions ────────────────────────────────────────────────────────────
@@ -833,10 +896,53 @@ def _going(run_id: str) -> bool:
     return _alive(actor_name(run_id)) or _alive(waiter_name(run_id))
 
 
+@ray.remote(num_cpus=0, max_retries=0)
+def _container_stopped(run_id: str, rank: int) -> bool:
+    out = _sh(["docker", "inspect", "-f", "{{.State.Running}}", container_name(run_id, rank)])
+    return (out.returncode == 0 and out.stdout.strip() == "false"
+            or out.returncode != 0 and ("No such object" in out.stderr or "No such container" in out.stderr))
+
+
+def execution_stopped(run: RunDir) -> bool:
+    """Actor disappearance alone is not proof that detached Docker work stopped."""
+    st = run.status()
+    if _going(run.id) or any(_alive(actor_name(run.id, i)) for i in range(1, st.nodes)):
+        return False
+    live = {n["NodeManagerAddress"] for n in alive_nodes()} if any(p.node_ip for p in st.places()) else set()
+    for place in st.places():
+        if not place.node_ip:
+            if place.machine or place.container or st.started_at is not None:
+                return False
+            continue  # actors publish location before starting Docker
+        if place.node_ip not in live:
+            return False
+        try:
+            task = _container_stopped.options(resources={f"node:{place.node_ip}": 0.001})
+            if not ray.get(task.remote(run.id, place.rank), timeout=5):
+                return False
+        except Exception:
+            return False
+    try:
+        discard_placement(run.id)
+    except Exception:
+        return False
+    return True
+
+
+def confirm_cleanup(run: RunDir) -> bool:
+    st = run.status()
+    if not _going(run.id) and not st.launch_pending and st.state in (RunState.CANCELLED,RunState.PREEMPTED,RunState.WAITING_QUOTA):
+        for p in st.places():
+            if p.node_ip:
+                _on_run_machine(p,["docker","rm","-f",container_name(run.id,p.rank)],5)
+    return execution_stopped(run)
+
+
 def _state(run_id: str, st: RunStatus) -> RunState:
     """The state as it is: a run that has not ended but has no actor any more is lost
     (one being preempted has none for a moment, between its stop and its requeue)."""
-    if st.state.terminal or st.state is RunState.PREEMPTED:
+    if (st.state.terminal or st.launch_pending or st.state in (RunState.PREEMPTED, RunState.WAITING_QUOTA)
+            or (st.state is RunState.WAITING_DEPENDENCY and st.namespace is not None)):
         return st.state
     return RunState.LOST if not _going(run_id) else st.state
 
@@ -847,7 +953,8 @@ def status(a: RunArgs, run_id: str) -> RunStatus:
     if _state(run_id, st) is RunState.LOST:
         # The actor is gone without reporting (a Ray restart): say what the container does.
         st = st.merged(state=RunState.LOST, container=_container_states(st, run_id))
-    return st.merged(metrics=run.last_metrics(), out=run.spec().out)
+    spec = run.spec()
+    return st.merged(metrics=run.last_metrics(), out=spec.out, priority=spec.profile.priority)
 
 
 def _container_states(st: RunStatus, run_id: str) -> str:
@@ -864,13 +971,13 @@ def cancel(a: RunArgs, run_id: str) -> RunStatus:
     st = run.update(state=RunState.CANCELLED, finished_at=time.time())
     if st.state is not RunState.CANCELLED:
         raise Conflict(f"{run_id} already {st.state.value}: nothing to cancel")
-    if st.container or st.ranks:  # it started: SIGTERM first, so the job can save its work
+    if st.node_ip or st.container or st.ranks:  # location is written before container creation
         _stop_ranks(st, run_id, run.spec().profile.stop_timeout_s)
     _end_actors(run_id, st.nodes)
     gone = [r.machine for r in st.places()
             if _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)]) is None]
     if gone:
-        st = st.merged(container=f"not removed: {', '.join(gone)} left the cluster")
+        st = run.update(container=f"not removed: {', '.join(gone)} left the cluster")
     try:
         remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
     except Exception:
@@ -910,6 +1017,9 @@ class Candidate(Record):
     """A run's share of one machine, as a preemption sees it."""
 
     id: str
+    namespace: str
+    priority: int
+    tag: str | None = None
     node_ip: str
     gpus: float
     cpus: float
@@ -930,33 +1040,92 @@ class Victims(Record):
 
 
 def choose_victims(need_gpus: float, need_cpus: float, free: dict[str, tuple[float, float]],
-                   candidates: list[Candidate], now: float, pin: str | None = None) -> Victims | None:
-    """The machine (node IP -> free GPUs, CPUs) where the fewest takeable runs free
-    enough for a bundle, and those runs: ones not started yet first, then the newest.
-    None when no machine can (the service waits, as it did before preemption)."""
+                   candidates: list[Candidate], now: float, pin: str | None = None, *, namespace: str, priority: int) -> Victims | None:
+    """Choose only lower-priority runs in this namespace, lowest priority first.
+    Ties prefer fewer victims, then unstarted and newer executions.
+    """
     best: Victims | None = None
+    best_score: tuple[int, ...] | None = None
     for ip, (gpus, cpus) in sorted(free.items()):
         if pin is not None and ip != pin:
             continue
         if gpus >= need_gpus and cpus >= need_cpus:
             return Victims(node_ip=ip)
-        pool = sorted((c for c in candidates if c.node_ip == ip and c.takeable(now)),
-                      key=lambda c: (c.started_at is not None, -(c.started_at or 0)))
+        pool = sorted((c for c in candidates if c.node_ip == ip and c.namespace == namespace and c.priority < priority and c.takeable(now)),
+                      key=lambda c: (c.priority, c.started_at is not None, -(c.started_at or 0)))
         picked: list[str] = []
+        priorities: list[int] = []
         for c in pool:
             if gpus >= need_gpus and cpus >= need_cpus:
                 break
             picked.append(c.id)
+            priorities.append(c.priority)
             gpus, cpus = gpus + c.gpus, cpus + c.cpus
-        if gpus >= need_gpus and cpus >= need_cpus and (best is None or len(picked) < len(best.runs)):
+        score = tuple(sorted(priorities, reverse=True))
+        if gpus >= need_gpus and cpus >= need_cpus and (best_score is None or score < best_score):
             best = Victims(node_ip=ip, runs=picked)
+            best_score = score
     return best
+
+
+def plan_preemption(spec: RunSpec, free: dict[str, tuple[float, float]], pool: list[Candidate],
+                    now: float, quota_fits: Callable[[set[str]], bool]) -> list[str] | None:
+    """Plan a complete placement and quota fit before stopping any run.
+
+    Multi-node jobs need distinct nodes. Stopping a run credits all its ranks,
+    while namespace/tag quota is credited once for the whole execution.
+    """
+    eligible = [c for c in pool if c.namespace == spec.namespace and c.priority < spec.profile.priority and c.takeable(now)]
+    if not quota_fits({c.id for c in eligible}):
+        return None
+    available = dict(free)
+    selected: set[str] = set()
+    order: list[str] = []
+    placed: list[str] = []
+
+    def select(run_id: str) -> None:
+        if run_id in selected:
+            return
+        selected.add(run_id)
+        order.append(run_id)
+        for c in eligible:
+            if c.id == run_id and c.node_ip in available:
+                g, cpu = available[c.node_ip]
+                available[c.node_ip] = g + c.gpus, cpu + c.cpus
+
+    for rank in range(spec.nodes):
+        pin = spec.machine_resources[rank].split(":", 1)[1] if spec.machine_resources else None
+        victims = choose_victims(spec.gpus, max(spec.cpus, 1), available,
+            [c for c in eligible if c.id not in selected], now, pin,
+            namespace=spec.namespace or "", priority=spec.profile.priority)
+        if victims is None:
+            return None
+        for run_id in victims.runs:
+            select(run_id)
+        placed.append(victims.node_ip)
+        del available[victims.node_ip]
+    for c in sorted(eligible, key=lambda c: (c.priority, c.started_at is not None, -(c.started_at or 0), c.id)):
+        if quota_fits(selected):
+            break
+        select(c.id)
+    if not quota_fits(selected):
+        return None
+    # Avoid evicting runs that cannot help the occupied tag cap, or redundant ranks.
+    for run_id in reversed(order):
+        remaining = selected - {run_id}
+        if quota_fits(remaining) and all(
+            free[ip][0] + sum(c.gpus for c in eligible if c.id in remaining and c.node_ip == ip) >= spec.gpus
+            and free[ip][1] + sum(c.cpus for c in eligible if c.id in remaining and c.node_ip == ip) >= max(spec.cpus, 1)
+            for ip in placed):
+            selected = remaining
+    return [run_id for run_id in order if run_id in selected]
 
 
 def candidates(runs_dir: str) -> list[Candidate]:
     """Every run holding cards or CPUs now (its actor placed), per machine it is on."""
     out = []
-    for i in os.listdir(runs_dir) if os.path.isdir(runs_dir) else []:
+    active = os.path.join(runs_dir, QUOTA_ACTIVE_DIR)
+    for i in os.listdir(active) if os.path.isdir(active) else []:
         if i.startswith("."):
             continue
         try:
@@ -964,58 +1133,64 @@ def candidates(runs_dir: str) -> list[Candidate]:
             st, spec = run.status(), run.spec()
         except (SystemExit, OSError, ValueError):
             continue
-        if st.state not in PREEMPTIBLE or not _alive(actor_name(i)):
+        if not spec.namespace or st.state not in PREEMPTIBLE or not _alive(actor_name(i)):
             continue
         started = st.started_at if st.state is RunState.RUNNING else None
         for r in st.places():
             if r.node_ip:
-                out.append(Candidate(id=i, node_ip=r.node_ip, gpus=float(spec.gpus), cpus=float(max(spec.cpus, 1)),
+                out.append(Candidate(id=i, namespace=spec.namespace, priority=spec.profile.priority, tag=spec.tag, node_ip=r.node_ip, gpus=float(spec.gpus), cpus=float(max(spec.cpus, 1)),
                                      started_at=started, preemptible=spec.profile.preemptible,
                                      min_runtime_s=spec.profile.min_runtime_s))
     return out
 
 
-def preempt(runs_dir: str, run_id: str, reason: str, requeue: bool = True) -> RunStatus:
-    """Stops a run with grace so its cards free, records the attempt as preempted and,
-    with requeue, queues it again at once (else the caller does, with `requeue_run`,
-    once what needed the cards has them)."""
+def preempt(runs_dir: str, run_id: str, reason: str, requeue: bool = True, *,
+            namespace: str | None = None, priority: int | None = None, defer_requeue: bool = False) -> RunStatus:
+    """Stop with grace, retaining reservations until every container is confirmed stopped.
+    Automatic callers must supply the requesting namespace and priority.
+    """
     run = RunDir(runs_dir, run_id)
-    spec = run.spec()
-    before = run.status()
+    spec, before = run.spec(), run.status()
+    if namespace is not None or priority is not None:
+        candidate = Candidate(id=run_id, namespace=spec.namespace or "", priority=spec.profile.priority,
+            node_ip="", gpus=spec.gpus, cpus=spec.cpus, started_at=before.started_at if before.state is RunState.RUNNING else None,
+            preemptible=spec.profile.preemptible, min_runtime_s=spec.profile.min_runtime_s)
+        if namespace != spec.namespace or priority is None or candidate.priority >= priority or not candidate.takeable(time.time()):
+            raise Conflict(f"{run_id}: not an eligible lower-priority run in this namespace")
     if before.state not in PREEMPTIBLE or not _alive(actor_name(run_id)):
         raise Conflict(f"{run_id} is {_state(run_id, before).value}: it holds no card to preempt")
-    st = run.update(state=RunState.PREEMPTED, detail=f"preempted: {reason}")
+    attempts = list(before.attempts)
+    if before.state is RunState.RUNNING:
+        attempts.append(Attempt(exit_code=None, cause=Cause.PREEMPTED, evidence=reason))
+    st = run.update(expected_state=before.state, state=RunState.PREEMPTED, preempt_requeue=requeue,
+                    attempts=attempts, preemptions=before.preemptions + 1, detail=f"preempted: {reason}")
     if st.state is not RunState.PREEMPTED:
         raise Conflict(f"{run_id} is {st.state.value}: nothing to preempt")
-    try:
-        running = before.state is RunState.RUNNING
-        if running:
-            _stop_ranks(st, run_id, spec.profile.stop_timeout_s)
-        _end_actors(run_id, st.nodes)
-        for r in st.places():
-            _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)])
-        try:
-            remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
-        except Exception:
-            pass
-        attempts = list(st.attempts)
-        if running:
-            attempts.append(Attempt(exit_code=None, cause=Cause.PREEMPTED, evidence=reason))
-        st = run.update(force=True, state=RunState.QUEUED, attempts=attempts, preemptions=st.preemptions + 1,
-                        started_at=None, container=None, detail=f"preempted ({reason}): waiting for cards again")
-        if requeue:
-            launch(spec, run.path)
-        return st
-    except Exception as e:  # report, never leave it preempted with nothing running it
-        return run.update(force=True, state=RunState.FAILED, finished_at=time.time(),
-                          error=f"preempted ({reason}), then could not be queued again: {e!r}"[:500])
+    if before.state is RunState.RUNNING:
+        _stop_ranks(st, run_id, spec.profile.stop_timeout_s)
+    _end_actors(run_id, st.nodes)
+    if not confirm_cleanup(run):
+        return run.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")
+    if requeue and not defer_requeue:
+        requeue_run(runs_dir, run_id)
+    return run.status()
 
 
 def requeue_run(runs_dir: str, run_id: str) -> None:
-    """Queues a run that `preempt(..., requeue=False)` stopped."""
+    """Persist requeue intent; never restart while a previous container may be alive."""
     run = RunDir(runs_dir, run_id)
-    if run.state() is RunState.QUEUED and not _going(run_id):
-        launch(run.spec(), run.path)
+    if run.state() not in (RunState.QUEUED, RunState.PREEMPTED):
+        return
+    run.update(force=True, preempt_requeue=True)
+    if not confirm_cleanup(run):
+        return
+    spec = run.spec()
+    if spec.namespace:
+        run.update(force=True, state=RunState.WAITING_QUOTA, preempt_requeue=False, quota_released=run.status().quota_released, started_at=None,
+                   container=None, detail="preempted: waiting for resources again")
+    else:
+        run.update(force=True, state=RunState.QUEUED, preempt_requeue=False, started_at=None, container=None)
+        launch(spec, run.path)
 
 
 def log_chunk(runs_dir: str, run_id: str, rank: int = 0, offset: int | None = None, lines: int = 50,
@@ -1085,15 +1260,23 @@ def purge(a: RunArgs, run_id: str | None) -> list[Purged]:
         targets = [RunDir(a.runs_dir, d) for d in os.listdir(a.runs_dir) if not d.startswith(".")
                    and os.path.isdir(os.path.join(a.runs_dir, d)) and os.path.getmtime(os.path.join(a.runs_dir, d)) < cut]
         uploads = os.path.join(a.runs_dir, UPLOADS_DIR)
-        for name in os.listdir(uploads) if os.path.isdir(uploads) else []:
-            if os.path.getmtime(os.path.join(uploads, name)) < cut:
-                os.remove(os.path.join(uploads, name))
+        for root, _, files in os.walk(uploads):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.getmtime(path) < cut:
+                    os.remove(path)
     else:
         raise SystemExit("purge ID, or purge --older-than DAYS")
     done = []
     for run in targets:
         state = run.state()
-        if (state is None or not state.terminal) and _going(run.id):
+        if state in (RunState.WAITING_QUOTA, RunState.WAITING_DEPENDENCY):
+            done.append(Purged(id=run.id, purged=False, state=state, reason="still waiting: cancel it first"))
+            continue
+        if (run.spec().namespace or run.spec().owner) and not run.status().quota_released:
+            done.append(Purged(id=run.id,purged=False,state=state,reason="execution cleanup and quota release pending"))
+            continue
+        if (state is None or not state.terminal or run.spec().namespace or run.spec().owner) and _going(run.id):
             done.append(Purged(id=run.id, purged=False, reason=f"still {state.value if state else '?'}: cancel it first"))
             continue
         if state is not None and not state.terminal:  # lost: its containers may still hold cards
@@ -1115,6 +1298,9 @@ class RunSummary(Record):
 
     id: str
     state: RunState
+    namespace: str | None = None
+    tag: str | None = None
+    priority: int = 0
     profile: str | None = None  # its app
     gpus: list[str] = field(default_factory=list)
     exit_code: int | None = None
@@ -1123,6 +1309,11 @@ class RunSummary(Record):
     submitted_at: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
+
+
+def in_namespace(spec: RunSpec, namespace: str, tag: str | None = None, all_tags: bool = False) -> bool:
+    """Access requires the recorded namespace and optional tag to match exactly."""
+    return spec.namespace == namespace and (all_tags or spec.tag == tag)
 
 
 def list_runs(a: RunArgs, n: int = 20, active: bool = False, profile: str | None = None) -> list[RunSummary]:
@@ -1137,7 +1328,13 @@ def list_runs(a: RunArgs, n: int = 20, active: bool = False, profile: str | None
         try:
             run = RunDir(a.runs_dir, i)
             st = run.status()
-            s = from_dict(RunSummary, {**st.dump(), "state": _state(i, st), "profile": run.spec().profile_name})
+            spec = run.spec()
+            if a.namespace is not None and not in_namespace(spec, a.namespace, a.tag, a.namespace_all_tags):
+                continue
+            if a.owner is not None and spec.owner != a.owner:
+                continue
+            s = from_dict(RunSummary, {**st.dump(), "state": _state(i, st), "profile": spec.profile_name,
+                                      "namespace": spec.namespace, "tag": spec.tag, "priority": spec.profile.priority})
         except (SystemExit, OSError, ValueError):
             continue
         if (not active or s.state.active) and (profile is None or s.profile == profile):
@@ -1151,6 +1348,8 @@ class RunApp(Record):
     """A run app: a runs.yaml profile (what a run may be), and how its jobs (runs) went."""
 
     name: str
+    namespace: str
+    priority: int
     image: str
     user: str | None
     max_gpus: int
@@ -1170,13 +1369,18 @@ class RunApp(Record):
 
 def apps(a: RunArgs, config: RunsConfig) -> list[RunApp]:
     """Every profile, with the runs submitted under it (the runs dir is scanned once)."""
-    by_name = {name: _run_app(name, p) for name, p in config.profiles.items()}
+    by_name = {name: _run_app(name, p) for name, p in config.profiles.items()
+               if a.namespace is None or p.namespace == a.namespace}
     for d in os.listdir(a.runs_dir) if os.path.isdir(a.runs_dir) else []:
         if d.startswith("."):
             continue
         try:
             run = RunDir(a.runs_dir, d)
             spec, st = run.spec(), run.status()
+            if a.namespace is not None and not in_namespace(spec, a.namespace, a.tag, a.namespace_all_tags):
+                continue
+            if a.owner is not None and spec.owner != a.owner:
+                continue
         except (SystemExit, OSError, ValueError):
             continue
         app = by_name.get(spec.profile_name)
@@ -1264,6 +1468,32 @@ def _with_profile_disabled(text: str, name: str, disabled: bool) -> str:
     return "".join(lines[:key + 1] + block + lines[end:])
 
 
+def set_app_priority(a: RunArgs, name: str, priority: int) -> RunApp:
+    config = load_config(a.profiles)
+    if name not in config.profiles:
+        raise Conflict(f"no run app {name}")
+    profile = config.profiles[name]
+    profile.priority = priority
+    profile.__post_init__()
+
+    def edit(text: str) -> str:
+        root = yaml.compose(text)
+        profiles = next(v for k, v in root.value if k.value == "profiles")
+        entry = next(v for k, v in profiles.value if k.value == name)
+        if entry.flow_style:
+            raise Conflict("profiles must use block YAML for priority changes")
+        value = next((v for k, v in entry.value if k.value == "priority"), None)
+        if value is not None:
+            return text[:value.start_mark.index] + str(priority) + text[value.end_mark.index:]
+        pos = entry.start_mark.index
+        return text[:pos] + f"priority: {priority}\n" + " " * entry.start_mark.column + text[pos:]
+
+    config = _edit_profiles(a, edit,
+        lambda b: {**b, "profiles": {**b["profiles"], name: {**b["profiles"][name], "priority": priority}}},
+        f"setting {name} priority")
+    return _run_app(name, config.profiles[name])
+
+
 def _profile_mapping(profile: Profile) -> dict[str, Any]:
     """The profile as runs.yaml writes it: its fields, less the ones at their defaults."""
     return {k: v for k, v in profile.dump().items()
@@ -1315,7 +1545,7 @@ def _edit_profiles(a: RunArgs, edit: Callable[[str], str], expect: Callable[[dic
 
 
 def _run_app(name: str, p: Profile, **counts: Any) -> RunApp:
-    return RunApp(name=name, image=p.image, user=p.user, max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
+    return RunApp(name=name, namespace=p.namespace, priority=p.priority, image=p.image, user=p.user, max_gpus=p.max_gpus, default_gpu_mem_gb=p.default_gpu_mem_gb,
                   allow=p.allow, shm_gb=p.shm_gb, env=p.env, disabled=p.disabled, **counts)
 
 
@@ -1327,6 +1557,8 @@ def add_app(a: RunArgs, name: str, body: dict[str, Any]) -> RunApp:
     config = load_config(a.profiles)
     if name in config.profiles:
         raise Conflict(f"run app {name} exists (fleetctl app lists it); delete it first to replace it")
+    if not body.get("namespace"):
+        raise SystemExit("namespace: an existing namespace is required")
     profile = from_dict(Profile, body, strict=True, where="app")
     if not profile.image:
         raise SystemExit("image: the container image a run gets")

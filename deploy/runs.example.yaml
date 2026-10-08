@@ -13,6 +13,8 @@
 
 profiles:
   trainer:
+    namespace: system                  # existing admin-created namespace; use a user namespace for user jobs
+    priority: 10                       # inherited by jobs; higher values run first
     image: zkm-fleet-comfyui:22.04      # the userland the tree's venv was built against
     user: "1000:1000"                   # owner of the mounted paths
     max_gpus: 2
@@ -26,7 +28,7 @@ profiles:
       - /tmp/train_jobs
     env:
       HOME: /home/ubuntu
-    # A service that needs the cards may preempt a run of this app once it has run
+    # A higher-priority job/service in this namespace may preempt this run after
     # min_runtime_s: SIGTERM, SIGKILL stop_timeout_s later (also on cancel), then the
     # run queues again with the same id and out/, FLEET_ATTEMPT counting on, no --retry spent.
     preemptible: true

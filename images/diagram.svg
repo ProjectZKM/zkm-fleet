@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="900" viewBox="0 0 1320 900" role="img" aria-labelledby="title desc">
+<title id="title">zkm-fleet architecture</title>
+<desc id="desc">SDK clients reach the gateway and Rust proof scheduler backed by Postgres. fleetctl reaches the admin and runs APIs. The Python bridge reconciles configuration into Ray actors; Ray allocates GPUs and CPUs for prover nodes with local GPU servers, one-shot run containers, and persistent apps.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0 L8 4 L0 8Z" fill="#475569"/></marker><marker id="blueArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#2563eb"/></marker></defs>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}.title{font-size:26px;font-weight:700}.section{font-size:19px;font-weight:700}.name{font-size:18px;font-weight:700}.detail{font-size:15px;fill:#475569}.label{font-size:14px;fill:#475569}.line{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}.config{fill:none;stroke:#2563eb;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#blueArrow)}</style>
+<rect width="1320" height="900" fill="#ffffff"/>
+
+<text x="32" y="38" class="title" text-anchor="start">zkm-fleet · one fleet, shared GPU / CPU capacity</text>
+<rect x="65" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="83" y="109" class="name" text-anchor="start">Proof clients</text>
+<text x="83" y="133" class="detail" text-anchor="start">EthProofs / GOAT</text>
+<text x="83" y="153" class="detail" text-anchor="start">Ziren SDK network prover</text>
+<rect x="490" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="508" y="109" class="name" text-anchor="start">fleetctl</text>
+<text x="508" y="133" class="detail" text-anchor="start">App and job management</text>
+<text x="508" y="153" class="detail" text-anchor="start">Admin token</text>
+<rect x="915" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="933" y="109" class="name" text-anchor="start">App clients</text>
+<text x="933" y="133" class="detail" text-anchor="start">Studio / inference clients</text>
+<text x="933" y="153" class="detail" text-anchor="start">App-specific endpoints</text>
+<rect x="32" y="244" width="440" height="596" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
+<text x="55" y="274" class="section" text-anchor="start">Control machine</text>
+<rect x="50" y="288" width="404" height="405" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
+<text x="65" y="313" class="detail" text-anchor="start">Docker Compose</text>
+<rect x="65" y="334" width="370" height="88" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="83" y="363" class="name" text-anchor="start">Gateway · Envoy</text>
+<text x="83" y="387" class="detail" text-anchor="start">mTLS :51000 · HTTP :9191</text>
+<rect x="65" y="467" width="370" height="88" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="83" y="496" class="name" text-anchor="start">fleet-scheduler · Rust</text>
+<text x="83" y="520" class="detail" text-anchor="start">Proof queue, placement and credentials</text>
+<rect x="65" y="600" width="370" height="70" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="83" y="629" class="name" text-anchor="start">Postgres</text>
+<text x="83" y="653" class="detail" text-anchor="start">Proof apps, jobs and credentials</text>
+<rect x="65" y="732" width="370" height="86" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="83" y="761" class="name" text-anchor="start">Python bridge · apply</text>
+<text x="83" y="785" class="detail" text-anchor="start">services.yaml → detached Ray actors</text>
+<rect x="520" y="244" width="768" height="596" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
+<text x="543" y="274" class="section" text-anchor="start">Ray cluster · one Ray node per machine</text>
+<rect x="555" y="300" width="698" height="70" rx="12" fill="#dcfce7" stroke="#cbd5e1"/>
+<text x="573" y="329" class="name" text-anchor="start">Ray allocation &amp; execution</text>
+<text x="573" y="353" class="detail" text-anchor="start">Placement groups reserve resources; Ray restarts actors</text>
+<rect x="555" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="573" y="472" class="name" text-anchor="start">Proof node actor</text>
+<text x="573" y="496" class="detail" text-anchor="start">fleet-ziren-node</text>
+<text x="573" y="516" class="detail" text-anchor="start">One proof at a time</text>
+<rect x="955" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="973" y="472" class="name" text-anchor="start">GPU server container</text>
+<text x="973" y="496" class="detail" text-anchor="start">Ziren GPU prover</text>
+<text x="973" y="516" class="detail" text-anchor="start">Same machine as its node</text>
+<rect x="555" y="590" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="573" y="619" class="name" text-anchor="start">Runs API actor</text>
+<text x="573" y="643" class="detail" text-anchor="start">:9192 · admin token</text>
+<text x="573" y="663" class="detail" text-anchor="start">runs.yaml profiles</text>
+<rect x="955" y="590" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="973" y="619" class="name" text-anchor="start">One-shot run containers</text>
+<text x="973" y="643" class="detail" text-anchor="start">Training / batch jobs</text>
+<text x="973" y="663" class="detail" text-anchor="start">Use granted GPU / CPU capacity</text>
+<rect x="955" y="737" width="300" height="81" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
+<text x="973" y="766" class="name" text-anchor="start">Persistent app actors</text>
+<text x="973" y="790" class="detail" text-anchor="start">ComfyUI / inference containers</text>
+<text x="555" y="769" class="detail" text-anchor="start">Ray owns resource reservations.</text>
+<text x="555" y="793" class="detail" text-anchor="start">Each machine executes its workloads.</text>
+<path d="M235 188 V334" class="line"/>
+<rect x="240" y="212" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="246" y="227" class="label" text-anchor="start">mTLS · :51000</text>
+<path d="M490 134 H454 V378 H435" class="line"/>
+<rect x="359" y="212" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="365" y="227" class="label" text-anchor="start">admin · :9191</text>
+<path d="M660 188 V218 H508 V568 H705 V590" fill="none" stroke="#ffffff" stroke-width="7"/>
+<path d="M660 188 V218 H508 V568 H705 V590" class="line"/>
+<rect x="534" y="195" width="99.6" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="540" y="210" class="label" text-anchor="start">runs · :9192</text>
+<path d="M1255 134 H1272 V777 H1255" class="line"/>
+<path d="M250 422 V467" class="line"/>
+<rect x="256" y="435" width="77.7" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="262" y="450" class="label" text-anchor="start">stage API</text>
+<path d="M250 555 V600" class="line"/>
+<rect x="256" y="571" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="262" y="586" class="label" text-anchor="start">durable state</text>
+<path d="M435 484 H555" class="line"/>
+<rect x="434" y="455" width="70.4" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="440" y="470" class="label" text-anchor="start">dispatch</text>
+<path d="M555 520 H435" class="line"/>
+<rect x="434" y="532" width="114.2" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="440" y="547" class="label" text-anchor="start">:51001 control</text>
+<path d="M855 484 H955" class="line"/>
+<rect x="853" y="455" width="70.4" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="859" y="470" class="label" text-anchor="start">loopback</text>
+<path d="M855 637 H955" class="line"/>
+<rect x="863" y="610" width="55.8" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="869" y="625" class="label" text-anchor="start">launch</text>
+<path d="M435 775 H535 V398 H900 V370" class="config"/>
+<rect x="547" y="384" width="238.29999999999998" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="553" y="399" class="label" text-anchor="start">reconcile desired configuration</text>
+<text x="32" y="875" class="label" text-anchor="start">Solid arrows: API / execution paths. Dashed arrow: configuration reconciliation. Detailed ports are listed in the README.</text>
+</svg>

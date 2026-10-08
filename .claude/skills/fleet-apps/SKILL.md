@@ -1,76 +1,86 @@
 ---
 name: fleet-apps
 description: >-
-  Manage zkm-fleet apps with `fleetctl app`: proof apps (a tenant's registered program)
-  and run apps (runs.yaml profiles). List, describe, add, disable / enable, delete; the
-  rule that a job runs only for an existing app; registering a new guest ELF before a
-  client switches to it. Use for anything about what may run on the fleet.
+  Use the zkm-fleet app interface to list and inspect approved apps, or administer
+  app registration, priority, enable/disable and deletion with fleetctl.
 ---
 
-# Apps on zkm-fleet
+# Apps
 
-An **app** is what can run; a **job** is one instance of it (see fleet-jobs).
-**A job runs only for an existing app**: the scheduler refuses a proof whose program is
-not registered for its tenant, and the runs API refuses a run whose profile is not in
-`runs.yaml`.
+An app defines what may run. Every app belongs to an existing namespace; jobs
+inherit that namespace and the app's priority at submission. App types are
+`proof` and `run`. A persistent app is a run app with `persistent: true`.
 
-| app kind | what it is | named | defined by | its jobs |
-|---|---|---|---|---|
-| proof app | one tenant's program (an ELF; its id is the sha256 of the ELF) | `tenant/<first 8 hex of the elf id>` | `fleetctl app add tenant/<elf id>`; a row in Postgres (`fleet_apps`) | proofs through the stage API |
-| run app | a profile: image, user, GPU cap, default GPU memory, shm, the roots a run may mount, env | the profile's name | `fleetctl app add NAME --image I --allow ROOT …`; a block in `/etc/zkm-fleet/runs.yaml` on the control machine (example: `deploy/runs.example.yaml`) | runs (`fleetctl job submit --app NAME …`) |
+| App | Name | Job submission |
+|---|---|---|
+| Proof | `TENANT/FULL_ELF_SHA256`; lists abbreviate the hash | Ziren SDK network prover |
+| One-shot run | Profile name, such as `training` | `fleetctl job submit --app NAME` or `POST /runs` |
+| Persistent run | App name, such as `comfyui` | Managed with enable/disable; not a submission profile |
 
-A proof refused before its app was known (bad signature, unknown program) is recorded
-under `(rejected)`, which is not an app and takes nothing; `fleetctl app delete
-'(rejected)' --yes` clears those records.
+Users can inspect granted apps in their credential's namespace. App creation,
+policy changes and deletion require administrator access. Namespaces are created
+separately; adding an app never creates a namespace. Tags are optional access
+attributes, not another app type.
 
-## Commands
+## Inspect
 
-```
-fleetctl app                                   # both kinds: ENABLED, ACTIVE, JOBS, OK, FAILED, LAST JOB, detail (anchor node / image)
-fleetctl app NAME                              # one app's record and its 5 newest jobs
-fleetctl app add TENANT/<elf id>               # a proof app (TENANT/ --elf FILE hashes a local ELF instead)
-fleetctl app add NAME --image I --allow ROOT [--allow ROOT …] [--user UID:GID] [--max-gpus N] [--gpu-mem GiB] [--shm-gb N] [--env K=V …]
-fleetctl app disable NAME                      # no new jobs; the queued and running ones finish; history stays
-fleetctl app enable NAME
-fleetctl app delete NAME                       # says what it would delete
-fleetctl app delete NAME --yes                 # deletes; refused while any of its jobs is queued or running
+```bash
+fleetctl app
+fleetctl app --type proof
+fleetctl app --type run
+fleetctl --namespace NAME app APP
+fleetctl --json app
 ```
 
-`--type proof|run` narrows the list; `--json` on any command. A proof app's name may
-be given with the full elf id; when an 8-hex prefix matches two programs the command
-refuses and lists them.
+Select `--namespace NAME` when an app name matches more than one namespace. Use
+the full ELF hash when an abbreviated proof app name is ambiguous. Records show
+namespace, priority, enabled state and job counts.
 
-## Proof apps
+## Administrator: register and manage
 
-- `add`: the tenant must be configured in `fleet.yaml` (404 otherwise); the elf id is
-  64 hex digits (400 otherwise); an app registered twice is 409. The ELF itself is not
-  uploaded: it arrives with the first accepted job (the SDK sends it when the scheduler
-  does not have it yet).
-- **A new program (a guest change produces a new elf id) must be registered before
-  the client switches to it**, or every proof is refused with InvalidParameter
-  "program … is not an app of tenant …". Compute the id (`sha256sum guest.elf`, or
-  `fleetctl app add tenant/ --elf guest.elf` does it), register it, then switch the client.
-  The old app stays until you disable or delete it.
-- `delete` removes the registration, the jobs' records, inputs, proofs and public
-  values, the anchor (and the node's reservation for an exclusive tenant), and the ELF
-  unless another tenant has the same program registered.
+```bash
+fleetctl --namespace NAME app add TENANT/ --elf ./guest.elf --priority 100
+fleetctl --namespace NAME app add training --image APPROVED_IMAGE \
+  --allow /srv/training --max-gpus 2 --priority 10
+fleetctl --namespace NAME app priority APP 20
+fleetctl --namespace NAME app disable APP
+fleetctl --namespace NAME app enable APP
+fleetctl --namespace NAME app delete APP
+fleetctl --namespace NAME app delete APP --yes
+```
 
-## Run apps
+Register a new proof program before clients submit it. `--elf` computes the
+program's SHA256 locally; a full hash may be supplied in the app name instead.
+Proof registration requires an existing tenant. The ELF arrives with the first
+proof submission. Registering the same app twice in a namespace returns 409.
 
-- `add` writes the profile as a block into `runs.yaml`, re-reads the result, and writes
-  it only when nothing else in the file changed; comments and the other profiles stay as
-  they were. Every `--allow` root is an absolute path on the machine runs land on.
-  Omitted flags take the server's defaults (max_gpus 8, shm 16 GiB, the whole card).
-  Preemption is set in the profile (`runs.yaml`): `preemptible` (default true: a service
-  that needs the cards may stop a run, which queues again), `min_runtime_s` (default 300:
-  not before it ran this long), `stop_timeout_s` (default 30: SIGTERM to SIGKILL, on
-  cancel and preemption).
-- `disable` is `disabled: true` in the profile (a submit answers 409); `enable` removes it.
-- `delete` cuts the profile out of `runs.yaml`; its past runs stay listed (under a name
-  that is no longer an app, shown as "removed") with their logs and outputs.
-- Editing `runs.yaml` by hand is equivalent; the runs API reads the file on every request.
+A run app specifies an approved image, mount roots and GPU limit. Optional flags
+include `--user UID:GID`, `--gpu-mem GiB`, `--shm-gb N` and repeated `--env K=V` or
+`--allow ROOT`. Mount roots refer to execution-machine paths. Persistent app
+creation/deletion is outside the current app interface.
 
-## Lower-risk removal
+| Action | Proof or one-shot app | Persistent app |
+|---|---|---|
+| Disable | Refuse new submissions; accepted jobs finish | Stop execution and release GPU reservations after cleanup |
+| Enable | Accept submissions again | Start execution again |
+| Delete | Refused while jobs are active | Unsupported through this interface |
 
-`disable`, wait for `fleetctl job --app NAME --active` to be empty, then `delete`.
-Without `--yes`, `delete` only describes what would go.
+Deleting a proof app removes its job history and results in the selected
+namespace. Deleting a one-shot app keeps its past job records and outputs.
+Without `--yes`, deletion describes the proposed change.
+
+## Priority
+
+Priority is a signed integer, default `0`; higher values take precedence. Only
+administrators set it. Jobs keep the value inherited at submission across retries
+and requeue; editing an app affects new submissions. Users cannot override a
+job's priority. Pending jobs with equal priority use creation order, then ID.
+
+Automatic preemption considers eligible lower-priority runs in the same namespace.
+Equal/higher-priority runs, active proofs and persistent apps are protected.
+Namespace and optional tag quotas still apply. Updating a persistent app's
+priority alone preserves its current execution.
+
+Use [fleet-jobs](../fleet-jobs/SKILL.md) for submission and job lifecycle,
+[fleet-resources](../fleet-resources/SKILL.md) for namespaces and credentials,
+and [local submission](../../../docs/submit-jobs.md) for client API examples.
