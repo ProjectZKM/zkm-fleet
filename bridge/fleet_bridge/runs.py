@@ -1004,10 +1004,9 @@ def _end_actors(run_id: str, nodes: int) -> None:
 # stopped with grace (SIGTERM, SIGKILL its app's stop_timeout_s later), its attempt
 # recorded as preempted, and it queues again for cards with the same id, out/ and
 # FLEET_ATTEMPT counting on; a preemption spends no --retry. Only runs of a
-# `preemptible` app that have run its min_runtime_s are taken (one still waiting
-# for card memory at any time: it has nothing to lose), the newest first, on the
-# machine where the fewest of them free enough (Slurm's REQUEUE with PreemptExemptTime;
-# Kueue's "most recently admitted first").
+# `preemptible` app that have run its min_runtime_s are eligible (a run still waiting
+# for card memory has no running work to lose). The Rust scheduler chooses the plan;
+# this module keeps the run record and performs the stop, cleanup, and requeue.
 
 PREEMPTIBLE = (RunState.RUNNING, RunState.WAITING_VRAM, RunState.RETRYING)
 
@@ -1019,7 +1018,6 @@ class Candidate(Record):
     id: str
     namespace: str
     priority: int
-    tag: str | None = None
     node_ip: str
     gpus: float
     cpus: float
@@ -1029,96 +1027,6 @@ class Candidate(Record):
 
     def takeable(self, now: float) -> bool:
         return self.preemptible and (self.started_at is None or now - self.started_at >= self.min_runtime_s)
-
-
-@dataclass(kw_only=True)
-class Victims(Record):
-    """Where a service fits once these runs are preempted (none: it fits as is)."""
-
-    node_ip: str
-    runs: list[str] = field(default_factory=list)
-
-
-def choose_victims(need_gpus: float, need_cpus: float, free: dict[str, tuple[float, float]],
-                   candidates: list[Candidate], now: float, pin: str | None = None, *, namespace: str, priority: int) -> Victims | None:
-    """Choose only lower-priority runs in this namespace, lowest priority first.
-    Ties prefer fewer victims, then unstarted and newer executions.
-    """
-    best: Victims | None = None
-    best_score: tuple[int, ...] | None = None
-    for ip, (gpus, cpus) in sorted(free.items()):
-        if pin is not None and ip != pin:
-            continue
-        if gpus >= need_gpus and cpus >= need_cpus:
-            return Victims(node_ip=ip)
-        pool = sorted((c for c in candidates if c.node_ip == ip and c.namespace == namespace and c.priority < priority and c.takeable(now)),
-                      key=lambda c: (c.priority, c.started_at is not None, -(c.started_at or 0)))
-        picked: list[str] = []
-        priorities: list[int] = []
-        for c in pool:
-            if gpus >= need_gpus and cpus >= need_cpus:
-                break
-            picked.append(c.id)
-            priorities.append(c.priority)
-            gpus, cpus = gpus + c.gpus, cpus + c.cpus
-        score = tuple(sorted(priorities, reverse=True))
-        if gpus >= need_gpus and cpus >= need_cpus and (best_score is None or score < best_score):
-            best = Victims(node_ip=ip, runs=picked)
-            best_score = score
-    return best
-
-
-def plan_preemption(spec: RunSpec, free: dict[str, tuple[float, float]], pool: list[Candidate],
-                    now: float, quota_fits: Callable[[set[str]], bool]) -> list[str] | None:
-    """Plan a complete placement and quota fit before stopping any run.
-
-    Multi-node jobs need distinct nodes. Stopping a run credits all its ranks,
-    while namespace/tag quota is credited once for the whole execution.
-    """
-    eligible = [c for c in pool if c.namespace == spec.namespace and c.priority < spec.profile.priority and c.takeable(now)]
-    if not quota_fits({c.id for c in eligible}):
-        return None
-    available = dict(free)
-    selected: set[str] = set()
-    order: list[str] = []
-    placed: list[str] = []
-
-    def select(run_id: str) -> None:
-        if run_id in selected:
-            return
-        selected.add(run_id)
-        order.append(run_id)
-        for c in eligible:
-            if c.id == run_id and c.node_ip in available:
-                g, cpu = available[c.node_ip]
-                available[c.node_ip] = g + c.gpus, cpu + c.cpus
-
-    for rank in range(spec.nodes):
-        pin = spec.machine_resources[rank].split(":", 1)[1] if spec.machine_resources else None
-        victims = choose_victims(spec.gpus, max(spec.cpus, 1), available,
-            [c for c in eligible if c.id not in selected], now, pin,
-            namespace=spec.namespace or "", priority=spec.profile.priority)
-        if victims is None:
-            return None
-        for run_id in victims.runs:
-            select(run_id)
-        placed.append(victims.node_ip)
-        del available[victims.node_ip]
-    for c in sorted(eligible, key=lambda c: (c.priority, c.started_at is not None, -(c.started_at or 0), c.id)):
-        if quota_fits(selected):
-            break
-        select(c.id)
-    if not quota_fits(selected):
-        return None
-    # Avoid evicting runs that cannot help the occupied tag cap, or redundant ranks.
-    for run_id in reversed(order):
-        remaining = selected - {run_id}
-        if quota_fits(remaining) and all(
-            free[ip][0] + sum(c.gpus for c in eligible if c.id in remaining and c.node_ip == ip) >= spec.gpus
-            and free[ip][1] + sum(c.cpus for c in eligible if c.id in remaining and c.node_ip == ip) >= max(spec.cpus, 1)
-            for ip in placed):
-            selected = remaining
-    return [run_id for run_id in order if run_id in selected]
 
 
 def candidates(runs_dir: str) -> list[Candidate]:
@@ -1138,7 +1046,7 @@ def candidates(runs_dir: str) -> list[Candidate]:
         started = st.started_at if st.state is RunState.RUNNING else None
         for r in st.places():
             if r.node_ip:
-                out.append(Candidate(id=i, namespace=spec.namespace, priority=spec.profile.priority, tag=spec.tag, node_ip=r.node_ip, gpus=float(spec.gpus), cpus=float(max(spec.cpus, 1)),
+                out.append(Candidate(id=i, namespace=spec.namespace, priority=spec.profile.priority, node_ip=r.node_ip, gpus=float(spec.gpus), cpus=float(max(spec.cpus, 1)),
                                      started_at=started, preemptible=spec.profile.preemptible,
                                      min_runtime_s=spec.profile.min_runtime_s))
     return out

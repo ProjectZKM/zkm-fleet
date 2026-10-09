@@ -239,27 +239,26 @@ class Api:
                     run.update(detail=f"reconciling launch: {e}")
 
     def preempt_for(self, spec: Any) -> bool:
-        """Policy stays in Fleet; Ray supplies placement and physical availability."""
-        pool = [c for c in runs.candidates(self.runs_dir)
-                if c.namespace == spec.namespace and c.priority < spec.profile.priority and c.takeable(time.time())]
-        if not pool:
-            return False
-        scope = self.admin_namespace(spec.namespace, self.admin_token, spec.tag)
-        if scope.get("suspended_ms") is not None:
-            return False
-        allocations = self.scheduler("GET", f"/namespaces/{spec.namespace}/allocations")
-
-        def fits(victims: set[str]) -> bool:
-            remaining = [a for a in allocations if a["id"] != "run:" + spec.id and a["id"] not in {"run:" + i for i in victims}]
-            for quota, entries in ((scope["quota"], remaining),
-                                   (scope["tag_quota"], [a for a in remaining if a.get("tag") == spec.tag])):
-                for key, need in (("gpus", spec.gpus * spec.nodes), ("cpus", max(spec.cpus, 1) * spec.nodes)):
-                    if quota.get(key) is not None and sum(a[key] for a in entries) + need > quota[key] + 1e-9:
-                        return False
-            return True
-
+        """Ask Rust to apply Fleet policy; Python reports Ray facts and executes the plan."""
         from .rayapi import free_by_node_ip
-        victims = runs.plan_preemption(spec, free_by_node_ip(), pool, time.time(), fits)
+
+        free = free_by_node_ip()
+        machine_resources = spec.machine_resources or []
+        pins = [resource.split(":", 1)[1] if ":" in resource else None
+                for resource in machine_resources]
+        decision = self.scheduler("POST", "/preemption/plan", {
+            "contract_version": 1,
+            "namespace": spec.namespace, "tag": spec.tag, "priority": spec.profile.priority,
+            "gpus": spec.gpus, "cpus": max(spec.cpus, 1), "nodes": spec.nodes, "pins": pins,
+            "now": time.time(),
+            "free": [{"node_ip": ip, "gpus": gpus, "cpus": cpus} for ip, (gpus, cpus) in free.items()],
+            "candidates": [candidate.dump() for candidate in runs.candidates(self.runs_dir)],
+            "quota_demand": [spec.gpus * spec.nodes, max(spec.cpus, 1) * spec.nodes],
+            "exclude_allocation": f"run:{spec.id}",
+        })
+        if not decision or not decision.get("possible"):
+            return False
+        victims = decision.get("runs", [])
         if not victims:
             return False
         for run_id in victims:

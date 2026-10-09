@@ -240,6 +240,8 @@ def test_starting_service_preempts_only_lower_priority_runs_in_its_namespace(mon
     cfg = reconcile.load_services({"services":[{"name":"comfyui","kind":"app","namespace":"alice","priority":10,"gpus":1,"cpus":1}]})
     spec = reconcile.replica_specs(cfg)["comfyui-0"]
     monkeypatch.setattr(reconcile.Scheduler, "require_namespace", lambda self, ref: "1"*32)
+    plan = Mock(return_value={"possible": True, "runs": ["low"]})
+    monkeypatch.setattr(reconcile.Scheduler, "_call", plan)
     monkeypatch.setattr(reconcile, "free_by_node_ip", lambda: {"worker":(0,8)})
     pool = [runs.Candidate(id=id, namespace=ns, priority=p, node_ip="worker", gpus=1, cpus=1,
                           started_at=1, preemptible=True, min_runtime_s=0)
@@ -248,5 +250,13 @@ def test_starting_service_preempts_only_lower_priority_runs_in_its_namespace(mon
     preempt = Mock()
     monkeypatch.setattr(runs, "preempt", preempt)
     assert reconcile._preempt_runs_for(spec, reconcile.bundle(spec), "/runs") == ["low"]
+    plan.assert_called_once()
+    method, path, body = plan.call_args.args
+    assert (method, path) == ("POST", "/preemption/plan")
+    assert body["contract_version"] == 1
+    assert body["namespace"] == "1"*32
+    assert body["priority"] == 10
+    assert body["free"] == [{"node_ip":"worker", "gpus":0, "cpus":8}]
+    assert {candidate["id"] for candidate in body["candidates"]} == {"other", "equal", "low"}
     assert preempt.call_args.args[1] == "low"
     assert preempt.call_args.kwargs == {"requeue":True,"defer_requeue":True,"namespace":"1"*32,"priority":10}

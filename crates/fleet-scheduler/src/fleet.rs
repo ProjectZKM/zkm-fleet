@@ -394,6 +394,26 @@ impl Fleet {
         self.allocations.lock().values().filter(|a| a.namespace == namespace).cloned().collect()
     }
 
+    /// Decide which lower-priority runs may be stopped to admit higher-priority work.
+    /// Ray-derived capacity/candidate facts come from the adapter; namespace and quota
+    /// state always come from this scheduler.
+    pub fn plan_preemption(&self, request: crate::preemption::Request) -> anyhow::Result<crate::preemption::Plan> {
+        let namespace = self.namespace(&request.namespace)
+            .ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        if namespace.suspended_ms.is_some() {
+            return Ok(crate::preemption::Plan::impossible());
+        }
+        if let Some(tag) = request.tag.as_deref().filter(|tag| !tag.is_empty()) {
+            Self::validate_tag(tag).map_err(|e| refuse(400, e.to_string()))?;
+        }
+        let tag_quota = namespace.tag_quotas.get(request.tag.as_deref().unwrap_or(""))
+            .cloned().unwrap_or_default();
+        let allocations: Vec<_> = self.allocations.lock().values().cloned().collect();
+        crate::preemption::plan(request, &namespace.quota, &tag_quota, &allocations)
+            .map(|plan| plan.unwrap_or_else(crate::preemption::Plan::impossible))
+            .map_err(|e| refuse(400, e.to_string()))
+    }
+
     fn fits_quota(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64) -> bool {
         let Some(n) = self.namespace(namespace) else { return false; };
         let tag_quota = n.tag_quotas.get(tag.unwrap_or("")).cloned().unwrap_or_default();
