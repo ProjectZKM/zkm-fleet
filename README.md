@@ -12,7 +12,7 @@ One scheduler for the GPU / CPU workloads on our machines. Ray owns the cards; t
 
 ![Architecture diagram showing client paths, the control plane, Ray workloads, and job storage](images/diagram.svg)
 
-The control plane combines the Rust scheduler, Postgres, the HTTPS gateway, the MCP server and a Python reconciler. The gateway routes proof traffic and the MCP `/mcp` path over the existing TLS ingress. MCP initialization and `tools/list` are public; `tools/call` requires a namespace-scoped user token. Direct `fleetctl` administration and run API access use restricted SSH forwards, so the scheduler and runs API do not need public listeners.
+The control plane combines the Rust scheduler, Postgres, the HTTPS gateway, the MCP server and a Python reconciler. The gateway routes proof traffic and the MCP `/mcp` path over the existing TLS ingress. MCP initialization and `tools/list` are public; `tools/call` requires a namespace-scoped user token. Operators run `fleetctl` on the control host; remote users connect through HTTPS MCP or the proof SDK. Remote workers use outbound TLS gRPC heartbeats; Fleet does not use SSH channels between machines.
 
 Every worker machine runs a Ray node. Prover nodes initiate bidirectional gRPC heartbeats to the scheduler; heartbeat responses carry assignments, and completion metadata returns on later heartbeats. The scheduler does not open RPC connections to nodes. Ray allocates resources to proof workers, one-shot run containers and persistent app actors. Proof nodes write proof outputs to job artifact storage; the runs API manages PI task inputs and outputs in `RUNS_DIR`.
 
@@ -361,7 +361,7 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ## Operate
 
-`install.sh` puts `fleetctl` on the PATH; on the control machine it finds the admin token by itself (elsewhere set `FLEET_URL`, `FLEET_RUNS_URL` and `FLEET_ADMIN_TOKEN_FILE`, through an SSH tunnel to 9191 and 9192). Every command prints a formatted view; `--json` prints the data.
+`install.sh` puts `fleetctl` on the PATH. Run operator commands on the control host, where it finds the admin token and private scheduler API. Remote namespace users use the HTTPS MCP endpoint or the proof SDK. Every command prints a formatted view; `--json` prints the data.
 
 ```bash
 fleetctl app | app NAME | app add … | app disable NAME | app enable NAME | app delete NAME --yes
@@ -371,8 +371,10 @@ fleetctl namespace create NAME --tenant TENANT --out ENV --endpoint URL [--serve
 fleetctl token | token TOKEN_ID | token issue --namespace NAME … | token refresh TOKEN_ID … | token revoke TOKEN_ID
 ```
 
-Submit from your laptop with `fleetctl job submit` or `POST /runs` through an SSH
-tunnel.
+Remote namespace users submit proof jobs through the Ziren network SDK. Run jobs use
+the runs API on its configured host; it listens on loopback by default, so remote run
+submission needs an HTTPS API path before it is available to remote clients. Operators
+use `fleetctl` on the control host.
 
 ### MCP clients
 
@@ -456,7 +458,7 @@ For a private certificate authority, set `scheduler_ca_file` so prover container
 The installer sets this to its generated public CA certificate; distribute that CA to
 every machine Ray may place a prover on.
 The scheduler holds a PostgreSQL advisory lock for its lifetime, so only one process can
-dispatch from a database at a time. Direct `fleetctl` access uses restricted SSH forwards;
+dispatch from a database at a time. Fleet does not use SSH channels between machines;
 MCP exposes only user-scoped tools through the existing HTTPS gateway. User operations use `FLEET_TOKEN_FILE`; operators use
 `FLEET_ADMIN_TOKEN_FILE`. The runs API listens on loopback by default.
 
