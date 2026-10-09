@@ -1,6 +1,6 @@
 //! Submits a guest through the Ziren SDK's network prover, exactly as EthProofs and
 //! GOAT do: `cargo run --example sdk_submit -- <elf> <u32 input> [compressed|groth16] [--elf-id]`.
-//! Configure it with the env file `fleetctl credential issue` writes.
+//! Configure it with the env file `fleetctl token issue` writes.
 
 use std::time::{Duration, Instant};
 

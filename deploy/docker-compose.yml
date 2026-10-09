@@ -38,7 +38,7 @@ services:
     ports:
       - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
 
-  # Terminates mTLS and holds client calls across scheduler restarts (deploy/gateway.yaml.in).
+  # Terminates HTTPS and holds client calls across scheduler restarts (deploy/gateway.yaml.in).
   gateway:
     image: ${FLEET_GATEWAY_IMAGE:-envoyproxy/envoy:v1.35.3}
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
     ports:
-      - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (mTLS), external
+      - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (HTTPS; bearer token)
       - "${HTTP_BIND:-0.0.0.0}:9191:9191"         # public values, /admin, /healthz
 
 # The scheduler's address is fixed so the gateway can reach it without DNS.

@@ -14,10 +14,17 @@ use fleet_proto::stage::v1::{
 use crate::auth;
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::{now_ms, Fleet};
-use crate::store::{normalize_address, Job, JobState};
+use crate::store::{normalize_address, Job, JobState, Token};
 
 pub struct StageApi {
     pub fleet: Arc<Fleet>,
+}
+
+#[derive(Clone)]
+struct ProofCaller {
+    tenant: String,
+    address: String,
+    token: Option<Token>,
 }
 
 /// Maps the request's steps to a proof kind, as the SDK's network prover sets them.
@@ -52,9 +59,9 @@ impl StageApi {
         if !is_safe_id(proof_id) {
             return;
         }
-        let credential = self.fleet.credential_for_signer(&identity.1);
-        let tag = credential.as_ref().and_then(|c| c.tag.clone());
-        let namespace = credential.and_then(|c| c.namespace);
+        let token = self.fleet.token_for_signer(&identity.1);
+        let tag = token.as_ref().and_then(|c| c.tag.clone());
+        let namespace = token.and_then(|c| c.namespace);
         let job = Job {
             id: proof_id.to_string(),
             client_id: client_id.to_string(),
@@ -79,25 +86,26 @@ impl StageApi {
         let _ = self.fleet.submit(job).await;
     }
 
-    /// The tenant of the client certificate the gateway verified, when the scheduler takes
-    /// identity from it (`client_cert_identity`); Ok(None) when it does not.
-    fn cert_tenant(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<(String, String)>, Status> {
-        if !self.fleet.cfg.client_cert_identity {
-            return Ok(None);
+    /// Bearer tokens identify proof API callers. The proof signature independently binds
+    /// each submitted proof to its owner.
+    fn caller(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<ProofCaller>, Status> {
+        let bearer = md.get(crate::token::HEADER).and_then(|v| v.to_str().ok());
+        match bearer {
+            Some(value) => {
+                let token = self.fleet.token_for_token(Some(value)).ok_or_else(|| {
+                    Status::unauthenticated("missing, invalid or revoked user token")
+                })?;
+                Ok(Some(ProofCaller {
+                    tenant: token.tenant.clone(),
+                    address: token.address.clone(),
+                    token: Some(token),
+                }))
+            }
+            None => Ok(None),
         }
-        let header = md
-            .get(XFCC)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| Status::permission_denied("no client certificate"))?;
-        let cn = cert_subject_cn(header)
-            .ok_or_else(|| Status::permission_denied("the client certificate names no credential"))?;
-        self.fleet
-            .tenant_for_signer(&cn)
-            .map(|tenant| Some((tenant, normalize_address(&cn))))
-            .ok_or_else(|| Status::permission_denied("the client certificate's credential is unknown or revoked"))
     }
 
-    async fn generate(&self, req: GenerateProofRequest, cert: Option<(String, String)>) -> GenerateProofResponse {
+    async fn generate(&self, req: GenerateProofRequest, caller: Option<ProofCaller>) -> GenerateProofResponse {
         let id = req.proof_id.clone();
         if !is_safe_id(&id) {
             return self.reject(
@@ -106,29 +114,30 @@ impl StageApi {
                 "proof_id must be 1-128 of [A-Za-z0-9_-]",
             );
         }
-        // Serialize id reservation and blob writes: another credential cannot race a
+        // Serialize id reservation and blob writes: another token cannot race a
         // submission with the same id and replace its input or ownership.
         let _submission = self.fleet.stage_submissions.lock().await;
-        if cert.as_ref().is_some_and(|(_, a)| self.fleet.tenant_for_signer(a).is_none()) {
-            return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
-        }
         let recovered = auth::recover_signer(&req.signature, &id, req.block_no, req.seg_size).ok();
-        let owner = recovered.as_ref().map(|a| normalize_address(&a.to_string())).or_else(|| cert.as_ref().map(|(_, a)| a.clone()));
+        let owner = recovered.as_ref().map(|a| normalize_address(&a.to_string())).or_else(|| caller.as_ref().map(|c| c.address.clone()));
         if owner.is_none() {
             return self.reject(&id, StageStatus::InvalidParameter, "an authenticated job owner is required");
         }
-        let credential = owner.as_ref().and_then(|a| self.fleet.credential_for_signer(a));
-        let cert_credential = cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a));
-        let scoped = credential.as_ref().is_some_and(|c| c.apps.is_some())
-            || cert_credential.as_ref().is_some_and(|c| c.apps.is_some());
-        if scoped && (recovered.is_none() || credential.is_none() || cert.as_ref().is_none_or(|(_, a)| owner.as_ref() != Some(a))) {
-            return self.reject(&id, StageStatus::InvalidParameter, "the client certificate must match the signing credential");
+        if caller.as_ref().is_some_and(|c| recovered.is_none() || owner.as_ref() != Some(&c.address)) {
+            return self.reject(&id, StageStatus::InvalidParameter, "the proof signature must match the bearer token");
+        }
+        let token = caller.as_ref().and_then(|c| c.token.clone()).or_else(|| owner.as_ref().and_then(|a| self.fleet.token_for_signer(a)));
+        if token.as_ref().is_some_and(|t| t.namespace.is_some()) && caller.is_none() {
+            return self.reject(&id, StageStatus::InvalidParameter, "a bearer token is required for namespace proof access");
+        }
+        let scoped = token.as_ref().is_some_and(|c| c.apps.is_some());
+        if scoped && (recovered.is_none() || token.is_none() || caller.as_ref().is_none_or(|c| owner.as_ref() != Some(&c.address))) {
+            return self.reject(&id, StageStatus::InvalidParameter, "a matching user token and proof signature are required");
         }
         if !req.signature.is_empty() && owner.as_ref().is_none_or(|a| self.fleet.tenant_for_signer(a).is_none()) {
             return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
         }
-        let tag = credential.as_ref().and_then(|c| c.tag.clone());
-        let namespace = credential.as_ref().and_then(|c| c.namespace.clone());
+        let tag = token.as_ref().and_then(|c| c.tag.clone());
+        let namespace = token.as_ref().and_then(|c| c.namespace.clone());
         let job_id = if let Some(n) = &namespace {
             match self.fleet.namespace_job(n, tag.as_deref(), &id).await {
                 Ok(Some(j)) => j.id,
@@ -142,9 +151,9 @@ impl StageApi {
                 namespace.is_some() && namespace.as_deref() == Some(job.namespace.as_str()) && job.tag == tag.as_deref().unwrap_or("")
             } else {
                 signed_tenant.as_ref().is_some_and(|t| t == &job.tenant)
-                    && cert.as_ref().is_none_or(|(t, _)| t == &job.tenant)
+                    && caller.as_ref().is_none_or(|c| c.tenant == job.tenant)
             };
-            if !allowed && (self.fleet.cfg.require_signature || credential.is_some() || cert.is_some()) {
+            if !allowed && (self.fleet.cfg.require_signature || token.is_some() || caller.is_some()) {
                 return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
             }
             return GenerateProofResponse { proof_id: id, status: StageStatus::Computing as i32, ..Default::default() };
@@ -175,10 +184,10 @@ impl StageApi {
                     .ok_or_else(|| fail(StageStatus::InvalidParameter, "permission denied"))?,
                 None => return Err(fail(StageStatus::InvalidParameter, "permission denied")),
             };
-            if cert.as_ref().is_some_and(|(t, _)| *t != tenant) {
+            if caller.as_ref().is_some_and(|c| c.tenant != tenant) {
                 return Err(fail(
                     StageStatus::InvalidParameter,
-                    "the client certificate and the signature belong to different tenants",
+                    "the proof caller and signature belong to different tenants",
                 ));
             }
             let tcfg = self
@@ -198,8 +207,8 @@ impl StageApi {
             } else {
                 req.elf_id.clone().unwrap_or_default().trim_start_matches("0x").to_ascii_lowercase()
             };
-            if credential.as_ref().is_some_and(|c| c.apps.as_ref().is_some_and(|g| !g.contains(&format!("{tenant}/{elf_id}")))) {
-                return Err(fail(StageStatus::InvalidParameter, "app is not granted to this credential"));
+            if token.as_ref().is_some_and(|c| c.apps.as_ref().is_some_and(|g| !g.contains(&format!("{tenant}/{elf_id}")))) {
+                return Err(fail(StageStatus::InvalidParameter, "app is not granted to this token"));
             }
             if !self.fleet.app_known(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id) {
                 return Err(fail(
@@ -287,12 +296,13 @@ impl StageApi {
         }
     }
 
-    async fn status(&self, id: &str, cert: Option<(String, String)>) -> GetStatusResponse {
+    async fn status(&self, id: &str, caller: Option<ProofCaller>) -> GetStatusResponse {
         let mut resp = GetStatusResponse {
             proof_id: id.to_string(),
             ..Default::default()
         };
-        let internal = if let Some(c) = cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a)).filter(|c| c.namespace.is_some()) {
+        let caller_token = caller.as_ref().and_then(|c| c.token.clone());
+        let internal = if let Some(c) = caller_token.as_ref().filter(|c| c.namespace.is_some()) {
             match self.fleet.namespace_job(c.namespace.as_deref().unwrap(), c.tag.as_deref(), id).await {
                 Ok(Some(j)) => j.id,
                 _ => { resp.status = StageStatus::Unspecified as i32; return resp; }
@@ -301,9 +311,9 @@ impl StageApi {
         let id = internal.as_str();
         let allowed = match self.fleet.job(id).await {
             Ok(Some(j)) => match j.namespace.as_str() {
-                n if n != crate::store::SYSTEM_NAMESPACE => cert.as_ref().and_then(|(_, a)| self.fleet.credential_for_signer(a))
+                n if n != crate::store::SYSTEM_NAMESPACE => caller_token.as_ref()
                     .is_some_and(|c| c.namespace.as_deref() == Some(n) && c.tag.as_deref().unwrap_or("") == j.tag),
-                _ => cert.as_ref().is_none_or(|(t, a)| j.tenant == *t && self.fleet.credential_for_signer(a).is_none_or(|c| c.apps.is_none())),
+                _ => caller.as_ref().is_none_or(|c| j.tenant == c.tenant && c.token.as_ref().is_none_or(|t| t.apps.is_none())),
             },
             Ok(None) => false,
             Err(e) => {
@@ -316,7 +326,7 @@ impl StageApi {
         self.fleet
             .wait_terminal(id, Duration::from_millis(self.fleet.cfg.long_poll_ms))
             .await;
-        if cert.as_ref().is_some_and(|(_, a)| self.fleet.tenant_for_signer(a).is_none()) {
+        if caller.as_ref().is_some_and(|c| self.fleet.tenant_for_signer(&c.address).is_none()) {
             resp.status = StageStatus::Unspecified as i32;
             return resp;
         }
@@ -345,16 +355,16 @@ impl StageApi {
                 resp.status = s as i32;
                 resp.step = Step::End as i32;
             }
-            JobState::Succeeded => match self.fleet.blobs.get(id, blobs::PROOF) {
+            JobState::Succeeded => match self.fleet.blobs.sdk_output(&job, blobs::PROOF).await {
                 Ok(proof) => {
                     resp.status = StageStatus::Success as i32;
                     resp.step = Step::End as i32;
                     resp.proof_with_public_inputs = proof;
                     resp.public_values_url = if job.namespace != crate::store::SYSTEM_NAMESPACE {
-                        let issuer = &cert.as_ref().expect("namespaced status requires mTLS").1;
-                        format!("{}/{}/wrap/public_values.bin?credential={}&key={}",
-                            self.fleet.cfg.public_url.trim_end_matches('/'), id, issuer,
-                            self.fleet.public_values_key_for(id, issuer))
+                        let token = caller_token.as_ref().expect("namespaced status requires user token");
+                        format!("{}/{}/wrap/public_values.bin?token_id={}&key={}",
+                            self.fleet.cfg.public_url.trim_end_matches('/'), id, token.id,
+                            self.fleet.public_values_key_for(id, &token.id))
                     } else {
                         format!("{}/{}/wrap/public_values.bin?key={}",
                             self.fleet.cfg.public_url.trim_end_matches('/'), id, self.fleet.public_values_key(id))
@@ -379,47 +389,24 @@ impl StageService for StageApi {
         &self,
         request: Request<GenerateProofRequest>,
     ) -> Result<Response<GenerateProofResponse>, Status> {
-        let cert = self.cert_tenant(request.metadata())?;
-        Ok(Response::new(self.generate(request.into_inner(), cert).await))
+        let caller = self.caller(request.metadata())?;
+        Ok(Response::new(self.generate(request.into_inner(), caller).await))
     }
 
     async fn get_status(
         &self,
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let cert = self.cert_tenant(request.metadata())?;
+        let caller = self.caller(request.metadata())?;
         Ok(Response::new(
-            self.status(&request.into_inner().proof_id, cert).await,
+            self.status(&request.into_inner().proof_id, caller).await,
         ))
     }
-}
-
-/// The header the gateway sets from the verified client certificate.
-pub const XFCC: &str = "x-forwarded-client-cert";
-
-/// The CN of the certificate subject in an Envoy `x-forwarded-client-cert` value
-/// (`Hash=...;Subject="CN=0xabc...,O=..."`), lower-cased.
-pub fn cert_subject_cn(header: &str) -> Option<String> {
-    let start = header.find("Subject=\"")? + "Subject=\"".len();
-    let subject = &header[start..start + header[start..].find('"')?];
-    subject
-        .split(',')
-        .find_map(|part| part.trim().strip_prefix("CN="))
-        .map(|cn| cn.trim().to_ascii_lowercase())
-        .filter(|cn| !cn.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_certificate_subject_cn_is_read_from_envoys_header() {
-        let h = r#"Hash=3a1b;Subject="CN=0x8080B0BD27ab81883e976cbecdbd63e66f920404,O=zkm-fleet""#;
-        assert_eq!(cert_subject_cn(h).as_deref(), Some("0x8080b0bd27ab81883e976cbecdbd63e66f920404"));
-        assert_eq!(cert_subject_cn("Hash=3a1b").as_deref(), None);
-        assert_eq!(cert_subject_cn(r#"Subject="O=x""#).as_deref(), None);
-    }
 
     #[test]
     fn steps_map_to_kinds_like_the_sdk_sets_them() {

@@ -8,20 +8,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
-use tonic::codegen::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
 
-use fleet_proto::fleet::v1::{node_service_client::NodeServiceClient, NodeInfo, ProveRequest};
+use fleet_proto::fleet::v1::{Assignment, Completion, HeartbeatRequest, HeartbeatResponse, NodeInfo, ProveRequest};
 use fleet_proto::stage::v1::Status as StageStatus;
 
 use crate::blobs::{self, Blobs};
 use crate::config::{Anchor, Config};
 use crate::placement::{self, Choice, NodeView};
 use crate::quota::{Allocation, Quota, Usage};
-use crate::store::{normalize_address, Namespace, Credential, Job, JobState, Store};
-use crate::token;
+use crate::store::{normalize_address, Namespace, Token, Job, JobState, Store};
 
-pub type NodeClient = NodeServiceClient<InterceptedService<Channel, token::Attach>>;
 
 /// How an attempt failed, which decides whether it counts and what it says about the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +87,6 @@ struct JobEntry {
 pub struct Node {
     pub id: String,
     pub info: NodeInfo,
-    client: NodeClient,
     pub last_heartbeat: Instant,
     pub ready: bool,
     /// The job running there: dispatched by this scheduler, or `~job` as the node reported it.
@@ -105,12 +100,14 @@ pub struct Node {
 struct Inner {
     jobs: HashMap<String, JobEntry>,
     nodes: HashMap<String, Node>,
-    /// (tenant, elf_id) -> node name.
-    anchors: HashMap<(String, String), String>,
+    /// (namespace, tenant, elf_id) -> dedicated node name.
+    anchors: HashMap<(String, String, String), String>,
     /// node name -> tenant, for exclusive anchors.
     reserved: HashMap<String, String>,
     /// Node names taking no new jobs.
     draining: HashSet<String>,
+    /// Assignments become visible only after their job and quota are durable.
+    deliverable: HashSet<String>,
 }
 
 pub struct Fleet {
@@ -119,9 +116,10 @@ pub struct Fleet {
     pub store: Arc<dyn Store>,
     pub blobs: Blobs,
     cluster_token: String,
+    completion_ops: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
-    /// address -> credential, mirrored from the store.
-    creds: Mutex<HashMap<String, Credential>>,
+    /// address -> token, mirrored from the store.
+    tokens: Mutex<HashMap<String, Token>>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     allocations: Mutex<HashMap<String, Allocation>>,
     quota_ops: tokio::sync::Mutex<()>,
@@ -165,6 +163,7 @@ pub struct NodeStatus {
     pub machine: String,
     pub zkm_version: String,
     pub image: String,
+    pub proof_app: Option<String>,
     pub ready: bool,
     pub busy: Option<String>,
     pub reserved_for: Option<String>,
@@ -178,7 +177,7 @@ pub struct FleetStatus {
     pub queued: usize,
     pub running: usize,
     pub nodes: Vec<NodeStatus>,
-    pub anchors: Vec<(String, String, String)>,
+    pub anchors: Vec<(String, String, String, String)>,
 }
 
 impl Fleet {
@@ -194,8 +193,9 @@ impl Fleet {
             store,
             blobs,
             cluster_token,
+            completion_ops: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
-            creds: Mutex::new(HashMap::new()),
+            tokens: Mutex::new(HashMap::new()),
             namespaces: Mutex::new(HashMap::new()),
             allocations: Mutex::new(HashMap::new()),
             quota_ops: tokio::sync::Mutex::new(()),
@@ -277,7 +277,7 @@ impl Fleet {
         Ok(serde_json::json!({ "app": app_name(tenant, elf_id), "disabled": disabled }))
     }
 
-    pub async fn load_credentials(&self) -> anyhow::Result<usize> {
+    pub async fn load_tokens(&self) -> anyhow::Result<usize> {
         let mut allocations = self.store.allocations().await?;
         for a in &allocations {
             if let Some(id) = a.id.strip_prefix("proof:") {
@@ -287,13 +287,13 @@ impl Fleet {
         allocations = self.store.allocations().await?;
         *self.allocations.lock() = allocations.into_iter().map(|a| (a.id.clone(), a)).collect();
         *self.namespaces.lock() = self.store.namespaces().await?.into_iter().map(|n| (n.id.clone(), n)).collect();
-        let all = self.store.credentials().await?;
+        let all = self.store.tokens().await?;
         let n = all.len();
-        *self.creds.lock() = all.into_iter().map(|c| (c.address.clone(), c)).collect();
+        *self.tokens.lock() = all.into_iter().map(|c| (c.address.clone(), c)).collect();
         Ok(n)
     }
 
-    /// Tenant of a request signer: a live credential, else an address listed in the config.
+    /// Tenant of a request signer: a live token, else an address listed in the config.
     /// The key a public values URL carries: an HMAC of the proof id under a secret derived
     /// from the cluster token, so the URL works only for whoever GetStatus gave it to.
     pub fn public_values_key(&self, proof_id: &str) -> String {
@@ -328,7 +328,7 @@ impl Fleet {
             && name.as_bytes()[0].is_ascii_lowercase()
             && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
             && !matches!(name, "system" | "admin"), "invalid or reserved namespace name");
-        let n = Namespace { quota, tag_quotas: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), name: name.into(), created_ms: now_ms(), suspended_ms: None };
+        let n = Namespace { quota, tag_quotas: [("default".into(), Default::default())].into_iter().collect(), id: uuid::Uuid::new_v4().simple().to_string(), name: name.into(), created_ms: now_ms(), suspended_ms: None };
         self.store.add_namespace(&n).await?;
         self.namespaces.lock().insert(n.id.clone(), n.clone());
         Ok(n)
@@ -337,7 +337,7 @@ impl Fleet {
     pub fn tags(&self, namespace: &str) -> Vec<String> {
         let mut tags = std::collections::BTreeSet::new();
         if let Some(n) = self.namespace(namespace) { tags.extend(n.tag_quotas.keys().filter(|t|!t.is_empty()).cloned()); }
-        tags.extend(self.creds.lock().values().filter(|c|c.namespace.as_deref()==Some(namespace)).filter_map(|c|c.tag.clone()));
+        tags.extend(self.tokens.lock().values().filter(|c|c.namespace.as_deref()==Some(namespace)).filter_map(|c|c.tag.clone()));
         tags.extend(self.allocations.lock().values().filter(|a|a.namespace==namespace).filter_map(|a|a.tag.clone()));
         tags.into_iter().collect()
     }
@@ -466,14 +466,15 @@ impl Fleet {
             gpus: node.info.gpus as f64, cpus: node.info.cpus as f64 }, restore).is_ok()
     }
 
-    fn credential_active(&self, c: &Credential) -> bool {
+    fn token_active(&self, c: &Token) -> bool {
         c.revoked_ms.is_none() && match &c.namespace {
             Some(id) => self.namespace(id).is_some_and(|n| n.suspended_ms.is_none()),
             None => c.apps.is_none(),
         }
     }
-    pub fn access_record(&self, c: &Credential) -> serde_json::Value {
-        let mut v = serde_json::to_value(c).expect("credential serialization");
+    pub fn access_record(&self, c: &Token) -> serde_json::Value {
+        let mut v = serde_json::to_value(c).expect("token serialization");
+        if c.apps.is_none() { v["apps"] = serde_json::json!([]); }
         if let Some(n) = c.namespace.as_ref().and_then(|id| self.namespace(id)) {
             v["namespace_name"] = serde_json::json!(n.name);
             v["quota"] = serde_json::json!(n.quota);
@@ -485,27 +486,31 @@ impl Fleet {
 
     pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
         let a = normalize_address(address);
-        let registered = self.creds.lock().get(&a).cloned();
+        let registered = self.tokens.lock().get(&a).cloned();
         if let Some(c) = registered {
-            return self.credential_active(&c).then_some(c.tenant);
+            return self.token_active(&c).then_some(c.tenant);
         }
         self.cfg.tenant_for_address(&a).map(|t| t.name.clone())
     }
 
-    pub fn credential_for_signer(&self, address: &str) -> Option<Credential> {
-        let c = self.creds.lock().get(&normalize_address(address)).cloned()?;
-        self.credential_active(&c).then_some(c)
+    pub fn token_for_signer(&self, address: &str) -> Option<Token> {
+        let c = self.tokens.lock().get(&normalize_address(address)).cloned()?;
+        self.token_active(&c).then_some(c)
     }
 
-    pub fn credential_for_token(&self, header: Option<&str>) -> Option<Credential> {
+    pub fn token_for_id(&self, id: &str) -> Option<Token> {
+        self.tokens.lock().values().find(|t| t.id == id).cloned().filter(|t| self.token_active(t))
+    }
+
+    pub fn token_for_token(&self, header: Option<&str>) -> Option<Token> {
         use sha2::Digest;
         use subtle_eq::ConstantTimeEq;
         let token = header?.strip_prefix("Bearer ")?;
         if token.len() < 64 { return None; }
         let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-        let c = self.creds.lock().values().find(|c| c.apps.is_some()
+        let c = self.tokens.lock().values().find(|c| (c.apps.is_some() || c.manage_apps)
             && c.token_hash.as_ref().is_some_and(|h| h.as_bytes().ct_eq(hash.as_bytes()))).cloned()?;
-        self.credential_active(&c).then_some(c)
+        self.token_active(&c).then_some(c)
     }
 
     pub async fn namespace_job(&self, namespace: &str, tag: Option<&str>, client_id: &str) -> anyhow::Result<Option<Job>> {
@@ -523,17 +528,18 @@ impl Fleet {
         self.public_values_key(&format!("{id}\0{issuer}"))
     }
 
-    pub async fn add_credential(
+    pub async fn add_token(
         &self,
         tenant: &str,
+        id: &str,
         address: &str,
         label: &str,
-    ) -> anyhow::Result<Credential> {
-        self.add_user_credential(tenant, address, label, None, None, None, None).await
+    ) -> anyhow::Result<Token> {
+        self.add_user_token(tenant, id, address, label, None, None, None, None, false).await
     }
 
-    pub async fn add_user_credential(&self, tenant: &str, address: &str, label: &str,
-        apps: Option<Vec<String>>, token_hash: Option<String>, namespace: Option<String>, tag: Option<String>) -> anyhow::Result<Credential> {
+    pub async fn add_user_token(&self, tenant: &str, id: &str, address: &str, label: &str,
+        apps: Option<Vec<String>>, token_hash: Option<String>, namespace: Option<String>, tag: Option<String>, manage_apps: bool) -> anyhow::Result<Token> {
         anyhow::ensure!(self.cfg.tenant(tenant).is_some(), "unknown tenant {tenant}");
         let namespace = match namespace {
             Some(reference) => {
@@ -547,18 +553,17 @@ impl Fleet {
             anyhow::ensure!(namespace.is_some(), "tag requires namespace");
             Self::validate_tag(tag)?;
         }
-        anyhow::ensure!(apps.is_none() || namespace.is_some(), "user credentials require an existing namespace");
+        anyhow::ensure!(apps.is_none() || namespace.is_some(), "user tokens require an existing namespace");
         anyhow::ensure!(apps.is_none() || namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved for operator-managed apps");
-        anyhow::ensure!(apps.is_some() || namespace.is_none(), "namespaced credentials require explicit app grants");
-
-        anyhow::ensure!(token_hash.is_none() || apps.is_some(), "user token requires explicit app grants");
+        anyhow::ensure!(apps.is_some() || namespace.is_none() || manage_apps, "namespaced tokens require explicit app grants");
+        anyhow::ensure!(!manage_apps || (namespace.is_some() && tag.is_some() && token_hash.is_some()), "app-management tokens require a namespace, tag and API token");
+        anyhow::ensure!(token_hash.is_none() || apps.is_some() || manage_apps, "user token requires explicit app grants or app-management permission");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");
         }
         if let Some(grants) = &apps {
             for app in grants {
                 if let Some((t, elf)) = app.split_once('/') {
-                    anyhow::ensure!(self.cfg.client_cert_identity, "proof user access requires client_cert_identity and mTLS");
                     anyhow::ensure!(t == tenant && elf.len() == 64 && elf.bytes().all(|b| b.is_ascii_hexdigit())
                         && self.app_known(namespace.as_deref().expect("user namespace"), t, elf), "proof grant must name a registered program in this namespace and tenant with its full ELF id");
                 } else {
@@ -571,7 +576,10 @@ impl Fleet {
             address.len() == 40 && address.bytes().all(|b| b.is_ascii_hexdigit()),
             "not an address"
         );
-        let c = Credential {
+        let id = id.to_ascii_lowercase();
+        anyhow::ensure!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()), "token id must be 32 hex characters");
+        let c = Token {
+            id,
             address: address.clone(),
             tenant: tenant.into(),
             label: label.into(),
@@ -580,24 +588,25 @@ impl Fleet {
             apps,
             namespace,
             tag,
+            manage_apps,
             token_hash: token_hash.map(|s| s.to_ascii_lowercase()),
         };
-        self.store.add_credential(&c).await?;
-        self.creds.lock().insert(address, c.clone());
+        self.store.add_token(&c).await?;
+        self.tokens.lock().insert(address, c.clone());
         Ok(c)
     }
 
-    pub async fn revoke_credential(&self, address: &str) -> anyhow::Result<bool> {
+    pub async fn revoke_token(&self, id: &str) -> anyhow::Result<bool> {
         let at = now_ms();
-        let found = self.store.revoke_credential(address, at).await?;
-        if let Some(c) = self.creds.lock().get_mut(&normalize_address(address)) {
+        let found = self.store.revoke_token(id, at).await?;
+        if let Some(c) = self.tokens.lock().values_mut().find(|t| t.id == id) {
             c.revoked_ms = Some(at);
         }
         Ok(found)
     }
 
-    pub fn credentials(&self) -> Vec<Credential> {
-        let mut v: Vec<Credential> = self.creds.lock().values().cloned().collect();
+    pub fn tokens(&self) -> Vec<Token> {
+        let mut v: Vec<Token> = self.tokens.lock().values().cloned().collect();
         v.sort_by_key(|c| c.created_ms);
         v
     }
@@ -624,7 +633,6 @@ impl Fleet {
                 // `node` stays as a hint: that node may still be proving the job and
                 // hands the result over when asked again (see `assign`).
                 j.state = JobState::Queued;
-                j.attempts = j.attempts.saturating_sub(1);
                 self.store.upsert(j).await?;
             }
         }
@@ -698,7 +706,7 @@ impl Fleet {
             .await?
             .into_iter()
             .map(|a| {
-                let node = anchors.get(&(a.tenant.clone(), a.elf_id.clone())).cloned();
+                let node = anchors.get(&(a.namespace.clone(), a.tenant.clone(), a.elf_id.clone())).cloned();
                 let mut v = serde_json::to_value(&a).unwrap_or_default();
                 v["name"] = serde_json::json!(app_name(&a.tenant, &a.elf_id));
                 v["anchored_on"] = serde_json::json!(node);
@@ -707,8 +715,9 @@ impl Fleet {
             .collect())
     }
 
-    /// Deletes a proof app: its registration, its jobs' records and files, its anchor, and
-    /// its ELF when no other app uses it. Refused while any of its jobs is queued or running.
+    /// Deletes a proof app, its terminal job records and their inputs and outputs, and its
+    /// anchor. Removes the ELF only when no other app or job uses it. Refused while any of
+    /// its jobs is queued or running.
     pub async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         let apps = self.store.apps().await?;
@@ -738,13 +747,10 @@ impl Fleet {
             for id in &ids {
                 inner.jobs.remove(id);
             }
-            if !apps.iter().any(|a| a.namespace != namespace && a.tenant == tenant && a.elf_id == elf_id) {
-                if let Some(node) = inner.anchors.remove(&(tenant.to_string(), elf_id.to_string())) {
-                    // Keep a shared physical anchor until its last namespace registration is gone.
-                    let still = inner.anchors.iter().any(|((t, _), n)| t == tenant && *n == node);
-                    if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
-                        inner.reserved.remove(&node);
-                    }
+            if let Some(node) = inner.anchors.remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string())) {
+                let still = inner.anchors.iter().any(|((_, t, _), n)| t == tenant && *n == node);
+                if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
+                    inner.reserved.remove(&node);
                 }
             }
         }
@@ -806,48 +812,51 @@ impl Fleet {
         Some(e.job.clone())
     }
 
-    async fn persist(&self, job: Option<Job>) {
-        if let Some(j) = job {
-            if let Err(e) = self.store.upsert(&j).await {
-                tracing::error!(job = %j.id, "persisting job failed: {e:#}");
-            }
-        }
-    }
-
     // ---------------------------------------------------------------- nodes
 
-    pub fn register(&self, info: NodeInfo) -> anyhow::Result<String> {
+    pub fn register(&self, mut info: NodeInfo) -> anyhow::Result<String> {
         anyhow::ensure!(!info.name.is_empty(), "node name is empty");
-        let endpoint = Endpoint::from_shared(info.endpoint.clone())?
-            .connect_timeout(Duration::from_secs(5))
-            .tcp_keepalive(Some(Duration::from_secs(30)));
-        let channel = endpoint.connect_lazy();
-        let client =
-            NodeServiceClient::with_interceptor(channel, token::Attach::new(&self.cluster_token)?)
-                .max_decoding_message_size(1 << 30)
-                .max_encoding_message_size(1 << 30);
+        anyhow::ensure!(info.control_version == 1, "worker must support heartbeat control version 1; upgrade the node binary");
+        let app_fields = [!info.app_namespace.is_empty(), !info.app_tenant.is_empty(), !info.app_elf_id.is_empty()];
+        anyhow::ensure!(app_fields.iter().all(|v| *v) || app_fields.iter().all(|v| !*v),
+            "dedicated proof app identity requires namespace, tenant and elf_id together");
+        if !info.app_namespace.is_empty() {
+            let namespace = self.namespace(&info.app_namespace).ok_or_else(|| anyhow::anyhow!("proof node names an unknown namespace"))?;
+            info.app_namespace = namespace.id;
+            anyhow::ensure!(self.cfg.tenant(&info.app_tenant).is_some(), "proof node names an unknown tenant");
+            anyhow::ensure!(info.app_elf_id.len() == 64 && info.app_elf_id.bytes().all(|b| b.is_ascii_hexdigit()), "proof node app elf_id must be 64 hex digits");
+            info.app_elf_id.make_ascii_lowercase();
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let mut inner = self.inner.lock();
-        let fresh = Duration::from_secs(2 * self.cfg.heartbeat_secs.max(1) as u64);
-        if let Some(other) = inner.nodes.values().find(|n| {
-            n.info.name == info.name
-                && n.info.endpoint != info.endpoint
-                && n.last_heartbeat.elapsed() < fresh
-        }) {
-            tracing::warn!(node = %info.name, live = %other.info.endpoint, new = %info.endpoint,
-                "two live processes claim this node name; the newer registration replaces the older");
+        if let Some(previous) = inner.nodes.values().find(|n| n.info.name == info.name) {
+            let same_app = previous.info.app_namespace == info.app_namespace
+                && previous.info.app_tenant == info.app_tenant
+                && previous.info.app_elf_id == info.app_elf_id;
+            anyhow::ensure!(
+                same_app || previous.busy.is_none(),
+                "cannot change the proof app binding of a busy node"
+            );
+            if !same_app {
+                inner.anchors.retain(|_, node| node != &info.name);
+                inner.reserved.remove(&info.name);
+            }
         }
         inner.nodes.retain(|_, n| n.info.name != info.name);
-        tracing::info!(node = %info.name, endpoint = %info.endpoint, backend = %info.backend, gpus = info.gpus, "node registered");
+        // A replacement session keeps the original execution and its reservation.
+        // The worker can resume the same lease without waiting for a scheduler restart.
+        let busy = inner.jobs.values()
+            .find(|e| e.job.state == JobState::Running && e.job.node.as_deref() == Some(info.name.as_str()))
+            .map(|e| e.job.id.clone());
+        tracing::info!(node = %info.name, backend = %info.backend, gpus = info.gpus, "node registered");
         inner.nodes.insert(
             id.clone(),
             Node {
                 id: id.clone(),
                 info,
-                client,
                 last_heartbeat: Instant::now(),
                 ready: false,
-                busy: None,
+                busy,
                 last_released: None,
                 cached: HashSet::new(),
             },
@@ -896,7 +905,8 @@ impl Fleet {
         }
     }
 
-    /// Drops nodes that stopped heartbeating; their running jobs fail over when the RPC errors.
+    /// Drops expired sessions. Uncertain executions retain their resource reservations
+    /// until the original worker reconnects and reports their outcome.
     pub fn sweep(&self) {
         let stale = Duration::from_secs(self.cfg.node_stale_secs);
         let mut inner = self.inner.lock();
@@ -935,6 +945,7 @@ impl Fleet {
                 machine: n.info.machine.clone(),
                 zkm_version: n.info.zkm_version.clone(),
                 image: n.info.image.clone(),
+                proof_app: (!n.info.app_namespace.is_empty()).then(|| format!("{}/{}/{}", n.info.app_namespace, n.info.app_tenant, n.info.app_elf_id)),
                 ready: n.ready,
                 busy: n.busy.clone(),
                 reserved_for: inner.reserved.get(&n.info.name).cloned(),
@@ -947,7 +958,7 @@ impl Fleet {
         let anchors = inner
             .anchors
             .iter()
-            .map(|((t, e), n)| (t.clone(), e.clone(), n.clone()))
+            .map(|((namespace, t, e), n)| (namespace.clone(), t.clone(), e.clone(), n.clone()))
             .collect();
         FleetStatus {
             queued,
@@ -965,7 +976,7 @@ impl Fleet {
         loop {
             for (job_id, node_id) in self.assign() {
                 let me = self.clone();
-                tokio::spawn(async move { me.run(job_id, node_id).await });
+                tokio::spawn(async move { me.prepare(job_id, node_id).await });
             }
             tokio::select! {
                 _ = self.wake.notified() => {}
@@ -1015,7 +1026,13 @@ impl Fleet {
                     .find(|n| n.busy.as_deref() == Some(mine.as_str()))
                     .map(|n| n.info.name.clone())
             });
-            if let Some(hint) = hint.as_ref().filter(|h| placement::allowed(tenant, h)) {
+            if let Some(hint) = hint.as_ref().filter(|h| {
+                placement::allowed(tenant, h) && inner.nodes.values().any(|n| {
+                    &n.info.name == *h && n.info.app_namespace == job.namespace
+                        && n.info.app_tenant == job.tenant
+                        && n.info.app_elf_id.eq_ignore_ascii_case(&job.elf_id)
+                })
+            }) {
                 let at = inner
                     .nodes
                     .values()
@@ -1055,7 +1072,10 @@ impl Fleet {
                         backend: n.info.backend.clone(),
                         gpus: n.info.gpus,
                         zkm_version: n.info.zkm_version.clone(),
-                        ready: n.ready && !inner.draining.contains(&n.info.name)
+                        ready: n.ready && n.info.app_namespace == job.namespace
+                            && n.info.app_tenant == job.tenant
+                            && n.info.app_elf_id.eq_ignore_ascii_case(&job.elf_id)
+                            && !inner.draining.contains(&n.info.name)
                             && self.fits_quota(&job.namespace, (!job.tag.is_empty()).then_some(job.tag.as_str()), &format!("proof:{}", job.id), n.info.gpus as f64, n.info.cpus as f64),
                         busy: n.busy.is_some(),
                         reserved_for: inner.reserved.get(&n.info.name).cloned(),
@@ -1063,7 +1083,7 @@ impl Fleet {
                     }
                 })
                 .collect();
-            let anchor_key = (job.tenant.clone(), job.elf_id.clone());
+            let anchor_key = (job.namespace.clone(), job.tenant.clone(), job.elf_id.clone());
             let anchor = inner.anchors.get(&anchor_key).cloned();
             match placement::choose(tenant, &job.failed_on, anchor.as_deref(), &views) {
                 Choice::Run(i) => {
@@ -1088,7 +1108,8 @@ impl Fleet {
     ) {
         let name = inner.nodes[node_id].info.name.clone();
         let elf_id = inner.jobs[job_id].job.elf_id.clone();
-        let anchor_key = (tenant.name.clone(), elf_id.clone());
+        let namespace = inner.jobs[job_id].job.namespace.clone();
+        let anchor_key = (namespace, tenant.name.clone(), elf_id.clone());
         let anchor = inner.anchors.get(&anchor_key).cloned();
         if tenant.anchor != Anchor::None && anchor.as_deref() != Some(name.as_str()) {
             if let Some(old) = anchor {
@@ -1106,15 +1127,20 @@ impl Fleet {
         let e = inner.jobs.get_mut(job_id).unwrap();
         e.job.state = JobState::Running;
         e.job.node = Some(name);
-        e.job.attempts += 1;
-        e.job.started_ms = Some(now_ms());
+        if e.job.started_ms.is_none() {
+            e.job.attempts += 1;
+            e.job.started_ms = Some(now_ms());
+        }
         e.changed.send_modify(|v| *v += 1);
     }
 
-    fn release(&self, node_id: &str, elf_id: Option<&str>) {
+    fn release(&self, node_id: &str, job_id: &str, elf_id: Option<&str>) {
         let mut inner = self.inner.lock();
         if let Some(n) = inner.nodes.get_mut(node_id) {
-            n.last_released = n.busy.take();
+            if n.busy.as_deref() == Some(job_id) || n.busy.as_deref() == Some(reported(job_id).as_str()) {
+                n.last_released = Some(job_id.to_string());
+                n.busy = None;
+            }
             if let Some(e) = elf_id {
                 n.cached.insert(e.to_string());
             }
@@ -1123,114 +1149,115 @@ impl Fleet {
         self.wake.notify_one();
     }
 
-    async fn run(self: Arc<Self>, job_id: String, node_id: String) {
-        let Some(job) = self.inner.lock().jobs.get(&job_id).map(|e| e.job.clone()) else {
-            return;
-        };
-        self.persist(Some(job.clone())).await;
-        let allocation = self.allocations.lock().get(&format!("proof:{job_id}")).cloned();
-        if let Some(a) = allocation {
-            if let Err(e) = self.store.reserve(&a).await {
-                self.allocations.lock().remove(&a.id);
-                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
-                self.release(&node_id, None);
-                let j = self.update_job(&job_id, |j| {
-                    j.state = JobState::Failed(StageStatus::InternalError);
-                    j.error = format!("persisting namespace allocation: {e:#}");
-                    j.finished_ms = Some(now_ms());
-                });
-                self.persist(j).await;
-                return;
+    /// Persist before offering work in a heartbeat response. No outbound node RPC.
+    async fn prepare(self: Arc<Self>, job_id: String, _node_id: String) {
+        loop {
+            let _ops = self.completion_ops.lock().await;
+            let Some(job) = self.inner.lock().jobs.get(&job_id).map(|e| e.job.clone()) else { return; };
+            if job.state != JobState::Running { return; }
+            let allocation = self.allocations.lock().get(&format!("proof:{job_id}")).cloned();
+            let durable = async {
+                if let Some(a) = allocation { self.store.reserve(&a).await?; }
+                self.store.upsert(&job).await
+            }.await;
+            match durable {
+                Ok(()) => { self.inner.lock().deliverable.insert(job_id); return; }
+                Err(e) => tracing::error!(job = %job_id, "persisting assignment: {e:#}"),
             }
+            if self.stopping.load(Ordering::SeqCst) { return; }
+            drop(_ops);
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        let found = self
-            .inner
-            .lock()
-            .nodes
-            .get(&node_id)
-            .map(|n| (n.client.clone(), n.cached.contains(&job.elf_id)));
-        let Some((client, has_elf)) = found else {
-            self.fail_attempt(
-                &job_id,
-                &node_id,
-                "node left before the job started",
-                Failure::NotStarted,
-            )
-            .await;
-            return;
-        };
-        let request = match self.build_request(&job, !has_elf) {
-            Ok(r) => r,
-            Err(e) => {
-                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
-                self.release(&node_id, None);
-                let j = self.update_job(&job_id, |j| {
-                    j.state = JobState::Failed(StageStatus::InternalError);
-                    j.error = format!("reading inputs: {e:#}");
-                    j.finished_ms = Some(now_ms());
-                });
-                self.persist(j).await;
-                return;
+    }
+
+    fn assignment(job: &Job) -> Assignment {
+        Assignment { job_id: job.id.clone(), elf_id: job.elf_id.clone(),
+            lease: format!("{}-{}", job.attempts, job.started_ms.unwrap_or(0)) }
+    }
+
+    /// Fence input access and completion reports by session, worker and execution attempt.
+    pub async fn assigned_job(&self, node_id: &str, a: &Assignment) -> Result<Job, tonic::Status> {
+        let name = self.inner.lock().nodes.get(node_id).map(|n| n.info.name.clone())
+            .ok_or_else(|| tonic::Status::not_found("node session expired; register again"))?;
+        let j = self.job(&a.job_id).await.map_err(|e| tonic::Status::internal(e.to_string()))?
+            .ok_or_else(|| tonic::Status::not_found("job missing"))?;
+        if j.node.as_deref() != Some(&name) || j.started_ms.is_none()
+            || Self::assignment(&j) != *a {
+            return Err(tonic::Status::failed_precondition("assignment superseded"));
+        }
+        Ok(j)
+    }
+
+    pub async fn fetch_inputs(&self, node_id: &str, a: &Assignment, with_elf: bool) -> Result<ProveRequest, tonic::Status> {
+        let j = self.assigned_job(node_id, a).await?;
+        if j.state.is_terminal() { return Err(tonic::Status::failed_precondition("job already finished")); }
+        self.build_request(&j, with_elf).map_err(|e| tonic::Status::internal(e.to_string()))
+    }
+
+    pub async fn exchange(&self, r: HeartbeatRequest) -> Result<HeartbeatResponse, tonic::Status> {
+        // Completion acknowledgments are sent only after durable state and quota cleanup.
+        if !self.heartbeat(&r.node_id, r.ready, r.cached_elf_ids, r.busy, &r.running_job) {
+            return Ok(HeartbeatResponse { known: false, ..Default::default() });
+        }
+        let mut completed_lease = String::new();
+        if let Some(c) = r.completion {
+            let _ops = self.completion_ops.lock().await;
+            let a = c.assignment.as_ref().ok_or_else(|| tonic::Status::invalid_argument("completion assignment missing"))?;
+            match self.assigned_job(&r.node_id, a).await {
+                Ok(j) => self.complete(&r.node_id, j, c.clone()).await?,
+                // A delayed result from an older attempt is acknowledged and discarded.
+                Err(e) if e.code() == tonic::Code::FailedPrecondition || e.code() == tonic::Code::NotFound => {},
+                Err(e) => return Err(e),
             }
+            completed_lease = a.lease.clone();
+        }
+        let assignment = {
+            let inner = self.inner.lock();
+            inner.nodes.get(&r.node_id).filter(|n| n.ready).and_then(|n| {
+                n.busy.as_ref().filter(|id| inner.deliverable.contains(*id))
+                    .and_then(|id| inner.jobs.get(id))
+                    .filter(|e| e.job.state == JobState::Running && e.job.node.as_ref() == Some(&n.info.name))
+                    .map(|e| Self::assignment(&e.job))
+            })
         };
-        let timeout = Duration::from_secs(self.cfg.job_timeout_secs);
-        let mut result = tokio::time::timeout(timeout, client.clone().prove(request.clone())).await;
-        if let Ok(Err(status)) = &result {
-            if status.code() == tonic::Code::FailedPrecondition
-                && status.message().contains("elf_missing")
-            {
-                let mut retry = request.clone();
-                match self.blobs.elf(&job.elf_id) {
-                    Ok(elf) => {
-                        retry.elf = elf;
-                        result = tokio::time::timeout(timeout, client.clone().prove(retry)).await;
-                    }
-                    Err(e) => tracing::error!(job = %job_id, "reading elf: {e:#}"),
+        Ok(HeartbeatResponse { known: true, assignment, completed_lease })
+    }
+
+    async fn complete(&self, node_id: &str, mut j: Job, c: Completion) -> Result<(), tonic::Status> {
+        let err = |e: anyhow::Error| tonic::Status::internal(e.to_string());
+        if !j.state.is_terminal() {
+            if c.error_code == 0 {
+                j.state = JobState::Succeeded;
+                j.error.clear();
+                j.cycles = c.cycles;
+                j.prove_ms = c.prove_ms;
+                j.finished_ms = Some(now_ms());
+            } else {
+                let failure = classify(&tonic::Status::new(tonic::Code::from_i32(c.error_code), c.error.clone()));
+                if matches!(failure, Failure::NotStarted | Failure::Lost | Failure::Busy) {
+                    // No transfer or timeout may release units for an uncertain execution.
+                    // Retry the same lease on the original node after its next heartbeat.
+                    return Ok(());
+                }
+                j.error = c.error;
+                if let Some(name) = j.node.clone() { j.failed_on.push(name); }
+                if j.attempts >= self.cfg.max_attempts || j.failed_on.len() >= MAX_NODES_TRIED {
+                    j.state = JobState::Failed(StageStatus::ProveError);
+                    j.finished_ms = Some(now_ms());
+                } else {
+                    j.state = JobState::Queued;
+                    j.node = None;
+                    j.started_ms = None;
                 }
             }
+            self.store.upsert(&j).await.map_err(err)?;
         }
-        match result {
-            Ok(Ok(resp)) => {
-                let resp = resp.into_inner();
-                let written = self
-                    .blobs
-                    .put(&job_id, blobs::PROOF, &resp.proof_json)
-                    .and_then(|_| {
-                        self.blobs
-                            .put(&job_id, blobs::PUBLIC_VALUES, &resp.public_values)
-                    });
-                if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
-                self.release(&node_id, Some(&job.elf_id));
-                let j = self.update_job(&job_id, |j| {
-                    match &written {
-                        Ok(()) => {
-                            j.state = JobState::Succeeded;
-                            j.cycles = resp.cycles;
-                            j.prove_ms = resp.prove_ms;
-                        }
-                        Err(e) => {
-                            j.state = JobState::Failed(StageStatus::InternalError);
-                            j.error = format!("storing the proof: {e:#}");
-                        }
-                    }
-                    j.finished_ms = Some(now_ms());
-                });
-                if let Some(j) = &j {
-                    tracing::info!(job = %j.id, tenant = %j.tenant, node = ?j.node, cycles = j.cycles, prove_ms = j.prove_ms,
-                        wall_ms = resp.wall_ms, queue_ms = j.started_ms.unwrap_or(0).saturating_sub(j.created_ms), "job done");
-                }
-                self.persist(j).await;
-            }
-            Ok(Err(status)) => {
-                let msg = format!("{}: {}", status.code(), status.message());
-                self.fail_attempt(&job_id, &node_id, &msg, classify(&status))
-                    .await;
-            }
-            Err(_) => {
-                self.fail_attempt(&job_id, &node_id, "timed out", Failure::Lost)
-                    .await
-            }
-        }
+        self.release_quota(&format!("proof:{}", j.id)).await.map_err(err)?;
+        self.update_job(&j.id, |stored| *stored = j.clone());
+        self.inner.lock().deliverable.remove(&j.id);
+        self.release(node_id, &j.id, (j.state == JobState::Succeeded).then_some(j.elf_id.as_str()));
+        self.wake.notify_one();
+        Ok(())
     }
 
     fn build_request(&self, job: &Job, with_elf: bool) -> anyhow::Result<ProveRequest> {
@@ -1251,88 +1278,7 @@ impl Fleet {
         })
     }
 
-    /// Requeues the job on another node, or fails it after `max_attempts` counted attempts
-    /// (or `MAX_NODES_TRIED` nodes). A node that could not be reached, or dropped the
-    /// connection, is marked not ready together with the other nodes on its machine (the
-    /// machine is likely gone); the next heartbeat of a live node marks it ready again.
-    async fn fail_attempt(&self, job_id: &str, node_id: &str, msg: &str, failure: Failure) {
-        let uncertain = matches!(failure, Failure::Lost | Failure::NotStarted)
-            && self.inner.lock().jobs.contains_key(job_id);
-        if uncertain {
-            // Provers detach execution from the RPC. An unavailable response does not
-            // establish whether the request started; preserve both units and node hint.
-            if let Some(n) = self.inner.lock().nodes.get_mut(node_id) {
-                n.ready = false;
-                n.busy = Some(reported(job_id));
-            }
-            let j = self.update_job(job_id, |j| {
-                j.state = JobState::Queued;
-                j.attempts = j.attempts.saturating_sub(1);
-                j.error = format!("awaiting original prover confirmation: {msg}");
-            });
-            self.persist(j).await;
-            self.wake.notify_one();
-            return;
-        }
-        if let Err(e) = self.release_quota(&format!("proof:{job_id}")).await { tracing::error!("releasing proof quota: {e:#}"); }
-        if failure == Failure::Busy {
-            // Busy with a proof from before a restart: keep the node out until its heartbeat
-            // says it is free, and place the job again as if it had not been tried.
-            if let Some(n) = self.inner.lock().nodes.get_mut(node_id) {
-                n.busy = Some(reported(""));
-            }
-            let j = self.update_job(job_id, |j| {
-                j.attempts = j.attempts.saturating_sub(1);
-                j.state = JobState::Queued;
-                j.node = None;
-            });
-            tracing::info!(job = job_id, "node was busy; placing the job again");
-            self.persist(j).await;
-            self.wake.notify_one();
-            return;
-        }
-        let node_name = {
-            let mut inner = self.inner.lock();
-            let info = inner
-                .nodes
-                .get(node_id)
-                .map(|n| (n.info.name.clone(), n.info.machine.clone()));
-            if failure != Failure::Prover {
-                if let Some((_, machine)) = &info {
-                    for n in inner.nodes.values_mut() {
-                        if n.info.machine == *machine || n.id == node_id {
-                            n.ready = false;
-                        }
-                    }
-                }
-            }
-            info.map(|(name, _)| name)
-        };
-        self.release(node_id, None);
-        let max = self.cfg.max_attempts;
-        let j = self.update_job(job_id, |j| {
-            // A node that never started the job says nothing about the job: placement
-            // waits for its machine's heartbeats instead (it was marked not ready above).
-            if failure == Failure::NotStarted {
-                j.attempts = j.attempts.saturating_sub(1);
-            } else if let Some(n) = node_name.clone().or_else(|| j.node.clone()) {
-                j.failed_on.push(n);
-            }
-            j.error = msg.to_string();
-            if j.attempts >= max || j.failed_on.len() >= MAX_NODES_TRIED {
-                j.state = JobState::Failed(StageStatus::ProveError);
-                j.finished_ms = Some(now_ms());
-            } else {
-                j.state = JobState::Queued;
-                j.node = None;
-                j.started_ms = None; // waiting again: it starts anew when placed
-            }
-        });
-        if let Some(j) = &j {
-            tracing::warn!(job = %j.id, attempt = j.attempts, ?failure, error = %msg, retrying = !j.state.is_terminal(), "job attempt failed");
-        }
-        self.persist(j).await;
-    }
+
 }
 
 #[cfg(test)]

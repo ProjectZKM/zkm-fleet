@@ -84,10 +84,10 @@ pub struct Job {
     /// Internal ID; namespaced requests retain the SDK proof_id in client_id.
     pub id: String,
     pub tenant: String,
-    /// Submitting credential (audit); access is controlled by namespace and tag.
+    /// Submitting token (audit); access is controlled by namespace and tag.
     pub owner: String,
     pub namespace: String,
-    /// Empty means untagged; credentials and selectors may still omit the tag.
+    /// Empty means untagged; tokens and selectors may still omit the tag.
     pub tag: String,
     pub client_id: String,
     pub elf_id: String,
@@ -110,7 +110,7 @@ pub struct Job {
 impl Job {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(crate::blobs::is_safe_id(&self.id) && crate::blobs::is_safe_id(&self.client_id), "job id and client_id are required safe identifiers");
-        anyhow::ensure!(self.owner.len() == 40 && self.owner.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "job owner must be an authenticated credential address");
+        anyhow::ensure!(self.owner.len() == 40 && self.owner.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "job owner must be an authenticated token address");
         anyhow::ensure!(self.namespace.len() == 32 && self.namespace.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "job namespace must be an immutable namespace ID");
         if !self.tag.is_empty() { crate::fleet::Fleet::validate_tag(&self.tag)?; }
         anyhow::ensure!(self.state.is_terminal() == self.finished_ms.is_some(), "only terminal jobs have finished_ms");
@@ -170,16 +170,19 @@ pub struct ProofApp {
     pub disabled: bool,
 }
 
-/// A tenant signing identity, optionally with explicit user app grants and an HTTP token verifier.
+/// An administrator-managed access token and its internal proof SDK binding.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Credential {
-    /// Lower-case hex address without 0x.
+pub struct Token {
+    /// Opaque 128-bit identifier issued independently of proof signing identity.
+    pub id: String,
+    /// Internal SDK binding; never part of the token resource API.
+    #[serde(skip_serializing)]
     pub address: String,
     pub tenant: String,
     pub label: String,
     pub created_ms: u64,
     pub revoked_ms: Option<u64>,
-    /// None denotes an operator tenant credential; Some(empty) grants no apps.
+    /// None denotes an operator tenant token; Some(empty) grants no apps.
     #[serde(default)]
     pub apps: Option<Vec<String>>,
     #[serde(default, skip_serializing)]
@@ -188,6 +191,9 @@ pub struct Credential {
     pub namespace: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    /// Namespace owner tokens may register apps in their namespace.
+    #[serde(default)]
+    pub manage_apps: bool,
 }
 
 /// Resource accounting and billing boundary; names and ids are never recycled.
@@ -229,10 +235,10 @@ pub trait Store: Send + Sync {
     async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32) -> anyhow::Result<()>;
     async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()>;
 
-    async fn add_credential(&self, c: &Credential) -> anyhow::Result<()>;
-    /// Marks the credential revoked; returns false when the address is unknown.
-    async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool>;
-    async fn credentials(&self) -> anyhow::Result<Vec<Credential>>;
+    async fn add_token(&self, c: &Token) -> anyhow::Result<()>;
+    /// Marks the token revoked; returns false when the address is unknown.
+    async fn revoke_token(&self, id: &str, at_ms: u64) -> anyhow::Result<bool>;
+    async fn tokens(&self) -> anyhow::Result<Vec<Token>>;
     async fn namespaces(&self) -> anyhow::Result<Vec<Namespace>>;
     async fn add_namespace(&self, namespace: &Namespace) -> anyhow::Result<()>;
     async fn suspend_namespace(&self, id: &str, at_ms: Option<u64>) -> anyhow::Result<()>;
@@ -275,7 +281,7 @@ pub struct MemoryStore {
     allocations: Mutex<HashMap<String, Allocation>>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     jobs: Mutex<HashMap<String, Job>>,
-    creds: Mutex<HashMap<String, Credential>>,
+    tokens: Mutex<HashMap<String, Token>>,
     /// (namespace, tenant, elf_id) -> (created_ms, disabled_ms, priority).
     apps: Mutex<HashMap<(String, String, String), (u64, Option<u64>, i32)>>,
 }
@@ -408,24 +414,22 @@ impl Store for MemoryStore {
         Ok(())
     }
 
-    async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {
-        let mut creds = self.creds.lock();
+    async fn add_token(&self, c: &Token) -> anyhow::Result<()> {
+        let mut tokens = self.tokens.lock();
         anyhow::ensure!(
-            !creds.contains_key(&c.address),
+            !tokens.contains_key(&c.address),
             "address already registered"
         );
-        anyhow::ensure!(c.token_hash.as_ref().is_none_or(|hash| !creds.values().any(|other| other.token_hash.as_ref() == Some(hash))), "token already registered");
-        creds.insert(c.address.clone(), c.clone());
+        anyhow::ensure!(c.token_hash.as_ref().is_none_or(|hash| !tokens.values().any(|other| other.token_hash.as_ref() == Some(hash))), "token already registered");
+        anyhow::ensure!(!tokens.values().any(|t| t.id == c.id), "token id already registered");
+        tokens.insert(c.address.clone(), c.clone());
         Ok(())
     }
 
-    async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool> {
-        Ok(self
-            .creds
-            .lock()
-            .get_mut(&normalize_address(address))
-            .map(|c| c.revoked_ms = Some(at_ms))
-            .is_some())
+    async fn revoke_token(&self, id: &str, at_ms: u64) -> anyhow::Result<bool> {
+        let mut tokens = self.tokens.lock();
+        let token = tokens.values_mut().find(|t| t.id == id);
+        Ok(token.map(|t| t.revoked_ms = Some(at_ms)).is_some())
     }
 
     async fn set_quota(&self, id: &str, quota: &Quota) -> anyhow::Result<()> {
@@ -481,8 +485,8 @@ impl Store for MemoryStore {
             && j.tag == tag.unwrap_or("") && j.client_id == client_id).cloned())
     }
 
-    async fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
-        let mut v: Vec<Credential> = self.creds.lock().values().cloned().collect();
+    async fn tokens(&self) -> anyhow::Result<Vec<Token>> {
+        let mut v: Vec<Token> = self.tokens.lock().values().cloned().collect();
         v.sort_by_key(|c| c.created_ms);
         Ok(v)
     }
@@ -495,7 +499,7 @@ pub struct PgStore {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 11;
+const SCHEMA_VERSION: i32 = 12;
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
     names.into_iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
@@ -503,7 +507,7 @@ fn quoted(names: impl IntoIterator<Item = String>) -> String {
 
 /// Create the current schema directly; development databases are reset, not backfilled.
 fn schema() -> String {
-    format!("{}{}{}", namespace_schema(), jobs_and_credentials(), apps())
+    format!("{}{}{}", namespace_schema(), jobs_and_tokens(), apps())
 }
 
 fn namespace_schema() -> String {
@@ -526,10 +530,10 @@ CREATE INDEX fleet_namespace_allocations_namespace ON fleet_namespace_allocation
 "#)
 }
 
-/// Jobs and credentials. Names, not numbers: a state, kind or stage status
+/// Jobs and tokens. Names, not numbers: a state, kind or stage status
 /// reads the same in the database as in the admin API, and the CHECKs list what may be
 /// there.
-fn jobs_and_credentials() -> String {
+fn jobs_and_tokens() -> String {
     let kinds = quoted(all::<ProofKind>().into_iter().map(kind_name));
     let statuses = quoted(all::<StageStatus>().into_iter().map(status_name));
     let states = quoted(STATES.map(String::from));
@@ -578,19 +582,22 @@ COMMENT ON COLUMN fleet_jobs.node IS 'Name of the node it runs or ran on (stable
 COMMENT ON COLUMN fleet_jobs.failed_on IS 'Nodes an attempt failed on; a retry avoids them.';
 COMMENT ON COLUMN fleet_jobs.started_ms IS 'Unix ms the current (or last) attempt started; cleared when it is queued again.';
 
-CREATE TABLE fleet_credentials (
-    address    TEXT   PRIMARY KEY CONSTRAINT fleet_credentials_address_hex CHECK (address ~ '^[0-9a-f]{{40}}$'),
-    tenant     TEXT   NOT NULL CONSTRAINT fleet_credentials_tenant_named CHECK (tenant <> ''),
+CREATE TABLE fleet_tokens (
+    id         TEXT   PRIMARY KEY CONSTRAINT fleet_tokens_id_hex CHECK (id ~ '^[0-9a-f]{{32}}$'),
+    address    TEXT   NOT NULL UNIQUE CONSTRAINT fleet_tokens_address_hex CHECK (address ~ '^[0-9a-f]{{40}}$'),
+    tenant     TEXT   NOT NULL CONSTRAINT fleet_tokens_tenant_named CHECK (tenant <> ''),
     label      TEXT   NOT NULL DEFAULT '',
     created_ms BIGINT NOT NULL,
     revoked_ms BIGINT,
     namespace  TEXT REFERENCES fleet_namespaces(id),
-    tag        TEXT CONSTRAINT fleet_credentials_tag_scope CHECK(tag IS NULL OR (namespace IS NOT NULL AND tag ~ '^[a-z][a-z0-9-]{{0,62}}$')),
+    tag        TEXT CONSTRAINT fleet_tokens_tag_scope CHECK(tag IS NULL OR (namespace IS NOT NULL AND tag ~ '^[a-z][a-z0-9-]{{0,62}}$')),
     apps       TEXT[],
-    token_hash TEXT UNIQUE
+    token_hash TEXT UNIQUE,
+    manage_apps BOOLEAN NOT NULL DEFAULT FALSE
 );
-COMMENT ON TABLE fleet_credentials IS 'Tenant signing keys: the SDK''s ZKM_PRIVATE_KEY maps to its address.';
-COMMENT ON COLUMN fleet_credentials.address IS 'Lower-case hex address without 0x.';
+COMMENT ON TABLE fleet_tokens IS 'Administrator-managed API tokens with optional namespace, tag and app scope; the address binds the token to the SDK proof signer.';
+COMMENT ON COLUMN fleet_tokens.id IS 'Opaque token resource identifier; unrelated to proof signing identity.';
+COMMENT ON COLUMN fleet_tokens.address IS 'Internal SDK proof signer binding; not exposed by token APIs.';
 "#
     )
 }
@@ -836,8 +843,9 @@ impl Store for PgStore {
         Ok(())
     }
 
-    async fn add_credential(&self, c: &Credential) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO fleet_credentials (address, tenant, label, created_ms, apps, token_hash, namespace, tag) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
+    async fn add_token(&self, c: &Token) -> anyhow::Result<()> {
+        sqlx::query("INSERT INTO fleet_tokens (id, address, tenant, label, created_ms, apps, token_hash, namespace, tag, manage_apps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+            .bind(&c.id)
             .bind(&c.address)
             .bind(&c.tenant)
             .bind(&c.label)
@@ -846,14 +854,15 @@ impl Store for PgStore {
             .bind(&c.token_hash)
             .bind(&c.namespace)
             .bind(&c.tag)
+            .bind(c.manage_apps)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn revoke_credential(&self, address: &str, at_ms: u64) -> anyhow::Result<bool> {
-        let r = sqlx::query("UPDATE fleet_credentials SET revoked_ms = $2 WHERE address = $1")
-            .bind(normalize_address(address))
+    async fn revoke_token(&self, id: &str, at_ms: u64) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE fleet_tokens SET revoked_ms = $2 WHERE id = $1")
+            .bind(id)
             .bind(at_ms as i64)
             .execute(&self.pool)
             .await?;
@@ -918,13 +927,14 @@ impl Store for PgStore {
         row.as_ref().map(Self::row_to_job).transpose()
     }
 
-    async fn credentials(&self) -> anyhow::Result<Vec<Credential>> {
-        let rows = sqlx::query("SELECT * FROM fleet_credentials ORDER BY created_ms")
+    async fn tokens(&self) -> anyhow::Result<Vec<Token>> {
+        let rows = sqlx::query("SELECT * FROM fleet_tokens ORDER BY created_ms")
             .fetch_all(&self.pool)
             .await?;
         rows.iter()
             .map(|r| {
-                Ok(Credential {
+                Ok(Token {
+                    id: r.try_get("id")?,
                     address: r.try_get("address")?,
                     tenant: r.try_get("tenant")?,
                     label: r.try_get("label")?,
@@ -934,6 +944,7 @@ impl Store for PgStore {
                     token_hash: r.try_get("token_hash")?,
                     namespace: r.try_get("namespace")?,
                     tag: r.try_get("tag")?,
+                    manage_apps: r.try_get("manage_apps")?,
                 })
             })
             .collect()

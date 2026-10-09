@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 #[derive(Clone)]
 pub struct Blobs {
     root: PathBuf,
+    proof_output: Option<PathBuf>,
 }
 
 pub const STDIN: &str = "stdin.bin";
@@ -34,7 +35,39 @@ impl Blobs {
         std::fs::create_dir_all(root.join("jobs"))?;
         Ok(Self {
             root: root.to_path_buf(),
+            proof_output: None,
         })
+    }
+
+    /// Attach shared job-artifact storage. Nodes write proof output; the SDK adapter
+    /// reads it, and deleting an app removes its terminal jobs' output directories.
+    pub fn with_proof_output(mut self, root: PathBuf) -> Self {
+        self.proof_output = Some(root);
+        self
+    }
+
+    pub async fn sdk_output(&self, job: &crate::store::Job, name: &'static str) -> anyhow::Result<Vec<u8>> {
+        let blobs = self.clone();
+        let job = job.clone();
+        // A remote mount must not block scheduling or health heartbeats.
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || blobs.read_output(&job, name))).await???;
+        Ok(bytes)
+    }
+
+    pub fn read_output(&self, job: &crate::store::Job, name: &str) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(matches!(name, PROOF | PUBLIC_VALUES), "unknown proof output");
+        anyhow::ensure!(is_safe_id(&job.id), "bad job id");
+        if let (Some(root), Some(started)) = (&self.proof_output, job.started_ms) {
+            let path = root.join(&job.id).join(format!("{}-{started}", job.attempts)).join(name);
+            match std::fs::read(path) {
+                Ok(bytes) => return Ok(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // Preserve access to proofs completed before node-owned output was enabled.
+        self.get(&job.id, name)
     }
 
     pub fn put_elf(&self, elf: &[u8]) -> anyhow::Result<String> {
@@ -74,11 +107,18 @@ impl Blobs {
         Ok(self.job_dir(job_id)?.join(name))
     }
 
-    /// Removes a job's files (input, proof, public values).
+    /// Removes all job artifacts: scheduler-side inputs, node-written outputs and
+    /// any legacy SDK results still kept beside the inputs.
     pub fn remove_job(&self, job_id: &str) -> anyhow::Result<()> {
         let dir = self.job_dir(job_id)?;
         if dir.exists() {
             std::fs::remove_dir_all(dir)?;
+        }
+        if let Some(root) = &self.proof_output {
+            let output = root.join(job_id);
+            if output.exists() {
+                std::fs::remove_dir_all(output)?;
+            }
         }
         Ok(())
     }

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "zkm-fleet": {
+      "type": "http",
+      "url": "https://34.215.238.232:8905/mcp",
+      "headers": {
+        "Authorization": "Bearer ${FLEET_MCP_AUTH}"
+      }
+    }
+  }
+}

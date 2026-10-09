@@ -6,7 +6,8 @@ use tonic::{Request, Response, Status};
 
 use fleet_proto::fleet::v1::{
     control_service_server::ControlService, DeregisterRequest, DeregisterResponse,
-    HeartbeatRequest, HeartbeatResponse, RegisterRequest, RegisterResponse,
+    FetchInputsRequest, HeartbeatRequest, HeartbeatResponse, ProveRequest, RegisterRequest,
+    RegisterResponse,
 };
 
 use crate::fleet::Fleet;
@@ -39,16 +40,24 @@ impl ControlService for ControlApi {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        self.fleet
+            .exchange(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn fetch_inputs(
+        &self,
+        request: Request<FetchInputsRequest>,
+    ) -> Result<Response<ProveRequest>, Status> {
         let r = request.into_inner();
-        Ok(Response::new(HeartbeatResponse {
-            known: self.fleet.heartbeat(
-                &r.node_id,
-                r.ready,
-                r.cached_elf_ids,
-                r.busy,
-                &r.running_job,
-            ),
-        }))
+        let assignment = r
+            .assignment
+            .ok_or_else(|| Status::invalid_argument("assignment missing"))?;
+        self.fleet
+            .fetch_inputs(&r.node_id, &assignment, r.include_elf)
+            .await
+            .map(Response::new)
     }
 
     async fn deregister(

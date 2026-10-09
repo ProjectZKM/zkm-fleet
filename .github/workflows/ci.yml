@@ -51,11 +51,11 @@ jobs:
           key: ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
-      - name: Test protocol, scheduler, and CLI
-        run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleetctl
+      - name: Test protocol, scheduler, CLI, and MCP server
+        run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleetctl -p fleet-mcp
 
   prover-check:
-    name: Prover node compilation
+    name: Prover output store
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -63,13 +63,8 @@ jobs:
       CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v4
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev pkg-config libssl-dev
-      - uses: actions/setup-go@v5
-        with:
-          # Required by the pinned Ziren gnark-ffi module.
-          go-version: '1.25.4'
-          cache: false
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install repository Rust toolchain
         run: rustup show active-toolchain
       - uses: actions/cache@v4
@@ -77,14 +72,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/go/pkg/mod
-            ~/.cache/go-build
             target
-          key: ${{ runner.os }}-prover-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          key: ${{ runner.os }}-prover-output-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-prover-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
-      - name: Check prover node and test targets (no GPU required)
-        run: cargo check --locked -p fleet-ziren-node --all-targets
+            ${{ runner.os }}-prover-output-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+      - name: Test proof output persistence without private runtime dependencies
+        run: cargo test --locked --no-default-features --lib -p fleet-ziren-node
 
   bridge-tests:
     name: Python bridge (${{ matrix.python }})

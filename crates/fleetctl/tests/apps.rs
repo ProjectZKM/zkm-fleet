@@ -116,3 +116,59 @@ fn app_priority_uses_admin_policy_routes_for_both_app_types() {
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["priority"], -5);
     }
 }
+
+#[test]
+fn proof_app_disable_uses_the_lifecycle_api_with_its_canonical_namespace() {
+    let scheduler = TcpListener::bind("127.0.0.1:0").unwrap();
+    let scheduler_url = format!("http://{}", scheduler.local_addr().unwrap());
+    let runs = TcpListener::bind("127.0.0.1:0").unwrap();
+    let runs_url = format!("http://{}", runs.local_addr().unwrap());
+    let token = std::env::temp_dir().join(format!("fleet-disable-test-{}.token", std::process::id()));
+    std::fs::write(&token, "test-admin").unwrap();
+    let elf = "a".repeat(64);
+    let hash = "1".repeat(32);
+    let scheduler_elf = elf.clone();
+    let scheduler_hash = hash.clone();
+    let runs_elf = elf.clone();
+    let runs_hash = hash.clone();
+
+    let scheduler_server = std::thread::spawn(move || {
+        let (mut stream, _) = scheduler.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(bytes).unwrap();
+        assert!(headers.starts_with("GET /admin/apps?namespace=alice HTTP/1.1\r\n"), "{headers}");
+        let body = serde_json::json!([{"name":format!("eth/{}", &scheduler_elf[..8]), "namespace":scheduler_hash,
+            "tenant":"eth", "elf_id":scheduler_elf, "disabled":false}]).to_string();
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+    let runs_server = std::thread::spawn(move || {
+        let (mut stream, _) = runs.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        let headers = String::from_utf8(bytes).unwrap();
+        let request = headers.lines().next().unwrap();
+        assert!(request.starts_with(&format!("PUT /proof-apps/disabled?namespace={runs_hash}&tenant=eth&elf_id={runs_elf} HTTP/1.1")), "{request}");
+        assert!(!request.contains("namespace=alice"), "duplicate caller namespace: {request}");
+        let body = format!(r#"{{"namespace":"{runs_hash}","tenant":"eth","elf_id":"{runs_elf}","disabled":true,"servers":["eth-a"]}}"#);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let output = cli().args(["--namespace", "alice", "--url", &scheduler_url, "--runs-url", &runs_url,
+        "--admin-token-file"]).arg(&token).args(["app", "disable", &format!("eth/{elf}")]).output().unwrap();
+    std::fs::remove_file(token).unwrap();
+    scheduler_server.join().unwrap();
+    runs_server.join().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("dedicated GPU server stopped"));
+}

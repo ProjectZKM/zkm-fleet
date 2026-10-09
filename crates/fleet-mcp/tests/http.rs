@@ -1,0 +1,153 @@
+#![cfg(unix)]
+
+use std::{
+    os::unix::fs::PermissionsExt,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use serde_json::{json, Value};
+
+struct Server(Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn message(response: &str) -> Value {
+    if let Ok(value) = serde_json::from_str(response) {
+        return value;
+    }
+    response
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("response contains no JSON-RPC message: {response}"))
+}
+
+#[tokio::test]
+async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
+    let temp = tempfile::tempdir().unwrap();
+    let fake_fleetctl = temp.path().join("fleetctl");
+    let args_log = temp.path().join("args.txt");
+    std::fs::write(
+        &fake_fleetctl,
+        format!(
+            "#!/bin/sh\n test -z \"${{FLEET_ADMIN_TOKEN_FILE}}\" || exit 41\n test \"$(cat \"$FLEET_TOKEN_FILE\")\" = scoped-token || exit 42\n printf '%s\\n' \"$*\" >> '{}'\n printf '{{\"apps\":[{{\"name\":\"demo\"}}]}}\\n'\n",
+            args_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_fleetctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let origin = format!("http://{address}");
+    let child = Command::new(env!("CARGO_BIN_EXE_fleet-mcp"))
+        .env("FLEETCTL_BIN", &fake_fleetctl)
+        .env("FLEET_MCP_BIND", address.to_string())
+        .env("FLEET_MCP_ALLOWED_HOSTS", address.to_string())
+        .env("FLEET_ADMIN_TOKEN_FILE", "/must/not/be/inherited")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut server = Server(child);
+
+    let client = reqwest::Client::new();
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.get(format!("{origin}/unknown")).send().await.is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "MCP server did not start"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let response = client
+        .post(format!("{origin}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let session = response
+        .headers()
+        .get("mcp-session-id")
+        .expect("initialize returns a session id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let init = message(&response.text().await.unwrap());
+    assert_eq!(init["result"]["protocolVersion"], "2025-11-25");
+
+    let tools_response = client
+        .post(format!("{origin}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(tools_response.status().is_success());
+    let tools = message(&tools_response.text().await.unwrap())["result"]["tools"].clone();
+    assert!(tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "fleet_run_submit"));
+
+    let anonymous_call = client
+        .post(format!("{origin}/mcp"))
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_run_app_create","arguments":{"name":"demo","image":"image:tag"}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(anonymous_call.status().is_success());
+    let anonymous_error = message(&anonymous_call.text().await.unwrap());
+    assert!(anonymous_error["error"].is_object() || anonymous_error["result"]["isError"] == true);
+    assert!(anonymous_error
+        .to_string()
+        .contains("Authorization: Bearer"));
+    assert!(!args_log.exists(), "unauthenticated tool call ran fleetctl");
+
+    let call_response = client
+        .post(format!("{origin}/mcp"))
+        .bearer_auth("scoped-token")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session)
+        .header("mcp-protocol-version", "2025-11-25")
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_run_app_create","arguments":{"name":"demo","image":"image:tag","allow":["/srv"],"max_gpus":2,"priority":7}}}))
+        .send()
+        .await
+        .unwrap();
+    assert!(call_response.status().is_success());
+    assert_eq!(
+        message(&call_response.text().await.unwrap())["result"]["structuredContent"]["apps"][0]
+            ["name"],
+        "demo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(args_log).unwrap().trim(),
+        "--json app add demo --image image:tag --allow /srv --max-gpus 2 --priority 7"
+    );
+
+    server.0.kill().unwrap();
+}

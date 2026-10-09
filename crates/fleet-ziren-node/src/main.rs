@@ -1,20 +1,20 @@
 //! A prover node: one Ziren SDK `ProverClient` (CPU, a GPU server, or mock) behind
-//! the fleet's NodeService. It registers itself with the scheduler, heartbeats,
+//! outbound control requests. It registers with the scheduler, heartbeats,
 //! and proves one job at a time.
 
 mod prover;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tonic::transport::{Channel, Endpoint, Server};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 use fleet_proto::fleet::v1::{
-    control_service_client::ControlServiceClient, node_service_server::NodeServiceServer,
-    DeregisterRequest, HeartbeatRequest, NodeInfo, RegisterRequest,
+    control_service_client::ControlServiceClient, Assignment, Completion, DeregisterRequest,
+    FetchInputsRequest, HeartbeatRequest, NodeInfo, RegisterRequest,
 };
+use fleet_ziren_node::output::Output;
 
 #[derive(Parser, Clone)]
 #[command(about = "zkm-fleet prover node")]
@@ -32,15 +32,6 @@ pub struct Args {
         default_value = "http://127.0.0.1:3000/twirp/"
     )]
     gpu_endpoint: String,
-    /// Interface NodeService listens on.
-    #[arg(long, env = "FLEET_LISTEN_IP", default_value = "0.0.0.0")]
-    listen_ip: std::net::IpAddr,
-    /// Ports to try, first free one wins (atomic: several nodes on one machine cannot collide).
-    #[arg(long, env = "FLEET_PORT_RANGE", default_value = "31000-31099")]
-    port_range: String,
-    /// Host the scheduler reaches this node at (the machine's cluster address).
-    #[arg(long, env = "FLEET_ADVERTISE_HOST")]
-    advertise_host: String,
     /// Scheduler control API, e.g. http://10.0.0.1:51001.
     #[arg(long, env = "FLEET_SCHEDULER")]
     scheduler: String,
@@ -56,6 +47,16 @@ pub struct Args {
     image: String,
     #[arg(long, env = "FLEET_MACHINE", default_value = "")]
     machine: String,
+    /// Namespace/tenant/ELF identity for this dedicated proof-app server.
+    #[arg(long, env = "FLEET_APP_NAMESPACE", default_value = "")]
+    app_namespace: String,
+    #[arg(long, env = "FLEET_APP_TENANT", default_value = "")]
+    app_tenant: String,
+    #[arg(long, env = "FLEET_APP_ELF_ID", default_value = "")]
+    app_elf_id: String,
+    /// Proof-node output directory; optionally exposed read-only to the SDK adapter.
+    #[arg(long, env = "FLEET_OUTPUT_DIR", default_value = "proof-output")]
+    output_dir: std::path::PathBuf,
     /// Program keys kept per node.
     #[arg(long, env = "FLEET_PK_CACHE", default_value_t = 8)]
     pk_cache: usize,
@@ -79,24 +80,9 @@ async fn main() -> anyhow::Result<()> {
     let token = load_token(&args.cluster_token_file)?;
 
     let node = Arc::new(prover::Node::start(&args).await?);
-    let service = NodeServiceServer::new(prover::NodeApi { node: node.clone() })
-        .max_decoding_message_size(1 << 30)
-        .max_encoding_message_size(1 << 30);
-    let service = tonic::service::interceptor::InterceptedService::new(
-        service,
-        prover::RequireToken(Arc::new(token.clone())),
-    );
-    let (listener, port) = bind_in_range(args.listen_ip, &args.port_range)?;
-    let advertise = format!("http://{}:{port}", args.advertise_host);
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let server = Server::builder()
-        .add_service(service)
-        .serve_with_incoming(incoming);
-    tracing::info!(port, %advertise, backend = %args.backend, "node service up");
-
-    let control = tokio::spawn(control_loop(args.clone(), advertise, token, node.clone()));
+    tracing::info!(backend = %args.backend, "worker ready; contacting scheduler through heartbeats");
+    let control = tokio::spawn(control_loop(args.clone(), token, node.clone()));
     tokio::select! {
-        r = server => r?,
         r = control => r??,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
         _ = parent_gone(args.exit_with_parent) => tracing::warn!("the process that started this node is gone; exiting"),
@@ -119,24 +105,6 @@ async fn parent_gone(watch: bool) {
     }
 }
 
-/// Binds the first free port of `lo-hi`.
-fn bind_in_range(
-    ip: std::net::IpAddr,
-    range: &str,
-) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
-    let (lo, hi) = range
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("port range must be lo-hi"))?;
-    let (lo, hi): (u16, u16) = (lo.trim().parse()?, hi.trim().parse()?);
-    for port in lo..=hi {
-        if let Ok(l) = std::net::TcpListener::bind(SocketAddr::new(ip, port)) {
-            l.set_nonblocking(true)?;
-            return Ok((tokio::net::TcpListener::from_std(l)?, port));
-        }
-    }
-    anyhow::bail!("no free port in {range}")
-}
-
 fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
     let t = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("reading the cluster token {}: {e}", path.display()))?
@@ -153,80 +121,190 @@ fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
 type Control =
     ControlServiceClient<tonic::codegen::InterceptedService<Channel, prover::AttachToken>>;
 
-async fn control_client(args: &Args, token: &str) -> anyhow::Result<Control> {
-    let channel = Endpoint::from_shared(args.scheduler.clone())?
-        .connect_timeout(Duration::from_secs(5))
-        .connect_lazy();
-    Ok(ControlServiceClient::with_interceptor(
-        channel,
-        prover::AttachToken::new(token)?,
-    ))
-}
+type Outcome = Result<(u64, u64), tonic::Status>;
 
-/// Registers, heartbeats, re-registers when the scheduler forgets us, deregisters on exit.
-async fn control_loop(
-    args: Args,
-    advertise: String,
-    token: String,
-    node: Arc<prover::Node>,
-) -> anyhow::Result<()> {
-    let mut client = control_client(&args, &token).await?;
+/// All scheduler connections originate here. Proof work and output persistence
+/// run separately so neither can block health and ownership heartbeats.
+async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> anyhow::Result<()> {
+    let mut endpoint =
+        Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5));
+    if endpoint.uri().scheme_str() == Some("https") {
+        let host = endpoint
+            .uri()
+            .host()
+            .ok_or_else(|| anyhow::anyhow!("scheduler HTTPS URL has no host"))?
+            .to_owned();
+        endpoint =
+            endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host))?;
+    }
+    let mut client: Control = ControlServiceClient::with_interceptor(
+        endpoint.clone().connect_lazy(),
+        prover::AttachToken::new(&token)?,
+    )
+    .max_decoding_message_size(1 << 30)
+    .max_encoding_message_size(1 << 30);
+    let inputs: Control = ControlServiceClient::with_interceptor(
+        endpoint.connect_lazy(),
+        prover::AttachToken::new(&token)?,
+    )
+    .max_decoding_message_size(1 << 30)
+    .max_encoding_message_size(1 << 30);
+    let output = Output::new(args.output_dir.clone())?;
     let info = NodeInfo {
         name: args.name.clone(),
-        endpoint: advertise,
         backend: args.backend.clone(),
         gpus: args.gpus,
         cpus: args.cpus,
-        zkm_version: node.zkm_version().to_string(),
+        zkm_version: node.zkm_version().into(),
         image: args.image.clone(),
         machine: args.machine.clone(),
+        control_version: 1,
+        app_namespace: args.app_namespace.clone(),
+        app_tenant: args.app_tenant.clone(),
+        app_elf_id: args.app_elf_id.to_ascii_lowercase(),
     };
     let mut node_id: Option<String> = None;
     let mut period = Duration::from_secs(5);
+    let mut working: Option<(Assignment, tokio::task::JoinHandle<Outcome>)> = None;
+    let mut pending: Option<(Assignment, Outcome)> = None;
     loop {
-        match &node_id {
-            None => match client
-                .register(RegisterRequest {
-                    node: Some(info.clone()),
-                })
-                .await
-            {
+        if node_id.is_none() {
+            let mut request = tonic::Request::new(RegisterRequest {
+                node: Some(info.clone()),
+            });
+            request.set_timeout(Duration::from_secs(10));
+            match client.register(request).await {
                 Ok(r) => {
                     let r = r.into_inner();
                     tracing::info!(node_id = %r.node_id, "registered");
                     period = Duration::from_secs(r.heartbeat_secs.max(1) as u64);
                     node_id = Some(r.node_id);
-                    continue;
                 }
                 Err(e) => tracing::warn!("register failed: {e}"),
-            },
-            Some(id) => {
-                let running_job = node.running_job();
-                let hb = HeartbeatRequest {
-                    node_id: id.clone(),
-                    ready: node.ready().await,
-                    cached_elf_ids: node.cached(),
-                    busy: running_job.is_some(),
-                    running_job: running_job.unwrap_or_default(),
+            }
+        }
+        if let Some(id) = node_id.clone() {
+            if working.as_ref().is_some_and(|(_, task)| task.is_finished()) {
+                let (assignment, task) = working.take().unwrap();
+                let result = task
+                    .await
+                    .unwrap_or_else(|e| Err(tonic::Status::internal(e.to_string())));
+                pending = Some((assignment, result));
+            }
+            let completion = pending.as_ref().map(|(assignment, result)| {
+                let mut completion = Completion {
+                    assignment: Some(assignment.clone()),
+                    ..Default::default()
                 };
-                match client.heartbeat(hb).await {
-                    Ok(r) => {
-                        if !r.into_inner().known {
-                            tracing::warn!("scheduler forgot this node; registering again");
-                            node_id = None;
-                            continue;
+                match result {
+                    Ok((cycles, prove_ms)) => {
+                        completion.cycles = *cycles;
+                        completion.prove_ms = *prove_ms;
+                    }
+                    Err(e) => {
+                        completion.error_code = e.code() as i32;
+                        completion.error = e.message().into();
+                    }
+                }
+                completion
+            });
+            let running_job = working
+                .as_ref()
+                .map(|(a, _)| a.job_id.clone())
+                .or_else(|| pending.as_ref().map(|(a, _)| a.job_id.clone()))
+                .unwrap_or_default();
+            let mut request = tonic::Request::new(HeartbeatRequest {
+                node_id: id.clone(),
+                ready: node.ready().await,
+                cached_elf_ids: node.cached(),
+                busy: !running_job.is_empty(),
+                running_job,
+                completion,
+            });
+            request.set_timeout(Duration::from_secs(10));
+            match client.heartbeat(request).await {
+                Ok(r) => {
+                    let r = r.into_inner();
+                    if !r.known {
+                        node_id = None;
+                        continue;
+                    }
+                    if pending
+                        .as_ref()
+                        .is_some_and(|(a, _)| a.lease == r.completed_lease)
+                    {
+                        pending = None;
+                    }
+                    if working.is_none() && pending.is_none() {
+                        if let Some(assignment) = r.assignment {
+                            let mut store = inputs.clone();
+                            let n = node.clone();
+                            let req = FetchInputsRequest {
+                                node_id: id.clone(),
+                                include_elf: !n.cached().contains(&assignment.elf_id),
+                                assignment: Some(assignment.clone()),
+                            };
+                            tracing::info!(job = %assignment.job_id, lease = %assignment.lease, "accepted assignment");
+                            let out = output.clone();
+                            let execution = assignment.clone();
+                            working = Some((
+                                assignment,
+                                tokio::spawn(async move {
+                                    let saved = tokio::task::spawn_blocking({
+                                        let out = out.clone();
+                                        let execution = execution.clone();
+                                        move || out.completed(&execution)
+                                    })
+                                    .await
+                                    .map_err(|e| tonic::Status::unavailable(e.to_string()))?
+                                    .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+                                    if let Some(metadata) = saved {
+                                        return Ok(metadata);
+                                    }
+                                    let inputs = store
+                                        .fetch_inputs(req)
+                                        .await
+                                        .map_err(|e| {
+                                            if e.code() == tonic::Code::NotFound {
+                                                tonic::Status::unavailable(e.message().to_owned())
+                                            } else {
+                                                e
+                                            }
+                                        })?
+                                        .into_inner();
+                                    let result = Arc::new(n.prove(inputs).await?);
+                                    loop {
+                                        let published = tokio::task::spawn_blocking({
+                                            let out = out.clone();
+                                            let execution = execution.clone();
+                                            let result = result.clone();
+                                            move || out.publish(&execution, &result)
+                                        })
+                                        .await;
+                                        match published {
+                                            Ok(Ok(())) => {
+                                                return Ok((result.cycles, result.prove_ms))
+                                            }
+                                            other => {
+                                                tracing::error!(job = %execution.job_id, error = ?other, "proof output write failed; retaining proof and reservation")
+                                            }
+                                        }
+                                        tokio::time::sleep(Duration::from_secs(5)).await;
+                                    }
+                                }),
+                            ));
                         }
                     }
-                    Err(e) => tracing::warn!("heartbeat failed: {e}"),
+                }
+                Err(e) => {
+                    tracing::warn!("heartbeat failed; retaining execution and pending result: {e}")
                 }
             }
         }
         tokio::select! {
-            _ = tokio::time::sleep(period) => {}
+            _ = tokio::time::sleep(period) => {},
             _ = tokio::signal::ctrl_c() => {
-                if let Some(id) = node_id {
-                    let _ = client.deregister(DeregisterRequest { node_id: id }).await;
-                }
+                if let Some(id) = node_id { let _ = client.deregister(DeregisterRequest { node_id: id }).await; }
                 return Ok(());
             }
         }

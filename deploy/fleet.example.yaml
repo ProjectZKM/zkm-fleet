@@ -1,14 +1,14 @@
 # fleet-scheduler configuration (inside the compose container: paths under /etc/zkm-fleet).
-stage_addr: 0.0.0.0:51000          # external, mutual TLS (the SDK only does TLS with a client cert)
+stage_addr: 0.0.0.0:51000          # SDK proof API (server TLS; authorize with the user bearer token)
 control_addr: 0.0.0.0:51001        # cluster-internal: node registration (publish on the cluster interface only)
 http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin (admin token)
 public_url: https://fleet.example.com:9191
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
+proof_output_dir: /var/lib/zkm-fleet/proofs # shared job artifacts: nodes write; scheduler reads and removes on app deletion
 long_poll_ms: 2000
 heartbeat_secs: 5
 node_stale_secs: 20
-job_timeout_secs: 3600
 max_attempts: 2
 require_signature: true
 cluster_token_file: /etc/zkm-fleet/cluster.token
@@ -16,7 +16,6 @@ admin_token_file: /etc/zkm-fleet/admin.token
 tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
-  client_ca_path: /etc/zkm-fleet/tls/ca.pem
 tenants:
   - name: ethproofs
     class: latency

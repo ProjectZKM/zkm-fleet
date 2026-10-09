@@ -21,62 +21,74 @@ The scheduler, its Postgres and the gateway run under docker compose. Every mach
 | **Namespace** | Administrator-created ownership and billing boundary. |
 | **App** | Belongs to one namespace; type is `proof` or `run`. |
 | **Job** | An execution of an app, belonging to its namespace. |
-| **Credential** | Belongs to one namespace, with explicit app grants and an optional tag. |
+| **Token** | Belongs to one namespace, with explicit app grants and an optional tag. |
 
 Nodes are infrastructure; allocations are internal reservation records. Tenants configure proof scheduling, quotas configure namespace limits, and tags are optional attributes for isolating work and applying additional limits. There is no Group resource. See [namespaces, access and quotas](#namespaces-access-and-quotas) for details.
 
-**Apps and jobs.** An *app* is what can run: a proof app is a tenant's program (named `tenant/<first 8 hex of the ELF id>`), a run app is a profile in `runs.yaml` (image, user, GPU cap, the roots a run may mount). A *job* is one instance of an app: a proof job, or a run. **Every app belongs to an administrator-created namespace. A job runs only for an existing app:** the scheduler refuses a proof whose program is not registered for its tenant, and the runs API refuses a run whose profile is not in `runs.yaml`. A proof app is registered with `fleetctl --namespace NAME app add tenant/<elf id>` (the tenant is in `fleet.yaml` and holds a credential; the ELF itself arrives with the first job); a run app with `fleetctl --namespace NAME app add APP --image … --allow …` (or by editing `runs.yaml`). `fleetctl app` lists the apps with their job counts, `fleetctl job` the jobs of both types. Either kind can be disabled (new jobs refused, history kept) and deleted.
+**Apps and jobs.** An *app* is what can run: a proof app is a tenant's program (named `tenant/<first 8 hex of the ELF id>`), a run app is a profile in `runs.yaml` (image, user, GPU cap, the roots a run may mount). A *job* is one instance of an app: a proof job, or a run. **Every app belongs to an administrator-created namespace. A job runs only for an existing app:** the scheduler refuses a proof whose program is not registered for its tenant, and the runs API refuses a run whose profile is not in `runs.yaml`. A proof app is registered with `fleetctl --namespace NAME app add tenant/<elf id>` (the tenant is in `fleet.yaml` and holds a token; the ELF itself arrives with the first job); a run app with `fleetctl --namespace NAME app add APP --image … --allow …` (or by editing `runs.yaml`). `fleetctl app` lists the apps with their job counts, `fleetctl job` the jobs of both types. Either kind can be disabled (new jobs refused, history kept) and deleted.
 
 Restarting or upgrading the scheduler does not fail the proofs in flight:
-- **gateway:** the SDK gives up on the first broken call, so the gateway (Envoy) terminates mTLS and retries calls until the scheduler is back. A resubmitted `proof_id` is never queued twice.
+- **gateway:** the SDK gives up on the first broken call, so the gateway (Envoy) terminates HTTPS and retries calls until the scheduler is back. A resubmitted `proof_id` is never queued twice.
 - **jobs:** the scheduler keeps them in Postgres.
-- **nodes:** a proof keeps running on its node; the restarted scheduler sends the job back to that node, which hands over the result.
+- **nodes:** proofs continue locally. Nodes reconnect and receive the same execution lease through heartbeat responses, then retry completion metadata until acknowledged. Uncertain executions retain their quota reservations.
+
+Nodes initiate authenticated gRPC control requests. Heartbeat responses carry assignments;
+workers fetch inputs separately, without an inbound prover RPC port. Heartbeats report
+health, the running job and completion metadata, never proof bytes.
+
+Proof nodes own proof output and write it durably before reporting success. The existing
+SDK-facing `GetStatus` and public-values routes read shared job-artifact storage
+(`proof_output_dir`); app deletion removes its terminal jobs' artifacts. Scheduling does
+not publish or inspect proofs. PI run outputs,
+logs and checkpoints use runs storage (`RUNS_DIR`, shared across machines when needed).
 
 ## Namespaces, access and quotas
 
-A namespace is a resource and the accounting and billing unit. A credential names
-one namespace and may optionally have a tag. Credentials with the same tag share
-proofs, runs and uploads; different tags isolate that work. Untagged credentials
+A namespace is a resource and the accounting and billing unit. A token names
+one namespace and may optionally have a tag. Tokens with the same tag share
+proofs, runs and uploads; different tags isolate that work. Untagged tokens
 share the namespace's untagged work. Refreshing preserves the namespace and optional
 tag, including access to earlier work. Proof tenants still define scheduling policy, and app
 types remain `proof` and `run`.
 
-### Identity and permissions
+### Token access and permissions
 
 An administrator creates a namespace with an immutable ID and unique name such
 as `alice`. Names start with a lowercase letter, contain lowercase letters,
 digits or hyphens, and have at most 63 characters; `system` and `admin` are
 reserved. Renaming and deleting namespaces are not currently supported.
 
-A credential belongs to a namespace, with an optional tag. Several credentials
+A token belongs to a namespace, with an optional tag. Several tokens
 can share a tag, for example teammates, laptop keys and automation keys.
 Members can access that tag's existing jobs and uploads; another tag in the
-same namespace cannot. App grants remain explicit on each credential, and
+same namespace cannot. App grants remain explicit on each token, and
 submission requires the relevant app grant. Only administrators create
-namespaces, issue credentials or change access.
+namespaces, issue tokens or change access.
 
-User requests infer their namespace from the verified credential. A
+User requests infer their namespace from the verified token. A
 `--namespace` selector must match that namespace; it cannot authorize access to
 another tag or namespace. Administrators can select `--namespace NAME --tag TAG`
 when listing jobs or looking up a client's proof ID. Fleet-wide records include
-namespace IDs and tags and retain the submitting credential for audit.
+namespace IDs and tags and retain the submitting token for audit.
 
-Revoking one credential blocks that key. Suspending a namespace blocks every
-credential in it. Resuming a namespace does not restore individually revoked
+Revoking one token blocks that key. Suspending a namespace blocks every
+token in it. Resuming a namespace does not restore individually revoked
 keys. Neither action cancels accepted work; an administrator stops jobs explicitly.
 Existing tenant/profile resource limits also apply. Each namespace has a shared
 GPU/CPU quota, described below.
 
 ### App ownership
 
-Every app belongs to an existing namespace. Namespace creation and app registration
-are administrator operations; user credentials cannot create either. Register the
-app before granting it:
+Every app belongs to an existing namespace. An administrator creates the namespace
+and issues its owner token for the built-in `default` tag. The owner can then
+register proof and run apps inside that namespace and submit jobs under that tag:
 
 ```bash
-fleetctl namespace create alice --gpus 2 --cpus 16
-fleetctl --namespace alice app add training --image APPROVED_IMAGE --allow /srv/training
-fleetctl --namespace alice app add eth/FULL_ELF_SHA256
+fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
+  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+fleetctl --token-file alice.token --namespace alice --tag default app add training --image IMAGE
+fleetctl --token-file alice.token --namespace alice --tag default app add eth/FULL_ELF_SHA256
 ```
 
 Omitting the namespace during app creation is refused; an unknown namespace is not
@@ -87,24 +99,27 @@ unique within the runs API's configuration; each profile has one namespace.
 A grant from another namespace cannot authorize submission. Admin run submissions
 also inherit the app's namespace and participate in its quota.
 
-The proof API uses `POST /admin/apps?namespace=alice&tenant=eth&elf_id=FULL_ELF_SHA256`.
+The proof API uses `POST /admin/apps?namespace=alice&tag=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
 The run API accepts `POST /apps?namespace=alice` with the profile JSON, or a
 `namespace` field in the JSON. Names and immutable namespace IDs are accepted;
 registrations persist the ID. A configured run profile or persistent `kind: app`
 entry can also specify `namespace: alice`; its namespace is verified before launch.
-Tags remain optional credential and job labels; apps do not require a tag.
+The owner token is bound to `default`; jobs and uploads inherit that tag. Run apps
+created with an owner token can mount only their tag's uploaded files.
 
 ### GPU and CPU quotas
 
 A namespace quota caps **concurrent resource units**, shared by proofs and runs
-across every tag and credential in that namespace. An optional tag can also cap its
+across every tag and token in that namespace. An optional tag can also cap its
 total concurrent GPU/CPU units. Admission must fit both caps; tag caps do not
 reserve a guaranteed share of fleet capacity. Neither quota has a duration, expiry, hourly
 budget or periodic reset. A job can keep its admitted units indefinitely; normal
 job lifecycle rules and existing application timeouts still apply.
 
 ```bash
-fleetctl namespace create alice --gpus 2 --cpus 16
+fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
+  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
 fleetctl namespace quota alice --gpus 4 --cpus 32
 fleetctl namespace get alice       # quota and currently reserved units
 fleetctl namespace quota alice     # clear both caps: unlimited (a write operation)
@@ -148,7 +163,7 @@ user quotas. Idle prover services and administrator-managed persistent apps are
 fleet infrastructure; this quota governs user proof/run jobs.
 
 Reservations are stored in Postgres and recovered after a scheduler restart;
-refreshing credentials never changes them. If the private quota service is
+refreshing tokens never changes them. If the private quota service is
 unavailable, new runs remain waiting. Reducing a cap lets already-admitted work
 finish, including work recovered during an upgrade. Further admissions wait
 until usage fits; a waiting run whose request exceeds a newly lowered cap fails
@@ -197,12 +212,14 @@ control namespace, while Fleet namespace IDs scope policy and accounting.
 ### Optional tags
 
 ```bash
-fleetctl namespace create team --gpus 8 --cpus 64
+fleetctl namespace create team --tenant eth --gpus 8 --cpus 64 \
+  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --server-ca /etc/zkm-fleet/tls/ca.pem --out team.env
 fleetctl namespace quota team --tag research --gpus 2 --cpus 16
 fleetctl namespace quota team --tag production --gpus 6 --cpus 48
 fleetctl namespace get team                  # namespace quota, usage and tags
 fleetctl namespace get team --tag research   # namespace totals and tag quota/usage
-fleetctl credential issue --namespace team --tag research --tenant eth \
+fleetctl token issue --namespace team --tag research --tenant eth \
   --app training --endpoint http://127.0.0.1:51000 --out alice.env
 fleetctl --namespace team --tag research job
 ```
@@ -213,50 +230,51 @@ neither can admit another GPU job. Jobs can retain admitted units indefinitely. 
 either quota lets admitted work finish and blocks further admissions as needed.
 
 Tags use the same character and length rules as namespace names and are scoped
-to their namespace. Tags are attributes, with no creation or registration step. Assign a tag when
-issuing a credential with `--tag`, or set its optional cap on the namespace. A newly
-used tag has no extra cap unless the administrator sets one. Omitting `--tag`
-issues an untagged credential; it still consumes the namespace quota.
+to their namespace. The `default` tag is created with each namespace. Additional
+tags are introduced when an administrator assigns one to a token or sets its
+optional cap. A newly used tag has no extra cap unless the administrator sets one.
 
 Membership cannot change for an existing key. Refresh copies the original tag,
-independently of CLI selectors. Client bundles use `FLEET_TAG`, empty when no tag is assigned.
-Users cannot select another tag or spoof it in a submission body. Untagged
-credentials store `tag: null`; proof jobs store `tag: ""`. There is no mandatory default tag.
+independently of CLI selectors. Namespace owner bundles use `FLEET_TAG=default`.
+Users cannot select another tag or spoof it in a submission body.
 
 ### Administrator workflow
 
 ```bash
-fleetctl namespace create alice
+fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
+  --endpoint https://stage.example:51000 --domain-name stage \
+  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
 fleetctl namespace list
 fleetctl namespace get alice
-fleetctl --namespace alice app add training --image APPROVED_IMAGE --allow /srv/training
-fleetctl credential issue --namespace alice --tenant eth --app training \
-  --endpoint http://127.0.0.1:51000 --out alice.env
-fleetctl job --namespace alice
+# Give alice.env, alice.token, and alice.ca.pem (if generated) to the owner securely.
+FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=default \
+  fleetctl app add training --image APPROVED_IMAGE --allow /srv/training
 
 # Copies the namespace, optional tag, tenant, app grants and label to a new key/token.
-fleetctl credential refresh OLD_ADDRESS \
+fleetctl token refresh OLD_TOKEN_ID \
   --endpoint http://127.0.0.1:51000 --out alice-next.env
 # After the user verifies the replacement:
-fleetctl credential revoke OLD_ADDRESS
+fleetctl token revoke OLD_TOKEN_ID
 
 fleetctl namespace suspend alice
 fleetctl namespace resume alice
 ```
 
-The endpoint above is unused for run-only access. For proofs, use the forwarded
-HTTPS gateway and supply `--tls-dir` and `--domain-name` as described in
-[user access](docs/user-access.md). `refresh` also accepts the alias `rotate`. It does
-not revoke the old key automatically or overwrite an existing bundle.
+Namespace creation requires the HTTPS stage gateway details so the owner bundle
+can submit proofs. `refresh` also accepts the alias `rotate`. It does not revoke
+the old key automatically or overwrite an existing bundle.
 
 Issuance requires an existing, active namespace. A typo cannot silently create a
-new owner. Credential namespace and optional tag cannot be changed after issuance.
+new owner. Token namespace and optional tag cannot be changed after issuance.
 
 Administrator HTTP endpoints, on the existing private scheduler listener:
 
 | Method and path | Action |
 |---|---|
 | `POST /admin/namespaces` with `{"name":"alice"}` | Create |
+| `GET /admin/tokens` | List opaque token IDs and access scopes |
+| `POST /admin/tokens` | Issue an access token (administrator only) |
+| `DELETE /admin/tokens/TOKEN_ID` | Revoke a token |
 | `GET /admin/namespaces` | List |
 | `GET /admin/namespaces/alice` | Inspect quota, total usage and tags |
 | `PUT /admin/namespaces/alice/quota` with `{"gpus":2,"cpus":16}` | Replace caps |
@@ -266,9 +284,9 @@ Administrator HTTP endpoints, on the existing private scheduler listener:
 | `PUT /admin/namespaces/alice/suspended` | Suspend |
 | `DELETE /admin/namespaces/alice/suspended` | Resume |
 
-Credential registration accepts a namespace name or ID and an optional `tag`.
+Token registration accepts a namespace name or ID and an optional `tag`. Tokens have opaque IDs; proof signer bindings are internal and are not exposed through the token API.
 Job/app lists and job reads accept `?namespace=alice&tag=research`; the runs API supports the same selectors. Refresh
-is a CLI operation using administrator credential lookup and registration.
+is a CLI operation using administrator token lookup and registration.
 No additional listener or public port is required.
 
 ### Job fields and storage
@@ -283,17 +301,17 @@ Run IDs and directories retain their existing flat layout, with namespace
 and tag ownership recorded in each run spec. Namespace names are never host paths.
 New uploaded archives live under
 `runs/.uploads/namespaces/<namespace-id>/tags/<tag>/<content-hash>.tar.gz` for
-tagged credentials, or `runs/.uploads/namespaces/<namespace-id>/untagged/<content-hash>.tar.gz`
-for untagged credentials. Dependencies,
+tagged tokens, or `runs/.uploads/namespaces/<namespace-id>/untagged/<content-hash>.tar.gz`
+for untagged tokens. Dependencies,
 logs, outputs and mutations check both namespace and tag membership. A verified replacement
-credential can reuse uploads and read accepted runs from earlier keys.
+token can reuse uploads and read accepted runs from earlier keys.
 
 Proof job identity is required and immutable:
 
 | Field | Meaning |
 |---|---|
 | `id` | Internal execution and storage identifier. |
-| `owner` | Authenticated submitting address, retained for audit after credential refresh. |
+| `owner` | Internal proof signer audit identifier, retained when an access token is refreshed. |
 | `namespace` | Immutable namespace ID controlling resource accounting and access. |
 | `tag` | Isolation label; `""` means untagged. |
 | `client_id` | Original SDK proof ID, unique within namespace and tag. |
@@ -303,16 +321,16 @@ Proof job identity is required and immutable:
 until the job succeeds or fails. Counters start at zero and failure history starts
 empty. Rejected authenticated proof requests retain their submitting identity;
 requests without an authenticated owner are refused without creating a job.
-Credential tags and run tags remain optional (`null` when absent).
+Token tags and run tags remain optional (`null` when absent).
 
-Public-values URLs for namespaced proofs are bound to the issuing credential.
+Public-values URLs for namespaced proofs are bound to the issuing token.
 Revoking that key or suspending its namespace invalidates its URLs. A replacement
-credential can poll the same job to obtain a fresh URL.
+token can poll the same job to obtain a fresh URL.
 
-Postgres creates the current schema directly. Reset databases created with an
-incompatible development schema before starting this version; there is no identity
-backfill or old group-name/path conversion. Operator-managed proof apps use the
-reserved `system` namespace. User credentials cannot be issued in `system`.
+Postgres creates the current schema directly. Reset the database before deploying this
+release: `fleet_credentials` is replaced by `fleet_tokens`, and the old signer records
+are not converted. There is no old group-name/path conversion. Operator-managed proof apps use the
+reserved `system` namespace. User tokens cannot be issued in `system`.
 
 Configured run profiles and persistent app entries default to `system`.
 Administrators assign a user app's namespace explicitly; API registrations require
@@ -347,58 +365,90 @@ deploy/install.sh node --head 10.0.0.1 --cluster-token cluster.token --cuda 0,1,
 
 ```bash
 fleetctl app | app NAME | app add … | app disable NAME | app enable NAME | app delete NAME --yes
-fleetctl job | job ID | job submit --app A --gpus 1 -- CMD | job logs ID -f | job fetch ID --out F | job cancel ID | job preempt ID | job purge ID
+fleetctl job [--namespace NAME] | job ID | job submit --app A --gpus 1 -- CMD | job logs ID -f | job fetch ID --out F | job cancel ID | job preempt ID | job purge ID
 fleetctl node | node NAME | node drain NAME | node undrain NAME
-fleetctl namespace create NAME --gpus N --cpus N | namespace quota NAME --gpus N --cpus N | namespace list | namespace get NAME | namespace suspend NAME | namespace resume NAME
-fleetctl credential | credential ADDRESS | credential issue --namespace NAME … | credential refresh ADDRESS … | credential revoke ADDRESS
+fleetctl namespace create NAME --tenant TENANT --out ENV --endpoint URL [--server-ca CA] [--domain-name NAME] [--gpus N --cpus N] | namespace quota NAME --gpus N --cpus N | namespace list | namespace get NAME | namespace suspend NAME | namespace resume NAME
+fleetctl token | token TOKEN_ID | token issue --namespace NAME … | token refresh TOKEN_ID … | token revoke TOKEN_ID
 ```
 
 Submit from your laptop with `fleetctl job submit` or `POST /runs` through an SSH
-tunnel. See [local CLI and API submission](docs/submit-jobs.md) for connection,
-code uploads, and output retrieval.
+tunnel.
 
-Admin-issued user access for proofs and runs, restricted to approved apps and
-the credential's namespace and optional tag, is supported. Credential refresh preserves jobs and uploads.
+### MCP clients
+
+The deployed MCP server is available at
+`https://34.215.238.232:8905/mcp` using Streamable HTTP over HTTPS. The repository's
+project-scoped `.mcp.json` connects to that endpoint; it does not launch a local
+stdio process or require another public port. Export the user token value and
+start Claude Code from the repository root:
+
+```bash
+export FLEET_MCP_AUTH="$(cat "$HOME/.config/zkm-fleet/alice.token")"
+claude
+```
+
+Initialization and `tools/list` are available without a token, so clients can
+inspect the tool names and schemas before connecting credentials. `tools/call`
+requires a current administrator-issued user token; the scheduler applies its
+namespace, tag, and app grants. The MCP service has no admin token. Keep the
+token file private and never place token contents in `.mcp.json`. Claude Code
+asks you to approve the project MCP server on first use; `/mcp` shows its status.
+The server exposes tools to list and inspect apps and jobs, create a run app,
+submit a run, and cancel a run. App creation requires an app-management token;
+scheduler authorization enforces the token's namespace, tag, and app grants.
+Proof jobs remain submitted through the Ziren network SDK; MCP can list and
+inspect their records.
+Other MCP clients can connect to the same HTTPS URL with the same Bearer
+authorization header.
+
+Namespace owner tokens can register apps and submit proof/run jobs inside
+their namespace and default tag. Administrators can also issue tokens limited
+to approved apps and a selected namespace/tag. Token refresh preserves jobs and uploads.
 Namespaces are the resource accounting and billing unit; namespace and optional tag quotas
 cap concurrent GPU/CPU units across proofs and runs, with no quota time limit.
-See [user access](docs/user-access.md) for onboarding and current limits, and
-[namespaces, access and quotas](#namespaces-access-and-quotas) for administration.
-
-The skills in [`.claude/skills/`](.claude/skills) cover user-facing interfaces and resources: [fleet-apps](.claude/skills/fleet-apps/SKILL.md) for app registration and lifecycle, [fleet-jobs](.claude/skills/fleet-jobs/SKILL.md) for CLI/API submission and job management, and [fleet-resources](.claude/skills/fleet-resources/SKILL.md) for namespaces, quotas, tags and credentials. Administrator-only actions are identified explicitly.
+The sections below describe token scopes, access, and quota administration.
 
 Persistent GPU apps such as ComfyUI appear as `run` apps in `fleetctl app`.
-`fleetctl app disable NAME` stops a persistent app and releases its GPUs;
-`fleetctl app enable NAME` starts it again. For proof apps and one-shot run
-profiles, disabling only blocks new jobs; existing jobs finish.
+`fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
+app has its own dedicated Ziren GPU server: disable blocks new submissions,
+drains its active proofs, then stops that server and releases its GPUs. Queued
+proofs wait until the app is enabled again. Enabling either app type starts its
+service before accepting work. Disabling a one-shot run profile only blocks new
+runs; accepted runs finish.
 
-GPU counts are currently configured in `services.yaml` for provers and persistent
-apps, or with `fleetctl job submit --gpus N` for one-shot runs. Active proofs cannot
-resize their GPU allocation. Live proof scaling is tracked in
+Each `ziren-gpu` entry in `services.yaml` must bind its server to one proof app
+using `namespace` and `proof_app: TENANT/FULL_ELF_SHA256`. Do not configure a
+Ziren server for multiple proof apps. `fleetctl app add TENANT/ELF` requires a
+matching dedicated service to exist first. GPU counts are configured in
+`services.yaml` for proof servers and persistent apps, or with
+`fleetctl job submit --gpus N` for one-shot runs. Active proofs cannot resize
+their GPU allocation. Live proof scaling is tracked in
 [issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3).
 
 ## Data
 
 | what | where |
 |---|---|
-| proof apps, proof jobs, credentials | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_credentials`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
-| ELFs, a job's input, proof and public values | the scheduler's data dir: `elf/<id>`, `jobs/<proof id>/` |
+| proof apps, proof jobs, tokens | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
+| ELFs and proof inputs | the scheduler's data dir: `elf/<id>`, `jobs/<proof id>/` |
+| Proof output | `proof_output_dir` is shared job-artifact storage: nodes write `<job id>/<execution lease>/proof.json`, `public_values.bin` and `manifest.json`; the SDK adapter reads them, and deleting an app removes its completed jobs' output directories. Previously completed proofs remain readable from the scheduler's data dir. |
 | runs | the runs dir (`install.sh --runs-dir`; shared storage when there are several machines): `<run id>/` holds `spec.json`, `status.json`, the log, `out/` and `code/`; `.uploads/` holds uploaded code tarballs |
 
-## Credentials
+## Tokens
 
 | what | held by | issued by |
 |---|---|---|
-| user API token (`FLEET_TOKEN_FILE`) | the user | `fleetctl credential issue --namespace NAME --app …`: only its hash is registered; approved apps and namespace jobs; revocable |
-| tenant signing key (`ZKM_PRIVATE_KEY`) | the client | `fleetctl credential issue`: generated on the operator's machine, only the address is registered, revocable |
-| client certificate (`SSL_CERT_PATH` / `SSL_KEY_PATH`) | the client | the same command with `--tls-dir`; its CN is the credential's address. The SDK only enables TLS when it has a client certificate, so the stage API runs mutual TLS |
-| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` | `install.sh` (`fleetctl init tls`) |
-| cluster token | scheduler and every node, both directions | `install.sh` (`fleetctl init token`) |
+| user token (`FLEET_TOKEN_FILE`) | the namespace owner/client | namespace/token issuance; authorizes proof RPCs and HTTP APIs within its scope; revocable |
+| SDK signing key (`ZKM_PRIVATE_KEY`) | the client | generated in the token bundle and bound internally to its token |
+| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` when supplied | `install.sh` (`fleetctl init tls`) |
+| cluster token | scheduler and every node; authenticates node-initiated requests | `install.sh` (`fleetctl init token`) |
 | admin token | operators | `install.sh` (`fleetctl init token`) |
 
-Proof clients use their signing key and mTLS certificate; scoped credentials are
-limited to approved programs and their own jobs. Operator credentials without app
-grants have tenant-level SDK access. Revocation applies to both proofs and runs.
-See [user access](docs/user-access.md) for issuance and permissions.
+Proof clients use bundled SDK signing material and bearer authorization over
+server-authenticated HTTPS. The token API exposes only opaque IDs and access
+scopes. Namespace-owner tokens can register apps, while app-limited tokens can
+use only approved programs and profiles. Revocation applies to both proofs and
+runs.
 
 The scheduler and runs API stay private. Users reach them through restricted SSH
 forwards and use `FLEET_TOKEN_FILE`; operators use `FLEET_ADMIN_TOKEN_FILE`.
@@ -408,11 +458,10 @@ The runs API listens on loopback by default, and this feature adds no public por
 
 | port | bind | who |
 |---|---|---|
-| 51000 stage (gRPC) | external, mTLS, on the gateway | SDK clients |
+| 51000 stage (gRPC) | external, server-authenticated HTTPS, on the gateway | SDK clients |
 | 9191 http | external by default (`--bind-http`), on the gateway | public values (SDK, per-proof key), `/admin` (admin token), `/healthz` |
 | 9192 runs API | 127.0.0.1 (the service's `listen`) | `fleetctl job` / `app` for runs (admin token) |
-| 51001 control (gRPC) | cluster interface | nodes (cluster token) |
-| 31000-31099 fleet-ziren-node | cluster | the scheduler (cluster token) |
+| 51001 control / input fetch (gRPC) | cluster interface; connections originate on nodes | nodes (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
 | app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |

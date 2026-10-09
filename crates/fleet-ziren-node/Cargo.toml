@@ -7,6 +7,11 @@ publish.workspace = true
 [[bin]]
 name = "fleet-ziren-node"
 path = "src/main.rs"
+required-features = ["prover-runtime"]
+
+[features]
+default = ["prover-runtime"]
+prover-runtime = ["dep:zkm-sdk", "dep:zkm-prover", "dep:zkm-cuda", "dep:zkm-core-machine"]
 
 [dependencies]
 fleet-proto.workspace = true
@@ -24,10 +29,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
 
-zkm-sdk.workspace = true
-zkm-prover.workspace = true
-zkm-cuda.workspace = true
-zkm-core-machine.workspace = true
+zkm-sdk = { workspace = true, optional = true }
+zkm-prover = { workspace = true, optional = true }
+zkm-cuda = { workspace = true, optional = true }
+zkm-core-machine = { workspace = true, optional = true }
 
 [dev-dependencies]
+tempfile.workspace = true
 hex.workspace = true

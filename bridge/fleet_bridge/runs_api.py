@@ -93,16 +93,18 @@ class Api:
             with urllib.request.urlopen(req, timeout=5) as response:
                 c = json.load(response)
         except urllib.error.HTTPError as e:
-            raise ApiError(401 if e.code == 401 else 503, "credential validation failed") from None
+            raise ApiError(401 if e.code == 401 else 503, "token validation failed") from None
         except (OSError, ValueError):
-            raise ApiError(503, "credential validation unavailable") from None
+            raise ApiError(503, "token validation unavailable") from None
         if not isinstance(c, dict):
-            raise ApiError(503, "invalid credential validation response")
-        address = c.get("address", "")
-        if (not isinstance(address, str) or len(address) != 40
-                or any(ch not in "0123456789abcdef" for ch in address)
+            raise ApiError(503, "invalid token validation response")
+        token_id = c.get("id", "")
+        if (not isinstance(token_id, str) or len(token_id) != 32
+                or any(ch not in "0123456789abcdef" for ch in token_id)
                 or not isinstance(c.get("apps"), list) or c.get("revoked_ms") is not None):
-            raise ApiError(401, "invalid credential")
+            raise ApiError(401, "invalid token")
+        if type(c.get("manage_apps", False)) is not bool:
+            raise ApiError(401, "invalid app-management permission")
         self.validate_namespace(c)
         self.validate_quota(c)
         if c.get("tag") is not None and (not isinstance(c["tag"],str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,62}",c["tag"])):
@@ -354,8 +356,11 @@ class Api:
             raise ApiError(404, "no such run")
 
     def user_submit(self, body: dict[str, Any], principal: dict[str, Any]) -> Record:
-        if body.get("profile") not in principal["apps"]:
-            raise ApiError(403, "app is not granted to this credential")
+        profile = runs.load_config(self.profiles).profiles.get(body.get("profile"))
+        if body.get("profile") not in principal["apps"] and not (
+                principal.get("manage_apps") and profile is not None
+                and profile.namespace in (principal["namespace"], principal.get("namespace_name"))):
+            raise ApiError(403, "app is not granted to this token")
         if body.get("nodes", 1) != 1:
             raise ApiError(400, "user jobs currently support one machine per job")
         if body.get("after"):
@@ -370,13 +375,14 @@ class Api:
         if code:
             if code.startswith("git:"):
                 paths.append(code[4:].rsplit("@", 1)[0])
-            elif os.path.dirname(os.path.realpath(code)) not in upload_roots:
+            elif not any(os.path.commonpath([os.path.realpath(code), root]) == root for root in upload_roots):
                 raise ApiError(403, "user code must come from this tag's uploads")
         for path in paths:
             real = os.path.realpath(path)
-            if any(os.path.commonpath([real, root]) in (real, root) for root in protected):
+            in_upload = any(os.path.commonpath([real, upload]) == upload for upload in upload_roots)
+            if not in_upload and any(os.path.commonpath([real, root]) in (real, root) for root in protected):
                 raise ApiError(403, "path overlaps fleet configuration or job storage")
-        return self.submit(body, owner=principal["address"], namespace=principal["namespace"], tag=principal["tag"])
+        return self.submit(body, owner=principal["id"], namespace=principal["namespace"], tag=principal["tag"])
 
     def args(self, **changes: Any) -> RunArgs:
         """RunArgs for an action: the server's paths, the caller's choices."""
@@ -424,7 +430,8 @@ class Api:
         with self.lock:
             return runs.delete_app(self.args(), name)
 
-    def add_app(self, body: dict[str, Any], namespace: str | None = None) -> Record:
+    def add_app(self, body: dict[str, Any], namespace: str | None = None,
+                principal: dict[str, Any] | None = None) -> Record:
         reference = namespace or body.get("namespace")
         if not isinstance(reference, str) or not reference:
             raise ApiError(400, "namespace: an existing namespace is required")
@@ -434,6 +441,10 @@ class Api:
         if body.get("namespace") not in (None, scope["namespace"], scope["namespace_name"]):
             raise ApiError(400, "conflicting app namespace")
         body["namespace"] = scope["namespace"]
+        if principal is not None:
+            # User-created profiles may mount only this token's isolated upload
+            # area; otherwise an app definition could grant access to host paths.
+            body["allow"] = [self.upload_root(principal["namespace"], principal["tag"])]
         name = body.pop("name", None)
         if not isinstance(name, str):
             raise ApiError(400, "name: the app's name")
@@ -452,6 +463,107 @@ class Api:
                  "image": s.image, "max_gpus": s.gpus * s.replicas,
                  "replicas": s.replicas} for s in cfg.services if s.kind is ServiceKind.APP]
 
+    def proof_app_services(self, namespace: str, tenant: str, elf_id: str) -> tuple[Any, list[Any]]:
+        """Find the dedicated configured GPU services for one proof app."""
+        from . import reconcile
+        from .model import ServiceKind
+
+        path = os.path.join(os.path.dirname(self.profiles), "services.yaml")
+        if not os.path.exists(path):
+            raise ApiError(409, "no dedicated zkm-gpu-server is configured for this proof app")
+        with open(path) as f:
+            cfg = reconcile.load_services(yaml.safe_load(f) or {})
+        scheduler = reconcile.Scheduler(cfg.cluster)
+        try:
+            wanted_namespace = scheduler.resolve_namespace_id(namespace)["id"]
+        except Exception as e:
+            raise ApiError(409, f"proof app namespace is unavailable: {e}") from e
+        matches = []
+        for service in cfg.services:
+            if service.kind is not ServiceKind.ZIREN_GPU or service.proof_app is None or service.proof_app.lower() != f"{tenant}/{elf_id}".lower():
+                continue
+            try:
+                service_namespace = scheduler.resolve_namespace_id(service.namespace)["id"]
+            except Exception as e:
+                raise ApiError(409, f"proof service {service.name} has no active namespace: {e}") from e
+            if service_namespace == wanted_namespace:
+                matches.append(service)
+        if not matches:
+            raise ApiError(409, "no dedicated zkm-gpu-server is configured for this proof app")
+        return cfg, matches
+
+    def proof_app_available(self, namespace: str, tenant: str, elf_id: str) -> dict[str, Any]:
+        cfg, services = self.proof_app_services(namespace, tenant, elf_id)
+        from . import reconcile
+        try:
+            reconcile.Scheduler(cfg.cluster).require_namespace(namespace)
+        except Exception as e:
+            raise ApiError(409, f"proof app namespace is unavailable: {e}") from e
+        return {"namespace": namespace, "tenant": tenant, "elf_id": elf_id,
+                "servers": [s.name for s in services], "enabled": any(not s.disabled for s in services)}
+
+    def set_proof_app_disabled(self, namespace: str, tenant: str, elf_id: str, disabled: bool) -> dict[str, Any]:
+        """Disable admission, drain this app's dedicated nodes, then release their GPUs."""
+        with self.lock:
+            cfg, services = self.proof_app_services(namespace, tenant, elf_id)
+            from . import reconcile
+            scheduler = reconcile.Scheduler(cfg.cluster)
+            if disabled:
+                scheduler.set_proof_app_disabled(namespace, tenant, elf_id, True)
+            else:
+                try:
+                    scheduler.require_namespace(namespace)
+                except Exception as e:
+                    raise ApiError(409, f"proof app namespace is unavailable: {e}") from e
+
+            path = os.path.join(os.path.dirname(self.profiles), "services.yaml")
+            with open(path) as f:
+                text = f.read()
+            data = yaml.safe_load(text) or {}
+            names = {s.name for s in services}
+            for service in data.get("services", []):
+                if service.get("name") in names:
+                    service["disabled"] = disabled
+
+            # Persist desired state before reconcile so a later apply cannot restart a
+            # deliberately disabled proof server.
+            root = yaml.compose(text)
+            sequence = next(v for k, v in root.value if k.value == "services")
+            for entry in sequence.value:
+                name_node = next((v for k, v in entry.value if k.value == "name"), None)
+                if name_node is None or name_node.value not in names:
+                    continue
+                value = next((v for k, v in entry.value if k.value == "disabled"), None)
+                scalar = str(disabled).lower()
+                if value is not None:
+                    text = text[:value.start_mark.index] + scalar + text[value.end_mark.index:]
+                else:
+                    pos = entry.start_mark.index
+                    text = text[:pos] + f"disabled: {scalar}\n" + " " * entry.start_mark.column + text[pos:]
+            tmp = tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(path), prefix=".services-", delete=False)
+            try:
+                with tmp:
+                    tmp.write(text)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                os.chmod(tmp.name, os.stat(path).st_mode & 0o777)
+                os.replace(tmp.name, path)
+            finally:
+                if os.path.exists(tmp.name):
+                    os.unlink(tmp.name)
+
+            cfg = reconcile.load_services(data)
+            report = reconcile.reconcile_once(cfg, only=sorted(names))
+            if report.unhealthy:
+                raise ApiError(503, f"proof app reconciliation failed; desired state saved: {', '.join(report.unhealthy)}")
+            if not disabled:
+                for node_name, spec in reconcile.replica_specs(cfg).items():
+                    if spec.service.name in names:
+                        scheduler.undrain(node_name)
+                scheduler.set_proof_app_disabled(namespace, tenant, elf_id, False)
+            return {"namespace": namespace, "tenant": tenant, "elf_id": elf_id,
+                    "disabled": disabled, "servers": sorted(names), "report": report.dump()}
+
     def apps(self, principal: dict[str, Any] | None = None, scope: dict[str, Any] | None = None) -> list[Any]:
         selected = scope or principal
         config = runs.load_config(self.profiles)
@@ -460,7 +572,7 @@ class Api:
                 if p.namespace == selected.get("namespace_name"):
                     p.namespace = selected["namespace"]
         profiles = runs.apps(self.scoped_args(selected), config)
-        if principal is not None:
+        if principal is not None and not principal.get("manage_apps"):
             return [p.dump() for p in profiles if p.name in principal["apps"]]
         services = self.service_apps()
         if selected:
@@ -661,6 +773,8 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                     if q.get("tag") is not None and q["tag"] != self.principal["tag"]:
                         raise ApiError(403,"another tag cannot be selected")
                     allowed = ((method == "GET" and parts == ["apps"])
+                        or (method == "POST" and parts == ["apps"] and self.principal.get("manage_apps") is True)
+                        or (method == "GET" and parts == ["proof-apps", "available"] and self.principal.get("manage_apps") is True)
                         or (method in ("GET", "POST") and parts == ["runs"])
                         or (method == "PUT" and parts == ["uploads"])
                         or (len(parts) == 2 and parts[0] == "runs" and method in ("GET", "DELETE"))
@@ -704,8 +818,19 @@ def handler(api: Api, token: str) -> type[BaseHTTPRequestHandler]:
                 return self._json(201, api.user_submit(self._json_body(), self.principal) if self.principal else api.submit(self._json_body(), namespace=self.scope["namespace"] if self.scope else None, tag=self.scope.get("tag") if self.scope else None))
             if (method, head, n) == ("GET", "apps", 1):
                 return self._json(200, api.apps(self.principal, self.scope))
+            if (method, head, n) == ("GET", "proof-apps", 2) and parts[1] == "available":
+                required = ("namespace", "tenant", "elf_id")
+                if any(not q.get(k) for k in required):
+                    raise ApiError(400, "give namespace, tenant and elf_id")
+                return self._json(200, api.proof_app_available(q["namespace"], q["tenant"], q["elf_id"]))
+            if (head, n) == ("proof-apps", 1) and method in ("PUT", "DELETE"):
+                required = ("namespace", "tenant", "elf_id")
+                if any(not q.get(k) for k in required):
+                    raise ApiError(400, "give namespace, tenant and elf_id")
+                return self._json(200, api.set_proof_app_disabled(q["namespace"], q["tenant"], q["elf_id"], method == "PUT"))
             if (method, head, n) == ("POST", "apps", 1):
-                return self._json(201, api.add_app(self._json_body(), self.scope["namespace"] if self.scope else None))
+                return self._json(201, api.add_app(self._json_body(), self.scope["namespace"] if self.scope else None,
+                                                   self.principal))
             if (method, head, n) == ("DELETE", "apps", 2):
                 return self._json(200, api.delete_app(parts[1]))
             if (method, head, n) == ("PUT", "apps", 3) and parts[2] == "priority":

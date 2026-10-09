@@ -14,7 +14,7 @@ use std::future::IntoFuture;
 use std::sync::Arc;
 
 use tokio::sync::watch;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
+use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use fleet_proto::fleet::v1::control_service_server::ControlServiceServer;
 use fleet_proto::stage::v1::stage_service_server::StageServiceServer;
@@ -37,17 +37,18 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let store: Arc<dyn store::Store> = match &cfg.database_url {
         Some(url) => Arc::new(store::PgStore::connect(url).await?),
         None => {
-            tracing::warn!("no database_url: jobs and credentials are kept in memory only");
+            tracing::warn!("no database_url: jobs and tokens are kept in memory only");
             Arc::new(store::MemoryStore::default())
         }
     };
-    let blobs = blobs::Blobs::new(&cfg.data_dir)?;
+    let blobs = blobs::Blobs::new(&cfg.data_dir)?
+        .with_proof_output(cfg.proof_output_dir.clone().unwrap_or_else(|| cfg.data_dir.join("proofs")));
     let fleet = fleet::Fleet::new(cfg.clone(), store, blobs, cluster_token.clone());
-    let creds = fleet.load_credentials().await?;
+    let tokens = fleet.load_tokens().await?;
     let apps = fleet.load_apps().await?;
     let recovered = fleet.recover().await?;
     tracing::info!(
-        credentials = creds,
+        tokens,
         apps,
         recovered_jobs = recovered,
         "scheduler state loaded"
@@ -59,11 +60,7 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
             std::fs::read(&tls.cert_path)?,
             std::fs::read(&tls.key_path)?,
         );
-        let mut t = ServerTlsConfig::new().identity(identity);
-        if let Some(ca) = &tls.client_ca_path {
-            t = t.client_ca_root(Certificate::from_pem(std::fs::read(ca)?));
-        }
-        stage_server = stage_server.tls_config(t)?;
+        stage_server = stage_server.tls_config(ServerTlsConfig::new().identity(identity))?;
     } else {
         tracing::warn!("stage API without TLS: keep it off untrusted networks");
     }
@@ -84,10 +81,9 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
         .add_service(stage)
         .serve_with_shutdown(stage_addr, stopping());
 
-    let control = ControlServiceServer::with_interceptor(
-        control::ControlApi {
-            fleet: fleet.clone(),
-        },
+    let control = tonic::codegen::InterceptedService::new(
+        ControlServiceServer::new(control::ControlApi { fleet: fleet.clone() })
+            .max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30),
         token::Require(Arc::new(cluster_token)),
     );
     let control_addr = cfg.control_addr.parse()?;

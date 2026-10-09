@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::Fleet;
-use crate::store::{Credential, JobFilter};
+use crate::store::{Token, JobFilter};
 use crate::token;
 
 #[derive(Clone)]
@@ -32,10 +32,10 @@ pub fn router(state: HttpState) -> Router {
         .route("/namespaces/:name/allocations", get(allocations).post(reserve_run))
         .route("/namespaces/:name/allocations/:id", axum::routing::delete(release_run))
         .route("/namespaces/:name/suspended", put(suspend_namespace).delete(resume_namespace))
-        .route("/credentials", get(list_credentials).post(add_credential))
+        .route("/tokens", get(list_tokens).post(add_token))
         .route(
-            "/credentials/:address",
-            axum::routing::delete(revoke_credential),
+            "/tokens/:id",
+            axum::routing::delete(revoke_token),
         )
         .route("/apps", get(apps).post(add_app).delete(delete_app))
         .route("/apps/disabled", put(disable_app).delete(enable_app))
@@ -64,11 +64,13 @@ async fn authorize_http(
     let header = headers.get(token::HEADER).and_then(|v| v.to_str().ok());
     let principal = if token::bearer_matches(header, &s.admin_token) {
         None
-    } else if let Some(c) = s.fleet.credential_for_token(header) {
+    } else if let Some(c) = s.fleet.token_for_token(header) {
         let path = req.uri().path().strip_prefix("/admin").unwrap_or(req.uri().path());
-        if req.method() != axum::http::Method::GET
-            || !(path == "/apps" || path == "/jobs"
-                || path.strip_prefix("/jobs/").is_some_and(|id| !id.is_empty() && !id.contains('/'))) {
+        let read_scoped = req.method() == axum::http::Method::GET
+            && (path == "/apps" || path == "/jobs"
+                || path.strip_prefix("/jobs/").is_some_and(|id| !id.is_empty() && !id.contains('/')));
+        let create_app = req.method() == axum::http::Method::POST && path == "/apps" && c.manage_apps;
+        if !read_scoped && !create_app {
             return StatusCode::FORBIDDEN.into_response();
         }
         Some(c)
@@ -80,7 +82,7 @@ async fn authorize_http(
 }
 
 async fn access(State(s): State<HttpState>, headers: HeaderMap) -> Response {
-    match s.fleet.credential_for_token(headers.get(token::HEADER).and_then(|v| v.to_str().ok())) {
+    match s.fleet.token_for_token(headers.get(token::HEADER).and_then(|v| v.to_str().ok())) {
         Some(c) => Json(s.fleet.access_record(&c)).into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
@@ -93,7 +95,7 @@ fn internal(e: anyhow::Error) -> Response {
 #[derive(Deserialize)]
 struct PublicValuesQuery {
     key: Option<String>,
-    credential: Option<String>,
+    token_id: Option<String>,
 }
 
 /// The SDK fetches this with a plain GET of the URL GetStatus gave it, which carries the
@@ -110,16 +112,16 @@ async fn public_values(
         Err(e) => return internal(e),
     };
     let allowed = if job.namespace != crate::store::SYSTEM_NAMESPACE {
-        q.credential.as_ref().and_then(|a| s.fleet.credential_for_signer(a)).is_some_and(|c| {
+        q.token_id.as_ref().and_then(|id| s.fleet.token_for_id(id)).is_some_and(|c| {
             c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag && s.fleet.public_values_open(
-                &format!("{proof_id}\0{}", c.address), q.key.as_deref())
+                &format!("{proof_id}\0{}", c.id), q.key.as_deref())
         })
     } else {
         s.fleet.public_values_open(&proof_id, q.key.as_deref())
             && s.fleet.tenant_for_signer(&job.owner).is_some()
     };
     if !allowed { return StatusCode::NOT_FOUND.into_response(); }
-    match s.fleet.blobs.get(&proof_id, blobs::PUBLIC_VALUES) {
+    match s.fleet.blobs.sdk_output(&job, blobs::PUBLIC_VALUES).await {
         Ok(bytes) => ([("content-type", "application/octet-stream")], bytes).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -222,7 +224,7 @@ async fn resume_namespace(State(s): State<HttpState>, Path(name): Path<String>) 
 #[serde(deny_unknown_fields)]
 struct NamespaceQuery { namespace: Option<String>, tag: Option<String> }
 
-fn selected_namespace(s: &HttpState, c: Option<&Credential>, selected: Option<&str>) -> Result<Option<String>, Response> {
+fn selected_namespace(s: &HttpState, c: Option<&Token>, selected: Option<&str>) -> Result<Option<String>, Response> {
     if let Some(c) = c {
         let n = c.namespace.as_ref().and_then(|id| s.fleet.namespace(id)).ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
         if selected.is_some_and(|v| v != n.id && v != n.name) { return Err(StatusCode::FORBIDDEN.into_response()); }
@@ -232,7 +234,7 @@ fn selected_namespace(s: &HttpState, c: Option<&Credential>, selected: Option<&s
     } else { Ok(None) }
 }
 
-fn selected_tag(s: &HttpState, c: Option<&Credential>, namespace: Option<&str>, selected: Option<&str>) -> Result<Option<String>,Response> {
+fn selected_tag(s: &HttpState, c: Option<&Token>, namespace: Option<&str>, selected: Option<&str>) -> Result<Option<String>,Response> {
     if let Some(c)=c {
         if selected.is_some_and(|g| c.tag.as_deref()!=Some(g)) { return Err(StatusCode::FORBIDDEN.into_response()); }
         Ok(Some(c.tag.clone().unwrap_or_default()))
@@ -244,13 +246,14 @@ fn selected_tag(s: &HttpState, c: Option<&Credential>, namespace: Option<&str>, 
     } else { Ok(None) }
 }
 
-async fn list_credentials(State(s): State<HttpState>) -> Response {
-    Json(s.fleet.credentials()).into_response()
+async fn list_tokens(State(s): State<HttpState>) -> Response {
+    Json(s.fleet.tokens()).into_response()
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NewCredential {
+struct NewToken {
+    id: String,
     tenant: String,
     address: String,
     #[serde(default)]
@@ -259,26 +262,28 @@ struct NewCredential {
     token_hash: Option<String>,
     namespace: Option<String>,
     tag: Option<String>,
+    #[serde(default)]
+    manage_apps: bool,
 }
 
-async fn add_credential(State(s): State<HttpState>, Json(c): Json<NewCredential>) -> Response {
+async fn add_token(State(s): State<HttpState>, Json(c): Json<NewToken>) -> Response {
     match s
         .fleet
-        .add_user_credential(&c.tenant, &c.address, &c.label, c.apps, c.token_hash, c.namespace, c.tag)
+        .add_user_token(&c.tenant, &c.id, &c.address, &c.label, c.apps, c.token_hash, c.namespace, c.tag, c.manage_apps)
         .await
     {
         Ok(cred) => {
-            tracing::info!(tenant = %cred.tenant, address = %cred.address, label = %cred.label, "credential added");
+            tracing::info!(tenant = %cred.tenant, token_id = %cred.id, label = %cred.label, "token added");
             (StatusCode::CREATED, Json(cred)).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
 }
 
-async fn revoke_credential(State(s): State<HttpState>, Path(address): Path<String>) -> Response {
-    match s.fleet.revoke_credential(&address).await {
+async fn revoke_token(State(s): State<HttpState>, Path(id): Path<String>) -> Response {
+    match s.fleet.revoke_token(&id).await {
         Ok(true) => {
-            tracing::info!(%address, "credential revoked");
+            tracing::info!(%id, "token revoked");
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
@@ -303,17 +308,19 @@ fn default_jobs_limit() -> usize {
     20
 }
 
-async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Credential>>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
+async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
     let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
     let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r };
     match s.fleet.apps().await {
         Ok(mut v) => {
             if let Some(c) = &c {
-                v.retain(|a| c.apps.as_ref().is_some_and(|g| g.contains(&format!("{}/{}", a["tenant"].as_str().unwrap_or_default(), a["elf_id"].as_str().unwrap_or_default()))));
+                if let Some(grants) = &c.apps {
+                    v.retain(|a| grants.contains(&format!("{}/{}", a["tenant"].as_str().unwrap_or_default(), a["elf_id"].as_str().unwrap_or_default())));
+                }
             }
             if namespace.is_some() {
                 v.retain(|a| a["namespace"].as_str() == namespace.as_deref());
-                // Counts and ordering are namespace-local even after rotating credentials.
+                // Counts and ordering are namespace-local even after rotating tokens.
                 let jobs = match s.fleet.recent_jobs(&JobFilter { namespace, tag, ..Default::default() }, i64::MAX as usize).await {
                     Ok(j) => j, Err(e) => return internal(e),
                 };
@@ -339,16 +346,17 @@ async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Credent
 #[derive(Deserialize)]
 struct AppKey {
     namespace: Option<String>,
+    tag: Option<String>,
     tenant: Option<String>,
     elf_id: Option<String>,
     priority: Option<i32>,
 }
 
 impl AppKey {
-    fn parts(self, fleet: &Fleet) -> Result<(String, String, String), Response> {
-        match (self.namespace, self.tenant, self.elf_id) {
-            (Some(n), Some(t), Some(e)) => match fleet.namespace(&n) {
-                Some(n) => Ok((n.id, t, e)),
+    fn parts(&self, fleet: &Fleet) -> Result<(String, String, String), Response> {
+        match (&self.namespace, &self.tenant, &self.elf_id) {
+            (Some(reference), Some(t), Some(e)) => match fleet.namespace(reference) {
+                Some(n) => Ok((n.id, t.clone(), e.clone())),
                 None => Err((StatusCode::NOT_FOUND, "unknown namespace; an administrator must create it first").into_response()),
             },
             _ => Err((StatusCode::BAD_REQUEST, "give namespace, tenant and elf_id (the full id, as GET /admin/apps lists it)").into_response()),
@@ -374,8 +382,16 @@ async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::e
     }
 }
 
-async fn add_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
     let priority = k.priority.unwrap_or(0);
+    if let Some(c) = c {
+        if !c.manage_apps { return StatusCode::FORBIDDEN.into_response(); }
+        match k.parts(&s.fleet) {
+            Ok((namespace, tenant, _)) if c.namespace.as_deref() == Some(namespace.as_str())
+                && k.tag.as_deref() == c.tag.as_deref() && tenant == c.tenant => {},
+            _ => return StatusCode::FORBIDDEN.into_response(),
+        }
+    }
     match k.parts(&s.fleet) {
         Ok((n, t, e)) => app_outcome(s.fleet.add_app(&n, &t, &e, priority).await),
         Err(r) => r,
@@ -404,7 +420,7 @@ async fn enable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::e
     }
 }
 
-async fn jobs(State(s): State<HttpState>, Extension(c): Extension<Option<Credential>>, axum::extract::Query(q): axum::extract::Query<JobsQuery>) -> Response {
+async fn jobs(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(q): axum::extract::Query<JobsQuery>) -> Response {
     let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
     let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r };
     match s.fleet.recent_jobs(&JobFilter { namespace, tag, owner: None, tenant: q.tenant, elf: q.elf, active: q.active }, q.limit.min(1000)).await {
@@ -413,7 +429,7 @@ async fn jobs(State(s): State<HttpState>, Extension(c): Extension<Option<Credent
     }
 }
 
-async fn job(State(s): State<HttpState>, Extension(c): Extension<Option<Credential>>, Path(id): Path<String>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
+async fn job(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path(id): Path<String>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
     let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
     let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r };
     let resolved = if let Some(n) = &namespace {

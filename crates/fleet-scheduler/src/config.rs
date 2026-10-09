@@ -21,8 +21,13 @@ pub struct Config {
     /// File holding the Postgres URL (keeps the password out of this file); wins over `database_url`.
     #[serde(default)]
     pub database_url_file: Option<PathBuf>,
-    /// ELFs, job inputs and results.
+    /// ELFs and job inputs; previously stored SDK results remain readable.
     pub data_dir: PathBuf,
+    /// Shared job-artifact directory: proof nodes write outputs, the SDK adapter reads
+    /// them, and app deletion removes completed jobs' output directories. Defaults to
+    /// data_dir/proofs.
+    #[serde(default)]
+    pub proof_output_dir: Option<PathBuf>,
     /// How long `GetStatus` holds a request open waiting for the job to finish.
     #[serde(default = "default_long_poll_ms")]
     pub long_poll_ms: u64,
@@ -31,9 +36,6 @@ pub struct Config {
     /// A node that has not sent a heartbeat for this long is dropped.
     #[serde(default = "default_node_stale_secs")]
     pub node_stale_secs: u64,
-    /// Upper bound on one proof on a node.
-    #[serde(default = "default_job_timeout_secs")]
-    pub job_timeout_secs: u64,
     /// Attempts per job, the first one included; a retry avoids the nodes that failed it.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
@@ -43,18 +45,10 @@ pub struct Config {
     /// Tenant for unsigned or unknown requests when `require_signature` is false.
     #[serde(default)]
     pub default_tenant: Option<String>,
-    /// Take the caller's identity from the client certificate the gateway verified and
-    /// forwarded (`x-forwarded-client-cert`, its CN a credential's address): GetStatus
-    /// answers only the tenant that submitted the proof, and a request whose certificate
-    /// and signature name different tenants is refused. Only with the gateway's mutual
-    /// TLS in front (it strips the header from clients), never with the stage port open.
-    #[serde(default)]
-    pub client_cert_identity: bool,
     pub tenants: Vec<TenantConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
-    /// Shared secret between the scheduler and its prover nodes, both directions
-    /// (node -> control API, scheduler -> node API). At least 32 characters.
+    /// Shared secret authenticating node-initiated control requests. At least 32 characters.
     pub cluster_token_file: PathBuf,
     /// Bearer token for the operator HTTP endpoints (`/status`, ELF upload).
     pub admin_token_file: PathBuf,
@@ -110,9 +104,6 @@ pub enum Anchor {
 pub struct TlsConfig {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
-    /// Require client certificates signed by this CA.
-    #[serde(default)]
-    pub client_ca_path: Option<PathBuf>,
 }
 
 fn default_stage_addr() -> String {
@@ -132,9 +123,6 @@ fn default_heartbeat_secs() -> u32 {
 }
 fn default_node_stale_secs() -> u64 {
     20
-}
-fn default_job_timeout_secs() -> u64 {
-    3_600
 }
 fn default_max_attempts() -> u32 {
     2

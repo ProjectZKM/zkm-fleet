@@ -3,6 +3,8 @@
     services:
       - name: ethproofs-gpu        # replica i runs as actor "<name>-<i>"
         kind: ziren-gpu            # ziren-gpu | ziren-cpu | app | hold | runs-api
+        namespace: ethproofs-user
+        proof_app: ethproofs/FULL_ELF_SHA256 # one server service per proof app
         replicas: 1
         gpus: 2
         cpus: 48
@@ -46,6 +48,7 @@ import json
 import logging
 import os
 import time
+import uuid
 import urllib.parse
 import urllib.request
 from typing import Any, Mapping
@@ -67,7 +70,7 @@ ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, Service
                                   ServiceKind.APP: GpuApp, ServiceKind.RUNS_API: RunsApi}
 PREEMPT_AFTER_S = 20  # a service's cards not granted this long: runs hold them
 # the cluster settings a replica's hash covers, as the file names them
-_SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "node_port_range", "gpu_port_range")
+_SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "proof_output_dir", "gpu_port_range", "scheduler_admin")
 
 
 def service_of(replica: str) -> str:
@@ -137,7 +140,10 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> Health:
 
 
 def _pg_name(actor: str) -> str:
-    return f"pg-{actor}"
+    # Ray keeps named placement-group records after removal. Reusing the same
+    # name on a later service restart is rejected by the GCS even when the old
+    # group is REMOVED, so each actor start needs a fresh name.
+    return f"pg-{actor}-{uuid.uuid4().hex}"
 
 
 def start(spec: ReplicaSpec, ready_timeout_s: float = 900, runs_dir: str | None = None) -> ActorHandle[Any]:
@@ -227,10 +233,16 @@ def stop(name: str) -> None:
                 log.warning("cleaning up after %s: %s", name, e)
         else:  # the actor's machine is unknown: clean here, which is right on one machine
             ray.get(clean_after.remote(name), timeout=120)
-    try:
-        remove_placement_group(ray.util.get_placement_group(_pg_name(name)))
-    except Exception:
-        pass
+    # Find all generations because an actor can have been restarted several
+    # times. Only remove live groups; Ray retains removed group names forever.
+    prefix = f"pg-{name}-"
+    for info in ray.util.placement_group_table().values():
+        group_name = info.get("name", "")
+        if group_name.startswith(prefix) and info.get("state") != "REMOVED":
+            try:
+                remove_placement_group(ray.util.get_placement_group(group_name))
+            except Exception:
+                pass
 
 
 class Scheduler:
@@ -255,13 +267,31 @@ class Scheduler:
         parsed = json.loads(body) if body.strip().startswith(b"{") else {}
         return parsed if isinstance(parsed, dict) else {}
 
-    def require_namespace(self, reference: str) -> str:
+    def resolve_namespace_id(self, reference: str) -> dict[str, Any]:
         if not self.token:
             raise ValueError("app namespace validation requires the administrator token")
         namespace = self._call("GET", "/namespaces/" + urllib.parse.quote(reference, safe=""))
-        if not namespace.get("id") or namespace.get("suspended_ms") is not None:
+        if not namespace.get("id"):
+            raise ValueError("namespace does not exist")
+        return namespace
+
+    def require_namespace(self, reference: str) -> str:
+        namespace = self.resolve_namespace_id(reference)
+        if namespace.get("suspended_ms") is not None:
             raise ValueError("app requires an existing, active namespace created by an administrator")
         return str(namespace["id"])
+
+    def set_proof_app_disabled(self, namespace: str, tenant: str, elf_id: str, disabled: bool) -> None:
+        if not self.token:
+            raise ValueError("proof app lifecycle requires the administrator token")
+        query = urllib.parse.urlencode({"namespace": namespace, "tenant": tenant, "elf_id": elf_id})
+        self._call("PUT" if disabled else "DELETE", f"/apps/disabled?{query}")
+
+    def undrain(self, name: str) -> None:
+        """A restarted dedicated node must clear the drain left by its old process."""
+        if not self.token:
+            raise ValueError("proof app lifecycle requires the administrator token")
+        self._call("DELETE", f"/nodes/{urllib.parse.quote(name, safe='')}/drain")
 
     def drain(self, name: str) -> bool:
         """True once `name` takes no job and has none running."""

@@ -4,3 +4,4 @@ __pycache__/
 *.token
 *.key
 *.env
+/.fleet/

@@ -6,13 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
 use fleet_proto::fleet::v1::{
     control_service_client::ControlServiceClient,
-    node_service_server::{NodeService, NodeServiceServer},
-    HealthRequest, HealthResponse, HeartbeatRequest, NodeInfo, ProveRequest, ProveResponse,
+    Assignment, Completion, FetchInputsRequest, HeartbeatRequest, NodeInfo, ProveRequest, ProveResponse,
     RegisterRequest,
 };
 use fleet_proto::stage::v1::{
@@ -44,8 +43,7 @@ struct FakeNode {
     failure_code: tonic::Code,
 }
 
-#[tonic::async_trait]
-impl NodeService for FakeNode {
+impl FakeNode {
     async fn prove(&self, req: Request<ProveRequest>) -> Result<Response<ProveResponse>, Status> {
         let auth = req
             .metadata()
@@ -78,13 +76,7 @@ impl NodeService for FakeNode {
         }))
     }
 
-    async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            ready: true,
-            cached_elf_ids: vec![],
-            busy: false,
-        }))
-    }
+
 }
 
 struct Harness {
@@ -98,7 +90,7 @@ async fn start() -> Harness {
     start_with("").await
 }
 
-/// A scheduler with extra top-level config lines (e.g. `client_cert_identity: true`).
+/// A scheduler with extra top-level config lines.
 async fn start_with(extra: &str) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("cluster.token"), TOKEN).unwrap();
@@ -182,6 +174,12 @@ async fn add_node(
     add_node_delayed(h, name, gpus, fail_first, 150).await
 }
 
+async fn add_node_for_app(h: &Harness, name: &str, gpus: u32, fail_first: bool,
+    namespace: &str, tenant: &str, elf: &[u8])
+    -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    add_node_app(h, name, gpus, fail_first, 150, tonic::Code::Internal, namespace, tenant, elf).await
+}
+
 async fn add_node_delayed(h: &Harness, name: &str, gpus: u32, fail_first: bool, delay_ms: u64)
     -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     add_node_error(h,name,gpus,fail_first,delay_ms,tonic::Code::Internal).await
@@ -189,9 +187,12 @@ async fn add_node_delayed(h: &Harness, name: &str, gpus: u32, fail_first: bool, 
 
 async fn add_node_error(h: &Harness,name: &str,gpus: u32,fail_first: bool,delay_ms: u64,failure_code: tonic::Code)
     -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
-    // Bind before advertising: an outbound connection must not steal a dropped port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+    add_node_app(h, name, gpus, fail_first, delay_ms, failure_code, "system", "eth", b"elf-one").await
+}
+
+async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, delay_ms: u64,
+    failure_code: tonic::Code, namespace: &str, tenant: &str, elf: &[u8])
+    -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let jobs = Arc::new(Mutex::new(vec![]));
     let svc = FakeNode {
@@ -202,31 +203,39 @@ async fn add_node_error(h: &Harness,name: &str,gpus: u32,fail_first: bool,delay_
         delay_ms,
         failure_code,
     };
-    tokio::spawn(async move {
-        Server::builder().add_service(NodeServiceServer::new(svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)).await.unwrap();
-    });
     let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port))
         .unwrap()
         .connect()
         .await
         .unwrap();
-    let mut ctl = ControlServiceClient::with_interceptor(channel, |mut r: Request<()>| {
+    let auth = |mut r: Request<()>| {
         r.metadata_mut()
             .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
         Ok(r)
-    });
+    };
+    let mut ctl = ControlServiceClient::with_interceptor(channel.clone(), auth);
+    let output_root = h._dir.path().join("data/proofs");
+    let namespace = if namespace == "system" {
+        "00000000000000000000000000000000".to_string()
+    } else {
+        let body = admin_curl(h, &[&format!("{}/admin/namespaces/{namespace}", h.http)]);
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string()
+    };
+    let elf_id = fleet_scheduler::blobs::elf_id_of(elf);
     let id = ctl
         .register(RegisterRequest {
             node: Some(NodeInfo {
                 name: name.into(),
-                endpoint: format!("http://127.0.0.1:{port}"),
                 backend: "cuda".into(),
                 gpus,
                 cpus: 8,
                 zkm_version: "v2.0.0".into(),
                 image: String::new(),
                 machine: "test".into(),
+                control_version: 1,
+                app_namespace: namespace,
+                app_tenant: tenant.into(),
+                app_elf_id: elf_id,
             }),
         })
         .await
@@ -234,15 +243,43 @@ async fn add_node_error(h: &Harness,name: &str,gpus: u32,fail_first: bool,delay_
         .into_inner()
         .node_id;
     tokio::spawn(async move {
+        let mut active: Option<(Assignment, tokio::task::JoinHandle<Result<Response<ProveResponse>, Status>>)> = None;
+        let mut completed: Option<Completion> = None;
+        let svc = Arc::new(svc);
         loop {
-            let _ = ctl
-                .heartbeat(HeartbeatRequest {
-                    node_id: id.clone(),
-                    ready: true,
-                    ..Default::default()
-                })
-                .await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if active.as_ref().is_some_and(|(_, t)| t.is_finished()) {
+                let (assignment, task) = active.take().unwrap();
+                let result = task.await.unwrap();
+                completed = Some(match result {
+                    Ok(result) => {
+                        // The fake worker owns output; no output bytes go to the control API.
+                        let result = result.into_inner();
+                        let dir = output_root.join(&assignment.job_id).join(&assignment.lease);
+                        std::fs::create_dir_all(&dir).unwrap();
+                        std::fs::write(dir.join("proof.json"), &result.proof_json).unwrap();
+                        std::fs::write(dir.join("public_values.bin"), &result.public_values).unwrap();
+                        Completion { assignment: Some(assignment), cycles: result.cycles, prove_ms: result.prove_ms, ..Default::default() }
+                    }
+                    Err(e) => Completion { assignment: Some(assignment), error_code: e.code() as i32, error: e.message().into(), ..Default::default() },
+                });
+            }
+            let running_job = active.as_ref().map(|(a, _)| a.job_id.clone())
+                .or_else(|| completed.as_ref().and_then(|c| c.assignment.as_ref().map(|a| a.job_id.clone()))).unwrap_or_default();
+            if let Ok(response) = ctl.heartbeat(HeartbeatRequest { node_id: id.clone(), ready: true,
+                busy: !running_job.is_empty(), running_job, completion: completed.clone(), ..Default::default() }).await {
+                let response = response.into_inner();
+                if completed.as_ref().is_some_and(|c| c.assignment.as_ref().unwrap().lease == response.completed_lease) { completed = None; }
+                if active.is_none() && completed.is_none() {
+                    if let Some(assignment) = response.assignment {
+                        let inputs = ctl.fetch_inputs(FetchInputsRequest { node_id: id.clone(), assignment: Some(assignment.clone()), include_elf: true }).await.unwrap().into_inner();
+                        let worker = svc.clone();
+                        let mut req = Request::new(inputs);
+                        req.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+                        active = Some((assignment, tokio::spawn(async move { worker.prove(req).await })));
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
     tokio::time::sleep(Duration::from_millis(700)).await;
@@ -349,8 +386,8 @@ async fn rejections_surface_through_get_status() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_attempt_moves_to_another_node() {
     let mut h = start().await;
-    let (a_calls, _) = add_node(&h, "gpu-a", 4, true).await;
-    let (b_calls, _) = add_node(&h, "gpu-b", 1, false).await;
+    let (a_calls, _) = add_node_for_app(&h, "gpu-a", 4, true, "system", "eth", b"elf-r").await;
+    let (b_calls, _) = add_node_for_app(&h, "gpu-b", 1, false, "system", "eth", b"elf-r").await;
     h.stage
         .generate_proof(request("job-r", b"elf-r"))
         .await
@@ -367,8 +404,8 @@ async fn a_failed_attempt_moves_to_another_node() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exclusive_anchor_keeps_the_program_and_keeps_others_off_the_node() {
     let mut h = start().await;
-    let (_, a_jobs) = add_node(&h, "gpu-a", 4, false).await;
-    let (_, b_jobs) = add_node(&h, "gpu-b", 1, false).await;
+    let (_, a_jobs) = add_node_for_app(&h, "gpu-a", 4, false, "system", "eth", b"eth-guest").await;
+    let (_, b_jobs) = add_node_for_app(&h, "gpu-b", 1, false, "system", "eth", b"eth-guest").await;
     for i in 0..3 {
         let id = format!("eth-{i}");
         h.stage
@@ -431,96 +468,55 @@ async fn the_control_api_refuses_a_node_without_the_cluster_token() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    let err = ctl.fetch_inputs(FetchInputsRequest::default()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    let err = ctl.heartbeat(HeartbeatRequest::default()).await.unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
 
-const ETH_ADDR: &str = "0x1111111111111111111111111111111111111111";
 const GOAT_ADDR: &str = "0x2222222222222222222222222222222222222222";
 
-fn credential(h: &Harness, tenant: &str, address: &str) {
+fn token(h: &Harness, tenant: &str, address: &str) {
+    let id = address.trim_start_matches("0x");
+    let id = &id[..32];
     let out = std::process::Command::new("curl")
         .args(["-sf", "-X", "POST", "-H", &format!("authorization: Bearer {ADMIN}"), "-H", "content-type: application/json"])
-        .args(["-d", &format!(r#"{{"tenant":"{tenant}","address":"{address}"}}"#), &format!("{}/admin/credentials", h.http)])
+        .args(["-d", &format!(r#"{{"id":"{id}","tenant":"{tenant}","address":"{address}"}}"#), &format!("{}/admin/tokens", h.http)])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-/// A request as the gateway forwards it after verifying a client certificate.
-fn with_cert<T>(msg: T, cn: Option<&str>) -> Request<T> {
+fn with_bearer<T>(msg: T, token: &str) -> Request<T> {
     let mut r = Request::new(msg);
-    if let Some(cn) = cn {
-        let v = format!(r#"Hash=ab12;Subject="CN={cn},O=zkm-fleet""#);
-        r.metadata_mut().insert("x-forwarded-client-cert", v.parse().unwrap());
-    }
+    r.metadata_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
     r
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn with_client_cert_identity_only_the_submitting_tenant_sees_a_proof() {
-    let mut h = start_with("client_cert_identity: true").await;
-    credential(&h, "eth", ETH_ADDR);
-    credential(&h, "goat", GOAT_ADDR);
-    add_node(&h, "gpu-a", 2, false).await;
-    // unsigned requests fall to the default tenant (eth): an eth certificate may send them
-    let mut unsigned = request("job-c", b"elf-c");
-    unsigned.signature.clear();
-    let r = h.stage.generate_proof(with_cert(unsigned, Some(ETH_ADDR))).await.unwrap().into_inner();
-    assert_eq!(r.status, S::Computing as i32);
-    // a goat certificate on an eth request is refused
-    let mismatch = h.stage.generate_proof(with_cert(request("job-m", b"elf-m"), Some(GOAT_ADDR))).await.unwrap().into_inner();
-    assert_eq!(mismatch.status, S::InvalidParameter as i32);
-    // the owner sees it finish; the other tenant sees nothing; no certificate or an unknown one is refused
-    let mut done = None;
-    for _ in 0..40 {
-        let s = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(ETH_ADDR))).await.unwrap().into_inner();
-        if s.status != S::Computing as i32 {
-            done = Some(s);
-            break;
-        }
-    }
-    let done = done.expect("job-c never finished");
-    assert_eq!(done.status, S::Success as i32);
-    let other = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(GOAT_ADDR))).await.unwrap().into_inner();
-    assert_eq!(other.status, S::Unspecified as i32, "another tenant sees an unknown proof");
-    assert!(other.proof_with_public_inputs.is_empty() && other.public_values_url.is_empty());
-    let none = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, None)).await.unwrap_err();
-    assert_eq!(none.code(), tonic::Code::PermissionDenied);
-    let unknown = h
-        .stage
-        .get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some("0x3333333333333333333333333333333333333333")))
-        .await
-        .unwrap_err();
-    assert_eq!(unknown.code(), tonic::Code::PermissionDenied);
-    // revoking the credential revokes its certificate
-    let out = std::process::Command::new("curl")
-        .args(["-sf", "-X", "DELETE", "-H", &format!("authorization: Bearer {ADMIN}")])
-        .arg(format!("{}/admin/credentials/{}", h.http, ETH_ADDR.trim_start_matches("0x")))
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    let revoked = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "job-c".into() }, Some(ETH_ADDR))).await.unwrap_err();
-    assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn without_client_cert_identity_a_forged_header_is_ignored() {
+async fn a_forged_certificate_header_does_not_authenticate_a_proof_caller() {
     let mut h = start().await;
-    add_node(&h, "gpu-a", 2, false).await;
-    h.stage.generate_proof(request("job-f", b"elf-f")).await.unwrap();
+    let elf = fleet_scheduler::blobs::elf_id_of(b"elf-f");
+    admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
+        r#"{"name":"alice"}"#, &format!("{}/admin/namespaces", h.http)]);
+    let (_, _, bearer) = namespace_token(&h, "alice", 91, &elf);
+    add_node_for_app(&h, "gpu-a", 2, false, "alice", "eth", b"elf-f").await;
+    let signed = signed_request("job-f", b"elf-f", &k256::ecdsa::SigningKey::from_slice(&[91; 32]).unwrap());
+    let missing_bearer = h.stage.generate_proof(Request::new(signed.clone())).await.unwrap().into_inner();
+    assert_eq!(missing_bearer.status, S::InvalidParameter as i32);
+    assert!(missing_bearer.error_message.contains("bearer token is required"));
+    h.stage.generate_proof(with_bearer(signed, &bearer)).await.unwrap();
     wait_done(&mut h, "job-f").await;
-    let s = h
-        .stage
-        .get_status(with_cert(GetStatusRequest { proof_id: "job-f".into() }, Some(GOAT_ADDR)))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(s.status, S::Success as i32);
+    let mut forged = Request::new(GetStatusRequest { proof_id: "job-f".into() });
+    forged.metadata_mut().insert("x-forwarded-client-cert", format!(r#"Hash=ab12;Subject="CN={GOAT_ADDR},O=zkm-fleet""#).parse().unwrap());
+    let s = h.stage.get_status(forged).await.unwrap().into_inner();
+    assert_eq!(s.status, S::Unspecified as i32);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     let mut h = start().await;
-    add_node(&h, "gpu-a", 2, false).await;
+    add_node_for_app(&h, "gpu-a", 2, false, "system", "eth", b"elf-d").await;
     h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
     let app = proof_app(&h, "eth");
@@ -554,7 +550,7 @@ fn proof_app(h: &Harness, tenant: &str) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_runs_only_for_a_registered_app() {
     let mut h = start().await;
-    add_node(&h, "gpu-a", 2, false).await;
+    add_node_for_app(&h, "gpu-a", 2, false, "system", "eth", b"unregistered").await;
     let id = fleet_scheduler::blobs::elf_id_of(b"unregistered");
     h.stage.generate_proof(request("job-u1", b"unregistered")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-u1").await.status, S::InvalidParameter as i32, "refused: not an app");
@@ -575,7 +571,7 @@ async fn a_job_runs_only_for_a_registered_app() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disabled_app_refuses_new_jobs_until_it_is_enabled() {
     let mut h = start().await;
-    add_node(&h, "gpu-a", 2, false).await;
+    add_node_for_app(&h, "gpu-a", 2, false, "system", "eth", b"elf-e").await;
     h.stage.generate_proof(request("job-e1", b"elf-e")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-e1").await.status, S::Success as i32);
     let elf = proof_app(&h, "eth")["elf_id"].as_str().unwrap().to_string();
@@ -628,10 +624,10 @@ async fn jobs_require_authenticated_immutable_identity() {
     for field in ["node", "started_ms", "finished_ms"] {
         assert!(saved[field].is_null(), "queued {field} is legitimately absent");
     }
-    // Another credential in the same tenant can poll/retry, but cannot rewrite audit identity.
+    // Another token in the same tenant can poll/retry, but cannot rewrite audit identity.
     let key = k256::ecdsa::SigningKey::from_slice(&[8; 32]).unwrap();
     let address = format!("{:x}", alloy_primitives::Address::from_public_key(key.verifying_key()));
-    credential(&h, "eth", &address);
+    token(&h, "eth", &address);
     h.stage.generate_proof(signed_request("identity", b"different input", &key)).await.unwrap();
     let unchanged: serde_json::Value = serde_json::from_str(&admin_curl(&h, &[&format!("{}/admin/jobs/identity", h.http)])).unwrap();
     assert_eq!(saved, unchanged);
@@ -648,10 +644,10 @@ fn user_http(h: &Harness, token: &str, method: &str, path: &str) -> (u16, String
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn user_credentials_scope_apps_jobs_and_revocation_even_within_one_tenant() {
+async fn user_tokens_scope_apps_jobs_and_revocation_even_within_one_tenant() {
     use sha2::Digest;
-    let mut h = start_with("client_cert_identity: true").await;
-    add_node(&h, "gpu-user", 2, false).await;
+    let mut h = start().await;
+    // Namespace-specific nodes are registered after their namespaces are created below.
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
     let keys: Vec<_> = [11u8, 12].iter().map(|v| k256::ecdsa::SigningKey::from_slice(&[*v; 32]).unwrap()).collect();
     let addresses: Vec<_> = keys.iter().map(|k| format!("{:x}", alloy_primitives::Address::from_public_key(k.verifying_key()))).collect();
@@ -664,35 +660,39 @@ async fn user_credentials_scope_apps_jobs_and_revocation_even_within_one_tenant(
         let code = admin_curl(&h, &["-X", "POST", "-o", "/dev/null", "-w", "%{http_code}",
             &format!("{}/admin/apps?namespace={ns}&tenant=eth&elf_id={elf}", h.http)]);
         assert_eq!(code, "200");
-        let body = serde_json::json!({"namespace": ns, "tenant": "eth", "address": addresses[i], "label": format!("user-{i}"),
+        let token_id = format!("{:02x}", i + 1).repeat(16);
+        let body = serde_json::json!({"id": token_id, "namespace": ns, "tenant": "eth", "address": addresses[i], "label": format!("user-{i}"),
             "apps": [format!("eth/{elf}"), "training"], "token_hash": hex::encode(sha2::Sha256::digest(tokens[i].as_bytes()))});
         let created = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body.to_string(),
-            &format!("{}/admin/credentials", h.http)]);
+            &format!("{}/admin/tokens", h.http)]);
         let c: serde_json::Value = serde_json::from_str(&created).unwrap();
         assert_eq!(c["apps"][1], "training");
+        assert!(c["id"].as_str().is_some_and(|id| id.len() == 32));
+        assert!(c.get("address").is_none(), "proof signer binding is internal to the token resource");
         assert!(c.get("token_hash").is_none());
+        add_node_for_app(&h, &format!("gpu-user-{i}"), 2, false, &ns, "eth", b"elf").await;
         let id = format!("user-{i}");
-        let response = h.stage.generate_proof(with_cert(signed_request(&id, b"elf", &keys[i]), Some(&addresses[i]))).await.unwrap().into_inner();
+        let response = h.stage.generate_proof(with_bearer(signed_request(&id, b"elf", &keys[i]), &tokens[i])).await.unwrap().into_inner();
         assert_eq!(response.status, S::Computing as i32, "{}", response.error_message);
     }
-    let own = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "user-0".into() }, Some(&addresses[0]))).await.unwrap().into_inner();
+    let own = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "user-0".into() }, &tokens[0])).await.unwrap().into_inner();
     assert_eq!(own.status, S::Success as i32);
-    let foreign = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "user-0".into() }, Some(&addresses[1]))).await.unwrap().into_inner();
+    let foreign = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "user-0".into() }, &tokens[1])).await.unwrap().into_inner();
     assert_eq!(foreign.status, S::Unspecified as i32);
-    let collision = h.stage.generate_proof(with_cert(signed_request("not-granted-b", b"elf-r", &keys[1]), Some(&addresses[1]))).await.unwrap().into_inner();
+    let collision = h.stage.generate_proof(with_bearer(signed_request("not-granted-b", b"elf-r", &keys[1]), &tokens[1])).await.unwrap().into_inner();
     assert_eq!(collision.status, S::InvalidParameter as i32); // This user's grant does not include elf-r.
-    let wrong_cert = h.stage.generate_proof(with_cert(signed_request("wrong-cert", b"elf", &keys[0]), Some(&addresses[1]))).await.unwrap().into_inner();
-    assert_eq!(wrong_cert.status, S::InvalidParameter as i32);
-    let unsigned = h.stage.generate_proof(with_cert(request("unsigned-user", b"elf"), Some(&addresses[0]))).await.unwrap().into_inner();
+    let wrong_signer = h.stage.generate_proof(with_bearer(signed_request("wrong-cert", b"elf", &keys[0]), &tokens[1])).await.unwrap().into_inner();
+    assert_eq!(wrong_signer.status, S::InvalidParameter as i32);
+    let unsigned = h.stage.generate_proof(with_bearer(request("unsigned-user", b"elf"), &tokens[0])).await.unwrap().into_inner();
     assert_eq!(unsigned.status, S::InvalidParameter as i32);
-    let denied = h.stage.generate_proof(with_cert(signed_request("not-granted", b"elf-r", &keys[0]), Some(&addresses[0]))).await.unwrap().into_inner();
+    let denied = h.stage.generate_proof(with_bearer(signed_request("not-granted", b"elf-r", &keys[0]), &tokens[0])).await.unwrap().into_inner();
     assert_eq!(denied.status, S::InvalidParameter as i32);
     assert!(denied.error_message.contains("not granted"));
-    let rejection = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "not-granted".into() }, Some(&addresses[0]))).await.unwrap().into_inner();
+    let rejection = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "not-granted".into() }, &tokens[0])).await.unwrap().into_inner();
     assert_eq!(rejection.status, S::InvalidParameter as i32);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/admin/jobs/user-0").0, 200);
     assert_eq!(user_http(&h, &tokens[1], "GET", "/admin/jobs/user-0").0, 404);
-    assert_eq!(user_http(&h, &tokens[0], "GET", "/admin/credentials").0, 403);
+    assert_eq!(user_http(&h, &tokens[0], "GET", "/admin/tokens").0, 403);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/admin/status").0, 403);
     assert_eq!(user_http(&h, &tokens[0], "POST", "/admin/apps").0, 403);
     assert_eq!(user_http(&h, &tokens[0], "PUT", &format!("/admin/apps/priority?namespace=user-0&tenant=eth&elf_id={elf}&priority=100")).0, 403);
@@ -705,23 +705,73 @@ async fn user_credentials_scope_apps_jobs_and_revocation_even_within_one_tenant(
     assert_eq!(apps.as_array().unwrap().len(), 1);
     assert_eq!(apps[0]["jobs"], 1);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/access").0, 200);
-    admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/credentials/{}", h.http, addresses[0])]);
+    admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/tokens/{}", h.http, "01".repeat(16))]);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/access").0, 401);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/admin/jobs/user-0").0, 401);
-    let revoked = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "user-0".into() }, Some(&addresses[0]))).await.unwrap_err();
-    assert_eq!(revoked.code(), tonic::Code::PermissionDenied);
+    let revoked = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "user-0".into() }, &tokens[0])).await.unwrap_err();
+    assert_eq!(revoked.code(), tonic::Code::Unauthenticated);
     // A previously issued public-values capability no longer works after revocation.
     let values = std::process::Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &own.public_values_url]).output().unwrap();
     assert_eq!(String::from_utf8(values.stdout).unwrap(), "404");
 }
 
-fn namespace_credential(h: &Harness, namespace: &str, seed: u8, elf_id: &str) -> (k256::ecdsa::SigningKey, String, String) {
-    tag_credential(h,namespace,None,seed,elf_id)
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_tokens_authorize_proof_submission_and_status_without_client_certificates() {
+    let mut h = start().await;
+    // Alice's dedicated node is registered after creating the namespace below.
+    let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
+    admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
+        &serde_json::json!({"name": "alice"}).to_string(), &format!("{}/admin/namespaces", h.http)]);
+    let (alice_key, _, alice_token) = tag_token(&h, "alice", Some("research"), 71, &elf);
+    let (bob_key, _, bob_token) = tag_token(&h, "alice", Some("production"), 72, &elf);
+    add_node_for_app(&h, "gpu-bearer", 2, false, "alice", "eth", b"elf").await;
+
+    let accepted = h.stage.generate_proof(with_bearer(
+        signed_request("bearer-proof", b"elf", &alice_key), &alice_token,
+    )).await.unwrap().into_inner();
+    assert_eq!(accepted.status, S::Computing as i32, "{}", accepted.error_message);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let own = loop {
+        let response = h.stage.get_status(with_bearer(
+            GetStatusRequest { proof_id: "bearer-proof".into() }, &alice_token,
+        )).await.unwrap().into_inner();
+        if response.status != S::Computing as i32 { break response; }
+        assert!(tokio::time::Instant::now() < deadline, "bearer proof did not finish");
+    };
+    assert_eq!(own.status, S::Success as i32);
+    assert!(own.public_values_url.contains("token_id=47474747474747474747474747474747"));
+
+    let foreign = h.stage.get_status(with_bearer(
+        GetStatusRequest { proof_id: "bearer-proof".into() }, &bob_token,
+    )).await.unwrap().into_inner();
+    assert_eq!(foreign.status, S::Unspecified as i32);
+
+    let mismatched = h.stage.generate_proof(with_bearer(
+        signed_request("bearer-mismatch", b"elf", &bob_key), &alice_token,
+    )).await.unwrap().into_inner();
+    assert_eq!(mismatched.status, S::InvalidParameter as i32);
+
+    let no_token = h.stage.get_status(Request::new(GetStatusRequest { proof_id: "bearer-proof".into() }))
+        .await.unwrap().into_inner();
+    assert_eq!(no_token.status, S::Unspecified as i32);
+
+    let revoked = admin_curl(&h, &["-X", "DELETE", "-H", &format!("authorization: Bearer {ADMIN}"),
+        &format!("{}/admin/tokens/{}", h.http, "47".repeat(16))]);
+    assert!(revoked.is_empty());
+    let after_revoke = h.stage.get_status(with_bearer(
+        GetStatusRequest { proof_id: "bearer-proof".into() }, &alice_token,
+    )).await.unwrap_err();
+    assert_eq!(after_revoke.code(), tonic::Code::Unauthenticated);
+}
+
+fn namespace_token(h: &Harness, namespace: &str, seed: u8, elf_id: &str) -> (k256::ecdsa::SigningKey, String, String) {
+    tag_token(h,namespace,None,seed,elf_id)
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn apps_require_admin_created_namespaces_and_mutations_are_namespace_local() {
-    let mut h = start_with("client_cert_identity: true").await;
+    let mut h = start().await;
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
     for (selector, expected) in [("", "400"), ("&namespace=missing", "404")] {
         let code = admin_curl(&h, &["-X", "POST", "-o", "/dev/null", "-w", "%{http_code}",
@@ -732,8 +782,8 @@ async fn apps_require_admin_created_namespaces_and_mutations_are_namespace_local
         admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
             &serde_json::json!({"name":name}).to_string(), &format!("{}/admin/namespaces", h.http)]);
     }
-    let (alice_key, alice_addr, alice_token) = namespace_credential(&h, "alice", 61, &elf);
-    let (bob_key, bob_addr, bob_token) = namespace_credential(&h, "bob", 62, &elf);
+    let (alice_key, _, alice_token) = namespace_token(&h, "alice", 61, &elf);
+    let (bob_key, _, bob_token) = namespace_token(&h, "bob", 62, &elf);
     assert_eq!(user_http(&h, &alice_token, "POST", "/admin/namespaces").0, 403);
     assert_eq!(user_http(&h, &alice_token, "POST", &format!("/admin/apps?namespace=alice&tenant=eth&elf_id={elf}")).0, 403);
     let key = format!("{}/admin/apps/disabled?namespace=alice&tenant=eth&elf_id={elf}", h.http);
@@ -743,20 +793,20 @@ async fn apps_require_admin_created_namespaces_and_mutations_are_namespace_local
     let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
     assert_eq!(apps.as_array().unwrap().len(), 1);
     assert_eq!(apps[0]["disabled"], false);
-    let denied = h.stage.generate_proof(with_cert(signed_request("disabled", b"elf", &alice_key), Some(&alice_addr))).await.unwrap().into_inner();
+    let denied = h.stage.generate_proof(with_bearer(signed_request("disabled", b"elf", &alice_key), &alice_token)).await.unwrap().into_inner();
     assert_eq!(denied.status, S::InvalidParameter as i32);
-    add_node(&h, "gpu-namespaces", 2, false).await;
-    h.stage.generate_proof(with_cert(signed_request("bob-job", b"elf", &bob_key), Some(&bob_addr))).await.unwrap();
-    let result = h.stage.get_status(with_cert(GetStatusRequest { proof_id:"bob-job".into() }, Some(&bob_addr))).await.unwrap().into_inner();
+    add_node_for_app(&h, "gpu-namespaces", 2, false, "bob", "eth", b"elf").await;
+    h.stage.generate_proof(with_bearer(signed_request("bob-job", b"elf", &bob_key), &bob_token)).await.unwrap();
+    let result = h.stage.get_status(with_bearer(GetStatusRequest { proof_id:"bob-job".into() }, &bob_token)).await.unwrap().into_inner();
     assert_eq!(result.status, S::Success as i32);
     let deleted = admin_curl(&h, &["-X", "DELETE", "-o", "/dev/null", "-w", "%{http_code}",
         &format!("{}/admin/apps?namespace=alice&tenant=eth&elf_id={elf}", h.http)]);
     assert_eq!(deleted, "200");
-    let result = h.stage.get_status(with_cert(GetStatusRequest { proof_id:"bob-job".into() }, Some(&bob_addr))).await.unwrap().into_inner();
+    let result = h.stage.get_status(with_bearer(GetStatusRequest { proof_id:"bob-job".into() }, &bob_token)).await.unwrap().into_inner();
     assert_eq!(result.status, S::Success as i32, "deleting Alice's registration preserves Bob's job and shared ELF");
 }
 
-fn tag_credential(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id: &str) -> (k256::ecdsa::SigningKey,String,String) {
+fn tag_token(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id: &str) -> (k256::ecdsa::SigningKey,String,String) {
     use sha2::Digest;
     let code = admin_curl(h, &["-X", "POST", "-o", "/dev/null", "-w", "%{http_code}",
         &format!("{}/admin/apps?namespace={namespace}&tenant=eth&elf_id={elf_id}", h.http)]);
@@ -764,11 +814,11 @@ fn tag_credential(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id:
     let key = k256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
     let address = format!("{:x}", alloy_primitives::Address::from_public_key(key.verifying_key()));
     let token = format!("{seed:02x}").repeat(48);
-    let body = serde_json::json!({"namespace": namespace, "tag":tag, "tenant": "eth", "address": address,
+    let body = serde_json::json!({"id": format!("{seed:02x}").repeat(16), "namespace": namespace, "tag":tag, "tenant": "eth", "address": address,
         "apps": [format!("eth/{elf_id}"), "training"], "label": namespace,
         "token_hash": hex::encode(sha2::Sha256::digest(token.as_bytes()))});
     let created = admin_curl(h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body.to_string(),
-        &format!("{}/admin/credentials", h.http)]);
+        &format!("{}/admin/tokens", h.http)]);
     let c: serde_json::Value = serde_json::from_str(&created).unwrap();
     assert!(c["namespace"].is_string(), "{created}");
     (key, address, token)
@@ -776,8 +826,7 @@ fn tag_credential(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
-    let mut h = start_with("client_cert_identity: true").await;
-    let (_, node_jobs) = add_node(&h, "gpu-ns", 2, false).await;
+    let mut h = start().await;
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
     for name in ["alice", "bob"] {
         let body = serde_json::json!({"name": name});
@@ -791,19 +840,23 @@ async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
             "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/namespaces", h.http)]);
         assert_eq!(code, "400", "invalid, reserved or duplicate namespace {invalid:?}");
     }
-    let (old_key, old_addr, old_token) = namespace_credential(&h, "alice", 21, &elf);
-    let (bob_key, bob_addr, bob_token) = namespace_credential(&h, "bob", 22, &elf);
-    for (key, address) in [(&old_key, &old_addr), (&bob_key, &bob_addr)] {
-        let r = h.stage.generate_proof(with_cert(signed_request("same-id", b"elf", key), Some(address))).await.unwrap().into_inner();
+    let (old_key, old_addr, old_token) = namespace_token(&h, "alice", 21, &elf);
+    let (bob_key, _, bob_token) = namespace_token(&h, "bob", 22, &elf);
+    let (_, alice_jobs) = add_node_for_app(&h, "gpu-ns-alice", 2, false, "alice", "eth", b"elf").await;
+    let (_, bob_jobs) = add_node_for_app(&h, "gpu-ns-bob", 2, false, "bob", "eth", b"elf").await;
+    for (key, token) in [(&old_key, &old_token), (&bob_key, &bob_token)] {
+        let r = h.stage.generate_proof(with_bearer(signed_request("same-id", b"elf", key), token)).await.unwrap().into_inner();
         assert_eq!(r.proof_id, "same-id");
         assert_eq!(r.status, S::Computing as i32);
     }
-    let alice = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "same-id".into() }, Some(&old_addr))).await.unwrap().into_inner();
-    let bob = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "same-id".into() }, Some(&bob_addr))).await.unwrap().into_inner();
+    let alice = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "same-id".into() }, &old_token)).await.unwrap().into_inner();
+    let bob = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "same-id".into() }, &bob_token)).await.unwrap().into_inner();
     assert_eq!(alice.status, S::Success as i32);
     assert_eq!(bob.status, S::Success as i32);
     assert_ne!(alice.public_values_url, bob.public_values_url);
-    let jobs = node_jobs.lock().clone();
+    assert_eq!(alice_jobs.lock().len(), 1, "Alice's dedicated server runs only Alice's proof");
+    assert_eq!(bob_jobs.lock().len(), 1, "Bob's dedicated server runs only Bob's proof");
+    let jobs: Vec<_> = alice_jobs.lock().iter().chain(bob_jobs.lock().iter()).cloned().collect();
     assert_eq!(jobs.len(), 2);
     assert_ne!(jobs[0], jobs[1], "nodes use distinct internal ids");
     let (_, a_json) = user_http(&h, &old_token, "GET", "/admin/jobs/same-id");
@@ -814,17 +867,17 @@ async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
     assert_ne!(a["namespace"], b["namespace"]);
     assert_eq!(user_http(&h, &bob_token, "GET", &format!("/admin/jobs/{}", a["id"].as_str().unwrap())).0, 404);
     assert_eq!(user_http(&h, &bob_token, "GET", "/admin/jobs/same-id?namespace=alice").0, 403);
-    let (new_key, new_addr, new_token) = namespace_credential(&h, "alice", 23, &elf);
-    let repeated = h.stage.generate_proof(with_cert(signed_request("same-id", b"elf", &new_key), Some(&new_addr))).await.unwrap().into_inner();
+    let (new_key, _, new_token) = namespace_token(&h, "alice", 23, &elf);
+    let repeated = h.stage.generate_proof(with_bearer(signed_request("same-id", b"elf", &new_key), &new_token)).await.unwrap().into_inner();
     assert_eq!(repeated.status, S::Computing as i32);
-    assert_eq!(node_jobs.lock().len(), 2, "rotation does not queue a duplicate proof");
-    admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/credentials/{old_addr}", h.http)]);
+    assert_eq!(alice_jobs.lock().len() + bob_jobs.lock().len(), 2, "rotation does not queue a duplicate proof");
+    admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/tokens/{}", h.http, "15".repeat(16))]);
     assert_eq!(user_http(&h, &old_token, "GET", "/access").0, 401);
     let (_, rotated_json) = user_http(&h, &new_token, "GET", "/admin/jobs/same-id");
     let rotated: serde_json::Value = serde_json::from_str(&rotated_json).unwrap();
     assert_eq!(rotated["id"], a["id"]);
     assert_eq!(rotated["owner"], old_addr, "the original submitter remains in the audit record");
-    let rotated = h.stage.get_status(with_cert(GetStatusRequest { proof_id: "same-id".into() }, Some(&new_addr))).await.unwrap().into_inner();
+    let rotated = h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "same-id".into() }, &new_token)).await.unwrap().into_inner();
     assert_eq!(rotated.status, S::Success as i32);
     for (url, expected) in [(&alice.public_values_url, "404"), (&rotated.public_values_url, "200")] {
         let out = std::process::Command::new("curl").args(["-s", "-o", "/dev/null", "-w", "%{http_code}", url]).output().unwrap();
@@ -832,20 +885,14 @@ async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
     }
     let admin_a = admin_curl(&h, &[&format!("{}/admin/jobs/same-id?namespace=alice", h.http)]);
     assert_eq!(serde_json::from_str::<serde_json::Value>(&admin_a).unwrap()["id"], a["id"]);
-    let (_, _, second_token) = namespace_credential(&h, "alice", 24, &elf);
-    let operator_address = "cd".repeat(20);
-    admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
-        &serde_json::json!({"tenant":"eth", "address":operator_address}).to_string(),
-        &format!("{}/admin/credentials", h.http)]);
-    let operator_read = h.stage.get_status(with_cert(GetStatusRequest { proof_id: a["id"].as_str().unwrap().into() }, Some(&operator_address))).await.unwrap().into_inner();
-    assert_eq!(operator_read.status, S::Unspecified as i32, "tenant-wide operator access cannot read a user namespace");
+    let (_, _, second_token) = namespace_token(&h, "alice", 24, &elf);
     let denied = user_http(&h, &new_token, "POST", "/admin/namespaces");
     assert_eq!(denied.0, 403);
     admin_curl(&h, &["-X", "PUT", &format!("{}/admin/namespaces/alice/suspended", h.http)]);
     assert_eq!(user_http(&h, &new_token, "GET", "/access").0, 401);
     assert_eq!(user_http(&h, &second_token, "GET", "/access").0, 401);
     assert_eq!(user_http(&h, &bob_token, "GET", "/access").0, 200);
-    assert_eq!(h.stage.get_status(with_cert(GetStatusRequest { proof_id: "same-id".into() }, Some(&new_addr))).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(h.stage.get_status(with_bearer(GetStatusRequest { proof_id: "same-id".into() }, &new_token)).await.unwrap_err().code(), tonic::Code::Unauthenticated);
     admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/namespaces/alice/suspended", h.http)]);
     assert_eq!(user_http(&h, &new_token, "GET", "/access").0, 200);
     assert_eq!(user_http(&h, &old_token, "GET", "/access").0, 401);
@@ -854,16 +901,17 @@ async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn namespace_resource_quota_is_shared_by_proofs_runs_and_rotated_keys() {
-    let mut h = start_with("client_cert_identity: true").await;
-    let (calls, _) = add_node_delayed(&h, "gpu-quota", 2, false, 1000).await;
+    let mut h = start().await;
+    // The namespace-bound node is added after Alice's namespace and app exist.
     for name in ["alice", "bob"] {
         let body = serde_json::json!({"name":name,"quota":{"gpus":2,"cpus":8}}).to_string();
         admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body,
             &format!("{}/admin/namespaces", h.http)]);
     }
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
-    let (key, address, token) = namespace_credential(&h, "alice", 31, &elf);
-    let (_, _, replacement_token) = namespace_credential(&h, "alice", 32, &elf);
+    let (key, _, token) = namespace_token(&h, "alice", 31, &elf);
+    let (calls, _) = add_node_app(&h, "gpu-quota", 2, false, 1000, tonic::Code::Internal, "alice", "eth", b"elf").await;
+    let (_, _, replacement_token) = namespace_token(&h, "alice", 32, &elf);
     let allocation_url = format!("{}/admin/namespaces/alice/allocations", h.http);
     let held = serde_json::json!({"id":"held-run","gpus":2,"cpus":8}).to_string();
     let held_reply = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &held, &allocation_url]);
@@ -872,7 +920,7 @@ async fn namespace_resource_quota_is_shared_by_proofs_runs_and_rotated_keys() {
     let code = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &overflow,
         "-o", "/dev/null", "-w", "%{http_code}", &allocation_url]);
     assert_eq!(code, "429");
-    let r = h.stage.generate_proof(with_cert(signed_request("proof-quota", b"elf", &key), Some(&address))).await.unwrap().into_inner();
+    let r = h.stage.generate_proof(with_bearer(signed_request("proof-quota", b"elf", &key), &token)).await.unwrap().into_inner();
     assert_eq!(r.status, S::Computing as i32);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "a run reservation leaves no quota for a proof");
@@ -897,7 +945,7 @@ async fn namespace_resource_quota_is_shared_by_proofs_runs_and_rotated_keys() {
     let code = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &overflow,
         "-o", "/dev/null", "-w", "%{http_code}", &allocation_url]);
     assert_eq!(code, "429", "a running proof occupies the same quota as runs");
-    let done = h.stage.get_status(with_cert(GetStatusRequest { proof_id:"proof-quota".into() }, Some(&address))).await.unwrap().into_inner();
+    let done = h.stage.get_status(with_bearer(GetStatusRequest { proof_id:"proof-quota".into() }, &token)).await.unwrap().into_inner();
     assert_eq!(done.status, S::Success as i32);
     let (_, access) = user_http(&h, &token, "GET", "/access");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&access).unwrap()["usage"]["cpus"], 0.0);
@@ -928,15 +976,16 @@ async fn namespace_resource_quota_is_shared_by_proofs_runs_and_rotated_keys() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disconnected_namespaced_proof_keeps_quota_and_rejoins_original_node() {
-    let mut h = start_with("client_cert_identity: true").await;
-    let (original,_) = add_node_error(&h,"original",2,true,100,tonic::Code::Unavailable).await;
-    let (other,_) = add_node(&h,"other",1,false).await;
+    let mut h = start().await;
+    // Both dedicated nodes are added after Alice's namespace app is registered below.
     let created = admin_curl(&h,&["-X","POST","-H","content-type: application/json","-d",
         r#"{"name":"alice","quota":{"gpus":2,"cpus":8}}"#,&format!("{}/admin/namespaces",h.http)]);
     assert!(created.contains("alice"));
     let elf=fleet_scheduler::blobs::elf_id_of(b"elf");
-    let (key,address,token)=namespace_credential(&h,"alice",41,&elf);
-    h.stage.generate_proof(with_cert(signed_request("disconnected",b"elf",&key),Some(&address))).await.unwrap();
+    let (key,_,token)=namespace_token(&h,"alice",41,&elf);
+    let (original,_) = add_node_app(&h,"original",2,true,100,tonic::Code::Unavailable,"alice","eth",b"elf").await;
+    let (other,_) = add_node_app(&h,"other",1,false,100,tonic::Code::Internal,"alice","eth",b"elf").await;
+    h.stage.generate_proof(with_bearer(signed_request("disconnected",b"elf",&key),&token)).await.unwrap();
     let deadline=tokio::time::Instant::now()+Duration::from_secs(3);
     while original.load(Ordering::SeqCst)==0 {
         assert!(tokio::time::Instant::now()<deadline);
@@ -948,7 +997,7 @@ async fn disconnected_namespaced_proof_keeps_quota_and_rejoins_original_node() {
         r#"{"id":"blocked","gpus":1,"cpus":1}"#,"-o","/dev/null","-w","%{http_code}",&format!("{}/admin/namespaces/alice/allocations",h.http)]);
     assert_eq!(code,"429");
     assert_eq!(other.load(Ordering::SeqCst),0,"never fail over an execution of uncertain status");
-    let done=h.stage.get_status(with_cert(GetStatusRequest{proof_id:"disconnected".into()},Some(&address))).await.unwrap().into_inner();
+    let done=h.stage.get_status(with_bearer(GetStatusRequest{proof_id:"disconnected".into()},&token)).await.unwrap().into_inner();
     assert_eq!(done.status,S::Success as i32);
     assert_eq!(original.load(Ordering::SeqCst),2);
     assert_eq!(other.load(Ordering::SeqCst),0);
@@ -956,16 +1005,16 @@ async fn disconnected_namespaced_proof_keeps_quota_and_rejoins_original_node() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tags_isolate_proofs_and_enforce_both_resource_caps() {
-    let mut h=start_with("client_cert_identity: true").await;
-    add_node(&h,"tag-prover",1,false).await;
+    let mut h=start().await;
     admin_curl(&h,&["-X","POST","-H","content-type: application/json","-d",r#"{"name":"billing","quota":{"gpus":2,"cpus":16}}"#,&format!("{}/admin/namespaces",h.http)]);
     let elf=fleet_scheduler::blobs::elf_id_of(b"elf");
-    let (ka,aa,ta)=tag_credential(&h,"billing",Some("research"),51,&elf);
-    let (kb,ab,tb)=tag_credential(&h,"billing",Some("production"),52,&elf);
-    let (_,_,replacement)=tag_credential(&h,"billing",Some("research"),53,&elf);
+    let (ka,_,ta)=tag_token(&h,"billing",Some("research"),51,&elf);
+    let (kb,_,tb)=tag_token(&h,"billing",Some("production"),52,&elf);
+    let (_,_,replacement)=tag_token(&h,"billing",Some("research"),53,&elf);
+    add_node_for_app(&h,"tag-prover",1,false,"billing","eth",b"elf").await;
     let listing=admin_curl(&h,&[&format!("{}/admin/namespaces/billing",h.http)]);
     let listing:serde_json::Value=serde_json::from_str(&listing).unwrap();
-    assert_eq!(listing["tags"].as_array().unwrap().len(),2);
+    assert_eq!(listing["tags"].as_array().unwrap().len(),3);
     // Tags are optional attributes; no separate registry or creation step exists.
     let before=admin_curl(&h,&[&format!("{}/admin/namespaces/billing?tag=research",h.http)]);
     let before:serde_json::Value=serde_json::from_str(&before).unwrap();
@@ -979,11 +1028,11 @@ async fn tags_isolate_proofs_and_enforce_both_resource_caps() {
         assert_eq!(result["quota"]["gpus"],2.0,"tag caps never replace the namespace quota");
         assert_eq!(result["tag_quota"]["gpus"],1.0);
     }
-    let (ku,au,tu)=namespace_credential(&h,"billing",54,&elf);
-    let (kd,ad,td)=tag_credential(&h,"billing",Some("default"),55,&elf);
-    for (k,a) in [(&ka,&aa),(&kb,&ab),(&ku,&au),(&kd,&ad)] {
-        h.stage.generate_proof(with_cert(signed_request("same",b"elf",k),Some(a))).await.unwrap();
-        assert_eq!(h.stage.get_status(with_cert(GetStatusRequest{proof_id:"same".into()},Some(a))).await.unwrap().into_inner().status,S::Success as i32);
+    let (ku,_,tu)=namespace_token(&h,"billing",54,&elf);
+    let (kd,_,td)=tag_token(&h,"billing",Some("default"),55,&elf);
+    for (k,t) in [(&ka,&ta),(&kb,&tb),(&ku,&tu),(&kd,&td)] {
+        h.stage.generate_proof(with_bearer(signed_request("same",b"elf",k),t)).await.unwrap();
+        assert_eq!(h.stage.get_status(with_bearer(GetStatusRequest{proof_id:"same".into()},t)).await.unwrap().into_inner().status,S::Success as i32);
     }
     let (_,a)=user_http(&h,&ta,"GET","/admin/jobs/same");
     let a:serde_json::Value=serde_json::from_str(&a).unwrap();
@@ -1052,7 +1101,7 @@ async fn jobs_inherit_app_priority_and_dispatch_highest_then_fifo() {
     assert_eq!(find("high-second")["priority"], 10);
     let expected: Vec<String> = ["high-first", "high-second", "low-priority"].iter()
         .map(|id| find(id)["id"].as_str().unwrap().to_owned()).collect();
-    let (_, calls) = add_node(&h, "priority-node", 1, false).await;
+    let (_, calls) = add_node_for_app(&h, "priority-node", 1, false, "system", "eth", b"elf").await;
     wait_done(&mut h, "low-priority").await;
     assert_eq!(*calls.lock(), expected);
     assert_eq!(proof_app(&h, "eth")["priority"], -10);

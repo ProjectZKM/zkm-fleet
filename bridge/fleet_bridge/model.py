@@ -18,6 +18,7 @@ import dataclasses
 import enum
 import json
 import os
+import re
 import types
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -533,7 +534,7 @@ class RunArgs(Record):
     profiles: str = field(default_factory=lambda: os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))
     runs_dir: str = field(default_factory=lambda: os.environ.get("FLEET_RUNS_DIR", "/var/lib/zkm-fleet/runs"))
     address: str = "127.0.0.1:6379"
-    owner: str | None = None  # submitting credential for audit, never a remote field
+    owner: str | None = None  # submitting token for audit, never a remote field
     namespace: str | None = None
     namespace_all_tags: bool = False
     tag: str | None = None
@@ -617,7 +618,7 @@ class ClusterConfig(Record):
     cluster_token_file: str | None = None
     node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
-    node_port_range: tuple[int, int] = (31000, 31099)
+    proof_output_dir: str | None = None
     gpu_port_range: tuple[int, int] = (30100, 30199)
     scheduler_admin: str = "http://127.0.0.1:9191"
     admin_token_file: str | None = None
@@ -638,7 +639,10 @@ class ServiceSpec(Record):
     priority: int = 0
     kind: ServiceKind = ServiceKind.ZIREN_GPU
     replicas: int = 1
-    disabled: bool = False  # persistent app: release resources until enabled
+    disabled: bool = False  # persistent app or proof app: release resources until enabled
+    # A Ziren prover service is dedicated to this one proof app (tenant/full ELF id).
+    # The service's namespace supplies the other part of the app identity.
+    proof_app: str | None = None
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
@@ -664,10 +668,16 @@ class ServiceSpec(Record):
     profiles: str | None = None
     runs_dir: str | None = None
 
-
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
+        if self.proof_app is not None:
+            tenant, sep, elf_id = self.proof_app.partition("/")
+            if (self.kind is not ServiceKind.ZIREN_GPU or not sep or not tenant
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", elf_id)):
+                raise ModelError("proof_app must be TENANT/FULL_ELF_SHA256 on a ziren-gpu service")
+        elif self.kind is ServiceKind.ZIREN_GPU:
+            raise ModelError("every ziren-gpu service must name its dedicated proof_app")
 
 
 @dataclass(kw_only=True)
@@ -736,13 +746,15 @@ class NodeEnv(Record):
 
     name: str = field(metadata={"env": "FLEET_NODE_NAME"})
     backend: str = field(metadata={"env": "FLEET_BACKEND"})
-    port_range: str = field(metadata={"env": "FLEET_PORT_RANGE"})
-    advertise_host: str = field(metadata={"env": "FLEET_ADVERTISE_HOST"})
     scheduler: str = field(metadata={"env": "FLEET_SCHEDULER"})
     cluster_token_file: str = field(metadata={"env": "FLEET_CLUSTER_TOKEN_FILE"})
     machine: str = field(metadata={"env": "FLEET_MACHINE"})
+    app_namespace: str | None = field(default=None, metadata={"env": "FLEET_APP_NAMESPACE"})
+    app_tenant: str | None = field(default=None, metadata={"env": "FLEET_APP_TENANT"})
+    app_elf_id: str | None = field(default=None, metadata={"env": "FLEET_APP_ELF_ID"})
     rust_log: str = field(metadata={"env": "RUST_LOG"})
     exit_with_parent: bool = field(default=True, metadata={"env": "FLEET_EXIT_WITH_PARENT"})
+    output_dir: str | None = field(default=None, metadata={"env": "FLEET_OUTPUT_DIR"})
     cpus: int = field(default=0, metadata={"env": "FLEET_CPUS"})
     gpus: int | None = field(default=None, metadata={"env": "FLEET_GPUS"})
     gpu_endpoint: str | None = field(default=None, metadata={"env": "FLEET_GPU_ENDPOINT"})

@@ -4,7 +4,8 @@ cluster_token_file: /etc/zkm-fleet/cluster.token
 node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
-node_port_range: [31000, 31099]    # fleet-ziren-node, cluster network
+# Nodes initiate authenticated control RPCs; no inbound prover ports.
+proof_output_dir: /var/lib/zkm-fleet/proofs # shared job-artifact directory; nodes write proof output
 services:
   # Ray hands out the lowest free cards in file order; a hold keeps a card free for
   # one-shot runs (deploy/run.sh) by taking it while the services after it start.
@@ -13,6 +14,8 @@ services:
     gpus: 1
   - name: ethproofs-gpu
     kind: ziren-gpu
+    namespace: ethproofs-user
+    proof_app: ethproofs/FULL_ELF_SHA256 # bind this server exclusively to one namespace proof app
     replicas: 1
     gpus: 2
     cpus: 48

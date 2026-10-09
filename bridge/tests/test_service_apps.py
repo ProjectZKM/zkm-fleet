@@ -91,6 +91,11 @@ def test_stop_kills_actor_without_restart_and_removes_reservation(monkeypatch):
     monkeypatch.setattr(reconcile.ray, "kill", kill)
     monkeypatch.setattr(reconcile.ray, "get", lambda *a, **k: None)
     monkeypatch.setattr(reconcile, "clean_after", Mock())
+    monkeypatch.setattr(
+        reconcile.ray.util,
+        "placement_group_table",
+        lambda: {"pg": {"name": "pg-comfyui-0-old", "state": "CREATED"}},
+    )
     monkeypatch.setattr(reconcile.ray.util, "get_placement_group", lambda *a: pg)
     monkeypatch.setattr(reconcile, "remove_placement_group", remove)
     reconcile.stop("comfyui-0")
@@ -111,6 +116,70 @@ def test_persistent_app_checks_namespace_before_reserving_resources(monkeypatch)
     with pytest.raises(ValueError, match="unknown namespace"):
         reconcile.start(spec)
     reserve.assert_not_called()
+
+
+def test_gpu_services_must_be_bound_to_one_proof_app():
+    with pytest.raises(ValueError, match="dedicated proof_app"):
+        reconcile.load_services({"services": [{"name": "shared-gpu", "kind": "ziren-gpu"}]})
+    with pytest.raises(ValueError, match="proof_app must be"):
+        reconcile.load_services({"services": [{"name": "wrong-kind", "kind": "app",
+                                                 "proof_app": "eth/" + "a" * 64}]})
+
+
+def test_proof_app_disable_stops_only_its_namespace_server_and_enable_starts_before_admission(tmp_path, monkeypatch):
+    profiles = tmp_path / "runs.yaml"
+    profiles.write_text("profiles: {}\n")
+    services_path = tmp_path / "services.yaml"
+    services_path.write_text(yaml.safe_dump({"services": [
+        {"name": "alice-eth", "kind": "ziren-gpu", "namespace": "alice", "proof_app": "eth/" + "a" * 64},
+        {"name": "bob-eth", "kind": "ziren-gpu", "namespace": "bob", "proof_app": "eth/" + "a" * 64},
+    ]}))
+    api = Api(str(profiles), str(tmp_path / "runs"))
+    order = []
+
+    class FakeScheduler:
+        def __init__(self, _cluster):
+            pass
+
+        def require_namespace(self, reference):
+            return {"alice": "a" * 32, "bob": "b" * 32}[reference]
+
+        def resolve_namespace_id(self, reference):
+            return {"id": self.require_namespace(reference), "suspended_ms": None}
+
+        def set_proof_app_disabled(self, namespace, tenant, elf_id, disabled):
+            order.append(("admission", namespace, tenant, elf_id, disabled))
+
+        def undrain(self, name):
+            order.append(("undrain", name))
+
+    def apply(cfg, only):
+        saved = yaml.safe_load(services_path.read_text())
+        assert only == ["alice-eth"]
+        assert saved["services"][0]["disabled"] == (f"{only[0]}-0" not in reconcile.replica_specs(cfg))
+        order.append(("reconcile", only[0], saved["services"][0]["disabled"]))
+        return ApplyReport()
+
+    monkeypatch.setattr(reconcile, "Scheduler", FakeScheduler)
+    monkeypatch.setattr(reconcile, "reconcile_once", apply)
+
+    available = api.proof_app_available("alice", "eth", "a" * 64)
+    assert available["servers"] == ["alice-eth"]
+    with pytest.raises(ApiError, match="no dedicated"):
+        api.proof_app_available("bob", "eth", "c" * 64)
+
+    disabled = api.set_proof_app_disabled("alice", "eth", "a" * 64, True)
+    assert disabled["disabled"] is True
+    assert disabled["servers"] == ["alice-eth"]
+    assert order[:2] == [("admission", "alice", "eth", "a" * 64, True),
+                         ("reconcile", "alice-eth", True)]
+
+    order.clear()
+    enabled = api.set_proof_app_disabled("alice", "eth", "a" * 64, False)
+    assert enabled["disabled"] is False
+    assert order == [("reconcile", "alice-eth", False),
+                     ("undrain", "alice-eth-0"),
+                     ("admission", "alice", "eth", "a" * 64, False)]
 
 
 def test_priority_edit_preserves_actor_identity_and_does_not_reconcile(api, monkeypatch):

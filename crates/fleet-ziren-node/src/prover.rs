@@ -7,12 +7,9 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use parking_lot::Mutex;
 use tokio::sync::watch;
-use tonic::{metadata::MetadataValue, Request, Response, Status};
+use tonic::{metadata::MetadataValue, Request, Status};
 
-use fleet_proto::fleet::v1::{
-    node_service_server::NodeService, HealthRequest, HealthResponse, ProofKind, ProveRequest,
-    ProveResponse,
-};
+use fleet_proto::fleet::v1::{ProofKind, ProveRequest, ProveResponse};
 use zkm_cuda::ZKMGpuServer;
 use zkm_prover::ZKMProver;
 use zkm_sdk::provers::CudaProver;
@@ -179,7 +176,9 @@ impl Node {
                             .map_err(|s| (s.code(), s.message().to_string()));
                         {
                             let mut running = me.running.lock();
-                            me.finished.lock().put(job_id, out.clone());
+                            if out.is_ok() {
+                                me.finished.lock().put(job_id, out.clone());
+                            }
                             *running = None;
                         }
                         let _ = tx.send(Some(out));
@@ -305,62 +304,6 @@ async fn gpu_ready(http: &reqwest::Client, endpoint: &str) -> bool {
             .map(|b| b.as_ref() == [0x08, 0x01])
             .unwrap_or(false),
         _ => false,
-    }
-}
-
-pub struct NodeApi {
-    pub node: Arc<Node>,
-}
-
-#[tonic::async_trait]
-impl NodeService for NodeApi {
-    async fn prove(
-        &self,
-        request: Request<ProveRequest>,
-    ) -> Result<Response<ProveResponse>, Status> {
-        self.node
-            .prove(request.into_inner())
-            .await
-            .map(Response::new)
-    }
-
-    async fn health(&self, _: Request<HealthRequest>) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            ready: self.node.ready().await,
-            cached_elf_ids: self.node.cached(),
-            busy: self.node.running_job().is_some(),
-        }))
-    }
-}
-
-fn bearer_ok(req: &Request<()>, token: &str) -> bool {
-    let Some(got) = req
-        .metadata()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    got.len() == token.len()
-        && got
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |a, (x, y)| a | (x ^ y))
-            == 0
-}
-
-/// Only the scheduler (holding the cluster token) may send work: the node receives witnesses.
-#[derive(Clone)]
-pub struct RequireToken(pub Arc<String>);
-
-impl tonic::service::Interceptor for RequireToken {
-    fn call(&mut self, req: Request<()>) -> Result<Request<()>, Status> {
-        if bearer_ok(&req, &self.0) {
-            Ok(req)
-        } else {
-            Err(Status::unauthenticated("missing or wrong cluster token"))
-        }
     }
 }
 

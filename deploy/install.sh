@@ -145,28 +145,22 @@ if [ "$ROLE" = control ]; then
     } > "$ETC/fleet.yaml"
   fi
   [ "$TLS" = 0 ] && [ "$BIND_STAGE" != 127.0.0.1 ] && die "--no-tls requires --bind-stage 127.0.0.1"
-  # The gateway terminates mTLS now; an older fleet.yaml still has the scheduler do it.
+  # The gateway terminates HTTPS; remove an older scheduler-side TLS configuration.
   if grep -q '^tls:' "$ETC/fleet.yaml"; then
     say "moving stage TLS from fleet.yaml to the gateway"
     awk '/^tls:/{skip=1; next} skip && /^[[:space:]]/{next} {skip=0; print}' "$ETC/fleet.yaml" > "$ETC/fleet.yaml.new"
     mv "$ETC/fleet.yaml.new" "$ETC/fleet.yaml"
-  fi
-  if [ "$TLS" = 1 ] && ! grep -q '^client_cert_identity:' "$ETC/fleet.yaml"; then
-    # the gateway verifies client certificates: GetStatus answers only the submitting tenant
-    echo "client_cert_identity: true" >> "$ETC/fleet.yaml"
   fi
   if [ "$TLS" = 1 ]; then
     STAGE_TLS='          transport_socket:
             name: envoy.transport_sockets.tls
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
-              require_client_certificate: true
               common_tls_context:
                 alpn_protocols: [h2]
                 tls_certificates:
                   - certificate_chain: { filename: /etc/zkm-fleet/tls/server.pem }
-                    private_key: { filename: /etc/zkm-fleet/tls/server.key }
-                validation_context: { trusted_ca: { filename: /etc/zkm-fleet/tls/ca.pem } }'
+                    private_key: { filename: /etc/zkm-fleet/tls/server.key }'
   else
     STAGE_TLS=""
   fi
@@ -267,8 +261,8 @@ if [ "$ROLE" = control ]; then
   provers:     edit $ETC/services.yaml, then $PREFIX/deploy/apply.sh
   proof app:   fleetctl app add ethproofs/ --elf PROGRAM.elf
   a namespace: fleetctl namespace create ethproofs-user
-  a client:    fleetctl credential issue --namespace ethproofs-user --tenant ethproofs --label poller --app ethproofs/FULL_ELF_SHA256 --endpoint https://127.0.0.1:51000 --domain-name stage \\
-                 --tls-dir $ETC/tls --out ethproofs.env
+  a client:    fleetctl token issue --namespace ethproofs-user --tenant ethproofs --label poller --app ethproofs/FULL_ELF_SHA256 --endpoint https://127.0.0.1:51000 --domain-name stage \\
+                 --server-ca $ETC/tls/ca.pem --out ethproofs.env
   a new node:  copy $ETC/cluster.token to it, then
                deploy/install.sh node --head $IP --cluster-token cluster.token --cuda 0,1,2,3
 EOF

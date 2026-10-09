@@ -71,11 +71,17 @@ def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extr
     c = spec.cluster
     if not (c.scheduler and c.cluster_token_file):
         raise RuntimeError(f"{spec.name}: services.yaml needs scheduler and cluster_token_file for a prover")
-    lo, hi = c.node_port_range
-    node = NodeEnv(name=spec.name, backend=backend, port_range=f"{lo}-{hi}",
-                   advertise_host=node_ip(), scheduler=c.scheduler,
+    app_namespace = None
+    app_tenant = None
+    app_elf_id = None
+    if spec.service.proof_app:
+        app_tenant, app_elf_id = spec.service.proof_app.split("/", 1)
+        app_namespace = spec.service.namespace
+    node = NodeEnv(name=spec.name, backend=backend, scheduler=c.scheduler,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
-                   rust_log=spec.service.rust_log, cpus=int(spec.service.cpus), **extra)  # type: ignore[arg-type]
+                   app_namespace=app_namespace, app_tenant=app_tenant, app_elf_id=app_elf_id,
+                   rust_log=spec.service.rust_log, cpus=int(spec.service.cpus),
+                   output_dir=c.proof_output_dir or os.path.join(c.log_dir, "proofs"), **extra)  # type: ignore[arg-type]
     env = dict(os.environ)
     env.update(to_env(node))
     if service_env:

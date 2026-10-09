@@ -27,10 +27,10 @@
 <text x="83" y="387" class="detail" text-anchor="start">mTLS :51000 · HTTP :9191</text>
 <rect x="65" y="467" width="370" height="88" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="83" y="496" class="name" text-anchor="start">fleet-scheduler · Rust</text>
-<text x="83" y="520" class="detail" text-anchor="start">Proof queue, placement and credentials</text>
+<text x="83" y="520" class="detail" text-anchor="start">Proof queue, placement and access tokens</text>
 <rect x="65" y="600" width="370" height="70" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="83" y="629" class="name" text-anchor="start">Postgres</text>
-<text x="83" y="653" class="detail" text-anchor="start">Proof apps, jobs and credentials</text>
+<text x="83" y="653" class="detail" text-anchor="start">Proof apps, jobs and access tokens</text>
 <rect x="65" y="732" width="370" height="86" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="83" y="761" class="name" text-anchor="start">Python bridge · apply</text>
 <text x="83" y="785" class="detail" text-anchor="start">services.yaml → detached Ray actors</text>
@@ -42,7 +42,7 @@
 <rect x="555" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="573" y="472" class="name" text-anchor="start">Proof node actor</text>
 <text x="573" y="496" class="detail" text-anchor="start">fleet-ziren-node</text>
-<text x="573" y="516" class="detail" text-anchor="start">One proof at a time</text>
+<text x="573" y="516" class="detail" text-anchor="start">Owns proof output · one job at a time</text>
 <rect x="955" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="973" y="472" class="name" text-anchor="start">GPU server container</text>
 <text x="973" y="496" class="detail" text-anchor="start">Ziren GPU prover</text>
@@ -53,7 +53,7 @@
 <text x="573" y="663" class="detail" text-anchor="start">runs.yaml profiles</text>
 <rect x="955" y="590" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="973" y="619" class="name" text-anchor="start">One-shot run containers</text>
-<text x="973" y="643" class="detail" text-anchor="start">Training / batch jobs</text>
+<text x="973" y="643" class="detail" text-anchor="start">PI tasks · output in runs storage</text>
 <text x="973" y="663" class="detail" text-anchor="start">Use granted GPU / CPU capacity</text>
 <rect x="955" y="737" width="300" height="81" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
 <text x="973" y="766" class="name" text-anchor="start">Persistent app actors</text>
@@ -78,11 +78,11 @@
 <rect x="256" y="571" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
 <text x="262" y="586" class="label" text-anchor="start">durable state</text>
 <path d="M435 484 H555" class="line"/>
-<rect x="434" y="455" width="70.4" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="440" y="470" class="label" text-anchor="start">dispatch</text>
+<rect x="434" y="455" width="116" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
+<text x="440" y="470" class="label" text-anchor="start">assignment reply</text>
 <path d="M555 520 H435" class="line"/>
 <rect x="434" y="532" width="114.2" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="440" y="547" class="label" text-anchor="start">:51001 control</text>
+<text x="440" y="547" class="label" text-anchor="start">heartbeat :51001</text>
 <path d="M855 484 H955" class="line"/>
 <rect x="853" y="455" width="70.4" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
 <text x="859" y="470" class="label" text-anchor="start">loopback</text>

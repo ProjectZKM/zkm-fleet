@@ -2,13 +2,8 @@ syntax = "proto3";
 
 package fleet.v1;
 
-// Scheduler -> prover node. One proof at a time per node. A proof outlives the
-// call that started it: Prove with the job_id of the running or a recently
-// finished proof returns that proof's result instead of proving again.
-service NodeService {
-  rpc Prove(ProveRequest) returns (ProveResponse);
-  rpc Health(HealthRequest) returns (HealthResponse);
-}
+// Nodes initiate every connection. Heartbeats carry control metadata only;
+// nodes fetch inputs separately and handle proof output themselves.
 
 enum ProofKind {
   PROOF_KIND_UNSPECIFIED = 0;
@@ -47,26 +42,41 @@ message ProveResponse {
   string zkm_version = 6;
 }
 
-message HealthRequest {}
-
-message HealthResponse {
-  bool ready = 1;
-  repeated string cached_elf_ids = 2;
-  bool busy = 3;
-}
-
 // Prover node -> scheduler. Cluster-internal port only.
 service ControlService {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+  rpc FetchInputs(FetchInputsRequest) returns (ProveRequest);
+}
+
+message Assignment {
+  string job_id = 1;
+  // Stable across scheduler restarts, changes for each execution attempt.
+  string lease = 2;
+  string elf_id = 3;
+}
+
+message Completion {
+  Assignment assignment = 1;
+  reserved 2;
+  // gRPC status code; zero means the node has finished handling its output.
+  int32 error_code = 3;
+  string error = 4;
+  uint64 cycles = 5;
+  uint64 prove_ms = 6;
+}
+
+message FetchInputsRequest {
+  string node_id = 1;
+  Assignment assignment = 2;
+  bool include_elf = 3;
 }
 
 message NodeInfo {
   // Unique and stable across restarts of the same node (e.g. the Ray actor name).
   string name = 1;
-  // Where the scheduler reaches this node's NodeService, e.g. http://10.0.0.5:31000.
-  string endpoint = 2;
+  reserved 2; // Nodes have no inbound RPC endpoint.
   // "cuda", "cpu" or "mock".
   string backend = 3;
   uint32 gpus = 4;
@@ -76,6 +86,13 @@ message NodeInfo {
   // GPU server image digest, for cuda nodes.
   string image = 7;
   string machine = 8;
+  // Version 1 pulls work through heartbeat responses; push-only workers are refused.
+  uint32 control_version = 9;
+  // Dedicated proof app served by this prover node. All three are set together;
+  // an app-specific node never accepts another app's proof jobs.
+  string app_namespace = 10;
+  string app_tenant = 11;
+  string app_elf_id = 12;
 }
 
 message RegisterRequest {
@@ -94,11 +111,15 @@ message HeartbeatRequest {
   // A proof is running; after a scheduler restart this is how it finds the job again.
   bool busy = 4;
   string running_job = 5;
+  // Retried until the scheduler acknowledges this lease.
+  Completion completion = 6;
 }
 
 message HeartbeatResponse {
   // False when the scheduler does not know this node id (it restarted): register again.
   bool known = 1;
+  Assignment assignment = 2;
+  string completed_lease = 3;
 }
 
 message DeregisterRequest {

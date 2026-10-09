@@ -1,0 +1,28 @@
+[Unit]
+Description=ZKM Fleet MCP server (Streamable HTTP)
+After=network-online.target zkm-scheduler.service
+Wants=network-online.target
+Requires=zkm-scheduler.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data/stephen/zkm-fleet
+ExecStart=/data/stephen/zkm-fleet/.fleet/bin/fleet-mcp
+Environment=RUST_LOG=info
+Environment=FLEET_MCP_BIND=127.0.0.1:8906
+Environment=FLEET_MCP_ALLOWED_HOSTS=34.215.238.232,localhost:8906,127.0.0.1:8906
+Environment=FLEET_URL=http://127.0.0.1:9191
+Environment=FLEET_RUNS_URL=http://127.0.0.1:9192
+Environment=FLEETCTL_BIN=/data/stephen/zkm-fleet/.fleet/bin/fleetctl
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

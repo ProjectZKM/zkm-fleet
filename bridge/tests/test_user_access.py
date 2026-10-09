@@ -26,8 +26,8 @@ def servers(tmp_path, monkeypatch):
     etc.mkdir()
     profiles = etc / "runs.yaml"
     profiles.write_text("profiles:\n  training:\n    namespace: '" + "1" * 32 + "'\n    image: python:3\n    max_gpus: 2\n    allow: [/tmp]\n  training-bob:\n    namespace: '" + "2" * 32 + "'\n    image: python:3\n    max_gpus: 2\n    allow: [/tmp]\n  training-system:\n    image: python:3\n    allow: [/tmp]\n  private:\n    image: python:3\n")
-    identities = {"alice": {"address": "a" * 40, "namespace": "1" * 32, "namespace_name": "alice", "tenant": "eth", "apps": ["training"], "revoked_ms": None, "quota": {"gpus": None, "cpus": None}, "tag":None, "tag_quota":{"gpus":None,"cpus":None}},
-                  "bob": {"address": "b" * 40, "namespace": "2" * 32, "namespace_name": "bob", "tenant": "eth", "apps": ["training-bob"], "revoked_ms": None, "quota": {"gpus": None, "cpus": None}, "tag":None, "tag_quota":{"gpus":None,"cpus":None}}}
+    identities = {"alice": {"id": "1" * 32, "address": "a" * 40, "namespace": "1" * 32, "namespace_name": "alice", "tenant": "eth", "apps": ["training"], "revoked_ms": None, "quota": {"gpus": None, "cpus": None}, "tag":None, "tag_quota":{"gpus":None,"cpus":None}},
+                  "bob": {"id": "2" * 32, "address": "b" * 40, "namespace": "2" * 32, "namespace_name": "bob", "tenant": "eth", "apps": ["training-bob"], "revoked_ms": None, "quota": {"gpus": None, "cpus": None}, "tag":None, "tag_quota":{"gpus":None,"cpus":None}}}
     checks = []
     allocations = {}
     quota_lock = threading.Lock()
@@ -41,7 +41,7 @@ def servers(tmp_path, monkeypatch):
 
         def do_GET(self):
             token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-            if token == "admin" and self.path == "/admin/credentials":
+            if token == "admin" and self.path == "/admin/tokens":
                 return self.reply(200, list(identities.values()))
             if token == "admin" and self.path.startswith("/admin/namespaces/"):
                 from urllib.parse import urlsplit, parse_qs
@@ -176,7 +176,7 @@ def test_owned_runs_and_counts_and_no_owner_spoofing(servers):
     assert code == 201
     code, bob = submit(request, "bob")
     assert code == 201
-    assert runs.RunDir(api.runs_dir, alice["id"]).spec().owner == "a" * 40
+    assert runs.RunDir(api.runs_dir, alice["id"]).spec().owner == "1" * 32
     assert request("alice", "GET", f'/runs/{alice["id"]}')[0] == 200
     for method, suffix in [("GET", ""), ("GET", "/logs"), ("GET", "/out.tar.gz"),
                            ("POST", "/cancel"), ("POST", "/preempt"), ("DELETE", "")]:
@@ -265,7 +265,7 @@ def test_own_archive_upload_is_captured_and_old_uploads_can_be_cleaned(servers):
     code, job = submit(request, "alice", code=upload["path"])
     assert code == 201
     spec = runs.RunDir(api.runs_dir, job["id"]).spec()
-    assert spec.owner == "a" * 40
+    assert spec.owner == "1" * 32
     with open(os.path.join(spec.code_dir, "hello.py"), "rb") as captured:
         assert captured.read() == data
     old = time.time() - 3 * 86400
@@ -274,7 +274,7 @@ def test_own_archive_upload_is_captured_and_old_uploads_can_be_cleaned(servers):
     assert not os.path.exists(upload["path"])
 
 
-def test_credential_validation_outage_fails_closed(servers, monkeypatch):
+def test_token_validation_outage_fails_closed(servers, monkeypatch):
     from fleet_bridge import runs_api
     api, _, _, _ = servers
 
@@ -302,7 +302,7 @@ def test_refresh_preserves_runs_and_uploads(servers):
     code, job = submit(request, "alice", code=upload["path"])
     assert code == 201
     run = runs.RunDir(api.runs_dir, job["id"])
-    identities["replacement"] = {**identities["alice"], "address": "c" * 40}
+    identities["replacement"] = {**identities["alice"], "id": "3" * 32, "address": "c" * 40}
     del identities["alice"]
     assert request("alice", "GET", f'/runs/{job["id"]}')[0] == 401
     assert request("replacement", "GET", f'/runs/{job["id"]}')[0] == 200
@@ -313,7 +313,7 @@ def test_refresh_preserves_runs_and_uploads(servers):
     assert submit(request, "bob", code=upload["path"])[0] == 403
     new_upload = request("replacement", "PUT", "/uploads", archive.getvalue())[1]
     assert new_upload["path"] == upload["path"]
-    assert run.spec().owner == "a" * 40
+    assert run.spec().owner == "1" * 32
 
 
 def test_namespace_selectors_are_verified_for_users_and_operators(servers):
@@ -334,10 +334,10 @@ def test_namespace_selectors_are_verified_for_users_and_operators(servers):
     assert request("bob", "GET", f'/runs/{job["id"]}')[0] == 404
 
 
-def test_namespace_quota_queues_runs_and_is_shared_across_credentials(servers, monkeypatch):
+def test_namespace_quota_queues_runs_and_is_shared_across_tokens(servers, monkeypatch):
     api, request, identities, _ = servers
     identities["alice"]["quota"] = {"gpus": 1, "cpus": 2}
-    identities["replacement"] = {**identities["alice"], "address": "c" * 40}
+    identities["replacement"] = {**identities["alice"], "id": "3" * 32, "address": "c" * 40}
     launched = []
     monkeypatch.setattr(runs, "launch", record_launch(launched))
     code, first = submit(request, "alice", gpus=1, cpus=2)

@@ -4,7 +4,7 @@
 use fleet_scheduler::store::SYSTEM_NAMESPACE;
 use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
-use fleet_scheduler::store::{Credential, Job, JobFilter, JobState, Namespace, PgStore, Store};
+use fleet_scheduler::store::{Token, Job, JobFilter, JobState, Namespace, PgStore, Store};
 use sqlx::{Executor, PgPool, Row};
 use fleet_scheduler::quota::{Allocation, Quota};
 
@@ -144,7 +144,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![11]);
+    assert_eq!(versions, vec![12]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
@@ -177,15 +177,15 @@ async fn fresh_schema_requires_complete_job_identity() {
         "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b1', 't', 'e', 'core', 'done', 1, repeat('a',40), repeat('0',32), '', 'b1')",
         "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, finished_ms, owner, namespace, tag, client_id) VALUES ('b2', 't', 'e', 'core', 'failed', 1, 2, repeat('a',40), repeat('0',32), '', 'b2')",
         "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b3', 't', 'e', 'core', 'succeeded', 1, repeat('a',40), repeat('0',32), '', 'b3')",
-        "INSERT INTO fresh.fleet_credentials (address, tenant, created_ms) VALUES ('0xABC', 't', 1)",
+        "INSERT INTO fresh.fleet_tokens (address, tenant, created_ms) VALUES ('0xABC', 't', 1)",
         "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms, namespace) VALUES ('', repeat('a', 64), 1, repeat('0',32))",
         "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms, namespace) VALUES ('t', 'abc', 1, repeat('0',32))",
     ];
     for sql in bad {
         assert!(sqlx::query(sql).execute(&admin).await.is_err(), "accepted: {sql}");
     }
-    let c = Credential { address: "84".repeat(20), tenant: "eth".into(), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: None, tag: None, namespace: None };
-    fresh.add_credential(&c).await.unwrap();
+    let c = Token { id: "84".repeat(16), address: "84".repeat(20), tenant: "eth".into(), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: None, tag: None, namespace: None, manage_apps: false };
+    fresh.add_token(&c).await.unwrap();
 
     let namespace = Namespace { tag_quotas: Default::default(), quota: Default::default(), id: "1".repeat(32), name: "alice".into(), created_ms: 1, suspended_ms: None };
     fresh.add_namespace(&namespace).await.unwrap();
@@ -220,9 +220,9 @@ async fn fresh_schema_requires_complete_job_identity() {
     let filtered = fresh.recent(&JobFilter { tag: None, namespace: None, owner: Some(c.address.clone()), ..Default::default() }, 1).await.unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].id, "owned");
-    let scoped = Credential { namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()]), token_hash: Some("ab".repeat(32)), ..c.clone() };
-    fresh.add_credential(&scoped).await.unwrap();
-    let restored = fresh.credentials().await.unwrap().into_iter().find(|r| r.address == scoped.address).unwrap();
+    let scoped = Token { id: "85".repeat(16), namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()]), token_hash: Some("ab".repeat(32)), ..c.clone() };
+    fresh.add_token(&scoped).await.unwrap();
+    let restored = fresh.tokens().await.unwrap().into_iter().find(|r| r.address == scoped.address).unwrap();
     assert_eq!(restored.apps, scoped.apps);
     assert_eq!(restored.token_hash, scoped.token_hash);
     assert!(serde_json::to_value(&restored).unwrap().get("token_hash").is_none());

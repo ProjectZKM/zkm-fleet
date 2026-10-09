@@ -1,8 +1,6 @@
-//! fleetctl: operate a zkm-fleet cluster and issue its credentials.
+//! fleetctl: operate a zkm-fleet cluster and issue its tokens.
 //!
-//! Credentials never leave the operator's machine except where they must:
-//! tenant signing keys are generated here and only their address is registered,
-//! tokens and TLS keys are written to 0600 files.
+//! User tokens are issued by administrators and written to 0600 files. The proof SDK still requires an internal signing key; its address is bound to that token and is not a separate access resource.
 //!
 //! Every command prints a formatted view, or with `--json` the data as JSON.
 
@@ -20,7 +18,7 @@ use serde_json::{json, Value};
 use out::{col, Out};
 
 #[derive(Parser)]
-#[command(about = "Operate a zkm-fleet cluster and issue its credentials")]
+#[command(about = "Operate a zkm-fleet cluster and issue its tokens")]
 struct Cli {
     /// Print the result as JSON instead of the formatted view.
     #[arg(long, global = true)]
@@ -47,10 +45,10 @@ struct Conn {
     /// User API token file. Takes precedence over the operator admin token.
     #[arg(long, env = "FLEET_TOKEN_FILE", global = true)]
     token_file: Option<PathBuf>,
-    /// User namespace selector (inferred from user credentials; operators may select one).
+    /// User namespace selector (inferred from user tokens; operators may select one).
     #[arg(long, env = "FLEET_NAMESPACE", global = true)]
     namespace: Option<String>,
-    /// Optional tag within the namespace; inferred from user credentials.
+    /// Optional tag within the namespace; inferred from user tokens.
     #[arg(long = "tag", env = "FLEET_TAG", global = true)]
     tag: Option<String>,
 }
@@ -64,9 +62,8 @@ enum Cmd {
     Job(JobArgs),
     /// Prover nodes: the list (by default), or drain / undrain one.
     Node(NodeArgs),
-    /// Tenant signing keys (the SDK's ZKM_PRIVATE_KEY): the list (by default), one by its
-    /// address, or issue / revoke one.
-    Credential(CredentialArgs),
+    /// Administrator-managed user access tokens: list, inspect, issue, refresh or revoke.
+    Token(TokenArgs),
     /// Create, inspect, suspend or resume stable user namespaces (administrator only).
     Namespace(NamespaceArgs),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
@@ -98,7 +95,7 @@ enum AppCmd {
         #[command(flatten)]
         add: AddApp,
     },
-    /// Persistent apps stop and release GPUs; proof/run apps refuse new jobs and finish existing jobs.
+    /// Disable an app: proof apps drain and stop their dedicated GPU servers; persistent apps stop and release GPUs.
     Disable { name: String },
     /// Set the priority inherited by new jobs (higher values run first).
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
@@ -168,11 +165,11 @@ struct NodeArgs {
 
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true)]
-struct CredentialArgs {
+struct TokenArgs {
     #[command(subcommand)]
-    cmd: Option<CredentialCmd>,
-    /// A credential's address: its record. Without one, the list.
-    address: Option<String>,
+    cmd: Option<TokenCmd>,
+    /// A token's opaque ID: its record. Without one, the list.
+    id: Option<String>,
     #[command(flatten)]
     conn: Conn,
 }
@@ -187,7 +184,14 @@ struct NamespaceArgs {
 
 #[derive(Subcommand)]
 enum NamespaceCmd {
-    Create { name: String, #[command(flatten)] quota: QuotaArgs },
+    Create {
+        name: String,
+        /// Tenant identity that will sign proof jobs for this namespace.
+        #[arg(long)]
+        tenant: String,
+        #[command(flatten)] quota: QuotaArgs,
+        #[command(flatten)] bundle: TokenBundle,
+    },
     /// Replace concurrent GPU/CPU caps for the namespace, or for its optional --tag.
     Quota { name: String, #[command(flatten)] quota: QuotaArgs },
     Get { name: String },
@@ -226,8 +230,8 @@ enum NodeCmd {
 }
 
 #[derive(Subcommand)]
-enum CredentialCmd {
-    /// Issue scoped proof/run access: register a signing address and token hash, write a client bundle.
+enum TokenCmd {
+    /// Issue an admin-managed token scoped to approved proof/run apps and write the client bundle.
     Issue {
         #[arg(long)]
         tenant: String,
@@ -237,37 +241,35 @@ enum CredentialCmd {
         #[arg(long, default_value = "")]
         label: String,
         #[command(flatten)]
-        bundle: CredentialBundle,
+        bundle: TokenBundle,
     },
     /// Issue a replacement in the same namespace with the same grants; revoke the old key after verification.
     #[command(alias = "rotate")]
     Refresh {
-        address: String,
+        id: String,
         #[command(flatten)]
-        bundle: CredentialBundle,
+        bundle: TokenBundle,
     },
-    /// Every registered key: address, tenant, label, active or revoked (the default).
+    /// Every registered token: proof binding, tenant, label, active or revoked (the default).
     List,
-    /// Refuse a key's requests from now on.
-    Revoke { address: String },
+    /// Revoke a token immediately.
+    Revoke { id: String },
 }
 
 #[derive(Args)]
-struct CredentialBundle {
-        /// Env file for the client (0600): ZKM_PROVER, ENDPOINT, ZKM_PRIVATE_KEY, TLS paths.
+struct TokenBundle {
+        /// Env file for the client (0600): ZKM_PROVER, ENDPOINT, token and signing key.
         #[arg(long)]
         out: PathBuf,
         /// Stage API endpoint clients use, e.g. https://fleet.example:51000.
         #[arg(long)]
         endpoint: String,
-        /// Directory of `fleetctl init tls`: issue a client certificate for this credential too.
-        /// The SDK only enables TLS when it has a client certificate (mutual TLS), so a
-        /// stage API reachable from outside needs this.
-        #[arg(long)]
-        tls_dir: Option<PathBuf>,
         /// Server name in the stage certificate, when it is not the SDK's default "stage".
         #[arg(long)]
         domain_name: Option<String>,
+        /// CA bundle used to verify the stage server certificate; omit when the SDK can use system trust roots.
+        #[arg(long)]
+        server_ca: Option<PathBuf>,
  }
 
 /// A submit: the command line and the request body are this one struct (its field
@@ -375,7 +377,7 @@ struct AddApp {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     shm_gb: Option<u32>,
-    /// A run app: a root (an absolute path on the server) a run may mount under; repeat. Nothing else can be mounted.
+    /// A run app: an absolute server path its runs may mount under; owner apps are limited to their tag's uploads.
     #[arg(long)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
@@ -440,15 +442,6 @@ enum InitCmd {
         #[arg(long, value_delimiter = ',', default_value = "stage")]
         names: Vec<String>,
     },
-    /// Issue a client certificate signed by the CA in `dir`. The stage API takes a client's
-    /// identity from its certificate's CN, so a certificate for a client is issued with its
-    /// credential (`credential issue --tls-dir`); this one is for other uses.
-    TlsClient {
-        #[arg(long)]
-        dir: PathBuf,
-        #[arg(long)]
-        name: String,
-    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -467,7 +460,7 @@ impl Cmd {
     fn conn(&self) -> &Conn {
         match self {
             Cmd::Node(n) => &n.conn,
-            Cmd::Credential(c) => &c.conn,
+            Cmd::Token(c) => &c.conn,
             Cmd::Namespace(n) => &n.conn,
             Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
         }
@@ -587,76 +580,74 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
                 let all = a.get("/namespaces")?;
                 out.table(all.as_array().unwrap_or(&vec![]), &[col("NAME", "name"), col("ID", "id"), col("SUSPENDED", "suspended_ms")], Some(&all));
             }
-            Some(NamespaceCmd::Create { name, quota }) => out.record(&a.send(a.req(M::POST, "/namespaces").json(&json!({"name": name, "quota": quota.value()?})))?),
+            Some(NamespaceCmd::Create { name, tenant, quota, bundle }) => {
+                let namespace = a.send(a.req(M::POST, "/namespaces").json(&json!({"name": name, "quota": quota.value()?})))?;
+                issue_token(&a, cmd.conn(), out, name, Some("default"), tenant, None, true, "owner", bundle)?;
+                if !out.json { println!("namespace {} is ready with default tag and owner access", namespace["name"].as_str().unwrap_or(name)); }
+            }
             Some(NamespaceCmd::Quota { name, quota }) => out.record(&a.send(a.req(M::PUT, &format!("/namespaces/{name}/quota")).json(&quota.value()?))?),
             Some(NamespaceCmd::Get { name }) => out.record(&a.get(&format!("/namespaces/{name}"))?),
             Some(NamespaceCmd::Suspend { name }) => out.record(&a.send(a.req(M::PUT, &format!("/namespaces/{name}/suspended")))?),
             Some(NamespaceCmd::Resume { name }) => out.record(&a.send(a.req(M::DELETE, &format!("/namespaces/{name}/suspended")))?),
         },
-        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Issue { tenant, apps, label, bundle }), .. }) => {
-            let namespace = cmd.conn().namespace.as_deref().context("credential issue requires --namespace (create it with fleetctl namespace create NAME)")?;
-            issue_credential(&a, cmd.conn(), out, namespace, a.tag.as_deref(), tenant, apps, label, bundle)?;
+        Cmd::Token(TokenArgs { cmd: Some(TokenCmd::Issue { tenant, apps, label, bundle }), .. }) => {
+            let namespace = cmd.conn().namespace.as_deref().context("token issue requires --namespace (create it with fleetctl namespace create NAME)")?;
+            issue_token(&a, cmd.conn(), out, namespace, a.tag.as_deref(), tenant, Some(apps), false, label, bundle)?;
         }
-        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Refresh { address, bundle }), .. }) => {
-            let all = a.get("/credentials")?;
-            let normalized = address.trim_start_matches("0x").to_ascii_lowercase();
-            let old = all.as_array().into_iter().flatten().find(|c| c["address"].as_str() == Some(&normalized))
-                .context("no such credential")?;
-            let namespace = old["namespace"].as_str().context("credential refresh requires an explicit namespace")?;
-            let apps: Vec<String> = serde_json::from_value(old["apps"].clone())?;
-            issue_credential(&a, cmd.conn(), out, namespace, old["tag"].as_str(), old["tenant"].as_str().context("credential has no tenant")?, &apps,
-                old["label"].as_str().unwrap_or_default(), bundle)?;
-            if !out.json { println!("old credential {address} remains active; revoke it after verifying the replacement"); }
+        Cmd::Token(TokenArgs { cmd: Some(TokenCmd::Refresh { id, bundle }), .. }) => {
+            let all = a.get("/tokens")?;
+            let old = all.as_array().into_iter().flatten().find(|c| c["id"].as_str() == Some(&id))
+                .context("no such token")?;
+            let namespace = old["namespace"].as_str().context("token refresh requires an explicit namespace")?;
+            let apps: Option<Vec<String>> = if old["apps"].is_null() { None } else { Some(serde_json::from_value(old["apps"].clone())?) };
+            issue_token(&a, cmd.conn(), out, namespace, old["tag"].as_str(), old["tenant"].as_str().context("token has no tenant")?, apps.as_deref(),
+                old["manage_apps"].as_bool().unwrap_or(false), old["label"].as_str().unwrap_or_default(), bundle)?;
+            if !out.json { println!("old token {id} remains active; revoke it after verifying the replacement"); }
         }
-        Cmd::Credential(CredentialArgs { cmd: None, address: Some(address), .. }) => {
-            let want = format!("0x{}", address.trim_start_matches("0x").to_ascii_lowercase());
-            let v = a.get("/credentials")?;
-            let Some(c) = credential_rows(&v).into_iter().find(|c| c["address"].as_str() == Some(want.as_str())) else {
-                bail!("no credential {address} (fleetctl credential lists them)");
+        Cmd::Token(TokenArgs { cmd: None, id: Some(id), .. }) => {
+            let v = a.get("/tokens")?;
+            let Some(c) = token_rows(&v).into_iter().find(|c| c["id"].as_str() == Some(id.as_str())) else {
+                bail!("no token {id} (fleetctl token lists them)");
             };
             out.record(&c);
         }
-        Cmd::Credential(CredentialArgs { cmd: None | Some(CredentialCmd::List), .. }) => {
-            let v = a.get("/credentials")?;
-            out.table(&credential_rows(&v), CREDENTIAL_COLS, Some(&v));
+        Cmd::Token(TokenArgs { cmd: None | Some(TokenCmd::List), .. }) => {
+            let v = a.get("/tokens")?;
+            out.table(&token_rows(&v), TOKEN_COLS, Some(&v));
         }
-        Cmd::Credential(CredentialArgs { cmd: Some(CredentialCmd::Revoke { address }), .. }) => {
-            a.send(a.req(M::DELETE, &format!("/credentials/{}", address.trim_start_matches("0x"))))?;
-            out.done(&format!("revoked {address}"), json!({ "revoked": address }));
+        Cmd::Token(TokenArgs { cmd: Some(TokenCmd::Revoke { id }), .. }) => {
+            a.send(a.req(M::DELETE, &format!("/tokens/{id}")))?;
+            out.done(&format!("revoked token {id}"), json!({ "revoked": id }));
         }
         Cmd::Init(_) | Cmd::Job(_) | Cmd::App(_) => unreachable!("not the scheduler's admin API alone"),
     }
     Ok(())
 }
 
-fn issue_credential(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Option<&str>, tenant: &str, apps: &[String], label: &str, bundle: &CredentialBundle) -> anyhow::Result<()> {
-    let CredentialBundle { out: env_file, endpoint, tls_dir, domain_name } = bundle;
+fn issue_token(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Option<&str>, tenant: &str, apps: Option<&[String]>, manage_apps: bool, label: &str, bundle: &TokenBundle) -> anyhow::Result<()> {
+    let TokenBundle { out: env_file, endpoint, domain_name, server_ca } = bundle;
     let token_file = env_file.with_extension("token");
     let ca_file = env_file.with_extension("ca.pem");
-    let cert_file = env_file.with_extension("client.pem");
-    let key_file = env_file.with_extension("client.key");
     let mut bundle = vec![env_file.clone(), token_file.clone()];
-    if tls_dir.is_some() { bundle.extend([ca_file.clone(), cert_file.clone(), key_file.clone()]); }
+    let trust_file = server_ca.clone();
+    if trust_file.is_some() { bundle.push(ca_file.clone()); }
     for (i, path) in bundle.iter().enumerate() {
         if bundle[..i].contains(path) { bail!("--out must use a distinct env filename, such as user.env"); }
-        if path.exists() { bail!("{} exists; refusing to overwrite a credential", path.display()); }
-    }
-    if tls_dir.is_none() && endpoint.starts_with("https") {
-        bail!("an https endpoint needs --tls-dir: the SDK only speaks TLS with a client certificate");
-    }
-    if apps.iter().any(|a| a.contains('/')) && tls_dir.is_none() {
-        bail!("proof user credentials require --tls-dir and the mTLS gateway");
+        if path.exists() { bail!("{} exists; refusing to overwrite a token", path.display()); }
     }
     use sha2::Digest;
     let mut random = [0u8; 48];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut random);
     let user_token = hex::encode(random);
+    let mut id_bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id_bytes);
+    let id = hex::encode(id_bytes);
     let token_hash = hex::encode(sha2::Sha256::digest(user_token.as_bytes()));
     let key = k256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
     let address = alloy_primitives::Address::from_private_key(&key);
-    let registered = a.send(a.req(reqwest::Method::POST, "/credentials").json(&json!({
-        "tenant": tenant, "address": format!("{address:#x}"), "label": label,
-        "apps": apps, "token_hash": token_hash, "namespace": namespace, "tag":tag,
+    let registered = a.send(a.req(reqwest::Method::POST, "/tokens").json(&json!({
+        "id": id, "tenant": tenant, "address": format!("{address:#x}"), "label": label,
+        "apps": apps, "manage_apps": manage_apps, "token_hash": token_hash, "namespace": namespace, "tag":tag,
     })))?;
     write_secret(&token_file, user_token.as_bytes())?;
     let mut env = vec![
@@ -670,31 +661,26 @@ fn issue_credential(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Opt
         ("ZKM_PRIVATE_KEY", hex::encode(key.to_bytes())),
         ("ZKM_PROOF_POLL_INTERVAL", "100".to_string()),
     ];
-    if let Some(dir) = tls_dir {
-        // its CN is the credential: the scheduler maps it to the tenant (and a
-        // revoked credential's certificate is refused with it)
-        let (cert, key_path) = tls_client(dir, &format!("{address:#x}"))?;
-        write_secret(&ca_file, &std::fs::read(dir.join("ca.pem"))?)?;
-        write_secret(&cert_file, &std::fs::read(cert)?)?;
-        write_secret(&key_file, &std::fs::read(key_path)?)?;
+    if let Some(trust) = trust_file {
+        let trust_bytes = std::fs::read(&trust)
+            .with_context(|| format!("reading server CA {}", trust.display()))?;
+        write_secret(&ca_file, &trust_bytes)?;
         env.push(("CA_CERT_PATH", abs(&ca_file)?));
-        env.push(("SSL_CERT_PATH", abs(&cert_file)?));
-        env.push(("SSL_KEY_PATH", abs(&key_file)?));
-        if let Some(d) = domain_name {
-            env.push(("DOMAIN_NAME", d.clone()));
-        }
+    }
+    if let Some(d) = domain_name {
+        env.push(("DOMAIN_NAME", d.clone()));
     }
     let text: String = env.iter().map(|(k, v)| format!("{k}='{}'\n", v.replace('\'', "'\\''"))).collect();
     write_secret(env_file, text.as_bytes())?;
     let result = json!({
-        "address": format!("{address:#x}"), "tenant": tenant, "label": label,
+        "id": id, "tenant": tenant, "label": label,
         "env_file": env_file.display().to_string(), "token_file": token_file.display().to_string(), "endpoint": endpoint,
         "registered": registered,
     });
     if out.json {
         out.record(&result);
     } else {
-        println!("issued {address:#x} for tenant {tenant}; client env in {} (0600)", env_file.display());
+        println!("issued token {id} for tenant {tenant}; client env in {} (0600)", env_file.display());
     }
     Ok(())
 }
@@ -709,20 +695,19 @@ const NODE_COLS: &[out::Col] = &[
     col("BUSY WITH", "busy"),
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
-const CREDENTIAL_COLS: &[out::Col] =
-    &[col("ADDRESS", "address"), col("NAMESPACE","namespace"), col("TAG","tag"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
+const TOKEN_COLS: &[out::Col] =
+    &[col("TOKEN ID", "id"), col("NAMESPACE","namespace"), col("TAG","tag"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
 const PURGE_COLS: &[out::Col] =
     &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
 
-/// Credentials as rows: the address with 0x, a STATE column (active / revoked).
-fn credential_rows(v: &Value) -> Vec<Value> {
+/// Tokens as rows: a STATE column (active / revoked); proof identity stays internal.
+fn token_rows(v: &Value) -> Vec<Value> {
     v.as_array()
         .into_iter()
         .flatten()
         .map(|c| {
             let mut r = c.clone();
             r["tag"] = c["tag"].clone();
-            r["address"] = json!(format!("0x{}", c["address"].as_str().unwrap_or("")));
             r["state"] = json!(if c["revoked_ms"].is_null() { "active" } else { "revoked" });
             r
         })
@@ -843,7 +828,10 @@ struct Want<'a> {
 /// filter can only match the other type).
 fn fetch_rows(kind: Kind, conn: &Conn, want: &Want) -> anyhow::Result<Vec<Value>> {
     let app = want.app.map(AppRef::parse);
-    let mut q: Vec<(&str, String)> = vec![("limit", want.limit.to_string()), ("n", want.limit.to_string())];
+    // The scheduler calls this parameter `limit`; the runs API still calls it `n`.
+    // Sending both breaks the scheduler because its query rejects unknown fields.
+    let limit_param = if kind == Kind::Proof { "limit" } else { "n" };
+    let mut q: Vec<(&str, String)> = vec![(limit_param, want.limit.to_string())];
     if want.active {
         q.push(("active", "true".into()));
     }
@@ -972,11 +960,20 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
     let method = if disabled { reqwest::Method::PUT } else { reqwest::Method::DELETE };
     let v = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let mut a = Admin::new(conn)?;
+            let a = Admin::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
-            a.namespace = app["namespace"].as_str().map(str::to_string);
-            let key = [("tenant", app["tenant"].as_str().unwrap_or("")), ("elf_id", app["elf_id"].as_str().unwrap_or(""))];
-            a.send(a.req(method, "/apps/disabled").query(&key))?
+            let mut manager = Admin::runs(conn)?;
+            // The app's canonical namespace is sent explicitly below. Do not append
+            // the caller's selector a second time to this lifecycle request.
+            manager.namespace = None;
+            manager.tag = None;
+            let key = [
+                ("namespace", app["namespace"].as_str().context("proof app has no namespace")?),
+                ("tenant", app["tenant"].as_str().unwrap_or("")),
+                ("elf_id", app["elf_id"].as_str().unwrap_or("")),
+            ];
+            manager.send(manager.req(method, "/proof-apps/disabled")
+                .query(&key).timeout(Duration::from_secs(1800)))?
         }
         AppRef::Run(_) => {
             let a = Admin::runs(conn)?;
@@ -987,6 +984,9 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
     let text = if v["persistent"].as_bool() == Some(true) {
         if disabled { format!("{name} disabled: stopped; GPU reservations released") }
         else { format!("{name} enabled: service started") }
+    } else if v["servers"].is_array() {
+        if disabled { format!("{name} disabled: active proofs drained, dedicated GPU server stopped") }
+        else { format!("{name} enabled: dedicated GPU server started") }
     } else if disabled {
         format!("{name} disabled: it takes no new jobs; the queued and running ones finish")
     } else {
@@ -1041,6 +1041,13 @@ fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
             (Some(_), _) => bail!("give the elf id in the name or --elf FILE, not both"),
             (None, _) => bail!("give TENANT/<elf id>, or TENANT/ with --elf FILE"),
         };
+        let namespace = conn.namespace.as_deref().context("proof app creation requires --namespace")?;
+        let mut manager = Admin::runs(conn)?;
+        manager.namespace = None;
+        manager.tag = None;
+        let _server = manager.get_q("/proof-apps/available", &[
+            ("namespace", namespace.to_string()), ("tenant", tenant.clone()), ("elf_id", elf_id.clone()),
+        ])?;
         let a = Admin::new(conn)?;
         let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str()), ("priority", &add.priority.unwrap_or(0).to_string())]))?;
         out.done(
@@ -1051,8 +1058,8 @@ fn add_app(add: &AddApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    if add.image.is_none() || add.allow.is_empty() {
-        bail!("a run app needs --image and at least one --allow root");
+    if add.image.is_none() {
+        bail!("a run app needs --image");
     }
     let mut body = serde_json::to_value(add)?;
     let mut env = serde_json::Map::new();
@@ -1356,18 +1363,11 @@ fn init(cmd: &InitCmd, out: &Out) -> anyhow::Result<()> {
             out.done(
                 &format!(
                     "CA and server certificate for {names:?} in {d}\n\
-                     scheduler: tls.cert_path={d}/server.pem tls.key_path={d}/server.key tls.client_ca_path={d}/ca.pem\n\
+                     scheduler: tls.cert_path={d}/server.pem tls.key_path={d}/server.key\n\
                      clients:   CA_CERT_PATH={d}/ca.pem (and DOMAIN_NAME={} if not \"stage\")",
                     names[0]
                 ),
                 v,
-            );
-        }
-        InitCmd::TlsClient { dir, name } => {
-            let (c, k) = tls_client(dir, name)?;
-            out.done(
-                &format!("client certificate: SSL_CERT_PATH={} SSL_KEY_PATH={}", c.display(), k.display()),
-                json!({ "cert": c.display().to_string(), "key": k.display().to_string() }),
             );
         }
     }
@@ -1456,24 +1456,4 @@ fn tls_init(dir: &Path, names: &[String]) -> anyhow::Result<Value> {
         "dir": dir.display().to_string(), "names": names,
         "ca_cert": file("ca.pem"), "ca_key": file("ca.key"), "server_cert": file("server.pem"), "server_key": file("server.key"),
     }))
-}
-
-fn tls_client(dir: &Path, name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let ca_key = rcgen::KeyPair::from_pem(&std::fs::read_to_string(dir.join("ca.key"))?)?;
-    let ca_params =
-        rcgen::CertificateParams::from_ca_cert_pem(&std::fs::read_to_string(dir.join("ca.pem"))?)?;
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let key = rcgen::KeyPair::generate()?;
-    let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
-    p.distinguished_name.push(rcgen::DnType::CommonName, name);
-    p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    validity(&mut p, 825);
-    let cert = p.signed_by(&key, &ca_cert, &ca_key)?;
-    let (c, k) = (
-        dir.join(format!("client-{name}.pem")),
-        dir.join(format!("client-{name}.key")),
-    );
-    write_public(&c, cert.pem().as_bytes())?;
-    write_secret(&k, key.serialize_pem().as_bytes())?;
-    Ok((c, k))
 }

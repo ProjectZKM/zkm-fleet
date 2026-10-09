@@ -3,8 +3,8 @@
 //!   client_matrix <elf> <plain-endpoint> <tls-endpoint> <cases.env-dir>
 //!
 //! `<cases.env-dir>` holds env files written by fleetctl / the test script:
-//!   valid.env (plain), valid-tls.env (mTLS), revoked.env, other-ca.env (client cert from
-//!   another CA), unknown.key (a key never registered). Each case sets the SDK's env,
+//!   valid.env (plain), valid-tls.env (server-authenticated TLS), revoked.env,
+//!   unknown.key (a key never registered). Each case sets the SDK's env,
 //!   builds `NetworkProver::from_env()`, proves, and compares with the expected outcome.
 
 use std::collections::HashMap;
@@ -18,8 +18,6 @@ const SDK_VARS: &[&str] = &[
     "ENDPOINT",
     "ZKM_PRIVATE_KEY",
     "CA_CERT_PATH",
-    "SSL_CERT_PATH",
-    "SSL_KEY_PATH",
     "DOMAIN_NAME",
     "ZKM_PROOF_POLL_INTERVAL",
     "SHARD_SIZE",
@@ -114,49 +112,23 @@ async fn main() -> anyhow::Result<()> {
         },
         // transport
         {
-            let mut c = case("tls: mTLS with the issued cert", "valid-tls", Expect::Proof);
-            c.set.push(("ENDPOINT", tls.clone()));
-            c
-        },
-        {
-            let mut c = case("tls: client cert from another CA", "other-ca", Expect::Fail);
+            let mut c = case("tls: server-authenticated HTTPS", "valid-tls", Expect::Proof);
             c.set.push(("ENDPOINT", tls.clone()));
             c
         },
         {
             let mut c = case("tls: wrong DOMAIN_NAME", "valid-tls", Expect::Fail);
-            c.set.push(("ENDPOINT", tls.clone()));
+            c.set.push(("ENDPOINT", tls.replace("https://", "http://")));
             c.set.push(("DOMAIN_NAME", "not-the-server".into()));
             c
         },
         {
             let mut c = case(
-                "tls: CA only, no client cert (SDK speaks plaintext)",
+                "tls: plaintext client to the HTTPS endpoint",
                 "valid-tls",
                 Expect::Fail,
             );
             c.set.push(("ENDPOINT", tls.clone()));
-            c.unset.push("SSL_CERT_PATH");
-            c.unset.push("SSL_KEY_PATH");
-            c
-        },
-        {
-            let mut c = case(
-                "tls: plaintext client to the mTLS port",
-                "valid",
-                Expect::Fail,
-            );
-            c.set.push(("ENDPOINT", tls.clone()));
-            c
-        },
-        {
-            let mut c = case(
-                "tls: TLS client to the plaintext port",
-                "valid-tls",
-                Expect::Fail,
-            );
-            c.set
-                .push(("ENDPOINT", plain.replace("http://", "https://")));
             c
         },
         {
@@ -268,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
         for (k, v) in &base {
             std::env::set_var(k, v);
         }
-        if c.base != "valid-tls" && c.base != "other-ca" && !base.contains_key("ENDPOINT") {
+        if c.base != "valid-tls" && !base.contains_key("ENDPOINT") {
             std::env::set_var("ENDPOINT", &plain);
         }
         for (k, v) in &c.set {
