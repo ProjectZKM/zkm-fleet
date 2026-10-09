@@ -4,13 +4,17 @@
 
 One scheduler for the GPU / CPU workloads on our machines. Ray owns the cards; three kinds of work share them:
 
-- **Ziren proofs.** EthProofs and GOAT submit through the Ziren SDK's network prover (`ZKM_PROVER=network`, unchanged); the scheduler places each job on a prover node, and the nodes run as Ray actors next to their GPU servers.
+- **Ziren proofs.** EthProofs and GOAT submit through the Ziren SDK's network prover (`ZKM_PROVER=network`); the scheduler assigns each job to an eligible prover node.
 - **One-shot runs** (training, batch jobs): a command in a container on the cards Ray grants it, queued until they are free, through the runs API (`fleetctl job submit`).
-- **Long-running GPU apps** (ComfyUI, an inference server): a container per replica, kept up like the provers.
+- **Persistent GPU apps** (ComfyUI, an inference server): a Ray-managed container per replica.
 
-![zkm-fleet architecture: clients, control machine, and Ray workloads](images/diagram.svg)
+## Architecture
 
-The scheduler, its Postgres and the gateway run under docker compose. Every machine runs a Ray node; the service actors (provers, apps, the runs API) are detached, so Ray restarts them on failure, and `apply` reconciles them with `services.yaml` when it changes.
+![Architecture diagram showing client paths, the control plane, Ray workloads, and job storage](images/diagram.svg)
+
+The control plane combines the Rust scheduler, Postgres, the HTTPS gateway, the MCP server and a Python reconciler. The gateway routes proof traffic and the MCP `/mcp` path over the existing TLS ingress. MCP initialization and `tools/list` are public; `tools/call` requires a namespace-scoped user token. Direct `fleetctl` administration and run API access use restricted SSH forwards, so the scheduler and runs API do not need public listeners.
+
+Every worker machine runs a Ray node. Prover nodes initiate bidirectional gRPC heartbeats to the scheduler; heartbeat responses carry assignments, and completion metadata returns on later heartbeats. The scheduler does not open RPC connections to nodes. Ray allocates resources to proof workers, one-shot run containers and persistent app actors. Proof nodes write proof outputs to job artifact storage; the runs API manages PI task inputs and outputs in `RUNS_DIR`.
 
 **Who gets a card.** Jobs inherit their app’s priority at submission (default `0`, higher first). A waiting run or starting service can preempt eligible lower-priority runs only within its own namespace. Stopped runs queue again after confirmed cleanup, spending no retry. Equal-priority jobs do not preempt each other; pending jobs with equal priority use FIFO order.
 
@@ -32,15 +36,11 @@ Restarting or upgrading the scheduler does not fail the proofs in flight:
 - **jobs:** the scheduler keeps them in Postgres.
 - **nodes:** proofs continue locally. Nodes reconnect and receive the same execution lease through heartbeat responses, then retry completion metadata until acknowledged. Uncertain executions retain their quota reservations.
 
-Nodes initiate authenticated gRPC control requests. Heartbeat responses carry assignments;
-workers fetch inputs separately, without an inbound prover RPC port. Heartbeats report
-health, the running job and completion metadata, never proof bytes.
-
-Proof nodes own proof output and write it durably before reporting success. The existing
-SDK-facing `GetStatus` and public-values routes read shared job-artifact storage
-(`proof_output_dir`); app deletion removes its terminal jobs' artifacts. Scheduling does
-not publish or inspect proofs. PI run outputs,
-logs and checkpoints use runs storage (`RUNS_DIR`, shared across machines when needed).
+Proof nodes own execution and write proof output durably before reporting success. The
+SDK-facing status and public-values routes read shared job-artifact storage
+(`proof_output_dir`); app deletion removes its terminal jobs' artifacts. The scheduler
+stores job metadata, not proof bytes. PI run inputs, outputs, logs and checkpoints use
+`RUNS_DIR`, shared across machines when needed.
 
 ## Namespaces, access and quotas
 
@@ -376,36 +376,36 @@ tunnel.
 
 ### MCP clients
 
-The deployed MCP server is available at
-`https://34.215.238.232:8905/mcp` using Streamable HTTP over HTTPS. The repository's
-project-scoped `.mcp.json` connects to that endpoint; it does not launch a local
-stdio process or require another public port. Export the user token value and
-start Claude Code from the repository root:
+Share these connection details with external MCP client users:
 
-```bash
-export FLEET_MCP_AUTH="$(cat "$HOME/.config/zkm-fleet/alice.token")"
-claude
-```
+- **Server:** ZKM Fleet
+- **Transport:** Streamable HTTP over HTTPS
+- **URL:** `https://34.215.238.232:8905/mcp`
+- **Authentication:** HTTP Bearer token in the `Authorization` header
+
+For clients with a custom-header field, set `Authorization` to `Bearer <user-token>`.
+An administrator issues each user a namespace/tag-scoped token and delivers it
+securely. Do not give external users the administrator token.
 
 Initialization and `tools/list` are available without a token, so clients can
-inspect the tool names and schemas before connecting credentials. `tools/call`
-requires a current administrator-issued user token; the scheduler applies its
-namespace, tag, and app grants. The MCP service has no admin token. Keep the
-token file private and never place token contents in `.mcp.json`. Claude Code
-asks you to approve the project MCP server on first use; `/mcp` shows its status.
-The server exposes tools to list and inspect apps and jobs, create a run app,
-submit a run, and cancel a run. App creation requires an app-management token;
-scheduler authorization enforces the token's namespace, tag, and app grants.
-Proof jobs remain submitted through the Ziren network SDK; MCP can list and
-inspect their records.
-Other MCP clients can connect to the same HTTPS URL with the same Bearer
-authorization header.
+discover the available tools and input schemas before adding a token. `tools/call`
+requires a current user token; the scheduler applies its namespace, tag, tenant,
+and app grants. MCP has no administrator token. Clients must support remote
+Streamable HTTP and allow the Bearer header to be configured. Clients that only
+support local `stdio` servers cannot connect directly to this endpoint.
 
-Namespace owner tokens can register apps and submit proof/run jobs inside
-their namespace and default tag. Administrators can also issue tokens limited
+The server exposes tools to list and inspect apps and jobs, create run apps,
+submit run jobs, and cancel run jobs. App creation requires an app-management
+grant. Proof jobs remain submitted through the Ziren network SDK; MCP can list
+and inspect their records.
+
+Namespace owner tokens can register and remove proof apps for their tenant in
+their namespace, and submit proof/run jobs inside their namespace and default tag.
+App removal refuses while any proof is queued or running and deletes that app's
+terminal proof records and artifacts. Administrators can also issue tokens limited
 to approved apps and a selected namespace/tag. Token refresh preserves jobs and uploads.
 Namespaces are the resource accounting and billing unit; namespace and optional tag quotas
-cap concurrent GPU/CPU units across proofs and runs, with no quota time limit.
+cap concurrent GPU/CPU units across proofs, runs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
 The sections below describe token scopes, access, and quota administration.
 
 Persistent GPU apps such as ComfyUI appear as `run` apps in `fleetctl app`.
@@ -450,18 +450,26 @@ scopes. Namespace-owner tokens can register apps, while app-limited tokens can
 use only approved programs and profiles. Revocation applies to both proofs and
 runs.
 
-The scheduler and runs API stay private. Users reach them through restricted SSH
-forwards and use `FLEET_TOKEN_FILE`; operators use `FLEET_ADMIN_TOKEN_FILE`.
-The runs API listens on loopback by default, and this feature adds no public port.
+The scheduler and runs API stay private. Node control gRPC uses TLS with the scheduler
+certificate and cluster bearer token; use an HTTPS `scheduler` URL in `services.yaml`.
+For a private certificate authority, set `scheduler_ca_file` so prover containers trust it.
+The installer sets this to its generated public CA certificate; distribute that CA to
+every machine Ray may place a prover on.
+The scheduler holds a PostgreSQL advisory lock for its lifetime, so only one process can
+dispatch from a database at a time. Direct `fleetctl` access uses restricted SSH forwards;
+MCP exposes only user-scoped tools through the existing HTTPS gateway. User operations use `FLEET_TOKEN_FILE`; operators use
+`FLEET_ADMIN_TOKEN_FILE`. The runs API listens on loopback by default.
 
 ## Ports
 
 | port | bind | who |
 |---|---|---|
-| 51000 stage (gRPC) | external, server-authenticated HTTPS, on the gateway | SDK clients |
-| 9191 http | external by default (`--bind-http`), on the gateway | public values (SDK, per-proof key), `/admin` (admin token), `/healthz` |
-| 9192 runs API | 127.0.0.1 (the service's `listen`) | `fleetctl job` / `app` for runs (admin token) |
-| 51001 control / input fetch (gRPC) | cluster interface; connections originate on nodes | nodes (cluster token) |
+| 8905 HTTPS gateway | existing TLS ingress | Production MCP endpoint at `/mcp` |
+| 8906 MCP backend | 127.0.0.1 | gateway only; anonymous discovery, user token required for tool calls |
+| 51000 stage (gRPC) | gateway to private scheduler; server-authenticated TLS | SDK proof clients (user bearer token) |
+| 9191 scheduler HTTP | gateway to private scheduler | public values, `/healthz`, `/admin` (admin token) |
+| 9192 runs API | 127.0.0.1 (the service's `listen`) | private `fleetctl` / MCP calls (user token; admin token for operator actions) |
+| 51001 control (gRPC) | cluster interface; nodes initiate connections | prover nodes (cluster token) |
 | 30100-30199 GPU server | 127.0.0.1 | its own node only |
 | app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
 | Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | cluster | Ray |

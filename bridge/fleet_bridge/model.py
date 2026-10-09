@@ -615,6 +615,7 @@ class ClusterConfig(Record):
     """The top of services.yaml: what every replica shares."""
 
     scheduler: str | None = None
+    scheduler_ca_file: str | None = None
     cluster_token_file: str | None = None
     node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
@@ -636,6 +637,7 @@ class ServiceSpec(Record):
 
     name: str
     namespace: str = "00000000000000000000000000000000"
+    tag: str | None = None
     priority: int = 0
     kind: ServiceKind = ServiceKind.ZIREN_GPU
     replicas: int = 1
@@ -747,6 +749,7 @@ class NodeEnv(Record):
     name: str = field(metadata={"env": "FLEET_NODE_NAME"})
     backend: str = field(metadata={"env": "FLEET_BACKEND"})
     scheduler: str = field(metadata={"env": "FLEET_SCHEDULER"})
+    scheduler_ca_file: str | None = field(default=None, metadata={"env": "FLEET_SCHEDULER_CA_FILE"})
     cluster_token_file: str = field(metadata={"env": "FLEET_CLUSTER_TOKEN_FILE"})
     machine: str = field(metadata={"env": "FLEET_MACHINE"})
     app_namespace: str | None = field(default=None, metadata={"env": "FLEET_APP_NAMESPACE"})

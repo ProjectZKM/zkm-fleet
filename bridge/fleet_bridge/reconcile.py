@@ -70,7 +70,7 @@ ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, Service
                                   ServiceKind.APP: GpuApp, ServiceKind.RUNS_API: RunsApi}
 PREEMPT_AFTER_S = 20  # a service's cards not granted this long: runs hold them
 # the cluster settings a replica's hash covers, as the file names them
-_SHARED_KEYS = ("scheduler", "cluster_token_file", "node_binary", "log_dir", "proof_output_dir", "gpu_port_range", "scheduler_admin")
+_SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "proof_output_dir", "gpu_port_range", "scheduler_admin")
 
 
 def service_of(replica: str) -> str:
@@ -212,7 +212,7 @@ def _preempt_runs_for(spec: ReplicaSpec, b: Bundle, runs_dir: str) -> list[str]:
     return done
 
 
-def stop(name: str) -> None:
+def stop(name: str, scheduler: "Scheduler | None" = None) -> None:
     """Kills the actor, then removes what it owned on its machine. The kill comes first:
     an actor asked to shut down and left alive restarts itself (max_restarts=-1) when
     its watcher sees the container gone, and the restart races the replacement."""
@@ -243,6 +243,8 @@ def stop(name: str) -> None:
                 remove_placement_group(ray.util.get_placement_group(group_name))
             except Exception:
                 pass
+    if scheduler is not None:
+        scheduler.release_service(name)
 
 
 class Scheduler:
@@ -267,6 +269,36 @@ class Scheduler:
         parsed = json.loads(body) if body.strip().startswith(b"{") else {}
         return parsed if isinstance(parsed, dict) else {}
 
+    def reserve_service(self, spec: ReplicaSpec, *, restore: bool = False) -> None:
+        if not self.token:
+            raise ValueError("persistent service quota requires the administrator token")
+        namespace = self.require_namespace(spec.service.namespace)
+        b = bundle(spec)
+        payload = json.dumps({
+            "id": f"service:{spec.name}", "tag": spec.service.tag,
+            "gpus": b.gpu, "cpus": b.cpu, "restore": restore,
+        }).encode()
+        req = urllib.request.Request(
+            self.url + "/namespaces/" + urllib.parse.quote(namespace, safe="") + "/allocations",
+            data=payload, method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                response.read()
+        except urllib.error.HTTPError as e:
+            raise ValueError(f"service {spec.name} could not reserve namespace/tag resources: {e.read().decode(errors='replace')}") from None
+
+    def release_service(self, name: str) -> None:
+        if not self.token:
+            raise ValueError("persistent service quota requires the administrator token")
+        path = "/allocations/" + urllib.parse.quote(f"service:{name}", safe="")
+        try:
+            self._call("DELETE", path)
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+
     def resolve_namespace_id(self, reference: str) -> dict[str, Any]:
         if not self.token:
             raise ValueError("app namespace validation requires the administrator token")
@@ -286,6 +318,19 @@ class Scheduler:
             raise ValueError("proof app lifecycle requires the administrator token")
         query = urllib.parse.urlencode({"namespace": namespace, "tenant": tenant, "elf_id": elf_id})
         self._call("PUT" if disabled else "DELETE", f"/apps/disabled?{query}")
+
+    def sync_proof_app_state(self, service: ServiceSpec, disabled: bool) -> None:
+        if not service.proof_app:
+            return
+        tenant, elf_id = service.proof_app.split("/", 1)
+        namespace = self.require_namespace(service.namespace)
+        try:
+            self.set_proof_app_disabled(namespace, tenant, elf_id, disabled)
+        except urllib.error.HTTPError as e:
+            # A service can be configured before its app is registered. Once the
+            # app exists, every apply reconciles its admission bit to desired state.
+            if e.code != 404:
+                raise
 
     def undrain(self, name: str) -> None:
         """A restarted dedicated node must clear the drain left by its old process."""
@@ -344,13 +389,29 @@ def reconcile_once(file: ServicesFile, dry_run: bool = False, only: list[str] | 
         want = {n: s for n, s in want.items() if picked(n) or s.kind is ServiceKind.HOLD}
         have = {n: a for n, a in have.items() if picked(n)}
     report = ApplyReport()
+    sched = Scheduler(file.cluster)
+    if not dry_run:
+        for svc in file.services:
+            if svc.kind is ServiceKind.ZIREN_GPU and svc.disabled and svc.proof_app:
+                sched.sync_proof_app_state(svc, True)
     holds: list[PlacementGroup] = []
     try:
-        _reconcile(want, have, report, Scheduler(file.cluster), holds, dry_run, _runs_dir(file))
+        _reconcile(want, have, report, sched, holds, dry_run, _runs_dir(file))
     finally:
         # Holds only steer which cards the services after them get; release them.
         for pg in holds:
             remove_placement_group(pg)
+    if not dry_run:
+        unhealthy = set(report.unhealthy)
+        for svc in file.services:
+            if svc.kind is not ServiceKind.ZIREN_GPU or svc.disabled or not svc.proof_app:
+                continue
+            if only and not any(name == svc.name or name.startswith(f"{svc.name}-") for name in only):
+                continue
+            replicas = {f"{svc.name}-{i}" for i in range(svc.replicas)}
+            reconciled = set(report.healthy) | set(report.started) | set(report.replaced)
+            if not replicas & unhealthy and replicas <= reconciled:
+                sched.sync_proof_app_state(svc, False)
     return report
 
 
@@ -358,13 +419,14 @@ def _replace(name: str, spec: ReplicaSpec, sched: Scheduler, report: ApplyReport
              runs_dir: str | None) -> None:
     log.info("replacing %s (%s): draining first", name, why)
     drained = sched.drain(name)
-    stop(name)
+    stop(name, sched)
     try:
+        sched.reserve_service(spec)
         start(spec, runs_dir=runs_dir)
         report.replaced.append(name)
     except Exception as e:
         log.error("restarting %s failed: %s", name, e)
-        stop(name)
+        stop(name, sched)
         report.unhealthy.append(name)
     finally:
         if drained:
@@ -379,7 +441,7 @@ def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], 
             continue
         log.info("stopping %s (no longer wanted)", name)
         drained = sched.drain(name)
-        stop(name)
+        stop(name, sched)
         if drained:
             sched.undrain(name)  # the name is free for a later replica
         report.stopped.append(name)
@@ -408,11 +470,12 @@ def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], 
                 continue
             log.info("starting %s", name)
             try:
+                sched.reserve_service(spec)
                 start(spec, runs_dir=runs_dir)
                 report.started.append(name)
             except Exception as e:
                 log.error("starting %s failed: %s", name, e)
-                stop(name)
+                stop(name, sched)
                 report.unhealthy.append(name)
             continue
         try:
@@ -427,4 +490,5 @@ def _reconcile(want: dict[str, ReplicaSpec], have: dict[str, ActorHandle[Any]], 
             else:
                 _replace(name, spec, sched, report, "spec changed", runs_dir)
         else:
+            sched.reserve_service(spec, restore=True)
             report.healthy.append(name)

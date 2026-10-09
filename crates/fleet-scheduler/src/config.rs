@@ -48,6 +48,9 @@ pub struct Config {
     pub tenants: Vec<TenantConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+    /// TLS for node-initiated control gRPC, independent of gateway TLS termination.
+    #[serde(default)]
+    pub control_tls: Option<TlsConfig>,
     /// Shared secret authenticating node-initiated control requests. At least 32 characters.
     pub cluster_token_file: PathBuf,
     /// Bearer token for the operator HTTP endpoints (`/status`, ELF upload).
@@ -143,6 +146,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        let control: std::net::SocketAddr = self.control_addr.parse()
+            .map_err(|e| anyhow::anyhow!("control_addr must be a socket address: {e}"))?;
+        anyhow::ensure!(
+            self.control_tls.is_some() || (control.ip().is_loopback() && self.database_url.is_none()),
+            "control gRPC requires TLS whenever it is network-reachable or backed by production Postgres"
+        );
         let mut seen = std::collections::HashSet::new();
         for t in &self.tenants {
             anyhow::ensure!(
@@ -171,6 +180,23 @@ impl Config {
         self.tenants
             .iter()
             .find(|t| t.addresses.iter().any(|a| normalize_address(a) == want))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn cfg(control: &str, tls: &str) -> Config {
+        serde_yaml::from_str(&format!("public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\nadmin_token_file: /tmp/admin\ncontrol_addr: {control}\n{tls}tenants: []\n")).unwrap()
+    }
+    #[test]
+    fn control_listener_requires_tls_outside_loopback() {
+        assert!(cfg("127.0.0.1:51001", "").validate().is_ok());
+        assert!(cfg("0.0.0.0:51001", "").validate().is_err());
+        assert!(cfg("0.0.0.0:51001", "control_tls:\n  cert_path: /tmp/cert\n  key_path: /tmp/key\n").validate().is_ok());
+        let mut production = cfg("127.0.0.1:51001", "");
+        production.database_url = Some("postgres://localhost/fleet".into());
+        assert!(production.validate().is_err());
     }
 }
 

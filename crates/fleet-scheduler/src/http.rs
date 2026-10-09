@@ -31,6 +31,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/namespaces/:name/quota", put(set_quota))
         .route("/namespaces/:name/allocations", get(allocations).post(reserve_run))
         .route("/namespaces/:name/allocations/:id", axum::routing::delete(release_run))
+        .route("/allocations/:id", axum::routing::delete(release_allocation))
         .route("/namespaces/:name/suspended", put(suspend_namespace).delete(resume_namespace))
         .route("/tokens", get(list_tokens).post(add_token))
         .route(
@@ -70,7 +71,8 @@ async fn authorize_http(
             && (path == "/apps" || path == "/jobs"
                 || path.strip_prefix("/jobs/").is_some_and(|id| !id.is_empty() && !id.contains('/')));
         let create_app = req.method() == axum::http::Method::POST && path == "/apps" && c.manage_apps;
-        if !read_scoped && !create_app {
+        let delete_app = req.method() == axum::http::Method::DELETE && path == "/apps" && c.manage_apps;
+        if !read_scoped && !create_app && !delete_app {
             return StatusCode::FORBIDDEN.into_response();
         }
         Some(c)
@@ -205,6 +207,13 @@ async fn release_run(State(s): State<HttpState>, Path((name, id)): Path<(String,
     let Some(n) = s.fleet.namespace(&name) else { return StatusCode::NOT_FOUND.into_response(); };
     match s.fleet.release_run(&n.id, &id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(e) => app_outcome(Err(e)),
+    }
+}
+
+async fn release_allocation(State(s): State<HttpState>, Path(id): Path<String>) -> Response {
+    match s.fleet.release_allocation(&id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => app_outcome(Err(e)),
     }
 }
 
@@ -375,9 +384,17 @@ fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
     }
 }
 
-async fn delete_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
+async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
     match k.parts(&s.fleet) {
-        Ok((n, t, e)) => app_outcome(s.fleet.delete_app(&n, &t, &e).await),
+        Ok((n, t, e)) => {
+            if let Some(c) = c {
+                if c.namespace.as_deref() != Some(n.as_str()) || c.tenant != t
+                    || k.tag.as_deref().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+            }
+            app_outcome(s.fleet.delete_app(&n, &t, &e).await)
+        }
         Err(r) => r,
     }
 }

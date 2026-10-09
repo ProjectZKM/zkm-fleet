@@ -433,9 +433,11 @@ impl Fleet {
 
     pub async fn reserve_run(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64, restore: bool) -> anyhow::Result<Allocation> {
         let _ops = self.quota_ops.lock().await;
-        anyhow::ensure!(blobs::is_safe_id(id), "invalid run id");
+        let service_id = id.strip_prefix("service:");
+        anyhow::ensure!(service_id.map_or_else(|| blobs::is_safe_id(id), blobs::is_safe_id), "invalid run/service id");
         let n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
-        let a = Allocation { id: format!("run:{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus };
+        let prefix = if service_id.is_some() { "" } else { "run:" };
+        let a = Allocation { id: format!("{prefix}{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus };
         let previous = self.allocations.lock().get(&a.id).cloned();
         self.allocate(a.clone(), restore)?;
         if let Err(e) = self.store.reserve(&a).await {
@@ -448,9 +450,15 @@ impl Fleet {
 
     pub async fn release_run(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
         let _ops = self.quota_ops.lock().await;
-        let key = format!("run:{id}");
+        let key = if id.starts_with("service:") { id.to_string() } else { format!("run:{id}") };
         anyhow::ensure!(self.allocations.lock().get(&key).is_none_or(|a| a.namespace == namespace), "allocation belongs to another namespace or tag");
         self.release_quota(&key).await
+    }
+
+    pub async fn release_allocation(&self, id: &str) -> anyhow::Result<()> {
+        let _ops = self.quota_ops.lock().await;
+        anyhow::ensure!(self.allocations.lock().contains_key(id), "no such allocation");
+        self.release_quota(id).await
     }
 
     async fn release_quota(&self, id: &str) -> anyhow::Result<()> {
@@ -1227,6 +1235,8 @@ impl Fleet {
         let err = |e: anyhow::Error| tonic::Status::internal(e.to_string());
         if !j.state.is_terminal() {
             if c.error_code == 0 {
+                self.blobs.verify_published_output(&j, c.cycles, c.prove_ms).await
+                    .map_err(|e| tonic::Status::unavailable(format!("proof output is not durable/readable yet: {e:#}")))?;
                 j.state = JobState::Succeeded;
                 j.error.clear();
                 j.cycles = c.cycles;

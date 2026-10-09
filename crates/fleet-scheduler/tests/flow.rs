@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use sha2::Digest;
 use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 
@@ -258,6 +259,12 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
                         std::fs::create_dir_all(&dir).unwrap();
                         std::fs::write(dir.join("proof.json"), &result.proof_json).unwrap();
                         std::fs::write(dir.join("public_values.bin"), &result.public_values).unwrap();
+                        let manifest = serde_json::json!({
+                            "cycles": result.cycles, "prove_ms": result.prove_ms,
+                            "proof_hash": hex::encode(sha2::Sha256::digest(&result.proof_json)),
+                            "public_values_hash": hex::encode(sha2::Sha256::digest(&result.public_values)),
+                        });
+                        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
                         Completion { assignment: Some(assignment), cycles: result.cycles, prove_ms: result.prove_ms, ..Default::default() }
                     }
                     Err(e) => Completion { assignment: Some(assignment), error_code: e.code() as i32, error: e.message().into(), ..Default::default() },
@@ -1105,4 +1112,59 @@ async fn jobs_inherit_app_priority_and_dispatch_highest_then_fifo() {
     wait_done(&mut h, "low-priority").await;
     assert_eq!(*calls.lock(), expected);
     assert_eq!(proof_app(&h, "eth")["priority"], -10);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_management_token_can_delete_only_its_namespace_and_tenant_apps() {
+    let h = start().await;
+    let elf = fleet_scheduler::blobs::elf_id_of(b"owner-managed-app");
+    for name in ["owner-scope", "other-scope"] {
+        admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
+            &serde_json::json!({"name": name}).to_string(), &format!("{}/admin/namespaces", h.http)]);
+    }
+    for (namespace, tenant) in [("owner-scope", "goat"), ("owner-scope", "eth"), ("other-scope", "goat")] {
+        let code = admin_curl(&h, &["-X", "POST", "-o", "/dev/null", "-w", "%{http_code}",
+            &format!("{}/admin/apps?namespace={namespace}&tenant={tenant}&elf_id={elf}", h.http)]);
+        assert_eq!(code, "200");
+    }
+    let address = format!("{:x}", alloy_primitives::Address::from_public_key(
+        k256::ecdsa::SigningKey::from_slice(&[81; 32]).unwrap().verifying_key()));
+    let bearer = "81".repeat(48);
+    let body = serde_json::json!({"id":"81".repeat(16), "namespace":"owner-scope", "tag":"default",
+        "tenant":"goat", "address":address, "label":"namespace owner", "manage_apps":true,
+        "token_hash":hex::encode(sha2::Sha256::digest(bearer.as_bytes()))});
+    admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body.to_string(),
+        &format!("{}/admin/tokens", h.http)]);
+    let own = format!("/admin/apps?namespace=owner-scope&tenant=goat&elf_id={elf}");
+    let other_tenant = format!("/admin/apps?namespace=owner-scope&tenant=eth&elf_id={elf}");
+    let other_namespace = format!("/admin/apps?namespace=other-scope&tenant=goat&elf_id={elf}");
+    assert_eq!(user_http(&h, &bearer, "DELETE", &own).0, 200);
+    assert_eq!(user_http(&h, &bearer, "DELETE", &other_tenant).0, 403);
+    assert_eq!(user_http(&h, &bearer, "DELETE", &other_namespace).0, 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn persistent_service_reservations_count_against_namespace_quota() {
+    let h = start().await;
+    let created = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
+        r#"{"name":"service-budget"}"#, &format!("{}/admin/namespaces", h.http)]);
+    let ns: serde_json::Value = serde_json::from_str(&created).unwrap();
+    let id = ns["id"].as_str().unwrap();
+    let quota = serde_json::json!({"gpus": 2.0, "cpus": 8.0}).to_string();
+    admin_curl(&h, &["-X", "PUT", "-H", "content-type: application/json", "-d", &quota,
+        &format!("{}/admin/namespaces/{id}/quota", h.http)]);
+    let service = serde_json::json!({"id":"service:ethproofs-gpu-0", "tag":"default", "gpus":1.0, "cpus":4.0});
+    let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &service.to_string(),
+        "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/namespaces/{id}/allocations", h.http)]);
+    assert_eq!(status, "200");
+    let run = serde_json::json!({"id":"overflow", "tag":"default", "gpus":1.0, "cpus":5.0});
+    let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &run.to_string(),
+        "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/namespaces/{id}/allocations", h.http)]);
+    assert_eq!(status, "429", "persistent service capacity must reduce available quota");
+    let status = admin_curl(&h, &["-X", "DELETE", "-o", "/dev/null", "-w", "%{http_code}",
+        &format!("{}/admin/allocations/service:ethproofs-gpu-0", h.http)]);
+    assert_eq!(status, "204");
+    let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &run.to_string(),
+        "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/namespaces/{id}/allocations", h.http)]);
+    assert_eq!(status, "200");
 }

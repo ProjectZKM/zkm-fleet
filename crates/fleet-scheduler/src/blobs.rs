@@ -55,6 +55,28 @@ impl Blobs {
         Ok(bytes)
     }
 
+    /// A successful worker completion is accepted only when the shared output is
+    /// visible and the committed manifest matches the result metadata and bytes.
+    pub async fn verify_published_output(&self, job: &crate::store::Job, cycles: u64, prove_ms: u64) -> anyhow::Result<()> {
+        if self.proof_output.is_none() { return Ok(()); }
+        let blobs = self.clone();
+        let job = job.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(10), tokio::task::spawn_blocking(move || {
+            let proof = blobs.read_output(&job, PROOF)?;
+            let public_values = blobs.read_output(&job, PUBLIC_VALUES)?;
+            let root = blobs.proof_output.as_ref().expect("checked above");
+            let started = job.started_ms.ok_or_else(|| anyhow::anyhow!("successful job has no execution lease"))?;
+            let path = root.join(&job.id).join(format!("{}-{started}", job.attempts)).join("manifest.json");
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            anyhow::ensure!(manifest["cycles"].as_u64() == Some(cycles) && manifest["prove_ms"].as_u64() == Some(prove_ms), "proof output manifest does not match completion metadata");
+            let proof_hash = hex::encode(Sha256::digest(&proof));
+            let public_values_hash = hex::encode(Sha256::digest(&public_values));
+            anyhow::ensure!(manifest["proof_hash"].as_str() == Some(proof_hash.as_str()), "proof output hash does not match manifest");
+            anyhow::ensure!(manifest["public_values_hash"].as_str() == Some(public_values_hash.as_str()), "public values hash does not match manifest");
+            Ok(())
+        })).await??
+    }
+
     pub fn read_output(&self, job: &crate::store::Job, name: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(matches!(name, PROOF | PUBLIC_VALUES), "unknown proof output");
         anyhow::ensure!(is_safe_id(&job.id), "bad job id");

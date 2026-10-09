@@ -1,5 +1,8 @@
 # Prover actors: edit, then deploy/apply.sh (written by install.sh).
-scheduler: http://10.0.0.1:51001
+scheduler: https://scheduler.example.com:51001
+# Copy the public CA certificate to every Ray worker at this path when using a
+# private CA; the cluster token remains the node's bearer credential.
+scheduler_ca_file: /etc/zkm-fleet/tls/ca.pem
 cluster_token_file: /etc/zkm-fleet/cluster.token
 node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
@@ -15,6 +18,7 @@ services:
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user
+    tag: default
     proof_app: ethproofs/FULL_ELF_SHA256 # bind this server exclusively to one namespace proof app
     replicas: 1
     gpus: 2

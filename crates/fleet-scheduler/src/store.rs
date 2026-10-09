@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{pool::PoolConnection, postgres::PgPoolOptions, PgPool, Postgres, Row};
 
 use crate::quota::{Allocation, Quota};
 use fleet_proto::fleet::v1::ProofKind;
@@ -496,6 +496,11 @@ pub struct PgStore {
     pool: PgPool,
 }
 
+/// Holds a session lock for the lifetime of the active scheduler.
+pub struct PgLeaderLock {
+    _connection: PoolConnection<Postgres>,
+}
+
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
@@ -635,6 +640,15 @@ impl PgStore {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         Self::initialize(&pool).await?;
         Ok(Self { pool })
+    }
+
+    pub async fn acquire_leader_lock(&self) -> anyhow::Result<PgLeaderLock> {
+        const LOCK_KEY: i64 = 0x5a4b_4d46_4c45_4554;
+        let mut connection = self.pool.acquire().await?;
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(LOCK_KEY).fetch_one(&mut *connection).await?;
+        anyhow::ensure!(acquired, "another fleet-scheduler already holds the database leader lock");
+        Ok(PgLeaderLock { _connection: connection })
     }
 
     /// Initialize a fresh database or verify the current schema. Old development

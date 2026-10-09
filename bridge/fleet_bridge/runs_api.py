@@ -508,9 +508,7 @@ class Api:
             cfg, services = self.proof_app_services(namespace, tenant, elf_id)
             from . import reconcile
             scheduler = reconcile.Scheduler(cfg.cluster)
-            if disabled:
-                scheduler.set_proof_app_disabled(namespace, tenant, elf_id, True)
-            else:
+            if not disabled:
                 try:
                     scheduler.require_namespace(namespace)
                 except Exception as e:
@@ -553,6 +551,10 @@ class Api:
                     os.unlink(tmp.name)
 
             cfg = reconcile.load_services(data)
+            if disabled:
+                # Persist desired state before changing admission state. The
+                # reconciler reapplies it after process or scheduler restarts.
+                scheduler.set_proof_app_disabled(namespace, tenant, elf_id, True)
             report = reconcile.reconcile_once(cfg, only=sorted(names))
             if report.unhealthy:
                 raise ApiError(503, f"proof app reconciliation failed; desired state saved: {', '.join(report.unhealthy)}")

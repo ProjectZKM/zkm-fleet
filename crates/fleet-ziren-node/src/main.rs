@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use fleet_proto::fleet::v1::{
     control_service_client::ControlServiceClient, Assignment, Completion, DeregisterRequest,
@@ -32,9 +32,12 @@ pub struct Args {
         default_value = "http://127.0.0.1:3000/twirp/"
     )]
     gpu_endpoint: String,
-    /// Scheduler control API, e.g. http://10.0.0.1:51001.
+    /// Scheduler control API, e.g. https://scheduler.internal:51001.
     #[arg(long, env = "FLEET_SCHEDULER")]
     scheduler: String,
+    /// Optional CA bundle for a private scheduler certificate authority.
+    #[arg(long, env = "FLEET_SCHEDULER_CA_FILE")]
+    scheduler_ca_file: Option<std::path::PathBuf>,
     /// File holding the cluster token shared with the scheduler.
     #[arg(long, env = "FLEET_CLUSTER_TOKEN_FILE")]
     cluster_token_file: std::path::PathBuf,
@@ -134,8 +137,14 @@ async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> any
             .host()
             .ok_or_else(|| anyhow::anyhow!("scheduler HTTPS URL has no host"))?
             .to_owned();
-        endpoint =
-            endpoint.tls_config(ClientTlsConfig::new().with_webpki_roots().domain_name(host))?;
+        let mut tls = ClientTlsConfig::new().with_webpki_roots().domain_name(host);
+        if let Some(path) = &args.scheduler_ca_file {
+            tls = tls.ca_certificate(Certificate::from_pem(std::fs::read(path)?));
+        }
+        endpoint = endpoint.tls_config(tls)?;
+    } else {
+        anyhow::ensure!(endpoint.uri().host().is_some_and(|h| h == "localhost" || h == "127.0.0.1"),
+            "scheduler control must use HTTPS outside loopback");
     }
     let mut client: Control = ControlServiceClient::with_interceptor(
         endpoint.clone().connect_lazy(),

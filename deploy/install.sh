@@ -105,8 +105,8 @@ if [ "$ROLE" = control ]; then
     (umask 077; head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ETC/pg_password")
   fi
   (umask 077; echo "postgres://fleet:$(cat "$ETC/pg_password")@postgres:5432/fleet" > "$ETC/database_url")
-  if [ "$TLS" = 1 ] && [ ! -f "$ETC/tls/ca.pem" ]; then
-    "$FLEETCTL" init tls --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname)}" > /dev/null
+  if [ ! -f "$ETC/tls/ca.pem" ]; then
+    "$FLEETCTL" init tls --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname),$IP}" > /dev/null
   fi
 else
   install -m 600 "$TOKEN" "$ETC/cluster.token"
@@ -126,6 +126,9 @@ if [ "$ROLE" = control ]; then
     {
       echo "stage_addr: 0.0.0.0:51000"
       echo "control_addr: 0.0.0.0:51001"
+      echo "control_tls:"
+      echo "  cert_path: $ETC/tls/server.pem"
+      echo "  key_path: $ETC/tls/server.key"
       echo "http_addr: 0.0.0.0:9191"
       echo "public_url: $PUBLIC_URL"
       echo "database_url_file: /etc/zkm-fleet/database_url"
@@ -145,7 +148,8 @@ if [ "$ROLE" = control ]; then
     } > "$ETC/fleet.yaml"
   fi
   [ "$TLS" = 0 ] && [ "$BIND_STAGE" != 127.0.0.1 ] && die "--no-tls requires --bind-stage 127.0.0.1"
-  # The gateway terminates HTTPS; remove an older scheduler-side TLS configuration.
+  # The gateway terminates stage TLS. Keep control_tls: nodes connect directly to
+  # the scheduler listener, which must encrypt the shared cluster bearer token.
   if grep -q '^tls:' "$ETC/fleet.yaml"; then
     say "moving stage TLS from fleet.yaml to the gateway"
     awk '/^tls:/{skip=1; next} skip && /^[[:space:]]/{next} {skip=0; print}' "$ETC/fleet.yaml" > "$ETC/fleet.yaml.new"
@@ -218,7 +222,8 @@ fi
 if [ "$ROLE" = control ]; then
   if [ ! -f "$ETC/services.yaml" ]; then
     {
-      echo "scheduler: http://$IP:51001"
+      echo "scheduler: https://$IP:51001"
+      echo "scheduler_ca_file: $ETC/tls/ca.pem"
       echo "cluster_token_file: $ETC/cluster.token"
       echo "node_binary: $PREFIX/bin/fleet-ziren-node"
       echo "log_dir: $WORKDIR/logs"

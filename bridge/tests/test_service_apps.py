@@ -1,4 +1,5 @@
 """Persistent apps release their actors and stay disabled across reconciliation."""
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -48,7 +49,9 @@ def test_disabled_app_is_removed_without_touching_other_services(api, monkeypatc
     monkeypatch.setattr(reconcile, "stop", stop)
     monkeypatch.setattr(reconcile.Scheduler, "drain", lambda *args: False)
     report = reconcile.reconcile_once(reconcile.load_services(data), only=["comfyui"])
-    stop.assert_called_once_with("comfyui-0")
+    assert stop.call_count == 1
+    assert stop.call_args.args[0] == "comfyui-0"
+    assert isinstance(stop.call_args.args[1], reconcile.Scheduler)
     assert report.stopped == ["comfyui-0"]
     # Disabling an already stopped service remains idempotent.
     monkeypatch.setattr(reconcile, "running", lambda: {})
@@ -116,6 +119,37 @@ def test_persistent_app_checks_namespace_before_reserving_resources(monkeypatch)
     with pytest.raises(ValueError, match="unknown namespace"):
         reconcile.start(spec)
     reserve.assert_not_called()
+
+
+def test_reconciler_reserves_persistent_replica_units(monkeypatch, tmp_path):
+    cfg = reconcile.load_services({"scheduler_admin": "http://scheduler", "services": [
+        {"name": "comfyui", "kind": "app", "namespace": "alice", "tag": "render", "gpus": 1, "cpus": 8},
+    ]})
+    token_file = tmp_path / "admin.token"
+    token_file.write_text("admin-secret")
+    cfg.cluster.admin_token_file = str(token_file)
+    scheduler = reconcile.Scheduler(cfg.cluster)
+    monkeypatch.setattr(scheduler, "require_namespace", lambda name: "a" * 32)
+    requests = []
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): return False
+        def read(self): return b"{}"
+
+    def open_request(req, timeout):
+        requests.append(req)
+        return Response()
+
+    monkeypatch.setattr(reconcile.urllib.request, "urlopen", open_request)
+    scheduler.reserve_service(reconcile.replica_specs(cfg)["comfyui-0"])
+    assert requests[0].full_url == "http://scheduler/admin/namespaces/" + "a" * 32 + "/allocations"
+    assert json.loads(requests[0].data) == {
+        "id": "service:comfyui-0", "tag": "render", "gpus": 1.0, "cpus": 8.0, "restore": False,
+    }
+    scheduler.release_service("comfyui-0")
+    assert requests[1].method == "DELETE"
+    assert requests[1].full_url.endswith("/allocations/service%3Acomfyui-0")
 
 
 def test_gpu_services_must_be_bound_to_one_proof_app():

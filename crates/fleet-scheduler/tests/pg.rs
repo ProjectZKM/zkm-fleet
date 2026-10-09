@@ -263,3 +263,22 @@ async fn fresh_schema_requires_complete_job_identity() {
     mig.close().await;
     admin.execute("DROP SCHEMA fresh CASCADE; DROP SCHEMA incompatible CASCADE").await.unwrap();
 }
+
+#[tokio::test]
+async fn postgres_allows_only_one_scheduler_leader_per_database() {
+    let Some(url) = url() else {
+        eprintln!("FLEET_TEST_PG_URL unset: skipped");
+        return;
+    };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "leader").await;
+    let scoped = in_schema(&url, "leader");
+    let first = PgStore::connect(&scoped).await.unwrap();
+    let _lock = first.acquire_leader_lock().await.unwrap();
+    let second = PgStore::connect(&scoped).await.unwrap();
+    let error = match second.acquire_leader_lock().await {
+        Ok(_) => panic!("a second scheduler acquired the same database lock"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("another fleet-scheduler"), "{error:#}");
+}

@@ -77,7 +77,7 @@ def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extr
     if spec.service.proof_app:
         app_tenant, app_elf_id = spec.service.proof_app.split("/", 1)
         app_namespace = spec.service.namespace
-    node = NodeEnv(name=spec.name, backend=backend, scheduler=c.scheduler,
+    node = NodeEnv(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
                    app_namespace=app_namespace, app_tenant=app_tenant, app_elf_id=app_elf_id,
                    rust_log=spec.service.rust_log, cpus=int(spec.service.cpus),

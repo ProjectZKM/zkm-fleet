@@ -34,11 +34,15 @@ async fn terminated() {
 pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
     let cluster_token = token::load(&cfg.cluster_token_file)?;
     let admin_token = token::load(&cfg.admin_token_file)?;
-    let store: Arc<dyn store::Store> = match &cfg.database_url {
-        Some(url) => Arc::new(store::PgStore::connect(url).await?),
+    let (store, _leader_lock): (Arc<dyn store::Store>, Option<store::PgLeaderLock>) = match &cfg.database_url {
+        Some(url) => {
+            let pg = store::PgStore::connect(url).await?;
+            let lock = pg.acquire_leader_lock().await?;
+            (Arc::new(pg), Some(lock))
+        }
         None => {
             tracing::warn!("no database_url: jobs and tokens are kept in memory only");
-            Arc::new(store::MemoryStore::default())
+            (Arc::new(store::MemoryStore::default()), None)
         }
     };
     let blobs = blobs::Blobs::new(&cfg.data_dir)?
@@ -87,7 +91,14 @@ pub async fn serve(cfg: config::Config) -> anyhow::Result<()> {
         token::Require(Arc::new(cluster_token)),
     );
     let control_addr = cfg.control_addr.parse()?;
-    let control_task = Server::builder()
+    let mut control_server = Server::builder();
+    if let Some(tls) = &cfg.control_tls {
+        let identity = Identity::from_pem(std::fs::read(&tls.cert_path)?, std::fs::read(&tls.key_path)?);
+        control_server = control_server.tls_config(ServerTlsConfig::new().identity(identity))?;
+    } else {
+        tracing::warn!("control API without TLS: keep it on a trusted private network");
+    }
+    let control_task = control_server
         .add_service(control)
         .serve_with_shutdown(control_addr, stopping());
 

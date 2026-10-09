@@ -1,96 +1,190 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="900" viewBox="0 0 1320 900" role="img" aria-labelledby="title desc">
-<title id="title">zkm-fleet architecture</title>
-<desc id="desc">SDK clients reach the gateway and Rust proof scheduler backed by Postgres. fleetctl reaches the admin and runs APIs. The Python bridge reconciles configuration into Ray actors; Ray allocates GPUs and CPUs for prover nodes with local GPU servers, one-shot run containers, and persistent apps.</desc>
-<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse"><path d="M0 0 L8 4 L0 8Z" fill="#475569"/></marker><marker id="blueArrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#2563eb"/></marker></defs>
-<style>text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}.title{font-size:26px;font-weight:700}.section{font-size:19px;font-weight:700}.name{font-size:18px;font-weight:700}.detail{font-size:15px;fill:#475569}.label{font-size:14px;fill:#475569}.line{fill:none;stroke:#475569;stroke-width:2;marker-end:url(#arrow)}.config{fill:none;stroke:#2563eb;stroke-width:2;stroke-dasharray:7 5;marker-end:url(#blueArrow)}</style>
-<rect width="1320" height="900" fill="#ffffff"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">zkm-fleet architecture</title>
+  <desc id="desc">Clients use the HTTPS gateway, restricted SSH forwards, or app endpoints. The control plane contains the MCP server, Rust scheduler, Postgres, and Python reconciler. Ray allocates resources to proof workers, one-shot runs, and persistent apps. Prover nodes initiate bidirectional heartbeats and write proof outputs; run tasks use shared run storage.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#475569"/></marker>
+    <marker id="arrowStart" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto"><path d="M10 0L0 5L10 10Z" fill="#15803d"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#15803d"/></marker>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#2563eb"/></marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#c2410c"/></marker>
+  </defs>
+  <style>
+    text{font-family:Inter,Arial,Helvetica,sans-serif;fill:#0f172a}
+    .title{font-size:30px;font-weight:750}
+    .subtitle{font-size:16px;fill:#475569}
+    .panel-title{font-size:21px;font-weight:700}
+    .name{font-size:18px;font-weight:700}
+    .detail{font-size:14px;fill:#475569}
+    .small{font-size:12px;fill:#475569}
+    .client{fill:#f8fafc;stroke:#cbd5e1;stroke-width:1.5}
+    .control{fill:#eff6ff;stroke:#93c5fd;stroke-width:1.5}
+    .compute{fill:#f0fdf4;stroke:#86efac;stroke-width:1.5}
+    .component{fill:#fff;stroke:#cbd5e1;stroke-width:1.5}
+    .gateway{fill:#eff6ff;stroke:#60a5fa;stroke-width:1.5}
+    .mcp{fill:#f5f3ff;stroke:#a78bfa;stroke-width:1.5}
+    .work{fill:#fff;stroke:#86efac;stroke-width:1.4}
+    .storage{fill:#fffbeb;stroke:#fbbf24;stroke-width:1.4}
+    .line{fill:none;stroke:#475569;stroke-width:2.2;marker-end:url(#arrow)}
+    .https{fill:none;stroke:#2563eb;stroke-width:2.4;marker-end:url(#arrowBlue)}
+    .heartbeat{fill:none;stroke:#15803d;stroke-width:2.5;marker-start:url(#arrowStart);marker-end:url(#arrowGreen)}
+    .config{fill:none;stroke:#c2410c;stroke-width:2.3;stroke-dasharray:8 6;marker-end:url(#arrowOrange)}
+    .label-bg{fill:#fff;stroke:#e2e8f0;stroke-width:1}
+    .legend{font-size:13px;fill:#334155}
+  </style>
 
-<text x="32" y="38" class="title" text-anchor="start">zkm-fleet · one fleet, shared GPU / CPU capacity</text>
-<rect x="65" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
-<text x="83" y="109" class="name" text-anchor="start">Proof clients</text>
-<text x="83" y="133" class="detail" text-anchor="start">EthProofs / GOAT</text>
-<text x="83" y="153" class="detail" text-anchor="start">Ziren SDK network prover</text>
-<rect x="490" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
-<text x="508" y="109" class="name" text-anchor="start">fleetctl</text>
-<text x="508" y="133" class="detail" text-anchor="start">App and job management</text>
-<text x="508" y="153" class="detail" text-anchor="start">Admin token</text>
-<rect x="915" y="80" width="340" height="108" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
-<text x="933" y="109" class="name" text-anchor="start">App clients</text>
-<text x="933" y="133" class="detail" text-anchor="start">Studio / inference clients</text>
-<text x="933" y="153" class="detail" text-anchor="start">App-specific endpoints</text>
-<rect x="32" y="244" width="440" height="596" rx="12" fill="#f8fafc" stroke="#cbd5e1"/>
-<text x="55" y="274" class="section" text-anchor="start">Control machine</text>
-<rect x="50" y="288" width="404" height="405" rx="12" fill="#eff6ff" stroke="#bfdbfe"/>
-<text x="65" y="313" class="detail" text-anchor="start">Docker Compose</text>
-<rect x="65" y="334" width="370" height="88" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="83" y="363" class="name" text-anchor="start">Gateway · Envoy</text>
-<text x="83" y="387" class="detail" text-anchor="start">mTLS :51000 · HTTP :9191</text>
-<rect x="65" y="467" width="370" height="88" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="83" y="496" class="name" text-anchor="start">fleet-scheduler · Rust</text>
-<text x="83" y="520" class="detail" text-anchor="start">Proof queue, placement and access tokens</text>
-<rect x="65" y="600" width="370" height="70" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="83" y="629" class="name" text-anchor="start">Postgres</text>
-<text x="83" y="653" class="detail" text-anchor="start">Proof apps, jobs and access tokens</text>
-<rect x="65" y="732" width="370" height="86" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="83" y="761" class="name" text-anchor="start">Python bridge · apply</text>
-<text x="83" y="785" class="detail" text-anchor="start">services.yaml → detached Ray actors</text>
-<rect x="520" y="244" width="768" height="596" rx="12" fill="#f0fdf4" stroke="#bbf7d0"/>
-<text x="543" y="274" class="section" text-anchor="start">Ray cluster · one Ray node per machine</text>
-<rect x="555" y="300" width="698" height="70" rx="12" fill="#dcfce7" stroke="#cbd5e1"/>
-<text x="573" y="329" class="name" text-anchor="start">Ray allocation &amp; execution</text>
-<text x="573" y="353" class="detail" text-anchor="start">Placement groups reserve resources; Ray restarts actors</text>
-<rect x="555" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="573" y="472" class="name" text-anchor="start">Proof node actor</text>
-<text x="573" y="496" class="detail" text-anchor="start">fleet-ziren-node</text>
-<text x="573" y="516" class="detail" text-anchor="start">Owns proof output · one job at a time</text>
-<rect x="955" y="443" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="973" y="472" class="name" text-anchor="start">GPU server container</text>
-<text x="973" y="496" class="detail" text-anchor="start">Ziren GPU prover</text>
-<text x="973" y="516" class="detail" text-anchor="start">Same machine as its node</text>
-<rect x="555" y="590" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="573" y="619" class="name" text-anchor="start">Runs API actor</text>
-<text x="573" y="643" class="detail" text-anchor="start">:9192 · admin token</text>
-<text x="573" y="663" class="detail" text-anchor="start">runs.yaml profiles</text>
-<rect x="955" y="590" width="300" height="95" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="973" y="619" class="name" text-anchor="start">One-shot run containers</text>
-<text x="973" y="643" class="detail" text-anchor="start">PI tasks · output in runs storage</text>
-<text x="973" y="663" class="detail" text-anchor="start">Use granted GPU / CPU capacity</text>
-<rect x="955" y="737" width="300" height="81" rx="12" fill="#ffffff" stroke="#cbd5e1"/>
-<text x="973" y="766" class="name" text-anchor="start">Persistent app actors</text>
-<text x="973" y="790" class="detail" text-anchor="start">ComfyUI / inference containers</text>
-<text x="555" y="769" class="detail" text-anchor="start">Ray owns resource reservations.</text>
-<text x="555" y="793" class="detail" text-anchor="start">Each machine executes its workloads.</text>
-<path d="M235 188 V334" class="line"/>
-<rect x="240" y="212" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="246" y="227" class="label" text-anchor="start">mTLS · :51000</text>
-<path d="M490 134 H454 V378 H435" class="line"/>
-<rect x="359" y="212" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="365" y="227" class="label" text-anchor="start">admin · :9191</text>
-<path d="M660 188 V218 H508 V568 H705 V590" fill="none" stroke="#ffffff" stroke-width="7"/>
-<path d="M660 188 V218 H508 V568 H705 V590" class="line"/>
-<rect x="534" y="195" width="99.6" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="540" y="210" class="label" text-anchor="start">runs · :9192</text>
-<path d="M1255 134 H1272 V777 H1255" class="line"/>
-<path d="M250 422 V467" class="line"/>
-<rect x="256" y="435" width="77.7" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="262" y="450" class="label" text-anchor="start">stage API</text>
-<path d="M250 555 V600" class="line"/>
-<rect x="256" y="571" width="106.89999999999999" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="262" y="586" class="label" text-anchor="start">durable state</text>
-<path d="M435 484 H555" class="line"/>
-<rect x="434" y="455" width="116" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="440" y="470" class="label" text-anchor="start">assignment reply</text>
-<path d="M555 520 H435" class="line"/>
-<rect x="434" y="532" width="114.2" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="440" y="547" class="label" text-anchor="start">heartbeat :51001</text>
-<path d="M855 484 H955" class="line"/>
-<rect x="853" y="455" width="70.4" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="859" y="470" class="label" text-anchor="start">loopback</text>
-<path d="M855 637 H955" class="line"/>
-<rect x="863" y="610" width="55.8" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="869" y="625" class="label" text-anchor="start">launch</text>
-<path d="M435 775 H535 V398 H900 V370" class="config"/>
-<rect x="547" y="384" width="238.29999999999998" height="20" rx="3" fill="#ffffff" stroke="#ffffff"/>
-<text x="553" y="399" class="label" text-anchor="start">reconcile desired configuration</text>
-<text x="32" y="875" class="label" text-anchor="start">Solid arrows: API / execution paths. Dashed arrow: configuration reconciliation. Detailed ports are listed in the README.</text>
+  <rect width="1600" height="1000" fill="#fff"/>
+  <text x="40" y="48" class="title">zkm-fleet · shared GPU / CPU fleet</text>
+  <text x="40" y="76" class="subtitle">Namespaces own and account for work; Ray places it; nodes report progress through outbound heartbeats.</text>
+
+  <!-- Clients -->
+  <g>
+    <rect x="40" y="105" width="360" height="108" rx="14" class="client"/>
+    <text x="62" y="137" class="name">Proof SDK clients</text>
+    <text x="62" y="164" class="detail">EthProofs · GOAT</text>
+    <text x="62" y="188" class="detail">Ziren network prover · bearer token</text>
+
+    <rect x="430" y="105" width="360" height="108" rx="14" class="client"/>
+    <text x="452" y="137" class="name">fleetctl</text>
+    <text x="452" y="164" class="detail">Operator and namespace workflows</text>
+    <text x="452" y="188" class="detail">Private APIs over restricted SSH forwards</text>
+
+    <rect x="820" y="105" width="360" height="108" rx="14" class="client"/>
+    <text x="842" y="137" class="name">MCP clients</text>
+    <text x="842" y="164" class="detail">Streamable HTTP · HTTPS <tspan font-family="monospace">/mcp</tspan></text>
+    <text x="842" y="188" class="detail">Anonymous discovery · bearer token for tools</text>
+
+    <rect x="1210" y="105" width="350" height="108" rx="14" class="client"/>
+    <text x="1232" y="137" class="name">App clients</text>
+    <text x="1232" y="164" class="detail">ComfyUI · inference endpoints</text>
+    <text x="1232" y="188" class="detail">Connect to the app's configured port</text>
+  </g>
+
+  <!-- Control plane -->
+  <rect x="40" y="265" width="470" height="690" rx="18" class="control"/>
+  <text x="66" y="302" class="panel-title">Control plane</text>
+
+  <rect x="68" y="326" width="414" height="106" rx="12" class="gateway"/>
+  <text x="88" y="357" class="name">HTTPS gateway</text>
+  <text x="88" y="383" class="detail">Proof SDK · gRPC :51000 · server-auth TLS</text>
+  <text x="88" y="407" class="detail">MCP HTTPS :8905 <tspan font-family="monospace">/mcp</tspan> · scheduler stays private</text>
+
+  <rect x="68" y="474" width="414" height="126" rx="12" class="component"/>
+  <text x="88" y="506" class="name">Rust scheduler</text>
+  <text x="88" y="532" class="detail">Proof admission · placement · job state</text>
+  <text x="88" y="556" class="detail">Namespace / tag access, quotas, app priority</text>
+  <text x="88" y="580" class="detail">Private admin API · node control :51001</text>
+
+  <rect x="68" y="642" width="194" height="118" rx="12" class="mcp"/>
+  <text x="86" y="674" class="name">MCP server</text>
+  <text x="86" y="700" class="detail">Streamable HTTP</text>
+  <text x="86" y="724" class="detail">loopback :8906</text>
+  <text x="86" y="746" class="small">Bearer checked at tool call</text>
+
+  <rect x="280" y="642" width="202" height="118" rx="12" class="component"/>
+  <text x="298" y="674" class="name">Postgres</text>
+  <text x="298" y="700" class="detail">Apps · jobs · tokens</text>
+  <text x="298" y="724" class="detail">Namespaces · reservations</text>
+
+  <rect x="68" y="805" width="414" height="106" rx="12" class="component"/>
+  <text x="88" y="837" class="name">Python bridge · apply</text>
+  <text x="88" y="864" class="detail"><tspan font-family="monospace">services.yaml</tspan> → detached Ray actors</text>
+  <text x="88" y="888" class="detail">Drains / replaces services; launches run API</text>
+
+  <!-- Ray compute plane -->
+  <rect x="600" y="265" width="960" height="690" rx="18" class="compute"/>
+  <text x="626" y="302" class="panel-title">Ray compute plane · one Ray node per machine</text>
+
+  <rect x="630" y="326" width="900" height="76" rx="12" fill="#dcfce7" stroke="#86efac" stroke-width="1.5"/>
+  <text x="654" y="357" class="name">Ray resource allocation and actor execution</text>
+  <text x="654" y="382" class="detail">Placement groups reserve CPU / GPU units · detached actors recover on failure</text>
+
+  <!-- Workload lanes -->
+  <rect x="630" y="438" width="270" height="320" rx="14" fill="#f7fee7" stroke="#bef264" stroke-width="1.4"/>
+  <text x="650" y="470" class="name">Proofs</text>
+  <rect x="650" y="487" width="230" height="104" rx="10" class="work"/>
+  <text x="668" y="518" class="name">Proof node actor</text>
+  <text x="668" y="544" class="detail">fleet-ziren-node</text>
+  <text x="668" y="568" class="detail">Assignment / result metadata</text>
+  <rect x="650" y="620" width="230" height="102" rx="10" class="work"/>
+  <text x="668" y="652" class="name">Local Ziren GPU server</text>
+  <text x="668" y="678" class="detail">Dedicated to one proof app</text>
+  <text x="668" y="702" class="detail">Loopback on the same node</text>
+
+  <rect x="930" y="438" width="270" height="320" rx="14" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.4"/>
+  <text x="950" y="470" class="name">One-shot runs</text>
+  <rect x="950" y="487" width="230" height="104" rx="10" class="work"/>
+  <text x="968" y="518" class="name">Runs API actor</text>
+  <text x="968" y="544" class="detail">Private :9192 · user token</text>
+  <text x="968" y="568" class="detail">Profiles · admission · lifecycle</text>
+  <rect x="950" y="620" width="230" height="102" rx="10" class="work"/>
+  <text x="968" y="652" class="name">Run container</text>
+  <text x="968" y="678" class="detail">PI / batch workload</text>
+  <text x="968" y="702" class="detail">Ray-granted CPU / GPU units</text>
+
+  <rect x="1230" y="438" width="270" height="320" rx="14" fill="#fff7ed" stroke="#fdba74" stroke-width="1.4"/>
+  <text x="1250" y="470" class="name">Persistent apps</text>
+  <rect x="1250" y="520" width="230" height="150" rx="10" class="work"/>
+  <text x="1268" y="554" class="name">App actor / container</text>
+  <text x="1268" y="584" class="detail">ComfyUI · inference</text>
+  <text x="1268" y="610" class="detail">Replica reserves its resources</text>
+  <text x="1268" y="640" class="detail">App client connects directly</text>
+
+  <!-- Job-level storage -->
+  <rect x="630" y="800" width="425" height="112" rx="12" class="storage"/>
+  <text x="652" y="832" class="name">Proof job artifacts</text>
+  <text x="652" y="858" class="detail">Node writes proof / public values durably</text>
+  <text x="652" y="884" class="detail">SDK adapter reads; scheduler tracks metadata</text>
+
+  <rect x="1075" y="800" width="425" height="112" rx="12" class="storage"/>
+  <text x="1097" y="832" class="name">Run storage · <tspan font-family="monospace">RUNS_DIR</tspan></text>
+  <text x="1097" y="858" class="detail">Job inputs · logs · outputs · checkpoints</text>
+  <text x="1097" y="884" class="detail">Shared mount when workers need common files</text>
+
+  <!-- Client and service flows -->
+  <path d="M220 213V326" class="https"/>
+  <rect x="230" y="239" width="152" height="24" rx="5" class="label-bg"/>
+  <text x="239" y="256" class="small">server TLS + bearer</text>
+
+  <path d="M1000 213V238H520V380H482" class="https"/>
+  <rect x="658" y="222" width="174" height="24" rx="5" class="label-bg"/>
+  <text x="669" y="239" class="small">HTTPS <tspan font-family="monospace">/mcp</tspan> → loopback MCP</text>
+
+  <path d="M68 380H52V696H68" class="line"/>
+
+  <path d="M1385 213V238H1540V595H1480" class="line"/>
+  <rect x="1464" y="444" width="80" height="23" rx="5" class="label-bg"/>
+  <text x="1473" y="460" class="small">app port</text>
+
+  <path d="M610 213V238H520V535H482" class="line"/>
+  <rect x="516" y="433" width="112" height="24" rx="5" class="label-bg"/>
+  <text x="525" y="450" class="small">SSH forwards</text>
+
+  <path d="M482 535H630" class="heartbeat"/>
+  <rect x="489" y="507" width="136" height="24" rx="5" class="label-bg"/>
+  <text x="497" y="524" class="small">gRPC :51001</text>
+
+  <path d="M765 402V487" class="line"/>
+  <path d="M1065 402V487" class="line"/>
+  <path d="M1365 402V520" class="line"/>
+  <path d="M765 591V620" class="line"/>
+  <path d="M1065 591V620" class="line"/>
+  <path d="M765 758V800" class="line"/>
+  <path d="M1065 758V800" class="line"/>
+  <path d="M450 432V474" class="line"/>
+  <rect x="359" y="438" width="82" height="22" rx="5" class="label-bg"/>
+  <text x="367" y="454" class="small">stage API</text>
+  <path d="M382 600V642" class="line"/>
+
+  <path d="M482 858H560V414H630" class="config"/>
+  <rect x="490" y="875" width="132" height="24" rx="5" class="label-bg"/>
+  <text x="500" y="892" class="small">desired state</text>
+
+  <!-- Legend -->
+  <path d="M42 976H94" class="https"/>
+  <text x="106" y="981" class="legend">Client / HTTPS flow</text>
+  <path d="M310 976H362" class="heartbeat"/>
+  <text x="374" y="981" class="legend">Node-initiated heartbeat and response</text>
+  <path d="M700 976H752" class="config"/>
+  <text x="764" y="981" class="legend">Reconcile desired configuration</text>
+  <text x="1110" y="981" class="legend">Namespaces scope jobs, access and resource quotas.</text>
 </svg>

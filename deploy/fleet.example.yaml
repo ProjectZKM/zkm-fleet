@@ -1,6 +1,6 @@
 # fleet-scheduler configuration (inside the compose container: paths under /etc/zkm-fleet).
 stage_addr: 0.0.0.0:51000          # SDK proof API (server TLS; authorize with the user bearer token)
-control_addr: 0.0.0.0:51001        # cluster-internal: node registration (publish on the cluster interface only)
+control_addr: 0.0.0.0:51001        # node-initiated gRPC; TLS uses the certificate below
 http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin (admin token)
 public_url: https://fleet.example.com:9191
 database_url_file: /etc/zkm-fleet/database_url
@@ -14,6 +14,9 @@ require_signature: true
 cluster_token_file: /etc/zkm-fleet/cluster.token
 admin_token_file: /etc/zkm-fleet/admin.token
 tls:
+  cert_path: /etc/zkm-fleet/tls/server.pem
+  key_path: /etc/zkm-fleet/tls/server.key
+control_tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
 tenants:
