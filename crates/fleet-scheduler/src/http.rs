@@ -32,6 +32,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/namespaces/:name/allocations", get(allocations).post(reserve_run))
         .route("/namespaces/:name/allocations/:id", axum::routing::delete(release_run))
         .route("/allocations/:id", axum::routing::delete(release_allocation))
+        .route("/preemption/plan", post(preemption_plan))
         .route("/namespaces/:name/suspended", put(suspend_namespace).delete(resume_namespace))
         .route("/tokens", get(list_tokens).post(add_token))
         .route(
@@ -214,6 +215,16 @@ async fn release_allocation(State(s): State<HttpState>, Path(id): Path<String>) 
     match s.fleet.release_allocation(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => app_outcome(Err(e)),
+    }
+}
+
+async fn preemption_plan(State(s): State<HttpState>, Json(request): Json<crate::preemption::Request>) -> Response {
+    match s.fleet.plan_preemption(request) {
+        Ok(plan) => Json(plan).into_response(),
+        Err(e) => match e.downcast_ref::<crate::fleet::Refusal>() {
+            Some(r) => (StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST), r.message.clone()).into_response(),
+            None => internal(e),
+        },
     }
 }
 

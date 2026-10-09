@@ -24,8 +24,8 @@ An `app` is any GPU container serving on a port of its own (ComfyUI, an inferenc
 server): see GpuApp and deploy/services.example.yaml. A `runs-api` serves one-shot
 runs over HTTP for `fleetctl job` (runs_api.py).
 
-A service that cannot get its cards because one-shot runs hold them preempts
-those runs (runs.py, "preemption"): they stop with grace and queue again once the
+A service that cannot get its cards because one-shot runs hold them asks the Rust
+scheduler to select eligible runs; they stop with grace and queue again once the
 service has started. `apply --only NAME` (a service or a replica; repeat) leaves
 every other actor as it is: to start one service without restarting others that
 were stopped on purpose.
@@ -189,20 +189,29 @@ def start(spec: ReplicaSpec, ready_timeout_s: float = 900, runs_dir: str | None 
 def _preempt_runs_for(spec: ReplicaSpec, b: Bundle, runs_dir: str) -> list[str]:
     """Preempts the runs that keep a replica's bundle from its machine; returns their ids
     (queued again by the caller, after the replica got the cards)."""
-    from .runs import candidates, choose_victims, preempt
+    from .runs import candidates, preempt
 
-    namespace = Scheduler(spec.cluster).require_namespace(spec.service.namespace)
+    scheduler = Scheduler(spec.cluster)
+    namespace = scheduler.require_namespace(spec.service.namespace)
     pin = b.pin.split(":", 1)[1] if b.pin else None
-    victims = choose_victims(b.gpu, b.cpu, free_by_node_ip(), candidates(runs_dir), time.time(), pin, namespace=namespace, priority=spec.service.priority)
-    if victims is None:
+    free = free_by_node_ip()
+    decision = scheduler._call("POST", "/preemption/plan", {
+        "contract_version": 1,
+        "namespace": namespace, "tag": spec.service.tag, "priority": spec.service.priority,
+        "gpus": b.gpu, "cpus": b.cpu, "nodes": 1, "pins": [pin], "now": time.time(),
+        "free": [{"node_ip": ip, "gpus": gpus, "cpus": cpus} for ip, (gpus, cpus) in free.items()],
+        "candidates": [candidate.dump() for candidate in candidates(runs_dir)], "quota_demand": None,
+    })
+    if not decision.get("possible"):
         log.warning("%s: its %g card(s) and %g CPUs are not free and no run can be preempted for them; waiting",
                     spec.name, b.gpu, b.cpu)
         return []
-    if not victims.runs:  # they freed up meanwhile: Ray places it
+    victims = decision.get("runs", [])
+    if not victims:  # capacity is already available; Ray places it
         return []
     done = []
-    for run_id in victims.runs:
-        log.info("preempting run %s on %s for %s", run_id, victims.node_ip, spec.name)
+    for run_id in victims:
+        log.info("preempting run %s for %s", run_id, spec.name)
         try:
             preempt(runs_dir, run_id, f"service {spec.name} (priority {spec.service.priority}) needs resources",
                     requeue=True, defer_requeue=True, namespace=namespace, priority=spec.service.priority)
@@ -262,11 +271,15 @@ class Scheduler:
             self.token = None
         self.timeout_s = cfg.drain_timeout_s
 
-    def _call(self, method: str, path: str) -> dict[str, Any]:
-        req = urllib.request.Request(self.url + path, method=method, headers={"Authorization": f"Bearer {self.token}"})
+    def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = json.dumps(body).encode() if body is not None else None
+        headers = {"Authorization": f"Bearer {self.token}"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(self.url + path, data=data, method=method, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as r:
-            body = r.read()
-        parsed = json.loads(body) if body.strip().startswith(b"{") else {}
+            response_body = r.read()
+        parsed = json.loads(response_body) if response_body.strip().startswith(b"{") else {}
         return parsed if isinstance(parsed, dict) else {}
 
     def reserve_service(self, spec: ReplicaSpec, *, restore: bool = False) -> None:

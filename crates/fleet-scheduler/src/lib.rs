@@ -5,6 +5,7 @@ pub mod control;
 pub mod fleet;
 pub mod http;
 pub mod placement;
+pub mod preemption;
 pub mod quota;
 pub mod stage;
 pub mod store;
