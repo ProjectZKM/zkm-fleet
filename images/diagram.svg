@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
   <title id="title">zkm-fleet architecture</title>
-  <desc id="desc">Clients use the HTTPS gateway, restricted SSH forwards, or app endpoints. The control plane contains the MCP server, Rust scheduler, Postgres, and Python reconciler. Ray allocates resources to proof workers, one-shot runs, and persistent apps. Prover nodes initiate bidirectional heartbeats and write proof outputs; run tasks use shared run storage.</desc>
+  <desc id="desc">Proof and MCP clients enter through HTTPS. Node control uses node-initiated TLS gRPC heartbeats. An optional SSH tunnel is for operator access to private APIs only. App ports are direct private endpoints and do not receive Fleet token or namespace checks; external app access needs an authenticated proxy.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#475569"/></marker>
     <marker id="arrowStart" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto"><path d="M10 0L0 5L10 10Z" fill="#15803d"/></marker>
@@ -28,6 +28,7 @@
     .https{fill:none;stroke:#2563eb;stroke-width:2.4;marker-end:url(#arrowBlue)}
     .heartbeat{fill:none;stroke:#15803d;stroke-width:2.5;marker-start:url(#arrowStart);marker-end:url(#arrowGreen)}
     .config{fill:none;stroke:#c2410c;stroke-width:2.3;stroke-dasharray:8 6;marker-end:url(#arrowOrange)}
+    .private{fill:none;stroke:#64748b;stroke-width:2;stroke-dasharray:5 5;marker-end:url(#arrow)}
     .label-bg{fill:#fff;stroke:#e2e8f0;stroke-width:1}
     .legend{font-size:13px;fill:#334155}
   </style>
@@ -46,7 +47,7 @@
     <rect x="430" y="105" width="360" height="108" rx="14" class="client"/>
     <text x="452" y="137" class="name">fleetctl</text>
     <text x="452" y="164" class="detail">Operator and namespace workflows</text>
-    <text x="452" y="188" class="detail">Private APIs over restricted SSH forwards</text>
+    <text x="452" y="188" class="detail">Operator-only tunnel to private APIs</text>
 
     <rect x="820" y="105" width="360" height="108" rx="14" class="client"/>
     <text x="842" y="137" class="name">MCP clients</text>
@@ -56,7 +57,7 @@
     <rect x="1210" y="105" width="350" height="108" rx="14" class="client"/>
     <text x="1232" y="137" class="name">App clients</text>
     <text x="1232" y="164" class="detail">ComfyUI · inference endpoints</text>
-    <text x="1232" y="188" class="detail">Connect to the app's configured port</text>
+    <text x="1232" y="188" class="detail">Private callers only · app-owned auth</text>
   </g>
 
   <!-- Control plane -->
@@ -66,18 +67,18 @@
   <rect x="68" y="326" width="414" height="106" rx="12" class="gateway"/>
   <text x="88" y="357" class="name">HTTPS gateway</text>
   <text x="88" y="383" class="detail">Proof SDK · gRPC :51000 · server-auth TLS</text>
-  <text x="88" y="407" class="detail">MCP HTTPS :8905 <tspan font-family="monospace">/mcp</tspan> · scheduler stays private</text>
+  <text x="88" y="407" class="detail">HTTPS <tspan font-family="monospace">/mcp</tspan> · proxy to loopback MCP adapter</text>
 
   <rect x="68" y="474" width="414" height="126" rx="12" class="component"/>
   <text x="88" y="506" class="name">Rust scheduler</text>
   <text x="88" y="532" class="detail">Proof admission · placement · job state</text>
   <text x="88" y="556" class="detail">Namespace / tag access, quotas, app priority</text>
-  <text x="88" y="580" class="detail">Private admin API · node control :51001</text>
+  <text x="88" y="580" class="detail">Private admin API · TLS node control :51001</text>
 
   <rect x="68" y="642" width="194" height="118" rx="12" class="mcp"/>
-  <text x="86" y="674" class="name">MCP server</text>
-  <text x="86" y="700" class="detail">Streamable HTTP</text>
-  <text x="86" y="724" class="detail">loopback :8906</text>
+  <text x="86" y="674" class="name">MCP adapter</text>
+  <text x="86" y="700" class="small">Separate Rust adapter process</text>
+  <text x="86" y="724" class="small">Loopback :8906 · gateway only</text>
   <text x="86" y="746" class="small">Bearer checked at tool call</text>
 
   <rect x="280" y="642" width="202" height="118" rx="12" class="component"/>
@@ -127,7 +128,7 @@
   <text x="1268" y="554" class="name">App actor / container</text>
   <text x="1268" y="584" class="detail">ComfyUI · inference</text>
   <text x="1268" y="610" class="detail">Replica reserves its resources</text>
-  <text x="1268" y="640" class="detail">App client connects directly</text>
+  <text x="1268" y="640" class="detail">Fleet does not proxy or authorize</text>
 
   <!-- Job-level storage -->
   <rect x="630" y="800" width="425" height="112" rx="12" class="storage"/>
@@ -152,12 +153,12 @@
   <path d="M68 380H52V696H68" class="line"/>
 
   <path d="M1385 213V238H1540V595H1480" class="line"/>
-  <rect x="1464" y="444" width="80" height="23" rx="5" class="label-bg"/>
-  <text x="1473" y="460" class="small">app port</text>
+  <rect x="1440" y="444" width="104" height="23" rx="5" class="label-bg"/>
+  <text x="1449" y="460" class="small">private port</text>
 
-  <path d="M610 213V238H520V535H482" class="line"/>
+  <path d="M610 213V238H545V535H482" class="private"/>
   <rect x="516" y="433" width="112" height="24" rx="5" class="label-bg"/>
-  <text x="525" y="450" class="small">SSH forwards</text>
+  <text x="525" y="450" class="small">optional SSH</text>
 
   <path d="M482 535H630" class="heartbeat"/>
   <rect x="489" y="507" width="136" height="24" rx="5" class="label-bg"/>
@@ -186,5 +187,6 @@
   <text x="374" y="981" class="legend">Node-initiated heartbeat and response</text>
   <path d="M700 976H752" class="config"/>
   <text x="764" y="981" class="legend">Reconcile desired configuration</text>
-  <text x="1110" y="981" class="legend">Namespaces scope jobs, access and resource quotas.</text>
+  <path d="M1110 976H1162" class="private"/>
+  <text x="1174" y="981" class="legend">Optional operator tunnel · never node control</text>
 </svg>
