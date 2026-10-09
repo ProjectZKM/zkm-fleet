@@ -67,6 +67,10 @@ def servers(tmp_path, monkeypatch):
 
         def do_POST(self):
             assert self.headers["Authorization"] == "Bearer admin"
+            if self.path == "/admin/preemption/plan":
+                # The scheduler owns the policy decision. Tests that exercise a
+                # selected victim replace Api.scheduler with an explicit plan.
+                return self.reply(200, {"possible": False, "runs": []})
             namespace = self.path.split("/")[3]
             claim = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             principal = next(c for c in identities.values() if c["namespace"] == namespace)
@@ -112,6 +116,8 @@ def servers(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "discard_placement", lambda run_id: None)
     monkeypatch.setattr(runs, "confirm_cleanup", lambda run: True)
     monkeypatch.setattr(runs, "_going", lambda run_id: False)
+    from fleet_bridge import rayapi
+    monkeypatch.setattr(rayapi, "free_by_node_ip", lambda: {})
     for s in (scheduler, server):
         threading.Thread(target=s.serve_forever, daemon=True).start()
 
@@ -669,6 +675,14 @@ def test_high_priority_job_preempts_only_own_namespace_and_waits_for_cleanup(ser
     monkeypatch.setattr(runs, "_end_actors", lambda *a: None)
     monkeypatch.setattr(runs, "confirm_cleanup", lambda run: run.id != victim.id)
     monkeypatch.setattr(rayapi, "free_by_node_ip", lambda: {"worker":(1,8)})
+    original_scheduler = api.scheduler
+    def scheduler_with_plan(method, path, body=None):
+        if method == "POST" and path == "/preemption/plan":
+            assert body["namespace"] == identities["alice"]["namespace"]
+            assert body["candidates"]
+            return {"possible": True, "runs": [victim.id]}
+        return original_scheduler(method, path, body)
+    monkeypatch.setattr(api, "scheduler", scheduler_with_plan)
     code, high = submit(request, "alice", gpus=1)
     assert code == 201 and high["state"] == "waiting_quota"
     assert victim.status().state is RunState.PREEMPTED
