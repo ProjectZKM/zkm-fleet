@@ -85,7 +85,7 @@ register proof and run apps inside that namespace and submit jobs under that tag
 
 ```bash
 fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
-  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --endpoint https://fleet.example:51000 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
 fleetctl --token-file alice.token --namespace alice --tag default app add training --image IMAGE
 fleetctl --token-file alice.token --namespace alice --tag default app add eth/FULL_ELF_SHA256
@@ -109,16 +109,17 @@ created with an owner token can mount only their tag's uploaded files.
 
 ### GPU and CPU quotas
 
-A namespace quota caps **concurrent resource units**, shared by proofs and runs
-across every tag and token in that namespace. An optional tag can also cap its
-total concurrent GPU/CPU units. Admission must fit both caps; tag caps do not
-reserve a guaranteed share of fleet capacity. Neither quota has a duration, expiry, hourly
-budget or periodic reset. A job can keep its admitted units indefinitely; normal
-job lifecycle rules and existing application timeouts still apply.
+A namespace quota caps **concurrent GPU/CPU units** held by proof jobs, one-shot
+runs and persistent service replicas assigned to that namespace. Reservations from
+all tags and tokens share this cap. An optional tag can cap its own reservations.
+Admission must fit both caps; tag caps do not
+reserve a guaranteed share of fleet capacity. Neither quota has a duration, expiry,
+hourly budget or periodic reset. Jobs and enabled services can keep their reservations
+indefinitely; normal job lifecycle rules and existing application timeouts still apply.
 
 ```bash
 fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
-  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --endpoint https://fleet.example:51000 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
 fleetctl namespace quota alice --gpus 4 --cpus 32
 fleetctl namespace get alice       # quota and currently reserved units
@@ -130,6 +131,10 @@ prohibits allocation of that resource. For example `--gpus 0 --cpus 8` permits
 CPU-only runs. Fractional GPU units are supported and retain the existing
 per-profile VRAM requirements for shared cards. New namespaces
 start with unlimited caps unless the administrator sets them.
+
+Use the publicly reachable TLS endpoint in bundles shared with users; `127.0.0.1`
+would refer to the user's own machine. Set `--server-ca` only when that endpoint
+uses a private CA.
 
 Runs requesting more than either cap receive HTTP 422 before creation. A run
 first obtains physical Ray capacity, then claims namespace and tag units.
@@ -159,8 +164,9 @@ out or disconnected proof keeps its reservation and rejoins its original prover;
 it cannot fail over to another prover while the original execution is uncertain.
 The node's entire allocation must fit: this feature does not resize a prover or
 scale an active proof. Configure appropriately sized prover nodes for smaller
-user quotas. Idle prover services and administrator-managed persistent apps are
-fleet infrastructure; this quota governs user proof/run jobs.
+user quotas. Persistent service replicas reserve their configured GPU/CPU units
+against the namespace and tag they are assigned to. Shared infrastructure
+configured in the `system` namespace is accounted there.
 
 Reservations are stored in Postgres and recovered after a scheduler restart;
 refreshing tokens never changes them. If the private quota service is
@@ -190,7 +196,9 @@ that fits can proceed.
 Automatic preemption selects only lower-priority runs in the requesting namespace
 whose profile permits preemption and whose minimum runtime has elapsed. It prefers
 the lowest priority victims and plans enough physical capacity and namespace/tag
-quota before stopping any run. Equal or higher priority runs, runs in another
+quota before stopping any run. The Rust scheduler makes this plan from Ray-reported
+capacity and run candidates; the Python bridge executes the selected stop and
+requeue. Equal or higher priority runs, runs in another
 namespace and active proofs are protected. Proof priority orders queued proofs;
 it does not resize active proofs or evict running prover services. Persistent apps
 are also protected from automatic eviction. Their `priority` in `services.yaml`
@@ -213,14 +221,14 @@ control namespace, while Fleet namespace IDs scope policy and accounting.
 
 ```bash
 fleetctl namespace create team --tenant eth --gpus 8 --cpus 64 \
-  --endpoint https://127.0.0.1:51000 --domain-name stage \
+  --endpoint https://fleet.example:51000 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out team.env
 fleetctl namespace quota team --tag research --gpus 2 --cpus 16
 fleetctl namespace quota team --tag production --gpus 6 --cpus 48
 fleetctl namespace get team                  # namespace quota, usage and tags
 fleetctl namespace get team --tag research   # namespace totals and tag quota/usage
 fleetctl token issue --namespace team --tag research --tenant eth \
-  --app training --endpoint http://127.0.0.1:51000 --out alice.env
+  --app training --endpoint https://fleet.example:51000 --out alice.env
 fleetctl --namespace team --tag research job
 ```
 
@@ -252,7 +260,7 @@ FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=default \
 
 # Copies the namespace, optional tag, tenant, app grants and label to a new key/token.
 fleetctl token refresh OLD_TOKEN_ID \
-  --endpoint http://127.0.0.1:51000 --out alice-next.env
+  --endpoint https://stage.example:51000 --out alice-next.env
 # After the user verifies the replacement:
 fleetctl token revoke OLD_TOKEN_ID
 
@@ -334,8 +342,9 @@ reserved `system` namespace. User tokens cannot be issued in `system`.
 
 Configured run profiles and persistent app entries default to `system`.
 Administrators assign a user app's namespace explicitly; API registrations require
-an existing namespace. Namespace quotas govern proof and one-shot run jobs;
-persistent apps retain their configured replica resource reservations.
+an existing namespace. Namespace quotas govern proof and one-shot run jobs as well as
+configured service replica reservations. Disabling a service releases its reservation
+after the actor stops.
 
 ## Install
 
@@ -371,10 +380,9 @@ fleetctl namespace create NAME --tenant TENANT --out ENV --endpoint URL [--serve
 fleetctl token | token TOKEN_ID | token issue --namespace NAME … | token refresh TOKEN_ID … | token revoke TOKEN_ID
 ```
 
-Remote namespace users submit proof jobs through the Ziren network SDK. Run jobs use
-the runs API on its configured host; it listens on loopback by default, so remote run
-submission needs an HTTPS API path before it is available to remote clients. Operators
-use `fleetctl` on the control host.
+Remote namespace users submit proof jobs through the Ziren network SDK and run jobs
+through MCP. Direct HTTP access to the runs API remains private; remote API clients
+would need an authenticated HTTPS ingress. Operators use `fleetctl` on the control host.
 
 ### MCP clients
 

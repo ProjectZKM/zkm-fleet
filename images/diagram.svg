@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
   <title id="title">zkm-fleet architecture</title>
-  <desc id="desc">Proof and MCP clients enter through HTTPS. Operators use fleetctl on the control host. Remote node control uses node-initiated TLS gRPC heartbeats, with no SSH channel. App ports are direct private endpoints and do not receive Fleet token or namespace checks; external app access needs an authenticated proxy.</desc>
+  <desc id="desc">Proof and MCP clients enter through HTTPS. Operators use fleetctl on the control host. Remote node control uses node-initiated TLS gRPC heartbeats, with no SSH channel. The Rust scheduler plans preemption; the Python bridge executes stop and requeue actions. App ports are private endpoints and do not receive Fleet token or namespace checks; external app access needs an authenticated proxy.</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#475569"/></marker>
     <marker id="arrowStart" markerWidth="10" markerHeight="10" refX="2" refY="5" orient="auto"><path d="M10 0L0 5L10 10Z" fill="#15803d"/></marker>
@@ -56,7 +56,7 @@
     <rect x="1210" y="105" width="350" height="108" rx="14" class="client"/>
     <text x="1232" y="137" class="name">App clients</text>
     <text x="1232" y="164" class="detail">ComfyUI · inference endpoints</text>
-    <text x="1232" y="188" class="detail">Private callers only · app-owned auth</text>
+    <text x="1232" y="188" class="detail">Private endpoint · no Fleet auth check</text>
   </g>
 
   <!-- Control plane -->
@@ -71,7 +71,7 @@
   <rect x="68" y="474" width="414" height="126" rx="12" class="component"/>
   <text x="88" y="506" class="name">Rust scheduler</text>
   <text x="88" y="532" class="detail">Proof admission · placement · job state</text>
-  <text x="88" y="556" class="detail">Namespace / tag access, quotas, app priority</text>
+  <text x="88" y="556" class="detail">Namespace/tag quotas · priority · preemption plan</text>
   <text x="88" y="580" class="detail">Private admin API · TLS node control :51001</text>
 
   <rect x="68" y="642" width="194" height="118" rx="12" class="mcp"/>
@@ -88,7 +88,7 @@
   <rect x="68" y="805" width="414" height="106" rx="12" class="component"/>
   <text x="88" y="837" class="name">Python bridge · apply</text>
   <text x="88" y="864" class="detail"><tspan font-family="monospace">services.yaml</tspan> → detached Ray actors</text>
-  <text x="88" y="888" class="detail">Drains / replaces services; launches run API</text>
+  <text x="88" y="888" class="detail">Reconciles services; stops / requeues selected runs</text>
 
   <!-- Ray compute plane -->
   <rect x="600" y="265" width="960" height="690" rx="18" class="compute"/>
@@ -127,7 +127,7 @@
   <text x="1268" y="554" class="name">App actor / container</text>
   <text x="1268" y="584" class="detail">ComfyUI · inference</text>
   <text x="1268" y="610" class="detail">Replica reserves its resources</text>
-  <text x="1268" y="640" class="detail">Fleet does not proxy or authorize</text>
+  <text x="1268" y="640" class="detail">No Fleet proxy or auth check</text>
 
   <!-- Job-level storage -->
   <rect x="630" y="800" width="425" height="112" rx="12" class="storage"/>
@@ -151,13 +151,17 @@
 
   <path d="M68 380H52V696H68" class="line"/>
 
-  <path d="M1385 213V238H1540V595H1480" class="line"/>
+  <path d="M1385 213V238H1540V530H1480" class="line"/>
   <rect x="1440" y="444" width="104" height="23" rx="5" class="label-bg"/>
   <text x="1449" y="460" class="small">private port</text>
 
   <path d="M610 213V238H545V535H482" class="line"/>
   <rect x="516" y="433" width="112" height="24" rx="5" class="label-bg"/>
-  <text x="525" y="450" class="small">local API</text>
+  <text x="525" y="450" class="small">private API</text>
+
+  <path d="M482 815H520V560H482" class="line"/>
+  <rect x="486" y="680" width="108" height="23" rx="5" class="label-bg"/>
+  <text x="493" y="696" class="small">scheduler API</text>
 
   <path d="M482 535H630" class="heartbeat"/>
   <rect x="489" y="507" width="136" height="24" rx="5" class="label-bg"/>
