@@ -1,5 +1,5 @@
-# Prover actors: edit, then deploy/apply.sh (written by install.sh).
-scheduler: https://scheduler.example.com:51001
+# Local execution services advertised by fleet-node to the Rust scheduler.
+scheduler: https://scheduler.example.com:8905
 # Copy the public CA certificate to every Ray worker at this path when using a
 # private CA; the cluster token remains the node's bearer credential.
 scheduler_ca_file: /etc/zkm-fleet/tls/ca.pem
@@ -8,10 +8,10 @@ node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
-proof_output_dir: /var/lib/zkm-fleet/proofs # shared job-artifact directory; nodes write proof output
+proof_output_dir: /var/lib/zkm-fleet/proofs # legacy proof jobs only
 services:
   # Ray hands out the lowest free cards in file order; a hold keeps a card free for
-  # one-shot runs (deploy/run.sh) by taking it while the services after it start.
+  # batch jobs by taking it while the services after it start.
   - name: train-card
     kind: hold
     gpus: 1
@@ -20,6 +20,7 @@ services:
     namespace: ethproofs-user
     tag: default
     proof_app: ethproofs/FULL_ELF_SHA256 # bind this server exclusively to one namespace proof app
+    proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1
     gpus: 2
     cpus: 48
@@ -34,14 +35,6 @@ services:
       ZIREN_FUSE_LEAVES: "1"
       ZIREN_REDUCE_OVERLAP: "1"
       TMPDIR: /dev/shm
-  # One-shot runs over HTTP for `fleetctl job` (admin token): on the machine that holds
-  # the profiles file and the runs dir; 127.0.0.1 unless the network is trusted.
-  - name: runs-api
-    kind: runs-api
-    cpus: 1
-    listen: 127.0.0.1:9192
-    profiles: /etc/zkm-fleet/runs.yaml
-    runs_dir: /var/lib/zkm-fleet/runs
   - name: cpu-wrap
     kind: ziren-cpu
     replicas: 1
@@ -54,7 +47,7 @@ services:
   - name: comfyui
     kind: app
     namespace: system                  # existing namespace; creation is admin-only
-    priority: 100                      # may displace lower-priority runs in this namespace
+    priority: 100                      # may displace lower-priority batch jobs in this namespace
     replicas: 2
     gpus: 1
     cpus: 8

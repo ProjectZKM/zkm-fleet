@@ -17,7 +17,9 @@ async fn fresh(cfg: Config, store: Arc<MemoryStore>) -> Arc<Fleet> {
     let f = Fleet::new(
         cfg.clone(),
         store,
-        Blobs::new(&cfg.data_dir).unwrap(),
+        Blobs::new(&cfg.data_dir).unwrap().with_proof_output(
+            cfg.proof_output_dir.clone().unwrap_or_else(|| cfg.data_dir.join("proofs")),
+        ),
         "a".repeat(48),
     );
     f.load_tokens().await.unwrap();
@@ -92,6 +94,7 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
             .unwrap();
     }
     f.submit(Job {
+                inputs: None, outputs: None,
         id: "job".into(),
         client_id: "job".into(),
         namespace: namespace.id.clone(),
@@ -174,6 +177,19 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         resumed, assignment,
         "restart cannot create a second execution attempt"
     );
+    let result = fleet_proto::fleet::v1::ProveResponse {
+        proof_json: b"proof".to_vec(), public_values: vec![1,2], cycles:42, prove_ms:9,
+        ..Default::default()
+    };
+    let foreign = recovered.register(info("other", &namespace.id, &elf_id)).unwrap();
+    for (node,a) in [(&foreign,&assignment),(&session,&stale)] {
+        assert_eq!(recovered.publish_output(node,a,result.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+    }
+    for _ in 0..2 { recovered.publish_output(&session,&assignment,result.clone()).await.unwrap(); }
+    assert_eq!(recovered.usage(&namespace.id).gpus,2.0,"upload must not release an active execution");
+    assert_eq!(recovered.blobs.sdk_output(&recovered.job("job").await.unwrap().unwrap(),blobs::PROOF).await.unwrap(),b"proof");
+    let mut changed=result.clone(); changed.proof_json=b"different".to_vec();
+    assert!(recovered.publish_output(&session,&assignment,changed).await.is_err());
     let request = HeartbeatRequest {
         node_id: session.clone(),
         ready: true,
@@ -197,6 +213,7 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
     assert_eq!(saved.state, JobState::Succeeded);
     assert_eq!(saved.attempts, 1);
     assert_eq!(saved.cycles, 42);
+    recovered.publish_output(&session,&assignment,result).await.unwrap();
     assert_eq!(recovered.usage(&namespace.id).gpus, 0.0);
     assert!(
         recovered.blobs.get("job", blobs::PROOF).is_err(),
@@ -249,5 +266,98 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         "old completion must not release the next job's worker"
     );
     assert_eq!(recovered.usage(&namespace.id).gpus, 2.0);
+    dispatcher.abort();
+}
+
+#[tokio::test]
+async fn metadata_completion_is_lease_fenced_and_survives_scheduler_restart() {
+    use fleet_proto::fleet::v1::{ArtifactRef, ProofInputs, ProofOutputs, ProveResponse};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let store = Arc::new(MemoryStore::default());
+    let f = fresh(cfg.clone(), store.clone()).await;
+    let namespace = f.create_namespace("app", Quota {gpus:Some(2.0),cpus:Some(8.0)}).await.unwrap();
+    let elf_id = fleet_proto::artifacts::hash(b"elf");
+    store.add_app(&namespace.id,"proof",&elf_id,1,0).await.unwrap();
+    f.load_apps().await.unwrap();
+    let input = ArtifactRef {uri:"file:///app/inputs/hash".into(),sha256:"a".repeat(64),size:3};
+    f.submit(Job {
+        inputs:Some(ProofInputs {input:Some(input),elf:Some(ArtifactRef {uri:"file:///app/elf/hash".into(),sha256:elf_id.clone(),size:3}),output_root:"file:///app/outputs".into()}),
+        outputs:None,id:"metadata-job".into(),client_id:"metadata-job".into(),namespace:namespace.id.clone(),owner:"ab".repeat(20),tag:String::new(),tenant:"proof".into(),elf_id:elf_id.clone(),priority:0,kind:ProofKind::Compressed,
+        state:JobState::Queued,error:String::new(),node:None,attempts:0,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:None,finished_ms:None,
+    }).await.unwrap();
+    let session = f.register(info("worker",&namespace.id,&elf_id)).unwrap();
+    let dispatch = tokio::spawn(f.clone().run_dispatcher());
+    let assignment = assigned(&f,&session).await;
+    assert!(assignment.inputs.is_some());
+    assert_eq!(assignment.kind,ProofKind::Compressed as i32);
+    assert!(f.fetch_inputs(&session,&assignment,true).await.is_err());
+    assert!(f.publish_output(&session,&assignment,ProveResponse {proof_json:b"proof".to_vec(),..Default::default()}).await.is_err());
+    dispatch.abort();
+    let recovered = fresh(cfg,store.clone()).await;
+    let session = recovered.register(info("worker",&namespace.id,&elf_id)).unwrap();
+    let dispatch = tokio::spawn(recovered.clone().run_dispatcher());
+    assert_eq!(assigned(&recovered,&session).await,assignment);
+    let outputs = ProofOutputs {
+        machine: "gpu-host".into(),
+        proof:Some(ArtifactRef {uri:format!("file:///app/outputs/metadata-job/{}/proof.json",assignment.lease),sha256:fleet_proto::artifacts::hash(b"proof"),size:5}),
+        public_values:Some(ArtifactRef {uri:format!("file:///app/outputs/metadata-job/{}/public_values.bin",assignment.lease),sha256:fleet_proto::artifacts::hash(b"values"),size:6}),
+    };
+    let heartbeat = HeartbeatRequest {node_id:session,ready:true,busy:true,running_job:"metadata-job".into(),completion:Some(Completion {assignment:Some(assignment.clone()),cycles:42,prove_ms:9,outputs:Some(outputs.clone()),..Default::default()}),..Default::default()};
+    let mut missing = heartbeat.clone();missing.completion.as_mut().unwrap().outputs=None;
+    assert_eq!(recovered.exchange(missing).await.unwrap_err().code(),tonic::Code::InvalidArgument);
+    let mut wrong = heartbeat.clone();wrong.completion.as_mut().unwrap().outputs.as_mut().unwrap().proof.as_mut().unwrap().uri="file:///app/outputs/other/proof.json".into();
+    assert_eq!(recovered.exchange(wrong).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
+    assert_eq!(recovered.usage(&namespace.id).gpus,2.0);
+    assert_eq!(store.get("metadata-job").await.unwrap().unwrap().state,JobState::Running);
+    for _ in 0..2 {assert_eq!(recovered.exchange(heartbeat.clone()).await.unwrap().completed_lease,assignment.lease);}
+    let saved = store.get("metadata-job").await.unwrap().unwrap();
+    assert_eq!(saved.outputs,Some(outputs));assert_eq!((saved.cycles,saved.prove_ms,saved.attempts),(42,9,1));
+    assert_eq!(recovered.usage(&namespace.id).gpus,0.0);
+    assert!(!dir.path().join("proofs").exists(),"Fleet must not read or write output bytes");
+    dispatch.abort();
+}
+
+#[tokio::test]
+async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let f = fresh(config(dir.path()), store.clone()).await;
+    let ns = f.create_namespace("app", Quota::default()).await.unwrap();
+    let elf = f.blobs.put_elf(b"elf").unwrap();
+    f.add_app(&ns.id, "proof", &elf, 0).await.unwrap();
+    let job = Job {
+        inputs: None, outputs: None, id: "active".into(), client_id: "active".into(),
+        namespace: ns.id.clone(), owner: "ab".repeat(20), tag: String::new(),
+        tenant: "proof".into(), elf_id: elf.clone(), priority: 0, kind: ProofKind::Compressed,
+        state: JobState::Queued, error: String::new(), node: None, attempts: 0,
+        failed_on: vec![], cycles: 0, prove_ms: 0, created_ms: 1, started_ms: None, finished_ms: None,
+    };
+    f.submit(job.clone()).await.unwrap();
+    let session = f.register(info("proof-0", &ns.id, &elf)).unwrap();
+    let dispatcher = tokio::spawn(f.clone().run_dispatcher());
+    let assignment = assigned(&f, &session).await;
+    f.set_machine_drain("gpu-host", true);
+    f.submit(Job {id: "next".into(), client_id: "next".into(), created_ms: 2, ..job}).await.unwrap();
+    let late = f.register(info("proof-1", &ns.id, &elf)).unwrap();
+    let running = f.exchange(HeartbeatRequest {node_id: session.clone(), ready: true,
+        busy: true, running_job: "active".into(), ..Default::default()}).await.unwrap();
+    assert_eq!(running.assignment, Some(assignment.clone()));
+    let completed = f.exchange(HeartbeatRequest {node_id: session.clone(), ready: true,
+        completion: Some(Completion {assignment: Some(assignment.clone()), cycles: 42, prove_ms: 9, ..Default::default()}),
+        ..Default::default()}).await.unwrap();
+    assert_eq!(completed.completed_lease, assignment.lease);
+    assert_eq!(f.job("active").await.unwrap().unwrap().state, JobState::Succeeded);
+    // Allow multiple dispatcher passes with both current and newly registered replicas ready.
+    for _ in 0..10 {
+        for session in [&session, &late] {
+            assert!(f.exchange(HeartbeatRequest {node_id: session.clone(), ready: true, ..Default::default()}).await.unwrap().assignment.is_none());
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(f.job("next").await.unwrap().unwrap().state, JobState::Queued);
+    assert_eq!(f.usage(&ns.id).gpus, 0.0);
+    f.set_machine_drain("gpu-host", false);
+    assert_eq!(assigned(&f, &session).await.job_id, "next");
     dispatcher.abort();
 }

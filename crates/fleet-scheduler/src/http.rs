@@ -21,6 +21,7 @@ use crate::token;
 pub struct HttpState {
     pub fleet: Arc<Fleet>,
     pub admin_token: Arc<String>,
+    pub runs: Arc<crate::runs_api::RunControl>,
 }
 
 pub fn router(state: HttpState) -> Router {
@@ -44,17 +45,22 @@ pub fn router(state: HttpState) -> Router {
         .route("/apps/priority", put(set_app_priority))
         .route("/jobs", get(jobs))
         .route("/jobs/:id", get(job))
+        .route("/jobs/:id/output/:name", get(proof_output))
+        .route("/proof-jobs", axum::routing::post(crate::proof_api::submit))
+
         .route("/nodes/:name/drain", post(drain).delete(undrain))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             authorize_http,
         ));
+    let fetch = crate::proof_fetch::router(state.clone());
     Router::new()
         .route("/access", get(access))
         .route("/healthz", get(|| async { "ok" }))
         .route("/:proof_id/wrap/public_values.bin", get(public_values))
         .nest("/admin", admin)
         .with_state(state)
+        .merge(fetch)
 }
 
 async fn authorize_http(
@@ -70,10 +76,14 @@ async fn authorize_http(
         let path = req.uri().path().strip_prefix("/admin").unwrap_or(req.uri().path());
         let read_scoped = req.method() == axum::http::Method::GET
             && (path == "/apps" || path == "/jobs"
-                || path.strip_prefix("/jobs/").is_some_and(|id| !id.is_empty() && !id.contains('/')));
+                || path.strip_prefix("/jobs/").is_some_and(|id| {
+                    let parts = id.split('/').collect::<Vec<_>>();
+                    !parts[0].is_empty() && (parts.len() == 1 ||
+                        (parts.len() == 3 && parts[1] == "output" && matches!(parts[2], blobs::PROOF | blobs::PUBLIC_VALUES)))
+                }));
         let create_app = req.method() == axum::http::Method::POST && path == "/apps" && c.manage_apps;
         let delete_app = req.method() == axum::http::Method::DELETE && path == "/apps" && c.manage_apps;
-        if !read_scoped && !create_app && !delete_app {
+        if !read_scoped && !create_app && !delete_app && !(path == "/proof-jobs" && req.method() == axum::http::Method::POST) {
             return StatusCode::FORBIDDEN.into_response();
         }
         Some(c)
@@ -116,7 +126,8 @@ async fn public_values(
     };
     let allowed = if job.namespace != crate::store::SYSTEM_NAMESPACE {
         q.token_id.as_ref().and_then(|id| s.fleet.token_for_id(id)).is_some_and(|c| {
-            c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag && s.fleet.public_values_open(
+            c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag
+                && c.apps.as_ref().is_none_or(|apps| apps.contains(&format!("{}/{}", job.tenant, job.elf_id))) && s.fleet.public_values_open(
                 &format!("{proof_id}\0{}", c.id), q.key.as_deref())
         })
     } else {
@@ -124,14 +135,16 @@ async fn public_values(
             && s.fleet.tenant_for_signer(&job.owner).is_some()
     };
     if !allowed { return StatusCode::NOT_FOUND.into_response(); }
-    match s.fleet.blobs.sdk_output(&job, blobs::PUBLIC_VALUES).await {
+    match s.fleet.proof_output(&job, blobs::PUBLIC_VALUES).await {
         Ok(bytes) => ([("content-type", "application/octet-stream")], bytes).into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => crate::proof_fetch::response_error(e),
     }
 }
 
 async fn status(State(s): State<HttpState>) -> Response {
-    Json(s.fleet.status()).into_response()
+    let mut status = serde_json::to_value(s.fleet.status()).unwrap();
+    status["nodes"] = serde_json::json!(s.runs.worker_status());
+    Json(status).into_response()
 }
 
 async fn namespaces(State(s): State<HttpState>) -> Response {
@@ -341,7 +354,7 @@ async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>
             if namespace.is_some() {
                 v.retain(|a| a["namespace"].as_str() == namespace.as_deref());
                 // Counts and ordering are namespace-local even after rotating tokens.
-                let jobs = match s.fleet.recent_jobs(&JobFilter { namespace, tag, ..Default::default() }, i64::MAX as usize).await {
+                let jobs = match s.fleet.recent_jobs(&JobFilter { namespace, tag: tag.clone(), ..Default::default() }, i64::MAX as usize).await {
                     Ok(j) => j, Err(e) => return internal(e),
                 };
                 for a in &mut v {
@@ -356,6 +369,7 @@ async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>
                 }
                 v.sort_by_key(|a| std::cmp::Reverse(a["last_created_ms"].as_u64().unwrap_or(0)));
             }
+            v = v.into_iter().map(|app| s.runs.proof_app_value(app, tag.as_deref())).collect();
             Json(v).into_response()
         }
         Err(e) => internal(e),
@@ -404,6 +418,9 @@ async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<T
                     return StatusCode::FORBIDDEN.into_response();
                 }
             }
+            let _guard = match s.runs.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
+                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
+            };
             app_outcome(s.fleet.delete_app(&n, &t, &e).await)
         }
         Err(r) => r,
@@ -436,14 +453,24 @@ async fn set_app_priority(State(s): State<HttpState>, axum::extract::Query(k): a
 
 async fn disable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
     match k.parts(&s.fleet) {
-        Ok((n, t, e)) => app_outcome(s.fleet.set_app_disabled(&n, &t, &e, true).await),
+        Ok((n, t, e)) => {
+            let _guard = match s.runs.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
+                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
+            };
+            app_outcome(s.fleet.set_app_disabled(&n, &t, &e, true).await)
+        },
         Err(r) => r,
     }
 }
 
 async fn enable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<AppKey>) -> Response {
     match k.parts(&s.fleet) {
-        Ok((n, t, e)) => app_outcome(s.fleet.set_app_disabled(&n, &t, &e, false).await),
+        Ok((n, t, e)) => {
+            let _guard = match s.runs.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
+                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
+            };
+            app_outcome(s.fleet.set_app_disabled(&n, &t, &e, false).await)
+        },
         Err(r) => r,
     }
 }
@@ -452,14 +479,21 @@ async fn jobs(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>
     let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
     let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r };
     match s.fleet.recent_jobs(&JobFilter { namespace, tag, owner: None, tenant: q.tenant, elf: q.elf, active: q.active }, q.limit.min(1000)).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(v) => Json(v.iter().map(|j| s.runs.proof_job_value(j)).collect::<Vec<_>>()).into_response(),
         Err(e) => internal(e),
     }
 }
 
 async fn job(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path(id): Path<String>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
-    let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
-    let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r };
+    match scoped_job(&s, c.as_ref(), &id, &q).await {
+        Ok(j) => Json(s.runs.proof_job_value(&j)).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn scoped_job(s: &HttpState, c: Option<&Token>, id: &str, q: &NamespaceQuery) -> Result<crate::store::Job, Response> {
+    let namespace = selected_namespace(s, c, q.namespace.as_deref())?;
+    let tag = selected_tag(s,c,namespace.as_deref(),q.tag.as_deref())?;
     let resolved = if let Some(n) = &namespace {
         match s.fleet.namespace_job(n, tag.as_deref().filter(|t|!t.is_empty()), &id).await {
             Ok(Some(j)) => Ok(Some(j)),
@@ -468,25 +502,37 @@ async fn job(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>,
         }
     } else { s.fleet.job(&id).await };
     match resolved {
-        Ok(Some(j)) if namespace.as_ref().is_none_or(|n| &j.namespace == n) && tag.as_ref().is_none_or(|g|&j.tag==g) => Json(j).into_response(),
-        Ok(_) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => internal(e),
+        Ok(Some(j)) if namespace.as_ref().is_none_or(|n| &j.namespace == n) && tag.as_ref().is_none_or(|g|&j.tag==g) => Ok(j),
+        Ok(_) => Err(StatusCode::NOT_FOUND.into_response()),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+async fn proof_output(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path((id,name)): Path<(String,String)>, axum::extract::Query(q): axum::extract::Query<NamespaceQuery>) -> Response {
+    if !matches!(name.as_str(), blobs::PROOF | blobs::PUBLIC_VALUES) { return StatusCode::NOT_FOUND.into_response(); }
+    let j = match scoped_job(&s,c.as_ref(),&id,&q).await { Ok(j)=>j, Err(r)=>return r };
+    if c.as_ref().is_some_and(|c| c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{}/{}", j.tenant, j.elf_id)))) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if j.state != crate::store::JobState::Succeeded { return (StatusCode::CONFLICT,"proof has not succeeded").into_response(); }
+    match s.fleet.proof_output(&j, if name == blobs::PROOF {blobs::PROOF} else {blobs::PUBLIC_VALUES}).await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE,"application/octet-stream")],bytes).into_response(),
+        Err(e) => crate::proof_fetch::response_error(e),
     }
 }
 
 async fn drain(State(s): State<HttpState>, Path(name): Path<String>) -> Response {
-    if s.fleet.set_drain(&name, true) {
+    if s.runs.drain_worker(&name, true) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            "no such node (the drain is kept for when it registers)",
-        )
-            .into_response()
+        (StatusCode::NOT_FOUND, "no such machine node").into_response()
     }
 }
 
 async fn undrain(State(s): State<HttpState>, Path(name): Path<String>) -> Response {
-    s.fleet.set_drain(&name, false);
-    StatusCode::NO_CONTENT.into_response()
+    if s.runs.drain_worker(&name, false) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such machine node").into_response()
+    }
 }

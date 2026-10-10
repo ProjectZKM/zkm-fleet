@@ -1,4 +1,4 @@
-//! Proof output belongs to the worker. There is no scheduler output RPC.
+//! Durable node-owned proof output, retained while publication is retried.
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +53,8 @@ impl Output {
     }
 
     pub fn publish(&self, assignment: &Assignment, result: &ProveResponse) -> anyhow::Result<()> {
+        anyhow::ensure!(!result.proof_json.is_empty() && result.proof_json.len() as u64 <= fleet_proto::artifacts::MAX_OUTPUT
+            && result.public_values.len() as u64 <= fleet_proto::artifacts::MAX_OUTPUT, "invalid proof output size");
         let dir = self.dir(assignment)?;
         let manifest = serde_json::json!({ "cycles": result.cycles, "prove_ms": result.prove_ms,
             "wall_ms": result.wall_ms, "zkm_version": result.zkm_version,
@@ -72,6 +74,44 @@ impl Output {
         std::fs::File::open(dir.parent().unwrap())?.sync_all()?;
         std::fs::File::open(&self.0)?.sync_all()?;
         Ok(())
+    }
+
+    pub fn read(&self, assignment: &Assignment) -> anyhow::Result<ProveResponse> {
+        anyhow::ensure!(self.completed(assignment)?.is_some(), "proof output is not committed");
+        let dir = self.dir(assignment)?;
+        let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+        let proof_json = std::fs::read(dir.join("proof.json"))?;
+        let public_values = std::fs::read(dir.join("public_values.bin"))?;
+        anyhow::ensure!(m["proof_hash"].as_str() == Some(format!("{:x}",Sha256::digest(&proof_json)).as_str())
+            && m["public_values_hash"].as_str() == Some(format!("{:x}",Sha256::digest(&public_values)).as_str()), "proof output hash mismatch");
+        Ok(ProveResponse {proof_json, public_values, cycles:m["cycles"].as_u64().unwrap(),
+            prove_ms:m["prove_ms"].as_u64().unwrap(), wall_ms:m["wall_ms"].as_u64().unwrap_or(0),
+            zkm_version:m["zkm_version"].as_str().unwrap_or_default().into()})
+    }
+
+    /// Completion metadata names committed files; no proof bytes go to Fleet.
+    pub fn references(&self, assignment: &Assignment) -> anyhow::Result<fleet_proto::fleet::v1::ProofOutputs> {
+        anyhow::ensure!(self.completed(assignment)?.is_some(), "proof output is not committed");
+        let dir = self.dir(assignment)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+        let reference = |name: &str, key: &str| -> anyhow::Result<_> {
+            let path = dir.join(name);
+            Ok(fleet_proto::fleet::v1::ArtifactRef {
+                uri: fleet_proto::artifacts::file_uri(&path)?,
+                sha256: manifest[key].as_str().ok_or_else(||anyhow::anyhow!("missing output hash"))?.into(),
+                size: std::fs::metadata(path)?.len(),
+            })
+        };
+        let outputs = fleet_proto::fleet::v1::ProofOutputs {
+            machine: String::new(), // The scheduler fills this from authenticated registration.
+            proof: Some(reference("proof.json","proof_hash")?),
+            public_values: Some(reference("public_values.bin","public_values_hash")?),
+        };
+        fleet_proto::artifacts::validate_outputs(&outputs)?;
+        for reference in [outputs.proof.as_ref().unwrap(), outputs.public_values.as_ref().unwrap()] {
+            fleet_proto::artifacts::read(reference, &self.0, fleet_proto::artifacts::MAX_OUTPUT)?;
+        }
+        Ok(outputs)
     }
 }
 
@@ -108,6 +148,10 @@ mod tests {
         };
         out.publish(&a, &result).unwrap();
         out.publish(&a, &result).unwrap();
+        assert_eq!(out.read(&a).unwrap(),result);
+        let refs = out.references(&a).unwrap();
+        assert_eq!(refs.proof.as_ref().unwrap().sha256, fleet_proto::artifacts::hash(b"proof"));
+        assert_eq!(refs.proof.as_ref().unwrap().size,5);
         let restarted = Output::new(temp.path().into()).unwrap();
         assert_eq!(restarted.completed(&a).unwrap(), Some((8, 3)));
         assert!(restarted
@@ -131,8 +175,11 @@ mod tests {
         assert!(out
             .completed(&Assignment {
                 job_id: "../escape".into(),
-                ..a
+                ..a.clone()
             })
             .is_err());
+        std::fs::write(temp.path().join("job/1-42/proof.json"),b"corrupted").unwrap();
+        assert!(out.read(&a).is_err(),"corrupt stored bytes cannot be uploaded");
+        assert!(out.references(&a).is_err(),"corrupt stored bytes cannot be reported as metadata");
     }
 }

@@ -227,13 +227,16 @@ impl Node {
         let client = self.client.clone();
         let elf_id = req.elf_id.clone();
         let job_id = req.job_id.clone();
-        let t1 = Instant::now();
-        let (proof, cycles, server_ms) = tokio::task::spawn_blocking(move || {
+        let (proof, cycles, server_ms, execution_ms) = tokio::task::spawn_blocking(move || {
+            // Clear any previous failed attempt's partial server timing.
+            let _ = client.prover.take_prove_ms();
+            let started = Instant::now();
             let r = client
                 .prover
                 .prove_with_cycles(&keys.0, &stdin, kind, Some(elf_id));
+            let execution_ms = started.elapsed().as_millis() as u64;
             let server_ms = client.prover.take_prove_ms();
-            r.map(|(p, c)| (p, c, server_ms))
+            r.map(|(p, c)| (p, c, server_ms, execution_ms))
         })
         .await
         .map_err(|e| Status::internal(format!("prover panicked: {e}")))?
@@ -254,7 +257,8 @@ impl Node {
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
         }
-        let prove_ms = server_ms.unwrap_or(t1.elapsed().as_millis() as u64);
+        let prove_ms = fleet_ziren_node::timing::prove_ms(&self.backend, server_ms, execution_ms)
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         let proof_json = serde_json::to_vec(&proof.proof)
             .map_err(|e| Status::internal(format!("encoding proof: {e}")))?;
         let wall_ms = t0.elapsed().as_millis() as u64;

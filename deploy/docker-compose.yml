@@ -34,9 +34,23 @@ services:
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
       - ${FLEET_DATA:-fleet-data}:/var/lib/zkm-fleet    # a host path works too (owned by FLEET_UID)
-    # Stage API and HTTP are reached through the gateway; only node control is published.
     ports:
-      - "${CONTROL_BIND:-127.0.0.1}:51001:51001"  # node control: set to the cluster interface
+      - "127.0.0.1:9191:9191" # local fleetctl; remote clients enter through HTTPS
+
+  mcp:
+    image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
+    restart: unless-stopped
+    user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
+    depends_on: [scheduler]
+    networks: [fleet]
+    entrypoint: [fleet-mcp]
+    command: []
+    healthcheck: { disable: true }
+    environment:
+      FLEET_MCP_BIND: 0.0.0.0:8906
+      FLEET_URL: http://${FLEET_SCHEDULER_IP:-172.28.250.10}:9191
+      FLEET_MCP_ALLOWED_HOSTS: ${FLEET_MCP_ALLOWED_HOSTS:-localhost:8906,127.0.0.1:8906}
+      FLEETCTL_BIN: /usr/local/bin/fleetctl
 
   # Terminates HTTPS and holds client calls across scheduler restarts (deploy/gateway.yaml.in).
   gateway:
@@ -48,8 +62,7 @@ services:
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
     ports:
-      - "${STAGE_BIND:-0.0.0.0}:51000:51000"      # stage API (HTTPS; bearer token)
-      - "${HTTP_BIND:-0.0.0.0}:9191:9191"         # public values, /admin, /healthz
+      - "${GATEWAY_BIND:-0.0.0.0}:8905:8905"
 
 # The scheduler's address is fixed so the gateway can reach it without DNS.
 networks:

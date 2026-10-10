@@ -1,7 +1,7 @@
 [project]
 name = "fleet-bridge"
 version = "0.1.0"
-description = "Ray bridge for zkm-fleet: runs prover nodes as Ray actors"
+description = "Local Ray execution adapter for Fleet apps and batches"
 requires-python = ">=3.10"
 dependencies = ["ray==2.59.0", "pyyaml>=6"]
 

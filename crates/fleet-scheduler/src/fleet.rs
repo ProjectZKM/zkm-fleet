@@ -104,8 +104,8 @@ struct Inner {
     anchors: HashMap<(String, String, String), String>,
     /// node name -> tenant, for exclusive anchors.
     reserved: HashMap<String, String>,
-    /// Node names taking no new jobs.
-    draining: HashSet<String>,
+    /// Machine identities taking no new proofs, including replicas registered later.
+    draining_machines: HashSet<String>,
     /// Assignments become visible only after their job and quota are durable.
     deliverable: HashSet<String>,
 }
@@ -115,6 +115,7 @@ pub struct Fleet {
     pub stage_submissions: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
     pub blobs: Blobs,
+    pub proof_fetch: crate::proof_fetch::Relay,
     cluster_token: String,
     completion_ops: tokio::sync::Mutex<()>,
     inner: Mutex<Inner>,
@@ -181,6 +182,10 @@ pub struct FleetStatus {
 }
 
 impl Fleet {
+    pub fn cluster_authorized(&self, header: Option<&str>) -> bool {
+        crate::token::bearer_matches(header, &self.cluster_token)
+    }
+
     pub fn new(
         cfg: Config,
         store: Arc<dyn Store>,
@@ -192,6 +197,7 @@ impl Fleet {
             cfg,
             store,
             blobs,
+            proof_fetch: crate::proof_fetch::Relay::default(),
             cluster_token,
             completion_ops: tokio::sync::Mutex::new(()),
             inner: Mutex::new(Inner::default()),
@@ -595,7 +601,7 @@ impl Fleet {
                     anyhow::ensure!(t == tenant && elf.len() == 64 && elf.bytes().all(|b| b.is_ascii_hexdigit())
                         && self.app_known(namespace.as_deref().expect("user namespace"), t, elf), "proof grant must name a registered program in this namespace and tenant with its full ELF id");
                 } else {
-                    anyhow::ensure!(!app.is_empty() && app.len() <= 128 && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "invalid run app name");
+                    anyhow::ensure!(!app.is_empty() && app.len() <= 128 && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "invalid workload name");
                 }
             }
         }
@@ -639,18 +645,16 @@ impl Fleet {
         v
     }
 
-    /// Stops placing new jobs on a node (it finishes its current one); `false` undoes it.
-    pub fn set_drain(&self, name: &str, drain: bool) -> bool {
+    /// Stops new proof placements on a machine while active executions finish.
+    pub fn set_machine_drain(&self, machine: &str, drain: bool) {
         let mut inner = self.inner.lock();
-        let found = inner.nodes.values().any(|n| n.info.name == name);
         if drain {
-            inner.draining.insert(name.to_string());
+            inner.draining_machines.insert(machine.to_string());
         } else {
-            inner.draining.remove(name);
+            inner.draining_machines.remove(machine);
         }
         drop(inner);
         self.wake.notify_one();
-        found
     }
 
     /// Reloads queued and running jobs after a restart; running ones go back to the queue.
@@ -695,7 +699,7 @@ impl Fleet {
         job.validate()?;
         anyhow::ensure!(self.namespace(&job.namespace).is_some(), "job namespace does not exist");
         let _ops = self.app_ops.read().await;
-        if !job.state.is_terminal() && !self.blobs.has_elf(&job.elf_id) {
+        if !job.state.is_terminal() && job.inputs.is_none() && !self.blobs.has_elf(&job.elf_id) {
             anyhow::bail!("program {} is not stored (its app was deleted): send the ELF itself again", job.elf_id);
         }
         {
@@ -736,6 +740,8 @@ impl Fleet {
             .map(|a| {
                 let node = anchors.get(&(a.namespace.clone(), a.tenant.clone(), a.elf_id.clone())).cloned();
                 let mut v = serde_json::to_value(&a).unwrap_or_default();
+                v["type"] = serde_json::json!("app");
+                v["kind"] = serde_json::json!("proof");
                 v["name"] = serde_json::json!(app_name(&a.tenant, &a.elf_id));
                 v["anchored_on"] = serde_json::json!(node);
                 v
@@ -977,7 +983,7 @@ impl Fleet {
                 ready: n.ready,
                 busy: n.busy.clone(),
                 reserved_for: inner.reserved.get(&n.info.name).cloned(),
-                draining: inner.draining.contains(&n.info.name),
+                draining: inner.draining_machines.contains(&n.info.machine),
                 cached_elfs: n.cached.len(),
                 heartbeat_age_ms: n.last_heartbeat.elapsed().as_millis() as u64,
             })
@@ -1103,7 +1109,7 @@ impl Fleet {
                         ready: n.ready && n.info.app_namespace == job.namespace
                             && n.info.app_tenant == job.tenant
                             && n.info.app_elf_id.eq_ignore_ascii_case(&job.elf_id)
-                            && !inner.draining.contains(&n.info.name)
+                            && !inner.draining_machines.contains(&n.info.machine)
                             && self.fits_quota(&job.namespace, (!job.tag.is_empty()).then_some(job.tag.as_str()), &format!("proof:{}", job.id), n.info.gpus as f64, n.info.cpus as f64),
                         busy: n.busy.is_some(),
                         reserved_for: inner.reserved.get(&n.info.name).cloned(),
@@ -1199,8 +1205,31 @@ impl Fleet {
     }
 
     fn assignment(job: &Job) -> Assignment {
-        Assignment { job_id: job.id.clone(), elf_id: job.elf_id.clone(),
+        Assignment { inputs: job.inputs.clone(), kind: job.kind as i32, job_id: job.id.clone(), elf_id: job.elf_id.clone(),
             lease: format!("{}-{}", job.attempts, job.started_ms.unwrap_or(0)) }
+    }
+
+    /// Callers authorize namespace/tag/app access before fetching bytes.
+    pub async fn proof_output(&self, job: &Job, name: &'static str) -> Result<Vec<u8>, tonic::Status> {
+        if job.state != JobState::Succeeded { return Err(tonic::Status::failed_precondition("proof has not succeeded")); }
+        if let Some(outputs) = &job.outputs {
+            let reference = match name {
+                blobs::PROOF => outputs.proof.clone(),
+                blobs::PUBLIC_VALUES => outputs.public_values.clone(),
+                _ => return Err(tonic::Status::not_found("unknown proof output")),
+            }.ok_or_else(|| tonic::Status::internal("output reference missing"))?;
+            let output_root = job.inputs.as_ref().ok_or_else(|| tonic::Status::internal("output root missing"))?.output_root.clone();
+            self.proof_fetch.fetch(&outputs.machine, fleet_proto::fleet::v1::ProofFetch {
+                job_id: job.id.clone(), lease: Self::assignment(job).lease, elf_id: job.elf_id.clone(),
+                output_root, name: name.into(), reference: Some(reference), ..Default::default()
+            }).await
+        } else {
+            self.blobs.sdk_output(job, name).await.map_err(|e| {
+                if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                    tonic::Status::not_found("proof output is not available on the control plane")
+                } else { tonic::Status::internal(e.to_string()) }
+            })
+        }
     }
 
     /// Fence input access and completion reports by session, worker and execution attempt.
@@ -1210,7 +1239,9 @@ impl Fleet {
         let j = self.job(&a.job_id).await.map_err(|e| tonic::Status::internal(e.to_string()))?
             .ok_or_else(|| tonic::Status::not_found("job missing"))?;
         if j.node.as_deref() != Some(&name) || j.started_ms.is_none()
-            || Self::assignment(&j) != *a {
+            || Self::assignment(&j).job_id != a.job_id
+            || Self::assignment(&j).elf_id != a.elf_id || Self::assignment(&j).lease != a.lease
+            || (j.inputs.is_some() && Self::assignment(&j) != *a) {
             return Err(tonic::Status::failed_precondition("assignment superseded"));
         }
         Ok(j)
@@ -1219,7 +1250,25 @@ impl Fleet {
     pub async fn fetch_inputs(&self, node_id: &str, a: &Assignment, with_elf: bool) -> Result<ProveRequest, tonic::Status> {
         let j = self.assigned_job(node_id, a).await?;
         if j.state.is_terminal() { return Err(tonic::Status::failed_precondition("job already finished")); }
+        if j.inputs.is_some() { return Err(tonic::Status::failed_precondition("inputs are in app-owned storage; read the assignment references directly")); }
         self.build_request(&j, with_elf).map_err(|e| tonic::Status::internal(e.to_string()))
+    }
+
+    /// Nodes initiate output publication; the scheduler never connects to a node.
+    pub async fn publish_output(&self, node_id: &str, a: &Assignment, result: fleet_proto::fleet::v1::ProveResponse) -> Result<(), tonic::Status> {
+        let _ops = self.completion_ops.lock().await;
+        let j = self.assigned_job(node_id, a).await?;
+        if j.inputs.is_some() { return Err(tonic::Status::failed_precondition("outputs stay in app-owned storage; report references in completion metadata")); }
+        if !matches!(j.state, JobState::Running | JobState::Succeeded) {
+            return Err(tonic::Status::failed_precondition("job cannot publish output"));
+        }
+        if result.proof_json.is_empty() || result.proof_json.len() > 64 << 20 || result.public_values.len() > 64 << 20 {
+            return Err(tonic::Status::invalid_argument("invalid proof output size"));
+        }
+        let blobs = self.blobs.clone();
+        tokio::task::spawn_blocking(move || blobs.publish_output(&j, &result)).await
+            .map_err(|e| tonic::Status::internal(e.to_string()))?
+            .map_err(|e| tonic::Status::internal(e.to_string()))
     }
 
     pub async fn exchange(&self, r: HeartbeatRequest) -> Result<HeartbeatResponse, tonic::Status> {
@@ -1255,8 +1304,19 @@ impl Fleet {
         let err = |e: anyhow::Error| tonic::Status::internal(e.to_string());
         if !j.state.is_terminal() {
             if c.error_code == 0 {
-                self.blobs.verify_published_output(&j, c.cycles, c.prove_ms).await
-                    .map_err(|e| tonic::Status::unavailable(format!("proof output is not durable/readable yet: {e:#}")))?;
+                // The authenticated worker reports success only after publishing its
+                // output. Scheduling must not depend on a control-host storage mount.
+                if let Some(inputs) = &j.inputs {
+                    let mut outputs = c.outputs.clone().ok_or_else(|| tonic::Status::invalid_argument("completion output references missing"))?;
+                    fleet_proto::artifacts::validate_outputs(&outputs).map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+                    let prefix = format!("{}/{}/{}/", inputs.output_root.trim_end_matches('/'), j.id, Self::assignment(&j).lease);
+                    if outputs.proof.as_ref().unwrap().uri != format!("{prefix}proof.json") || outputs.public_values.as_ref().unwrap().uri != format!("{prefix}public_values.bin") {
+                        return Err(tonic::Status::failed_precondition("output does not belong to this execution lease"));
+                    }
+                    outputs.machine = self.inner.lock().nodes.get(node_id).map(|n| n.info.machine.clone())
+                        .filter(|m| !m.is_empty()).ok_or_else(|| tonic::Status::failed_precondition("output machine identity missing"))?;
+                    j.outputs = Some(outputs);
+                }
                 j.state = JobState::Succeeded;
                 j.error.clear();
                 j.cycles = c.cycles;

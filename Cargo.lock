@@ -2531,7 +2531,11 @@ dependencies = [
 name = "fleet-proto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "prost 0.13.5",
+ "serde",
+ "sha2",
+ "tempfile",
  "tonic 0.12.3",
  "tonic-build 0.12.3",
 ]
@@ -2547,10 +2551,13 @@ dependencies = [
  "bincode",
  "clap",
  "fleet-proto",
+ "fleet-ziren-node",
  "hex",
  "hmac",
  "k256",
  "parking_lot",
+ "prost 0.13.5",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2576,6 +2583,7 @@ dependencies = [
  "hex",
  "lru",
  "parking_lot",
+ "prost 0.13.5",
  "reqwest 0.12.28",
  "serde_json",
  "sha2",

@@ -21,10 +21,16 @@ pub struct StageApi {
 }
 
 #[derive(Clone)]
-struct ProofCaller {
+pub(crate) struct ProofCaller {
     tenant: String,
     address: String,
     token: Option<Token>,
+}
+
+impl ProofCaller {
+    pub(crate) fn from_token(token: Token) -> Self {
+        Self { tenant: token.tenant.clone(), address: token.address.clone(), token: Some(token) }
+    }
 }
 
 /// Maps the request's steps to a proof kind, as the SDK's network prover sets them.
@@ -63,6 +69,7 @@ impl StageApi {
         let tag = token.as_ref().and_then(|c| c.tag.clone());
         let namespace = token.and_then(|c| c.namespace);
         let job = Job {
+                inputs: None, outputs: None,
             id: proof_id.to_string(),
             client_id: client_id.to_string(),
             namespace: namespace.unwrap_or_else(|| crate::store::SYSTEM_NAMESPACE.into()),
@@ -88,7 +95,7 @@ impl StageApi {
 
     /// Bearer tokens identify proof API callers. The proof signature independently binds
     /// each submitted proof to its owner.
-    fn caller(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<ProofCaller>, Status> {
+    pub(crate) fn caller(&self, md: &tonic::metadata::MetadataMap) -> Result<Option<ProofCaller>, Status> {
         let bearer = md.get(crate::token::HEADER).and_then(|v| v.to_str().ok());
         match bearer {
             Some(value) => {
@@ -106,6 +113,17 @@ impl StageApi {
     }
 
     async fn generate(&self, req: GenerateProofRequest, caller: Option<ProofCaller>) -> GenerateProofResponse {
+        self.generate_inner(req, caller, None).await
+    }
+
+    pub(crate) async fn generate_metadata(&self, req: GenerateProofRequest, caller: Option<ProofCaller>, inputs: fleet_proto::fleet::v1::ProofInputs) -> GenerateProofResponse {
+        if let Err(error) = fleet_proto::artifacts::validate_inputs(&inputs, req.elf_id.as_deref().unwrap_or("")) {
+            return self.reject(&req.proof_id, StageStatus::InvalidParameter, &error.to_string());
+        }
+        self.generate_inner(req, caller, Some(inputs)).await
+    }
+
+    async fn generate_inner(&self, req: GenerateProofRequest, caller: Option<ProofCaller>, inputs: Option<fleet_proto::fleet::v1::ProofInputs>) -> GenerateProofResponse {
         let id = req.proof_id.clone();
         if !is_safe_id(&id) {
             return self.reject(
@@ -153,6 +171,10 @@ impl StageApi {
                 signed_tenant.as_ref().is_some_and(|t| t == &job.tenant)
                     && caller.as_ref().is_none_or(|c| c.tenant == job.tenant)
             };
+            if inputs.is_some() && (job.inputs != inputs || job.elf_id != req.elf_id.clone().unwrap_or_default()
+                || kind_for(req.from_step, req.target_step).ok() != Some(job.kind)) {
+                return self.reject(&id, StageStatus::InvalidParameter, "proof_id already exists with different inputs or parameters");
+            }
             if !allowed && (self.fleet.cfg.require_signature || token.is_some() || caller.is_some()) {
                 return self.reject(&id, StageStatus::InvalidParameter, "permission denied");
             }
@@ -223,7 +245,7 @@ impl StageApi {
                     .map_err(|e| fail(StageStatus::InternalError, &format!("{e:#}")))?
             } else {
                 let given = elf_id;
-                if !self.fleet.blobs.has_elf(&given) {
+                if inputs.is_none() && !self.fleet.blobs.has_elf(&given) {
                     return Err(fail(
                         StageStatus::InvalidParameter,
                         "elf_id not found: send the ELF itself once; later requests may carry only its elf_id",
@@ -249,10 +271,11 @@ impl StageApi {
             };
             let receipts: Vec<Vec<u8>> = req.receipts.clone();
             let put = |name, bytes: Vec<u8>| self.fleet.blobs.put(&job_id, name, &bytes);
-            put(blobs::STDIN, bincode::serialize(&stdin).unwrap())
+            if inputs.is_none() { put(blobs::STDIN, bincode::serialize(&stdin).unwrap())
                 .and_then(|_| put(blobs::RECEIPTS, bincode::serialize(&receipts).unwrap()))
-                .map_err(|e| fail(StageStatus::InternalError, &format!("{e:#}")))?;
+                .map_err(|e| fail(StageStatus::InternalError, &format!("{e:#}")))?; }
             Ok(Job {
+                inputs: inputs.clone(), outputs: None,
                 id: job_id.clone(),
                 namespace: namespace.clone().unwrap_or_else(|| crate::store::SYSTEM_NAMESPACE.into()),
                 tag: tag.clone().unwrap_or_default(),
@@ -355,7 +378,10 @@ impl StageApi {
                 resp.status = s as i32;
                 resp.step = Step::End as i32;
             }
-            JobState::Succeeded => match self.fleet.blobs.sdk_output(&job, blobs::PROOF).await {
+            JobState::Succeeded if caller_token.as_ref().is_some_and(|c| c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{}/{}", job.tenant, job.elf_id)))) => {
+                resp.status = StageStatus::Unspecified as i32;
+            }
+            JobState::Succeeded => match self.fleet.proof_output(&job, blobs::PROOF).await {
                 Ok(proof) => {
                     resp.status = StageStatus::Success as i32;
                     resp.step = Step::End as i32;

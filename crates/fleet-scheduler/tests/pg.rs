@@ -55,6 +55,7 @@ async fn ddl(admin: &PgPool, schema: &str) -> Vec<String> {
 
 fn job(id: &str, state: JobState) -> Job {
     Job {
+                inputs: None, outputs: None,
         owner: "ab".repeat(20),
         namespace: SYSTEM_NAMESPACE.into(),
         tag: String::new(),
@@ -78,8 +79,12 @@ fn job(id: &str, state: JobState) -> Job {
 }
 
 async fn check_job_identity(store: &dyn Store) {
-    let original = job("immutable", JobState::Running);
+    let mut original = job("immutable", JobState::Running);
+    let reference = fleet_proto::fleet::v1::ArtifactRef { uri:"file:///app/input".into(), sha256:"b".repeat(64), size:3 };
+    original.inputs = Some(fleet_proto::fleet::v1::ProofInputs {input:Some(reference.clone()),elf:Some(reference.clone()),output_root:"file:///app/outputs".into()});
     store.upsert(&original).await.unwrap();
+    assert!(store.recent(&JobFilter::default(),usize::MAX).await.unwrap().iter().any(|j|j.id==original.id),
+        "unbounded drain queries must not produce a negative Postgres LIMIT");
     let mut changed = original.clone();
     changed.owner = "ff".repeat(20);
     changed.namespace = "1".repeat(32);
@@ -90,6 +95,9 @@ async fn check_job_identity(store: &dyn Store) {
     changed.kind = ProofKind::Core;
     changed.priority = 99;
     changed.created_ms += 1;
+    changed.inputs.as_mut().unwrap().elf.as_mut().unwrap().sha256 = "a".repeat(64);
+    changed.inputs.as_mut().unwrap().input.as_mut().unwrap().uri = "file:///replacement".into();
+    changed.outputs = Some(fleet_proto::fleet::v1::ProofOutputs {machine: String::new(), proof:Some(reference.clone()),public_values:Some(reference)});
     changed.state = JobState::Succeeded;
     changed.finished_ms = Some(2003);
     store.upsert(&changed).await.unwrap();
@@ -98,6 +106,8 @@ async fn check_job_identity(store: &dyn Store) {
         (&original.owner, &original.namespace, &original.tag, &original.client_id));
     assert_eq!((&restored.tenant, &restored.elf_id, restored.kind, restored.created_ms),
         (&original.tenant, &original.elf_id, original.kind, original.created_ms));
+    assert_eq!(restored.inputs, original.inputs, "input references are immutable");
+    assert_eq!(restored.outputs, changed.outputs, "completion metadata survives storage");
     assert_eq!(restored.priority, original.priority);
     assert_eq!(restored.state, JobState::Succeeded, "execution state can change");
     assert_eq!(restored.finished_ms, Some(2003));
@@ -120,7 +130,22 @@ async fn check_job_identity(store: &dyn Store) {
 
 #[tokio::test]
 async fn memory_store_preserves_job_identity_and_validates_fields() {
-    check_job_identity(&fleet_scheduler::store::MemoryStore::default()).await;
+    let store = fleet_scheduler::store::MemoryStore::default();
+    check_job_identity(&store).await;
+    check_registered_app_inventory(&store).await;
+}
+
+async fn check_registered_app_inventory(store: &dyn Store) {
+    let mut rejected = job("unregistered-attempt", JobState::Failed(StageStatus::InvalidParameter));
+    rejected.tenant = "unregistered".into();
+    store.upsert(&rejected).await.unwrap();
+    assert!(!store.apps().await.unwrap().iter().any(|a| a.tenant == rejected.tenant));
+    assert!(store.get(&rejected.id).await.unwrap().is_some(), "rejected requests remain in job history");
+    store.add_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id, 3000, 0).await.unwrap();
+    let registered = store.apps().await.unwrap().into_iter().find(|a| a.tenant == rejected.tenant).unwrap();
+    assert_eq!((registered.jobs, registered.failed, registered.created_ms), (1, 1, 3000));
+    store.delete_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id).await.unwrap();
+    assert!(!store.apps().await.unwrap().iter().any(|a| a.tenant == rejected.tenant));
 }
 
 #[tokio::test]
@@ -144,7 +169,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![12]);
+    assert_eq!(versions, vec![13]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
@@ -190,6 +215,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     let namespace = Namespace { tag_quotas: Default::default(), quota: Default::default(), id: "1".repeat(32), name: "alice".into(), created_ms: 1, suspended_ms: None };
     fresh.add_namespace(&namespace).await.unwrap();
     check_job_identity(&fresh).await;
+    check_registered_app_inventory(&fresh).await;
     let shared_elf = "a".repeat(64);
     assert!(fresh.add_app("missing-namespace", "goat", &shared_elf, 1, 0).await.is_err());
     fresh.add_app(SYSTEM_NAMESPACE, "goat", &shared_elf, 1, 0).await.unwrap();
@@ -281,4 +307,24 @@ async fn postgres_allows_only_one_scheduler_leader_per_database() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("another fleet-scheduler"), "{error:#}");
+}
+
+#[tokio::test]
+async fn schema_12_migrates_without_changing_existing_jobs() {
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "metadata_migration").await;
+    let db = in_schema(&url, "metadata_migration");
+    let store = PgStore::connect(&db).await.unwrap();
+    store.upsert(&job("pre-migration", JobState::Succeeded)).await.unwrap();
+    let pool = PgPool::connect(&db).await.unwrap();
+    sqlx::raw_sql("ALTER TABLE fleet_jobs DROP COLUMN inputs; ALTER TABLE fleet_jobs DROP COLUMN outputs; UPDATE fleet_schema SET version=12").execute(&pool).await.unwrap();
+    let upgraded = PgStore::connect(&db).await.unwrap();
+    let saved = upgraded.get("pre-migration").await.unwrap().unwrap();
+    assert_eq!(saved.state, JobState::Succeeded);
+    assert!(saved.inputs.is_none() && saved.outputs.is_none());
+    let versions:Vec<i32> = sqlx::query_scalar("SELECT version FROM fleet_schema ORDER BY version").fetch_all(&pool).await.unwrap();
+    assert_eq!(versions, vec![12,13]);
+    PgStore::connect(&db).await.unwrap();
+    assert_eq!(upgraded.get("pre-migration").await.unwrap().unwrap().owner, saved.owner);
 }

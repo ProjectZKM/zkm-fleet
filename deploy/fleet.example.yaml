@@ -5,7 +5,7 @@ http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin
 public_url: https://fleet.example.com:9191
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
-proof_output_dir: /var/lib/zkm-fleet/proofs # shared job artifacts: nodes write; scheduler reads and removes on app deletion
+proof_output_dir: /var/lib/zkm-fleet/proofs # control-host proof results received from nodes; no shared mount required
 long_poll_ms: 2000
 heartbeat_secs: 5
 node_stale_secs: 20

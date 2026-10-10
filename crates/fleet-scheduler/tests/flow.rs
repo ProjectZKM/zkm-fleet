@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use fleet_proto::fleet::v1::{
     control_service_client::ControlServiceClient,
     Assignment, Completion, FetchInputsRequest, HeartbeatRequest, NodeInfo, ProveRequest, ProveResponse,
-    RegisterRequest,
+    RegisterRequest, PublishOutputRequest,
 };
 use fleet_proto::stage::v1::{
     stage_service_client::StageServiceClient, GenerateProofRequest, GetStatusRequest, Status as S,
@@ -194,6 +194,13 @@ async fn add_node_error(h: &Harness,name: &str,gpus: u32,fail_first: bool,delay_
 async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, delay_ms: u64,
     failure_code: tonic::Code, namespace: &str, tenant: &str, elf: &[u8])
     -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+    let (calls, jobs, _) = add_node_app_session(h, name, gpus, fail_first, delay_ms, failure_code, namespace, tenant, elf).await;
+    (calls, jobs)
+}
+
+async fn add_node_app_session(h: &Harness, name: &str, gpus: u32, fail_first: bool, delay_ms: u64,
+    failure_code: tonic::Code, namespace: &str, tenant: &str, elf: &[u8])
+    -> (Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>, String) {
     let calls = Arc::new(AtomicUsize::new(0));
     let jobs = Arc::new(Mutex::new(vec![]));
     let svc = FakeNode {
@@ -215,7 +222,6 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
         Ok(r)
     };
     let mut ctl = ControlServiceClient::with_interceptor(channel.clone(), auth);
-    let output_root = h._dir.path().join("data/proofs");
     let namespace = if namespace == "system" {
         "00000000000000000000000000000000".to_string()
     } else {
@@ -243,6 +249,7 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
         .unwrap()
         .into_inner()
         .node_id;
+    let session_id = id.clone();
     tokio::spawn(async move {
         let mut active: Option<(Assignment, tokio::task::JoinHandle<Result<Response<ProveResponse>, Status>>)> = None;
         let mut completed: Option<Completion> = None;
@@ -253,19 +260,18 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
                 let result = task.await.unwrap();
                 completed = Some(match result {
                     Ok(result) => {
-                        // The fake worker owns output; no output bytes go to the control API.
                         let result = result.into_inner();
-                        let dir = output_root.join(&assignment.job_id).join(&assignment.lease);
-                        std::fs::create_dir_all(&dir).unwrap();
-                        std::fs::write(dir.join("proof.json"), &result.proof_json).unwrap();
-                        std::fs::write(dir.join("public_values.bin"), &result.public_values).unwrap();
-                        let manifest = serde_json::json!({
-                            "cycles": result.cycles, "prove_ms": result.prove_ms,
-                            "proof_hash": hex::encode(sha2::Sha256::digest(&result.proof_json)),
-                            "public_values_hash": hex::encode(sha2::Sha256::digest(&result.public_values)),
-                        });
-                        std::fs::write(dir.join("manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
-                        Completion { assignment: Some(assignment), cycles: result.cycles, prove_ms: result.prove_ms, ..Default::default() }
+                        let outputs = if let Some(inputs) = &assignment.inputs {
+                            let root = std::path::Path::new(inputs.output_root.strip_prefix("file://").unwrap());
+                            let output = fleet_ziren_node::output::Output::new(root.into()).unwrap();
+                            output.publish(&assignment, &result).unwrap();
+                            Some(output.references(&assignment).unwrap())
+                        } else {
+                            ctl.publish_output(PublishOutputRequest {
+                                node_id:id.clone(), assignment:Some(assignment.clone()), result:Some(result.clone()),
+                            }).await.unwrap(); None
+                        };
+                        Completion { assignment: Some(assignment), outputs, cycles: result.cycles, prove_ms: result.prove_ms, ..Default::default() }
                     }
                     Err(e) => Completion { assignment: Some(assignment), error_code: e.code() as i32, error: e.message().into(), ..Default::default() },
                 });
@@ -278,7 +284,14 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
                 if completed.as_ref().is_some_and(|c| c.assignment.as_ref().unwrap().lease == response.completed_lease) { completed = None; }
                 if active.is_none() && completed.is_none() {
                     if let Some(assignment) = response.assignment {
-                        let inputs = ctl.fetch_inputs(FetchInputsRequest { node_id: id.clone(), assignment: Some(assignment.clone()), include_elf: true }).await.unwrap().into_inner();
+                        let inputs = if let Some(refs) = &assignment.inputs {
+                            use prost::Message;
+                            let root=std::path::Path::new(refs.output_root.strip_prefix("file://").unwrap()).parent().unwrap();
+                            let bytes=fleet_proto::artifacts::read(refs.input.as_ref().unwrap(),root,fleet_proto::artifacts::MAX_INPUT).unwrap();
+                            let mut request=ProveRequest::decode(bytes.as_slice()).unwrap();
+                            request.job_id=assignment.job_id.clone();
+                            request.elf=fleet_proto::artifacts::read(refs.elf.as_ref().unwrap(),root,fleet_proto::artifacts::MAX_INPUT).unwrap(); request
+                        } else { ctl.fetch_inputs(FetchInputsRequest { node_id: id.clone(), assignment: Some(assignment.clone()), include_elf: true }).await.unwrap().into_inner() };
                         let worker = svc.clone();
                         let mut req = Request::new(inputs);
                         req.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
@@ -290,7 +303,7 @@ async fn add_node_app(h: &Harness, name: &str, gpus: u32, fail_first: bool, dela
         }
     });
     tokio::time::sleep(Duration::from_millis(700)).await;
-    (calls, jobs)
+    (calls, jobs, session_id)
 }
 
 fn request(id: &str, elf: &[u8]) -> GenerateProofRequest {
@@ -349,6 +362,12 @@ async fn a_job_runs_end_to_end_and_its_public_values_are_served() {
     );
     assert_eq!(s.total_steps, 1234);
     assert_eq!(s.proving_time, 100);
+    for path in ["/admin/jobs/job-1", "/admin/jobs"] {
+        let view:serde_json::Value=serde_json::from_str(&admin_curl(&h,&[&format!("{}{path}",h.http)])).unwrap();
+        let job=if view.is_array() {&view[0]} else {&view};
+        assert_eq!(job["node"],"test","HTTP exposes the machine, not the proof replica");
+        assert_eq!(job["diagnostics"]["execution_replica"],"gpu-a");
+    }
     let pv = std::process::Command::new("curl")
         .args(["-sf", &s.public_values_url])
         .output()
@@ -436,14 +455,9 @@ async fn an_exclusive_anchor_keeps_the_program_and_keeps_others_off_the_node() {
         .output()
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&st.stdout).unwrap();
-    let a = v["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["name"] == "gpu-a")
-        .unwrap()
-        .clone();
-    assert_eq!(a["reserved_for"], "eth");
+    assert!(v["nodes"].as_array().unwrap().is_empty(), "proof replicas do not create machine node records");
+    assert!(v["anchors"].as_array().unwrap().iter().any(|a|
+        a[1] == "eth" && a[2] == fleet_scheduler::blobs::elf_id_of(b"eth-guest") && a[3] == "gpu-a"));
     let unauth = std::process::Command::new("curl")
         .args([
             "-s",
@@ -754,6 +768,15 @@ async fn bearer_tokens_authorize_proof_submission_and_status_without_client_cert
     )).await.unwrap().into_inner();
     assert_eq!(foreign.status, S::Unspecified as i32);
 
+    let proof_path = "/admin/jobs/bearer-proof/output/proof.json";
+    assert_eq!(user_http(&h,&alice_token,"GET",proof_path).0,200);
+    assert_eq!(user_http(&h,&bob_token,"GET",proof_path).0,404);
+    assert_eq!(user_http(&h,&alice_token,"GET","/admin/jobs/bearer-proof/output/stdin.bin").0,403);
+    std::fs::remove_dir_all(h._dir.path().join("data/proofs")).unwrap();
+    let missing = user_http(&h,&alice_token,"GET",proof_path);
+    assert_eq!(missing.0,404);
+    assert!(missing.1.contains("proof output is not available on the control plane"));
+
     let mismatched = h.stage.generate_proof(with_bearer(
         signed_request("bearer-mismatch", b"elf", &bob_key), &alice_token,
     )).await.unwrap().into_inner();
@@ -770,6 +793,125 @@ async fn bearer_tokens_authorize_proof_submission_and_status_without_client_cert
         GetStatusRequest { proof_id: "bearer-proof".into() }, &alice_token,
     )).await.unwrap_err();
     assert_eq!(after_revoke.code(), tonic::Code::Unauthenticated);
+}
+
+/// Machine fetches run without any GPU actor or inbound listener.
+async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+    use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerHeartbeatRequest};
+    let mut worker = WorkerServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port)).await.unwrap();
+    let http = h.http.clone();
+    let task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        loop {
+            let mut request = Request::new(WorkerHeartbeatRequest {
+                worker_id: "storage-agent".into(), session: "storage-session".into(), proof_fetch_ready: true,
+                report_json: serde_json::to_vec(&serde_json::json!({"version":1,"machine":"test","ready":true,
+                    "total_gpus":8,"total_cpus":48,"free_gpus":8,"free_cpus":48})).unwrap(),
+            });
+            request.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+            let response = worker.heartbeat(request).await.unwrap().into_inner();
+            for fetch in response.proof_fetches {
+                let result = fleet_ziren_node::fetch::read(&fetch, std::slice::from_ref(&root));
+                let mut post = client.post(format!("{http}/internal/proof-fetch/{}",fetch.ticket))
+                    .bearer_auth(TOKEN).header("x-fleet-worker","storage-agent").header("x-fleet-session","storage-session");
+                post = match result { Ok(bytes) => post.body(bytes), Err(_) => post.header("x-fleet-fetch-error","invalid") };
+                assert_eq!(post.send().await.unwrap().status().as_u16(),204);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    task
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbeat() {
+    use fleet_scheduler::proof_app::{App, AppApi};
+    use std::future::IntoFuture;
+    use fleet_proto::stage::v1::stage_service_server::StageServiceServer;
+    let h = start().await;
+    admin_curl(&h,&["-X","POST","-H","content-type: application/json","-d","{\"name\":\"alice\"}",&format!("{}/admin/namespaces",h.http)]);
+    let elf=fleet_scheduler::blobs::elf_id_of(b"elf");
+    let (key,_,token)=tag_token(&h,"alice",Some("research"),81,&elf);
+    let (_,_,foreign)=tag_token(&h,"alice",Some("production"),82,&elf);
+    let (_, _, proof_node) = add_node_app_session(&h,"app-prover",2,false,150,tonic::Code::Internal,"alice","eth",b"elf").await;
+    let storage=tempfile::tempdir().unwrap();
+    let fetch_agent = start_fetch_agent(&h, storage.path().into()).await;
+    let http_listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_url=format!("http://{}",http_listener.local_addr().unwrap());
+    let namespace:serde_json::Value=serde_json::from_str(&admin_curl(&h,&[&format!("{}/admin/namespaces/alice",h.http)])).unwrap();
+    let token_file = storage.path().join("user.token");
+    std::fs::write(&token_file,&token).unwrap();
+    let mut app = App::new(storage.path().into(),namespace["id"].as_str().unwrap().into(),"eth".into(),
+        vec![elf, fleet_scheduler::blobs::elf_id_of(b"another-program")],h.http.clone(),http_url).unwrap();
+    app.token_file = Some(token_file);
+    let app=Arc::new(app);
+    tokio::spawn(axum::serve(http_listener,fleet_scheduler::proof_app::router(app.clone())).into_future());
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let channel=Channel::from_shared(format!("http://{}",listener.local_addr().unwrap())).unwrap();
+    let task=tokio::spawn(tonic::transport::Server::builder().add_service(StageServiceServer::new(AppApi(app)))
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)));
+    let mut client=StageServiceClient::new(channel.connect().await.unwrap());
+    let mut request=signed_request("app-storage-proof",b"elf",&key);
+    request.receipt_inputs = vec![vec![9,8,7]]; // Older SDK wire field.
+    let accepted=client.generate_proof(request.clone()).await.unwrap().into_inner();
+    assert_eq!(accepted.status,S::Computing as i32,"{}",accepted.error_message);
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(5);
+    let status=loop {
+        let response=client.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},&token)).await.unwrap().into_inner();
+        if response.status==S::Success as i32 {break response;}
+        assert!(tokio::time::Instant::now()<deadline,"app proof did not finish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(!status.proof_with_public_inputs.is_empty());
+    // The fake prover reports 100 ms despite slower execution and heartbeat
+    // fetches. Neither admission nor input/output transfers change this value.
+    assert_eq!(status.proving_time, 100);
+    assert!(status.total_steps > 0);
+    let mut changed=request.clone();
+    changed.private_input_stream=bincode::serialize(&vec![b"different".to_vec()]).unwrap();
+    assert_eq!(client.generate_proof(with_bearer(changed,&token)).await.unwrap().into_inner().status,S::InvalidParameter as i32);
+    let duplicate=client.generate_proof(with_bearer(request,&token)).await.unwrap().into_inner();
+    assert_eq!(duplicate.status,S::Computing as i32);
+    let foreign=client.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},&foreign)).await.unwrap().into_inner();
+    assert_eq!(foreign.status,S::Unspecified as i32);
+    let values=reqwest::get(&status.public_values_url).await.unwrap();
+    assert!(values.status().is_success());assert!(!values.bytes().await.unwrap().is_empty());
+    for dir in ["elf","jobs"] {assert_eq!(std::fs::read_dir(h._dir.path().join("data").join(dir)).unwrap().count(),0);}
+    assert!(!h._dir.path().join("data/proofs").exists());
+    let metadata=user_http(&h,&token,"GET","/admin/jobs/app-storage-proof");
+    let metadata:serde_json::Value=serde_json::from_str(&metadata.1).unwrap();
+    assert!(metadata["inputs"]["input"]["uri"].as_str().unwrap().starts_with("file://"));
+    use prost::Message;
+    let input_path=metadata["inputs"]["input"]["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
+    let input=fleet_proto::fleet::v1::ProveRequest::decode(std::fs::read(input_path).unwrap().as_slice()).unwrap();
+    assert_eq!(input.receipts,vec![vec![9,8,7]]);
+    assert_eq!(client.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},"invalid-supplied-token")).await.unwrap_err().code(),tonic::Code::Unauthenticated);
+    assert!(metadata["outputs"]["proof"]["sha256"].as_str().unwrap().len()==64);
+    let (_,_,ungranted)=tag_token(&h,"alice",Some("research"),83,&fleet_scheduler::blobs::elf_id_of(b"another-program"));
+    assert_eq!(user_http(&h,&ungranted,"GET","/admin/jobs/app-storage-proof/output/proof.json").0,404);
+    let mut control_stage=h.stage.clone();
+    assert_eq!(control_stage.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},&ungranted)).await.unwrap().into_inner().status,S::Unspecified as i32);
+    // Stopping the proof actor releases GPU execution, but machine storage still serves files.
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{}",h.control_port)).unwrap().connect().await.unwrap();
+    let mut ctl = ControlServiceClient::with_interceptor(channel, fleet_scheduler::token::Attach::new(TOKEN).unwrap());
+    ctl.deregister(fleet_proto::fleet::v1::DeregisterRequest {node_id:proof_node.into()}).await.unwrap();
+    assert_eq!(metadata["outputs"]["machine"],"test");
+    let elf = metadata["elf_id"].as_str().unwrap();
+    admin_curl(&h,&["-X","PUT",&format!("{}/admin/apps/disabled?namespace=alice&tenant=eth&elf_id={elf}",h.http)]);
+    let fetch = reqwest::Client::new().get(format!("{}/admin/jobs/app-storage-proof/output/proof.json",h.http))
+        .bearer_auth(&token).send().await.unwrap();
+    assert_eq!(fetch.status().as_u16(),200);assert_eq!(fetch.bytes().await.unwrap().as_ref(),status.proof_with_public_inputs);
+    let path = metadata["outputs"]["proof"]["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
+    std::fs::write(path,b"corrupt").unwrap();
+    let corrupt = reqwest::Client::new().get(format!("{}/admin/jobs/app-storage-proof/output/proof.json",h.http)).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(corrupt.status().as_u16(),502);
+    std::fs::write(path,&status.proof_with_public_inputs).unwrap();
+    admin_curl(&h,&["-X","DELETE",&format!("{}/admin/tokens/{}",h.http,"51".repeat(16))]);
+    assert_eq!(reqwest::get(&status.public_values_url).await.unwrap().status().as_u16(),404);
+    assert_eq!(client.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},&token)).await.unwrap_err().code(),tonic::Code::Unauthenticated);
+    fetch_agent.abort();
+    task.abort();
 }
 
 fn namespace_token(h: &Harness, namespace: &str, seed: u8, elf_id: &str) -> (k256::ecdsa::SigningKey, String, String) {
@@ -1167,4 +1309,28 @@ async fn persistent_service_reservations_count_against_namespace_quota() {
     let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &run.to_string(),
         "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/admin/namespaces/{id}/allocations", h.http)]);
     assert_eq!(status, "200");
+}
+
+/// Machine execution commands are delivered on the authenticated control listener;
+/// a client needs no route to the machine or Ray itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn machine_heartbeat_requires_cluster_token_and_populates_control_plane_nodes() {
+    use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerHeartbeatRequest};
+    let h = start().await;
+    let mut worker = WorkerServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port)).await.unwrap();
+    let report = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "machine": "gpu-machine", "ready": true,
+        "total_gpus": 8, "total_cpus": 48, "free_gpus": 8, "free_cpus": 48,
+    })).unwrap();
+    let heartbeat = || WorkerHeartbeatRequest { worker_id: "gpu-1".into(), session: "agent-session".into(), report_json: report.clone(), proof_fetch_ready: false };
+    assert_eq!(worker.heartbeat(heartbeat()).await.unwrap_err().code(),tonic::Code::Unauthenticated);
+    let mut wrong = Request::new(heartbeat());
+    wrong.metadata_mut().insert("authorization", "Bearer wrong-token".parse().unwrap());
+    assert_eq!(worker.heartbeat(wrong).await.unwrap_err().code(),tonic::Code::Unauthenticated);
+    let mut request = Request::new(heartbeat());
+    request.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    assert_eq!(worker.heartbeat(request).await.unwrap().into_inner().heartbeat_secs,2);
+    let status = admin_curl(&h,&[&format!("{}/admin/status",h.http)]);
+    let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert!(status["nodes"].as_array().unwrap().iter().any(|n| n["name"]=="gpu-1" && n["backend"]=="ray-local"));
 }

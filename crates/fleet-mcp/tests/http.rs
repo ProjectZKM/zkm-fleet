@@ -109,14 +109,28 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "fleet_run_submit"));
+        .any(|tool| tool["name"] == "fleet_batch_submit"));
+    for name in ["fleet_apps_list", "fleet_batch_profiles_list", "fleet_batch_profile_get",
+        "fleet_batches_list", "fleet_batch_get", "fleet_batch_logs", "fleet_batch_cancel"] {
+        assert!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == name), "missing {name}");
+    }
+    let submit_schema = &tools.as_array().unwrap().iter()
+        .find(|tool| tool["name"] == "fleet_batch_submit").unwrap()["inputSchema"];
+    assert!(submit_schema["properties"].get("profile").is_some());
+    assert!(submit_schema["properties"].get("app").is_none());
+    assert!(!tools.as_array().unwrap().iter().any(|tool|
+        tool["name"].as_str().unwrap().starts_with("fleet_run_")));
+    let jobs_schema = &tools.as_array().unwrap().iter()
+        .find(|tool| tool["name"] == "fleet_jobs_list").unwrap()["inputSchema"];
+    assert!(jobs_schema.to_string().contains("batch"));
+    assert!(!jobs_schema.to_string().contains("\"run\""));
 
     let anonymous_call = client
         .post(format!("{origin}/mcp"))
         .header("accept", "application/json, text/event-stream")
         .header("mcp-session-id", &session)
         .header("mcp-protocol-version", "2025-11-25")
-        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_run_app_create","arguments":{"name":"demo","image":"image:tag"}}}))
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_batch_profile_create","arguments":{"name":"demo","image":"image:tag"}}}))
         .send()
         .await
         .unwrap();
@@ -134,7 +148,7 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .header("accept", "application/json, text/event-stream")
         .header("mcp-session-id", &session)
         .header("mcp-protocol-version", "2025-11-25")
-        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_run_app_create","arguments":{"name":"demo","image":"image:tag","allow":["/srv"],"max_gpus":2,"priority":7}}}))
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_batch_profile_create","arguments":{"name":"demo","image":"image:tag","allow":["/srv"],"max_gpus":2,"priority":7}}}))
         .send()
         .await
         .unwrap();
@@ -145,9 +159,47 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         "demo"
     );
     assert_eq!(
-        std::fs::read_to_string(args_log).unwrap().trim(),
-        "--json app add demo --image image:tag --allow /srv --max-gpus 2 --priority 7"
+        std::fs::read_to_string(&args_log).unwrap().trim(),
+        "--json batch add demo --image image:tag --allow /srv --max-gpus 2 --priority 7"
     );
+
+    for (id, kind, accepted) in [(5, "batch", true), (6, "run", false)] {
+        let response = client.post(format!("{origin}/mcp"))
+            .bearer_auth("scoped-token")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":"fleet_jobs_list","arguments":{"kind":kind}}}))
+            .send().await.unwrap();
+        assert!(response.status().is_success());
+        let result = message(&response.text().await.unwrap());
+        assert_eq!(result["error"].is_object() || result["result"]["isError"] == true, !accepted);
+        assert_eq!(std::fs::read_to_string(&args_log).unwrap().lines().count(), 2);
+    }
+    assert!(std::fs::read_to_string(&args_log).unwrap()
+        .contains("--json job --limit 20 --type batch"));
+
+    for (id, name, arguments, expected) in [
+        (7, "fleet_batches_list", json!({"profile":"training","active":true,"limit":3}),
+            "--json batch --limit 3 --profile training --active"),
+        (8, "fleet_batch_submit", json!({"profile":"training","gpus":1,"cpus":4,"command":["python","train.py"]}),
+            "--json batch submit --profile training --gpus 1 --cpus 4 -- python train.py"),
+        (9, "fleet_batch_logs", json!({"id":"training-job","lines":25}),
+            "--json batch logs training-job --lines 25"),
+    ] {
+        let response = client.post(format!("{origin}/mcp"))
+            .bearer_auth("scoped-token")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-session-id", &session)
+            .header("mcp-protocol-version", "2025-11-25")
+            .json(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":name,"arguments":arguments}}))
+            .send().await.unwrap();
+        let result = message(&response.text().await.unwrap());
+        assert!(!result["error"].is_object() && result["result"]["isError"] != true, "{result}");
+        assert_eq!(std::fs::read_to_string(&args_log).unwrap().lines().last().unwrap(), expected);
+    }
 
     server.0.kill().unwrap();
 }

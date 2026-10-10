@@ -26,9 +26,6 @@ from typing import Any, Callable
 import ray
 
 from .model import Health, NodeEnv, ReplicaSpec, to_env
-from .rayapi import node_ip
-
-NODE_BINARY_NAMES = ("fleet-ziren-node", "fleet-node")  # the current name and the one before it
 
 
 def spec_hash(spec: ReplicaSpec) -> str:
@@ -80,6 +77,7 @@ def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extr
     node = NodeEnv(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
                    app_namespace=app_namespace, app_tenant=app_tenant, app_elf_id=app_elf_id,
+                   app_storage_root=spec.service.proof_storage_root,
                    rust_log=spec.service.rust_log, cpus=int(spec.service.cpus),
                    output_dir=c.proof_output_dir or os.path.join(c.log_dir, "proofs"), **extra)  # type: ignore[arg-type]
     env = dict(os.environ)
@@ -143,13 +141,15 @@ def _kill_orphans(name: str) -> None:
     the actor but not its children; nodes since then exit with their parent): an orphan
     keeps the name registered and points it at a GPU server port a new container may reuse.
     Names are unique per actor, so any such process is stale."""
-    comm_names = {n[:15] for n in NODE_BINARY_NAMES}  # /proc/<pid>/comm holds 15 bytes of the name
+    # /proc/<pid>/comm holds 15 bytes of the name. The machine fleet-node agent
+    # has a different lifecycle and is never a prover actor's child.
+    comm_name = "fleet-ziren-node"[:15]
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
         try:
             with open(f"/proc/{pid}/comm") as f:
-                if f.read().strip() not in comm_names:
+                if f.read().strip() != comm_name:
                     continue
             with open(f"/proc/{pid}/environ", "rb") as f:
                 if f"FLEET_NODE_NAME={name}".encode() not in f.read().split(b"\0"):

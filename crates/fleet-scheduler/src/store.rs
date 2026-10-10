@@ -1,4 +1,4 @@
-//! Job metadata. Payloads (ELFs, inputs, proofs) live in [`crate::blobs`].
+//! Job metadata. New proof jobs reference app-owned storage; legacy payloads use blobs.
 
 use std::collections::HashMap;
 
@@ -81,6 +81,8 @@ fn all<T: TryFrom<i32>>() -> Vec<T> {
 /// A proof job: an instance of a proof app (its tenant's program).
 #[derive(Debug, Clone)]
 pub struct Job {
+    pub inputs: Option<fleet_proto::fleet::v1::ProofInputs>,
+    pub outputs: Option<fleet_proto::fleet::v1::ProofOutputs>,
     /// Internal ID; namespaced requests retain the SDK proof_id in client_id.
     pub id: String,
     pub tenant: String,
@@ -114,6 +116,11 @@ impl Job {
         anyhow::ensure!(self.namespace.len() == 32 && self.namespace.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "job namespace must be an immutable namespace ID");
         if !self.tag.is_empty() { crate::fleet::Fleet::validate_tag(&self.tag)?; }
         anyhow::ensure!(self.state.is_terminal() == self.finished_ms.is_some(), "only terminal jobs have finished_ms");
+        if let Some(inputs) = &self.inputs {
+            fleet_proto::artifacts::validate_inputs(inputs, &self.elf_id)?;
+            if self.state == JobState::Succeeded { anyhow::ensure!(self.outputs.is_some(), "successful proof requires output references"); }
+        }
+        if let Some(outputs) = &self.outputs { fleet_proto::artifacts::validate_outputs(outputs)?; }
         Ok(())
     }
 }
@@ -125,6 +132,8 @@ impl serde::Serialize for Job {
         use serde::ser::SerializeStruct;
         let mut m = s.serialize_struct("Job", 20)?;
         m.serialize_field("id", &self.id)?;
+        m.serialize_field("inputs", &self.inputs)?;
+        m.serialize_field("outputs", &self.outputs)?;
         m.serialize_field("tenant", &self.tenant)?;
         m.serialize_field("owner", &self.owner)?;
         m.serialize_field("namespace", &self.namespace)?;
@@ -302,6 +311,7 @@ impl Store for MemoryStore {
             saved.kind = existing.kind;
             saved.priority = existing.priority;
             saved.created_ms = existing.created_ms;
+            saved.inputs = existing.inputs.clone();
         }
         anyhow::ensure!(!jobs.values().any(|j| j.id != saved.id && j.namespace == saved.namespace
             && j.tag == saved.tag && j.client_id == saved.client_id), "proof_id already exists in this namespace and tag");
@@ -344,11 +354,10 @@ impl Store for MemoryStore {
             .map(|((n, t, e), (created, disabled, priority))| ((n.clone(), t.clone(), e.clone()), (blank(n, t, e, *created, disabled.is_some(), *priority), 0.0)))
             .collect();
         for j in self.jobs.lock().values() {
-            let (a, prove_sum) = apps
-                .entry((j.namespace.clone(), j.tenant.clone(), j.elf_id.clone()))
-                .or_insert_with(|| (blank(j.namespace.as_str(), &j.tenant, &j.elf_id, j.created_ms, false, 0), 0.0));
+            let Some((a, prove_sum)) = apps.get_mut(&(j.namespace.clone(), j.tenant.clone(), j.elf_id.clone())) else {
+                continue;
+            };
             a.jobs += 1;
-            a.created_ms = a.created_ms.min(j.created_ms);
             a.last_created_ms = Some(a.last_created_ms.map_or(j.created_ms, |t| t.max(j.created_ms)));
             match j.state {
                 JobState::Queued | JobState::Running => a.active += 1,
@@ -504,7 +513,7 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 12;
+const SCHEMA_VERSION: i32 = 13;
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
     names.into_iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ")
@@ -553,6 +562,8 @@ CREATE TABLE fleet_jobs (
     priority    INT     NOT NULL DEFAULT 0,
     tenant      TEXT    NOT NULL,
     elf_id      TEXT    NOT NULL,
+    inputs      JSONB,
+    outputs     JSONB,
     kind        TEXT    NOT NULL CONSTRAINT fleet_jobs_kind_known CHECK (kind IN ({kinds})),
     state       TEXT    NOT NULL CONSTRAINT fleet_jobs_state_known CHECK (state IN ({states})),
     fail_status TEXT             CONSTRAINT fleet_jobs_fail_status_known CHECK (fail_status IN ({statuses})),
@@ -662,6 +673,14 @@ impl PgStore {
         let jobs_table: bool = sqlx::query_scalar("SELECT to_regclass('fleet_jobs') IS NOT NULL").fetch_one(pool).await?;
         match (have, jobs_table) {
             (Some(SCHEMA_VERSION), true) => Ok(()),
+            (Some(12), true) => {
+                let mut tx = pool.begin().await?;
+                sqlx::query("ALTER TABLE fleet_jobs ADD COLUMN IF NOT EXISTS inputs JSONB").execute(&mut *tx).await?;
+                sqlx::query("ALTER TABLE fleet_jobs ADD COLUMN IF NOT EXISTS outputs JSONB").execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO fleet_schema (version, applied_ms) VALUES ($1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)").bind(SCHEMA_VERSION).execute(&mut *tx).await?;
+                tx.commit().await?;
+                Ok(())
+            },
             (None, false) => {
                 sqlx::raw_sql(CREATE.as_str()).execute(pool).await?;
                 tracing::info!(schema = SCHEMA_VERSION, "database created");
@@ -673,6 +692,8 @@ impl PgStore {
 
     fn row_to_job(row: &sqlx::postgres::PgRow) -> anyhow::Result<Job> {
         Ok(Job {
+            inputs: row.try_get::<Option<serde_json::Value>, _>("inputs")?.map(serde_json::from_value).transpose()?,
+            outputs: row.try_get::<Option<serde_json::Value>, _>("outputs")?.map(serde_json::from_value).transpose()?,
             id: row.try_get("id")?,
             tenant: row.try_get("tenant")?,
             owner: row.try_get("owner")?,
@@ -706,10 +727,10 @@ impl Store for PgStore {
         j.validate()?;
         sqlx::query(
             "INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, fail_status, error, node, attempts, failed_on, \
-             cycles, prove_ms, created_ms, started_ms, finished_ms, owner, namespace, client_id, tag, priority) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
+             cycles, prove_ms, created_ms, started_ms, finished_ms, owner, namespace, client_id, tag, priority, inputs, outputs) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) \
              ON CONFLICT (id) DO UPDATE SET state=$5, fail_status=$6, error=$7, node=$8, attempts=$9, failed_on=$10, \
-             cycles=$11, prove_ms=$12, started_ms=$14, finished_ms=$15",
+             cycles=$11, prove_ms=$12, started_ms=$14, finished_ms=$15, outputs=$22",
         )
         .bind(&j.id)
         .bind(&j.tenant)
@@ -731,6 +752,8 @@ impl Store for PgStore {
         .bind(&j.client_id)
         .bind(&j.tag)
         .bind(j.priority)
+        .bind(j.inputs.as_ref().map(serde_json::to_value).transpose()?)
+        .bind(j.outputs.as_ref().map(serde_json::to_value).transpose()?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -760,7 +783,7 @@ impl Store for PgStore {
         .bind(&f.tenant)
         .bind(&f.elf)
         .bind(f.active)
-        .bind(limit as i64)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .bind(&f.owner)
         .bind(&f.namespace)
         .bind(&f.tag)
@@ -779,10 +802,6 @@ impl Store for PgStore {
                     j.last_created_ms, j.mean_prove_ms \
              FROM fleet_apps a LEFT JOIN (SELECT namespace, tenant, elf_id, {COUNTS} FROM fleet_jobs GROUP BY namespace, tenant, elf_id) j \
                   ON j.namespace = a.namespace AND j.tenant = a.tenant AND j.elf_id = a.elf_id \
-             UNION ALL \
-             SELECT j.namespace, j.tenant, j.elf_id, min(created_ms), 0, false, {COUNTS} \
-             FROM fleet_jobs j WHERE NOT EXISTS (SELECT 1 FROM fleet_apps a WHERE a.namespace = j.namespace AND a.tenant = j.tenant AND a.elf_id = j.elf_id) \
-             GROUP BY j.namespace, j.tenant, j.elf_id \
              ORDER BY last_created_ms DESC NULLS LAST, created_ms DESC"
         );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;

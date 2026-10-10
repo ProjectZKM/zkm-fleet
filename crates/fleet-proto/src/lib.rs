@@ -4,6 +4,8 @@
 //! network prover (`ZKM_PROVER=network`) talks to the scheduler unchanged.
 //! `fleet::v1` is internal: scheduler <-> prover nodes.
 
+pub mod artifacts;
+
 pub mod stage {
     pub mod v1 {
         tonic::include_proto!("stage.v1");

@@ -3,8 +3,8 @@
 Everything the bridge keeps or passes around is a dataclass here (a run's spec and
 status, a service replica, the cluster settings, a health report), with enums for
 the closed sets. Nothing else in the package spells a field name as a string:
-records go to and from JSON / YAML / argparse / environment variables through the
-reflection in `from_dict`, `to_dict`, `merge`, `to_env` and `argparser`, which
+records go to and from JSON / YAML / environment variables through the
+reflection in `from_dict`, `to_dict`, `merge` and `to_env`, which
 read the dataclass fields and their type hints.
 
 Loading is lenient about extra keys (an older or newer record still loads) and
@@ -13,7 +13,6 @@ strict about types; `merge` refuses a field the record does not have.
 
 from __future__ import annotations
 
-import argparse
 import dataclasses
 import enum
 import json
@@ -22,7 +21,7 @@ import re
 import types
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Callable, ClassVar, Iterator, Mapping, TypeVar
+from typing import Any, Mapping, TypeVar
 
 T = TypeVar("T")
 D = TypeVar("D", bound="Record")
@@ -172,51 +171,6 @@ def to_env(obj: Any) -> dict[str, str]:
     return out
 
 
-def argparser(cls: type, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Adds one argument per field of `cls`: the field's type decides the parser's
-    (bool = a flag, list = repeatable), its default is the argument's, and its
-    metadata gives `help`, `flags` (e.g. ("-f", "--follow")) or `positional`."""
-    hints = _hints(cls)
-    for f in fields(cls):
-        md = f.metadata
-        tp = hints[f.name]
-        default: Any = f.default if f.default is not dataclasses.MISSING else (
-            f.default_factory() if f.default_factory is not dataclasses.MISSING else None)
-        kwargs: dict[str, Any] = {"help": md.get("help")}
-        if md.get("positional"):
-            flags = [f.name]
-            if _is_union(tp):
-                kwargs["nargs"] = "?"
-                tp = next(a for a in typing.get_args(tp) if a is not _NONE)
-            if "choices" in md:
-                kwargs["choices"] = md["choices"]
-        else:
-            flags = list(md.get("flags", ("--" + f.name.replace("_", "-"),)))
-            kwargs["dest"] = f.name
-        if _is_union(tp):
-            tp = next(a for a in typing.get_args(tp) if a is not _NONE)
-        if tp is bool:
-            kwargs["action"] = "store_true"
-        elif typing.get_origin(tp) is list:
-            (item,) = typing.get_args(tp)
-            kwargs.update(action="append", type=item, default=None)
-        else:
-            kwargs["type"] = tp
-        if "default" not in kwargs:
-            kwargs["default"] = default
-        if "choices" in md and "choices" not in kwargs:
-            kwargs["choices"] = md["choices"]
-        parser.add_argument(*flags, **kwargs)
-    return parser
-
-
-def from_args(cls: type[T], ns: argparse.Namespace) -> T:
-    """The dataclass a parser built by `argparser` filled in (None for an unused
-    repeatable argument becomes the field's empty default)."""
-    data = {k: v for k, v in vars(ns).items() if v is not None}
-    return from_dict(cls, data)
-
-
 # ── records ──────────────────────────────────────────────────────────────────
 
 @dataclass(kw_only=True)
@@ -325,7 +279,7 @@ class Profile(Record):
     shm_gb: int = 16
     allow: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    disabled: bool = False  # takes no new runs (fleetctl app disable); the ones going finish
+    disabled: bool = False  # takes no new runs (fleetctl batch disable); the ones going finish
     # A higher-priority requester in this namespace may stop a run once it has run
     # min_runtime_s; the run queues again (FLEET_ATTEMPT goes on) and spends no --retry.
     preemptible: bool = True
@@ -343,9 +297,6 @@ class RunsConfig(Record):
     """runs.yaml."""
 
     profiles: dict[str, Profile] = field(default_factory=dict)
-    model_store: str | None = None
-    hf_token_file: str | None = None
-    stage_profile: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -508,94 +459,6 @@ class RunStatus(Record):
                          container=self.container or "")]
 
 
-@dataclass(kw_only=True)
-class GangEnv(Record):
-    """Where the ranks of a --nodes run meet. Each value goes out under the fleet's
-    own name and the names torchrun reads, so `torchrun train.py` joins as is."""
-
-    nnodes: int = field(metadata={"env": ("FLEET_NNODES", "NNODES", "PET_NNODES")})
-    master_addr: str = field(metadata={"env": ("FLEET_MASTER_ADDR", "MASTER_ADDR", "PET_MASTER_ADDR")})
-    master_port: int = field(metadata={"env": ("FLEET_MASTER_PORT", "MASTER_PORT", "PET_MASTER_PORT")})
-    nproc_per_node: int = field(metadata={"env": "PET_NPROC_PER_NODE"})
-    node_rank: int | None = field(default=None, metadata={"env": ("FLEET_NODE_RANK", "NODE_RANK", "PET_NODE_RANK")})
-
-
-@dataclass(kw_only=True)
-class RunArgs(Record):
-    """`run.sh` command line (one field per argument; see `argparser`). The fields marked
-    `remote` are what a submit through the runs API may set; the rest belong to the
-    machine that runs the bridge (where the profiles and the runs dir are) or to
-    other actions."""
-
-    action: str = field(metadata={"positional": True, "choices": ["submit", "status", "cancel", "preempt", "list", "logs",
-                                                                   "fetch", "purge", "render", "stage-model"]})
-    run_id: str | None = field(default=None, metadata={"positional": True,
-                                                       "help": "a run id (stage-model: the Hugging Face repo)"})
-    profiles: str = field(default_factory=lambda: os.environ.get("FLEET_RUN_PROFILES", "/etc/zkm-fleet/runs.yaml"))
-    runs_dir: str = field(default_factory=lambda: os.environ.get("FLEET_RUNS_DIR", "/var/lib/zkm-fleet/runs"))
-    address: str = "127.0.0.1:6379"
-    owner: str | None = None  # submitting token for audit, never a remote field
-    namespace: str | None = None
-    namespace_all_tags: bool = False
-    tag: str | None = None
-    profile: str | None = field(default=None, metadata={"remote": True})
-    name: str | None = field(default=None, metadata={"remote": True})
-    gpus: float = field(default=1, metadata={"remote": True, "help": "cards; a fraction (0.5) shares one card and needs a --gpu-mem"})
-    cpus: int = field(default=8, metadata={"remote": True})
-    gpu_mem: int = field(default=0, metadata={"remote": True, "help": "GiB free each granted card must have before the job starts "
-                                                      "(default: the profile's, else the whole card)"})
-    vram_wait: int = field(default=1800, metadata={"remote": True, "help": "seconds to wait for that memory before failing "
-                                                           "(the run shows waiting_vram meanwhile)"})
-    machine: list[str] = field(default_factory=list, metadata={
-        "remote": True, "help": "the machine (host name or IP) the run must land on; with --nodes N, repeat for each"})
-    nodes: int = field(default=1, metadata={"remote": True, "help": "spread the run over N machines: --gpus and --cpus on each, one "
-                                                    "container per machine, ranks wired through FLEET_MASTER_ADDR / "
-                                                    "FLEET_NODE_RANK (and torchrun's PET_*)"})
-    after: str | None = field(default=None, metadata={"remote": True, "help": "run only after this run succeeded"})
-    retry: int = field(default=0, metadata={"remote": True, "help": "try a failed run again up to N times"})
-    restart_on_oom: int = field(default=0, metadata={"remote": True, "help": "try again up to N times when an attempt ran out of memory"})
-    code: str | None = field(default=None, metadata={"remote": True, "help": "git:/repo@ref or FILE.tar.gz, captured into the run "
-                                                             "(FLEET_CODE, {code})"})
-    mount: list[str] = field(default_factory=list, metadata={"remote": True, "help": "PATH[:ro|:rw], mounted at its own path; repeat"})
-    env: list[str] = field(default_factory=list, metadata={"remote": True, "help": "K=V for the job ({out} / {code} expand); repeat"})
-    log: str | None = field(default=None, metadata={"remote": True, "help": "file the job's output is appended to (default RUNS_DIR/<id>/log)"})
-    workdir: str | None = field(default=None, metadata={"remote": True})
-    follow: bool = field(default=False, metadata={"flags": ("-f", "--follow"), "help": "logs: keep printing until the run ends"})
-    lines: int = field(default=50, metadata={"flags": ("-n", "--lines"), "help": "logs: lines of history first"})
-    rank: int = field(default=0, metadata={"help": "logs: a --nodes run's rank k (its output is log.rank<k>)"})
-    older_than: float | None = field(default=None, metadata={"help": "purge: finished runs older than this many days"})
-    revision: str = field(default="main", metadata={"help": "stage-model: branch, tag or commit"})
-    include: list[str] = field(default_factory=list, metadata={"help": "stage-model: only files matching this glob; repeat"})
-    host_gpus: str = field(default="0", metadata={"help": "render: host cards to show in the command"})
-
-    @property
-    def env_map(self) -> dict[str, str]:
-        return dict(e.split("=", 1) for e in self.env if "=" in e)
-
-    @classmethod
-    def remote_fields(cls) -> set[str]:
-        return {f.name for f in fields(cls) if f.metadata.get("remote")}
-
-
-@dataclass(kw_only=True)
-class LogChunk(Record):
-    """A piece of a run's output: from `offset` on (or the last lines), the offset to ask
-    for next, and whether the run has ended (no more will come)."""
-
-    data: str
-    offset: int
-    done: bool
-
-
-@dataclass(kw_only=True)
-class Uploaded(Record):
-    """A code tarball sent to the runs API, kept under the runs dir for `--code`."""
-
-    path: str
-    sha256: str
-    bytes: int
-
-
 # ── services ─────────────────────────────────────────────────────────────────
 
 class ServiceKind(str, enum.Enum):
@@ -603,11 +466,10 @@ class ServiceKind(str, enum.Enum):
     ZIREN_CPU = "ziren-cpu"
     APP = "app"
     HOLD = "hold"
-    RUNS_API = "runs-api"
 
     @property
     def takes_gpus(self) -> bool:
-        return self not in (ServiceKind.ZIREN_CPU, ServiceKind.RUNS_API)
+        return self is not ServiceKind.ZIREN_CPU
 
 
 @dataclass(kw_only=True)
@@ -621,14 +483,6 @@ class ClusterConfig(Record):
     log_dir: str = "/tmp/zkm-fleet"
     proof_output_dir: str | None = None
     gpu_port_range: tuple[int, int] = (30100, 30199)
-    scheduler_admin: str = "http://127.0.0.1:9191"
-    admin_token_file: str | None = None
-    drain_timeout_s: float = 900
-
-    @property
-    def admin_token_path(self) -> str:
-        return self.admin_token_file or os.path.join(os.path.dirname(self.cluster_token_file or "/etc/zkm-fleet/x"),
-                                                     "admin.token")
 
 
 @dataclass(kw_only=True)
@@ -645,6 +499,7 @@ class ServiceSpec(Record):
     # A Ziren prover service is dedicated to this one proof app (tenant/full ELF id).
     # The service's namespace supplies the other part of the app identity.
     proof_app: str | None = None
+    proof_storage_root: str | None = None
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
@@ -664,12 +519,6 @@ class ServiceSpec(Record):
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
-    # the runs API (one-shot runs over HTTP, for `fleetctl job`): where it listens, and the
-    # profiles file and runs dir of this machine (pin it with `machine:` to where they are)
-    listen: str = "127.0.0.1:9192"
-    profiles: str | None = None
-    runs_dir: str | None = None
-
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
@@ -758,6 +607,7 @@ class NodeEnv(Record):
     rust_log: str = field(metadata={"env": "RUST_LOG"})
     exit_with_parent: bool = field(default=True, metadata={"env": "FLEET_EXIT_WITH_PARENT"})
     output_dir: str | None = field(default=None, metadata={"env": "FLEET_OUTPUT_DIR"})
+    app_storage_root: str | None = field(default=None, metadata={"env": "FLEET_APP_STORAGE_ROOT"})
     cpus: int = field(default=0, metadata={"env": "FLEET_CPUS"})
     gpus: int | None = field(default=None, metadata={"env": "FLEET_GPUS"})
     gpu_endpoint: str | None = field(default=None, metadata={"env": "FLEET_GPU_ENDPOINT"})
@@ -780,31 +630,12 @@ class Health(Record):
     stopping: bool = False
     error: str | None = None
 
-
-@dataclass(kw_only=True)
-class ApplyReport(Record):
-    """What one apply did, by replica name."""
-
-    started: list[str] = field(default_factory=list)
-    stopped: list[str] = field(default_factory=list)
-    replaced: list[str] = field(default_factory=list)
-    healthy: list[str] = field(default_factory=list)
-    unhealthy: list[str] = field(default_factory=list)
-    held: list[str] = field(default_factory=list)
-    planned: list[str] = field(default_factory=list)  # --dry-run: what would change
-
-
-class Fields:
-    """Field names of a record as attributes, for callers that must name one (a
-    JSON key to show, a column to select) without spelling it as a string."""
-
-    def __init__(self, cls: type) -> None:
-        self._names = [f.name for f in fields(cls)]
-
-    def __getattr__(self, name: str) -> str:
-        if name in self._names:
-            return name
-        raise AttributeError(name)
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._names)
+    @property
+    def is_ready(self) -> bool:
+        if self.stopping or self.error or self.spec is None:
+            return False
+        if self.ready is not None:
+            return self.ready
+        if self.gpu_ready is not None:
+            return self.gpu_ready
+        return True  # CPU prover health already checks its local process.

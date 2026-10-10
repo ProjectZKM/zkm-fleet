@@ -55,7 +55,7 @@ jobs:
         run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleetctl -p fleet-mcp
 
   prover-check:
-    name: Prover output store
+    name: Prover artifact storage and fetching
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -76,7 +76,7 @@ jobs:
           key: ${{ runner.os }}-prover-output-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-prover-output-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
-      - name: Test proof output persistence without private runtime dependencies
+      - name: Test proof persistence and storage-only fetching without private runtime dependencies
         run: cargo test --locked --no-default-features --lib -p fleet-ziren-node
 
   bridge-tests:

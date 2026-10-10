@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 use fleet_proto::fleet::v1::{
     control_service_server::ControlService, DeregisterRequest, DeregisterResponse,
     FetchInputsRequest, HeartbeatRequest, HeartbeatResponse, ProveRequest, RegisterRequest,
-    RegisterResponse,
+    RegisterResponse, PublishOutputRequest, PublishOutputResponse,
 };
 
 use crate::fleet::Fleet;
@@ -18,6 +18,19 @@ pub struct ControlApi {
 
 #[tonic::async_trait]
 impl ControlService for ControlApi {
+    async fn publish_output(
+        &self,
+        request: Request<PublishOutputRequest>,
+    ) -> Result<Response<PublishOutputResponse>, Status> {
+        let r = request.into_inner();
+        self.fleet.publish_output(
+            &r.node_id,
+            &r.assignment.ok_or_else(|| Status::invalid_argument("assignment missing"))?,
+            r.result.ok_or_else(|| Status::invalid_argument("result missing"))?,
+        ).await?;
+        Ok(Response::new(PublishOutputResponse {}))
+    }
+
     async fn register(
         &self,
         request: Request<RegisterRequest>,

@@ -1,19 +1,20 @@
 #!/bin/bash
-# Keeps this machine's Ray node up (run from cron every minute; install.sh adds the line).
-# The scheduler runs under docker compose (restart: unless-stopped); prover actors are
-# detached and restarted by Ray itself while the head lives.
-set -u
+# This machine's local Ray plus outbound fleet-node; control hosts need neither.
+set -euo pipefail
 . "${FLEET_ENV:-/etc/zkm-fleet/watchdog.env}"
-export PATH="$FLEET_HOME/venv/bin:$PATH" RAY_NODE_IP CUDA_VISIBLE_DEVICES RAY_NUM_CPUS FLEET_WORKDIR
+export PATH="$FLEET_HOME/venv/bin:$PATH" CUDA_VISIBLE_DEVICES RAY_NUM_CPUS FLEET_WORKDIR
 mkdir -p "$FLEET_LOG"
-# This machine's own Ray node: its raylet (asking the cluster would answer for the head, not for us).
-if ! pgrep -x raylet > /dev/null; then
-  echo "$(date -u +%FT%TZ) starting ray $RAY_ROLE"
-  "$FLEET_HOME/deploy/ray-start.sh" "$RAY_ROLE" "${RAY_HEAD:-}" >> "$FLEET_LOG/ray.log" 2>&1
-  # Detached actors die with the head (no GCS persistence): a restarted head brings the
-  # services back from services.yaml (after a reboot, a crash).
-  if [ "$RAY_ROLE" = head ] && [ -x "$FLEET_HOME/deploy/apply.sh" ]; then
-    echo "$(date -u +%FT%TZ) re-applying services"
-    "$FLEET_HOME/deploy/apply.sh" >> "$FLEET_LOG/apply.log" 2>&1 || echo "$(date -u +%FT%TZ) apply failed: see $FLEET_LOG/apply.log"
-  fi
+exec 8>"$FLEET_WORKDIR/watchdog.lock"
+flock -n 8 || exit 0
+FOUND=0
+for PID in $(pgrep -x -u "$(id -u)" raylet || true); do
+  case "$(readlink "/proc/$PID/exe")" in "$FLEET_HOME/venv/"*) FOUND=1;; esac
+done
+if [ "$FOUND" = 0 ]; then
+  "$FLEET_HOME/deploy/ray-start.sh" >> "$FLEET_LOG/ray.log" 2>&1
+fi
+# node-start's lock prevents duplicates, including a separately supervised agent.
+if [ "${FLEET_NODE_SUPERVISED:-0}" != 1 ]; then
+nohup env FLEET_ENV="${FLEET_ENV:-/etc/zkm-fleet/watchdog.env}" "$FLEET_HOME/deploy/node-start.sh" \
+  8>&- >> "$FLEET_LOG/node.log" 2>&1 < /dev/null &
 fi

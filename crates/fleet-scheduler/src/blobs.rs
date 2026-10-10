@@ -39,8 +39,8 @@ impl Blobs {
         })
     }
 
-    /// Attach shared job-artifact storage. Nodes write proof output; the SDK adapter
-    /// reads it, and deleting an app removes its terminal jobs' output directories.
+    /// Choose control-host proof storage for node uploads and SDK downloads.
+    /// Deleting an app removes its terminal jobs' output directories.
     pub fn with_proof_output(mut self, root: PathBuf) -> Self {
         self.proof_output = Some(root);
         self
@@ -55,32 +55,35 @@ impl Blobs {
         Ok(bytes)
     }
 
-    /// A successful worker completion is accepted only when the shared output is
-    /// visible and the committed manifest matches the result metadata and bytes.
-    pub async fn verify_published_output(&self, job: &crate::store::Job, cycles: u64, prove_ms: u64) -> anyhow::Result<()> {
-        if self.proof_output.is_none() { return Ok(()); }
-        let blobs = self.clone();
-        let job = job.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(10), tokio::task::spawn_blocking(move || {
-            let proof = blobs.read_output(&job, PROOF)?;
-            let public_values = blobs.read_output(&job, PUBLIC_VALUES)?;
-            let root = blobs.proof_output.as_ref().expect("checked above");
-            let started = job.started_ms.ok_or_else(|| anyhow::anyhow!("successful job has no execution lease"))?;
-            let path = root.join(&job.id).join(format!("{}-{started}", job.attempts)).join("manifest.json");
-            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            anyhow::ensure!(manifest["cycles"].as_u64() == Some(cycles) && manifest["prove_ms"].as_u64() == Some(prove_ms), "proof output manifest does not match completion metadata");
-            let proof_hash = hex::encode(Sha256::digest(&proof));
-            let public_values_hash = hex::encode(Sha256::digest(&public_values));
-            anyhow::ensure!(manifest["proof_hash"].as_str() == Some(proof_hash.as_str()), "proof output hash does not match manifest");
-            anyhow::ensure!(manifest["public_values_hash"].as_str() == Some(public_values_hash.as_str()), "public values hash does not match manifest");
-            Ok(())
-        })).await??
+    pub fn publish_output(&self, job: &crate::store::Job, result: &fleet_proto::fleet::v1::ProveResponse) -> anyhow::Result<()> {
+        anyhow::ensure!(is_safe_id(&job.id), "bad job id");
+        let started = job.started_ms.ok_or_else(|| anyhow::anyhow!("missing execution lease"))?;
+        let root = self.proof_output.clone().unwrap_or_else(|| self.root.join("proofs"));
+        let dir = root.join(&job.id).join(format!("{}-{started}", job.attempts));
+        std::fs::create_dir_all(&dir)?;
+        let manifest = serde_json::json!({"cycles":result.cycles,"prove_ms":result.prove_ms,
+            "wall_ms":result.wall_ms,"zkm_version":result.zkm_version,
+            "proof_hash":hex::encode(Sha256::digest(&result.proof_json)),
+            "public_values_hash":hex::encode(Sha256::digest(&result.public_values))});
+        if dir.join("manifest.json").exists() {
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+            anyhow::ensure!(saved == manifest && std::fs::read(dir.join(PROOF))? == result.proof_json
+                && std::fs::read(dir.join(PUBLIC_VALUES))? == result.public_values, "proof output is immutable");
+            return Ok(());
+        }
+        write_atomic(&dir.join(PROOF), &result.proof_json)?;
+        write_atomic(&dir.join(PUBLIC_VALUES), &result.public_values)?;
+        write_atomic(&dir.join("manifest.json"), &serde_json::to_vec(&manifest)?)?;
+        std::fs::File::open(dir.parent().unwrap())?.sync_all()?;
+        std::fs::File::open(root)?.sync_all()?;
+        Ok(())
     }
 
     pub fn read_output(&self, job: &crate::store::Job, name: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(matches!(name, PROOF | PUBLIC_VALUES), "unknown proof output");
         anyhow::ensure!(is_safe_id(&job.id), "bad job id");
-        if let (Some(root), Some(started)) = (&self.proof_output, job.started_ms) {
+        if let Some(started) = job.started_ms {
+            let root = self.proof_output.clone().unwrap_or_else(|| self.root.join("proofs"));
             let path = root.join(&job.id).join(format!("{}-{started}", job.attempts)).join(name);
             match std::fs::read(path) {
                 Ok(bytes) => return Ok(bytes),
@@ -159,8 +162,12 @@ impl Blobs {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, bytes)?;
+    use std::io::Write;
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     std::fs::rename(&tmp, path)?;
+    std::fs::File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
 }
 

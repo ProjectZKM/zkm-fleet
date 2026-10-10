@@ -1,113 +1,146 @@
-# The stage API and the HTTP port, in front of the scheduler. The SDK gives up on the
-# first broken call, so a scheduler restart would fail every client waiting on a proof;
-# the gateway holds those calls and retries them until the scheduler is back.
-# Every stage call is safe to retry: GetStatus reads, and GenerateProof with a known
-# proof_id answers "computing" without queueing it again.
-# The scheduler is addressed by its fixed IP: Docker's DNS forgets a stopped container's
-# name, and an upstream with no address is answered at once instead of retried.
-# deploy/install.sh writes this to ${FLEET_ETC}/gateway.yaml. HTTPS is server-authenticated;
-# the proof API uses bearer tokens; TLS protects the connection and authenticates the server.
-
+# HTTPS ingress; internal scheduler and MCP listeners are not public.
 static_resources:
   listeners:
-    - name: stage
-      address: { socket_address: { address: 0.0.0.0, port_value: 51000 } }
-      filter_chains:
-        - filters:
-            - name: envoy.filters.network.http_connection_manager
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: stage
-                codec_type: HTTP2
-                request_timeout: 0s
-                route_config:
-                  virtual_hosts:
-                    - name: stage
-                      domains: ["*"]
-                      routes:
-                        # Long polls answer within seconds: a try that hangs is a dead connection.
-                        - match: { path: "/stage.v1.StageService/GetStatus" }
-                          route:
-                            cluster: stage
-                            timeout: 0s
-                            retry_policy:
-                              retry_on: connect-failure,refused-stream,reset,unavailable
-                              num_retries: 120
-                              per_try_timeout: 15s
-                              retry_back_off: { base_interval: 0.25s, max_interval: 1s }
-                        - match: { prefix: "/" }
-                          # GenerateProof carries the witness: buffer it so it can be sent again.
-                          per_request_buffer_limit_bytes: 268435456
-                          route:
-                            cluster: stage
-                            timeout: 0s
-                            retry_policy:
-                              retry_on: connect-failure,refused-stream,reset,unavailable
-                              num_retries: 120
-                              per_try_timeout: 600s
-                              retry_back_off: { base_interval: 0.25s, max_interval: 1s }
-                http_filters:
-                  - name: envoy.filters.http.router
-                    typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
-          # @STAGE_TLS@
-
-    - name: http
-      address: { socket_address: { address: 0.0.0.0, port_value: 9191 } }
-      filter_chains:
-        - filters:
-            - name: envoy.filters.network.http_connection_manager
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: http
-                route_config:
-                  virtual_hosts:
-                    - name: http
-                      domains: ["*"]
-                      routes:
-                        # Reads (public values, status) wait out a restart; writes are only
-                        # retried when they never reached the scheduler.
-                        - match: { prefix: "/", headers: [{ name: ":method", string_match: { exact: GET } }] }
-                          route:
-                            cluster: http
-                            retry_policy:
-                              retry_on: connect-failure,refused-stream,reset,retriable-status-codes
-                              retriable_status_codes: [502, 503]
-                              num_retries: 120
-                              per_try_timeout: 10s
-                              retry_back_off: { base_interval: 0.25s, max_interval: 1s }
-                        - match: { prefix: "/" }
-                          route:
-                            cluster: http
-                            retry_policy:
-                              retry_on: connect-failure,refused-stream
-                              num_retries: 120
-                              retry_back_off: { base_interval: 0.25s, max_interval: 1s }
-                http_filters:
-                  - name: envoy.filters.http.router
-                    typed_config: { "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router }
-
+  - name: https
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 8905
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: fleet
+          codec_type: AUTO
+          stream_idle_timeout: 0s
+          route_config:
+            virtual_hosts:
+            - name: fleet
+              domains:
+              - '*'
+              routes:
+              - match:
+                  prefix: /mcp
+                route:
+                  cluster: mcp
+                  timeout: 0s
+              - match:
+                  prefix: /fleet.v1.WorkerService/
+                route:
+                  cluster: control
+                  timeout: 0s
+              - match:
+                  prefix: /fleet.v1.ControlService/
+                route:
+                  cluster: control
+                  timeout: 0s
+              - match:
+                  prefix: /stage.v1.StageService/
+                per_request_buffer_limit_bytes: 268435456
+                route:
+                  cluster: stage
+                  timeout: 0s
+                  retry_policy:
+                    retry_on: connect-failure,refused-stream,reset,unavailable
+                    num_retries: 120
+                    per_try_timeout: 600s
+                    retry_back_off:
+                      base_interval: 0.25s
+                      max_interval: 1s
+              - match:
+                  prefix: /
+                route:
+                  cluster: http
+                  timeout: 0s
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            alpn_protocols:
+            - h2
+            - http/1.1
+            tls_certificates:
+            - certificate_chain:
+                filename: /etc/zkm-fleet/tls/server.pem
+              private_key:
+                filename: /etc/zkm-fleet/tls/server.key
   clusters:
-    - name: stage
-      type: STATIC
-      connect_timeout: 1s
-      typed_extension_protocol_options:
-        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-          explicit_http_config:
-            # A killed scheduler never closes its connections: pings find them.
-            http2_protocol_options: { connection_keepalive: { interval: 1s, timeout: 2s } }
-      # Every client waiting out a restart retries at once.
-      circuit_breakers:
-        thresholds: [{ max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 100000 }]
-      load_assignment:
-        cluster_name: stage
-        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: @SCHEDULER_IP@, port_value: 51000 } } } }] }]
-
-    - name: http
-      type: STATIC
-      connect_timeout: 1s
-      circuit_breakers:
-        thresholds: [{ max_connections: 100000, max_pending_requests: 100000, max_requests: 100000, max_retries: 100000 }]
-      load_assignment:
-        cluster_name: http
-        endpoints: [{ lb_endpoints: [{ endpoint: { address: { socket_address: { address: @SCHEDULER_IP@, port_value: 9191 } } } }] }]
+  - name: stage
+    type: STATIC
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: stage
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: '@SCHEDULER_IP@'
+                port_value: 51000
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+  - name: control
+    type: STATIC
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: control
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: '@SCHEDULER_IP@'
+                port_value: 51001
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: stage
+        common_tls_context:
+          alpn_protocols:
+          - h2
+          validation_context:
+            trusted_ca:
+              filename: /etc/zkm-fleet/tls/ca.pem
+            match_typed_subject_alt_names:
+            - san_type: DNS
+              matcher:
+                exact: stage
+  - name: http
+    type: STATIC
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: http
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: '@SCHEDULER_IP@'
+                port_value: 9191
+  - name: mcp
+    type: STRICT_DNS
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: mcp
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: mcp
+                port_value: 8906

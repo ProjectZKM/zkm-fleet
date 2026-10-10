@@ -3,7 +3,7 @@ syntax = "proto3";
 package fleet.v1;
 
 // Nodes initiate every connection. Heartbeats carry control metadata only;
-// nodes fetch inputs separately and handle proof output themselves.
+// app-owned storage holds payloads. FetchInputs/PublishOutput remain for legacy jobs.
 
 enum ProofKind {
   PROOF_KIND_UNSPECIFIED = 0;
@@ -47,14 +47,57 @@ service ControlService {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
+  // Legacy payload path, refused for jobs with app-owned references.
   rpc FetchInputs(FetchInputsRequest) returns (ProveRequest);
+  rpc PublishOutput(PublishOutputRequest) returns (PublishOutputResponse);
 }
+
+message PublishOutputRequest {
+  string node_id = 1;
+  Assignment assignment = 2;
+  ProveResponse result = 3;
+}
+
+message PublishOutputResponse {}
 
 message Assignment {
   string job_id = 1;
   // Stable across scheduler restarts, changes for each execution attempt.
   string lease = 2;
   string elf_id = 3;
+  ProofInputs inputs = 4;
+  ProofKind kind = 5;
+}
+
+// References only. Fleet never reads the bytes in app-owned storage.
+message ArtifactRef {
+  string uri = 1;
+  string sha256 = 2;
+  uint64 size = 3;
+}
+
+message ProofInputs {
+  ArtifactRef input = 1;
+  ArtifactRef elf = 2;
+  string output_root = 3;
+}
+
+message ProofOutputs {
+  ArtifactRef proof = 1;
+  ArtifactRef public_values = 2;
+  // Stable machine identity, recorded by the scheduler from the proving node.
+  string machine = 3;
+}
+
+// Ephemeral, authorized client fetch. Delivered in a machine heartbeat response.
+message ProofFetch {
+  string ticket = 1;
+  string job_id = 2;
+  string lease = 3;
+  string elf_id = 4;
+  string output_root = 5;
+  string name = 6;
+  ArtifactRef reference = 7;
 }
 
 message Completion {
@@ -65,6 +108,7 @@ message Completion {
   string error = 4;
   uint64 cycles = 5;
   uint64 prove_ms = 6;
+  ProofOutputs outputs = 7;
 }
 
 message FetchInputsRequest {
@@ -127,3 +171,46 @@ message DeregisterRequest {
 }
 
 message DeregisterResponse {}
+
+// Machine agents use their own local Ray instance. No Ray cluster crosses machines.
+service WorkerService {
+  rpc Heartbeat(WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+}
+
+enum NodeOperation {
+  NODE_OPERATION_UNSPECIFIED = 0;
+  NODE_OPERATION_LAUNCH_RUN = 1;
+  NODE_OPERATION_CANCEL_RUN = 2;
+  NODE_OPERATION_PREEMPT_RUN = 3;
+  NODE_OPERATION_SET_SERVICE = 4;
+  NODE_OPERATION_PURGE_RUN = 5;
+  reserved 6;
+  reserved "NODE_OPERATION_STAGE_MODEL";
+}
+
+message NodeCommand {
+  string id = 1;
+  NodeOperation operation = 2;
+  // Versioned execution parameters, not HTTP requests or user credentials.
+  bytes parameters_json = 3;
+}
+
+message WorkerHeartbeatRequest {
+  string worker_id = 1;
+  // A fresh process session fences duplicate agents on one machine.
+  string session = 2;
+  // Capacity, app inventory, job status/leases and command acknowledgements only.
+  // Inputs, logs and outputs use job artifact storage, outside the heartbeat.
+  bytes report_json = 3;
+  // A storage-only fleet-ziren-node handler is configured on this machine.
+  bool proof_fetch_ready = 4;
+}
+
+message WorkerHeartbeatResponse {
+  uint32 heartbeat_secs = 1;
+  repeated NodeCommand commands = 2;
+  repeated string acknowledged_results = 3;
+  // Terminal executions whose metadata and artifact receipts are durable.
+  repeated string acknowledged_runs = 4;
+  repeated ProofFetch proof_fetches = 5;
+}

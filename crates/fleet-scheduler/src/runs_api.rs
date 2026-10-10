@@ -1,0 +1,2288 @@
+//! Batch policy and durable records live in the control plane. Workers execute typed
+//! commands with their own Ray instance and initiate every control connection.
+use crate::{
+    blobs::is_safe_id,
+    fleet::Fleet,
+    preemption::{Candidate, Capacity, Request as PreemptionRequest},
+    store::Token,
+    token,
+};
+use axum::{
+    body::to_bytes,
+    extract::{Request, State},
+    http::{Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::any,
+    Json, Router,
+};
+use fleet_proto::fleet::v1::{
+    worker_service_server::WorkerService, NodeCommand, NodeOperation, WorkerHeartbeatRequest,
+    WorkerHeartbeatResponse,
+};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+    v[key].as_str().unwrap_or("")
+}
+fn terminal(state: &str) -> bool {
+    matches!(state, "succeeded" | "failed" | "cancelled" | "lost")
+}
+fn fail(code: u16, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(crate::fleet::Refusal {
+        status: code,
+        message: message.into(),
+    })
+}
+fn response_error(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<serde_json::Error>().is_some() {
+        return (StatusCode::BAD_REQUEST, "invalid JSON request").into_response();
+    }
+    if let Some(e) = e.downcast_ref::<crate::fleet::Refusal>() {
+        (StatusCode::from_u16(e.status).unwrap(), e.message.clone()).into_response()
+    } else {
+        tracing::error!(error=%e, "batch control operation failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "batch control operation failed",
+        )
+            .into_response()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct App {
+    name: String,
+    namespace: String,
+    tag: Option<String>,
+    profile: Value,
+    persistent: bool,
+    #[serde(default)]
+    removed: bool,
+    workers: HashSet<String>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Run {
+    id: String,
+    lease: String,
+    owner: String,
+    namespace: String,
+    tag: Option<String>,
+    profile: String,
+    policy: Value,
+    request: Value,
+    worker: Option<String>,
+    status: Value,
+    quota_held: bool,
+    #[serde(default)]
+    stop: Option<String>,
+    #[serde(default, alias = "artifacts_ready")]
+    logs_ready: bool,
+    #[serde(default)]
+    purged: bool,
+}
+impl Run {
+    fn value(&self) -> Value {
+        let mut v = self.status.clone();
+        for (k, x) in [
+            ("type", json!("batch")),
+            ("id", json!(self.id)),
+            ("profile", json!(self.profile)),
+            ("namespace", json!(self.namespace)),
+            ("tag", json!(self.tag)),
+            ("owner", json!(self.owner)),
+            ("priority", self.policy["priority"].clone()),
+            ("worker", json!(self.worker)),
+            ("node", json!(self.worker)),
+        ] {
+            v[k] = x;
+        }
+        v
+    }
+    fn state(&self) -> &str {
+        text(&self.status, "state")
+    }
+    fn gpus(&self) -> f64 {
+        self.request["gpus"].as_f64().unwrap_or(0.0)
+    }
+    fn cpus(&self) -> f64 {
+        self.request["cpus"].as_f64().unwrap_or(1.0)
+    }
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Command {
+    id: String,
+    worker: String,
+    operation: i32,
+    parameters: Value,
+    done: bool,
+    result: Value,
+    error: Option<String>,
+    #[serde(default)]
+    admitted: bool,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Report {
+    version: u32,
+    machine: String,
+    ready: bool,
+    total_gpus: f64,
+    total_cpus: f64,
+    free_gpus: f64,
+    free_cpus: f64,
+    #[serde(default)]
+    profiles: BTreeMap<String, Value>,
+    #[serde(default)]
+    services: Vec<Value>,
+    #[serde(default)]
+    runs: Vec<RunReport>,
+    #[serde(default)]
+    results: Vec<ResultReport>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunReport {
+    id: String,
+    lease: String,
+    status: Value,
+    spec: Value,
+    cleaned: bool,
+    #[serde(alias = "artifacts_ready")]
+    logs_ready: bool,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultReport {
+    id: String,
+    result: Value,
+    error: Option<String>,
+}
+struct Worker {
+    session: String,
+    seen: f64,
+    report: Report,
+    draining: bool,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct ServiceIntent {
+    worker: String,
+    service: Value,
+    disabled: bool,
+    #[serde(default)]
+    scale: Option<scaling::ScaleState>,
+}
+#[derive(Default)]
+struct Inner {
+    apps: BTreeMap<String, App>,
+    runs: BTreeMap<String, Run>,
+    commands: BTreeMap<String, Command>,
+    workers: BTreeMap<String, Worker>,
+    services: BTreeMap<String, ServiceIntent>,
+}
+
+pub struct RunControl {
+    fleet: Arc<Fleet>,
+    admin: String,
+    cluster: String,
+    dir: PathBuf,
+    inner: Mutex<Inner>,
+    ops: tokio::sync::Mutex<()>,
+    notify: tokio::sync::Notify,
+}
+impl RunControl {
+    pub fn new(fleet: Arc<Fleet>, admin: String, cluster: String) -> anyhow::Result<Self> {
+        let dir = fleet.cfg.data_dir.join("run-control");
+        for name in ["apps", "jobs", "commands", "artifacts", "services"] {
+            fs::create_dir_all(dir.join(name))?;
+        }
+        let mut inner = Inner::default();
+        for v in load::<App>(&dir.join("apps"))? {
+            inner.apps.insert(v.name.clone(), v);
+        }
+        for v in load::<Run>(&dir.join("jobs"))? {
+            inner.runs.insert(v.id.clone(), v);
+        }
+        for v in load::<Command>(&dir.join("commands"))? {
+            inner.commands.insert(v.id.clone(), v);
+        }
+        for v in load::<ServiceIntent>(&dir.join("services"))? {
+            inner
+                .services
+                .insert(format!("{}-{}", v.worker, text(&v.service, "name")), v);
+        }
+        Ok(Self {
+            fleet,
+            admin,
+            cluster,
+            dir,
+            inner: Mutex::new(inner),
+            ops: tokio::sync::Mutex::new(()),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+    fn save(&self, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
+        atomic(
+            &self.dir.join(kind).join(format!("{id}.json")),
+            &serde_json::to_vec(value)?,
+        )
+    }
+    fn command(
+        &self,
+        worker: &str,
+        operation: NodeOperation,
+        parameters: Value,
+    ) -> anyhow::Result<String> {
+        let mut inner = self.inner.lock();
+        if let Some(c) = inner.commands.values().find(|c| {
+            (!c.done || operation == NodeOperation::LaunchRun)
+                && c.worker == worker
+                && c.operation == operation as i32
+                && c.parameters == parameters
+        }) {
+            return Ok(c.id.clone());
+        }
+        if operation == NodeOperation::SetService {
+            if inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
+                .and_then(|s| s.scale.as_ref()).is_some_and(|s|
+                    s.pending() && parameters["scale_id"].as_str() != Some(s.id())) {
+                return Err(fail(409, "app scaling is already pending"));
+            }
+            if inner.commands.values().any(|c| {
+                !c.done
+                    && c.worker == worker
+                    && c.operation == operation as i32
+                    && text(&c.parameters["service"], "name")
+                        == text(&parameters["service"], "name")
+            }) {
+                return Err(fail(409, "a service operation is already pending"));
+            }
+            let intent = ServiceIntent {
+                worker: worker.into(),
+                service: parameters["service"].clone(),
+                disabled: parameters["disabled"].as_bool().unwrap_or(true),
+                scale: inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
+                    .and_then(|s| s.scale.as_ref().filter(|_| parameters["scale_id"].is_string() || parameters["scale_cleanup"].as_bool() == Some(true)).cloned()),
+            };
+            let key = format!("{}-{}", worker, text(&intent.service, "name"));
+            self.save("services", &key, &intent)?;
+            inner.services.insert(key, intent);
+        }
+        let c = Command {
+            id: uuid::Uuid::new_v4().to_string(),
+            worker: worker.into(),
+            operation: operation as i32,
+            parameters,
+            done: false,
+            result: Value::Null,
+            error: None,
+            admitted: operation != NodeOperation::SetService,
+        };
+        self.save("commands", &c.id, &c)?;
+        let id = c.id.clone();
+        inner.commands.insert(id.clone(), c);
+        self.notify.notify_waiters();
+        Ok(id)
+    }
+    pub fn worker_status(&self) -> Vec<Value> {
+        let proofs = self.fleet.status().nodes;
+        let inner = self.inner.lock();
+        inner.workers.iter().map(|(id, w)| {
+            let busy = inner.runs.values()
+                .filter(|r| r.worker.as_deref() == Some(id) && !terminal(r.state()))
+                .map(|r| r.id.clone())
+                .chain(proofs.iter().filter(|n| n.machine == w.report.machine).filter_map(|n| n.busy.clone()))
+                .collect::<Vec<_>>();
+            let apps = w.report.services.iter().map(|s| {
+                if text(s, "proof_app").is_empty() { text(s, "name") } else { text(s, "proof_app") }
+            }).collect::<Vec<_>>();
+            json!({"id":id,"name":id,"backend":"ray-local",
+                "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
+                "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
+                "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
+                "batch_profiles":w.report.profiles.keys().collect::<Vec<_>>(),
+                "heartbeat_age_ms":((now()-w.seen)*1000.0) as u64})
+        }).collect()
+    }
+    pub fn drain_worker(&self, id: &str, draining: bool) -> bool {
+        let mut inner = self.inner.lock();
+        let Some(worker) = inner.workers.get_mut(id) else { return false; };
+        worker.draining = draining;
+        self.fleet.set_machine_drain(&worker.report.machine, draining);
+        true
+    }
+    fn visible(
+        &self,
+        namespace: &str,
+        tag: Option<&str>,
+        principal: Option<&Token>,
+        q: &BTreeMap<String, String>,
+    ) -> bool {
+        if let Some(c) = principal {
+            if c.namespace.as_deref() != Some(namespace) || c.tag.as_deref() != tag {
+                return false;
+            }
+        }
+        if let Some(n) = q.get("namespace") {
+            if self.fleet.namespace(n).is_none_or(|n| n.id != namespace) {
+                return false;
+            }
+        }
+        if let Some(t) = q.get("tag") {
+            if t.as_str() != tag.unwrap_or("") {
+                return false;
+            }
+        }
+        true
+    }
+    fn scope(
+        &self,
+        principal: Option<&Token>,
+        q: &BTreeMap<String, String>,
+        reference: Option<&str>,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        let reference = reference
+            .or_else(|| q.get("namespace").map(String::as_str))
+            .or_else(|| principal.and_then(|p| p.namespace.as_deref()))
+            .ok_or_else(|| fail(400, "namespace: an existing namespace is required"))?;
+        let n = self
+            .fleet
+            .namespace(reference)
+            .ok_or_else(|| fail(404, "unknown namespace"))?;
+        if n.suspended_ms.is_some() {
+            return Err(fail(403, "namespace is suspended"));
+        }
+        let tag = principal
+            .and_then(|p| p.tag.clone())
+            .or_else(|| q.get("tag").filter(|t| !t.is_empty()).cloned());
+        if !self.visible(&n.id, tag.as_deref(), principal, q) {
+            return Err(fail(403, "another namespace or tag cannot be selected"));
+        }
+        if let Some(t) = &tag {
+            Fleet::validate_tag(t)?;
+        }
+        Ok((n.id, tag))
+    }
+    fn require_grant(c: Option<&Token>, name: &str) -> anyhow::Result<()> {
+        if c.is_some_and(|c| {
+            c.apps
+                .as_ref()
+                .is_some_and(|a| !a.iter().any(|a| a == name))
+        }) {
+            return Err(fail(403, "app is not granted"));
+        }
+        Ok(())
+    }
+    fn job(
+        &self,
+        id: &str,
+        c: Option<&Token>,
+        q: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Run> {
+        let r = self
+            .inner
+            .lock()
+            .runs
+            .get(id)
+            .filter(|r| !r.purged)
+            .cloned()
+            .ok_or_else(|| fail(404, "no such batch job"))?;
+        if !self.visible(&r.namespace, r.tag.as_deref(), c, q) {
+            return Err(fail(404, "no such batch job"));
+        }
+        Ok(r)
+    }
+    async fn wait(&self, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+        tokio::time::timeout(Duration::from_secs(1800), async {
+            loop {
+                let notified = self.notify.notified();
+                let results: Option<Vec<Command>> = {
+                    let i = self.inner.lock();
+                    ids.iter()
+                        .map(|id| i.commands.get(id).filter(|c| c.done).cloned())
+                        .collect()
+                };
+                if let Some(results) = results {
+                    return results
+                        .into_iter()
+                        .map(|c| c.error.map_or(Ok(c.result), |e| Err(fail(503, e))))
+                        .collect();
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            fail(
+                503,
+                "node has not confirmed the operation; desired state is retained",
+            )
+        })?
+    }
+    fn app_value(&self, app: &App) -> Value {
+        let resources = app.persistent.then(|| self.app_resources(&app.namespace, &app.name, app.tag.as_deref()));
+        let i = self.inner.lock();
+        let jobs: Vec<_> = i
+            .runs
+            .values()
+            .filter(|r| !r.purged && r.profile == app.name && r.namespace == app.namespace)
+            .collect();
+        let mut v = app.profile.clone();
+        if let Some(resources) = resources {
+            v.as_object_mut().unwrap().extend(resources.as_object().unwrap().clone());
+        }
+        v["tag"] = json!(app.tag);
+        v["last_submitted_at"] = json!(jobs
+            .iter()
+            .filter_map(|r| r.status["submitted_at"].as_f64())
+            .max_by(f64::total_cmp));
+        if app.persistent {
+            v["kind"] = json!("serving");
+            v["max_gpus"] = json!(
+                app.profile["gpus"].as_f64().unwrap_or(0.0)
+                    * app.profile["replicas"].as_f64().unwrap_or(1.0)
+            );
+        }
+
+        for (k, value) in [
+            ("name", json!(app.name)),
+            ("namespace", json!(app.namespace)),
+            ("type", json!(if app.persistent { "app" } else { "batch" })),
+            ("persistent", json!(app.persistent)),
+            ("removed", json!(app.removed)),
+            ("jobs", json!(jobs.len())),
+            (
+                "active",
+                json!(jobs.iter().filter(|r| !terminal(r.state())).count()),
+            ),
+            (
+                "succeeded",
+                json!(jobs.iter().filter(|r| r.state() == "succeeded").count()),
+            ),
+            (
+                "failed",
+                json!(jobs
+                    .iter()
+                    .filter(|r| matches!(r.state(), "failed" | "lost"))
+                    .count()),
+            ),
+            ("workers", json!(app.workers)),
+        ] {
+            v[k] = value;
+        }
+        v
+    }
+    async fn submit(
+        &self,
+        mut request: Value,
+        c: Option<&Token>,
+        q: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Value> {
+        let _ops = self.ops.lock().await;
+        let body = request
+            .as_object_mut()
+            .ok_or_else(|| fail(400, "expected object"))?;
+        let allowed = [
+            "profile",
+            "name",
+            "command",
+            "gpus",
+            "cpus",
+            "gpu_mem",
+            "vram_wait",
+            "machine",
+            "nodes",
+            "after",
+            "retry",
+            "restart_on_oom",
+            "mount",
+            "env",
+            "log",
+            "workdir",
+        ];
+        if body.keys().any(|k| !allowed.contains(&k.as_str())) {
+            return Err(fail(400, "unknown or server-side submission fields"));
+        }
+        for key in [
+            "cpus",
+            "nodes",
+            "gpu_mem",
+            "vram_wait",
+            "retry",
+            "restart_on_oom",
+        ] {
+            if !request[key].is_null() && request[key].as_u64().is_none() {
+                return Err(fail(400, format!("{key}: expected non-negative integer")));
+            }
+        }
+        if !request["gpus"].is_null() && request["gpus"].as_f64().is_none() {
+            return Err(fail(400, "gpus: expected number"));
+        }
+        for key in ["mount", "env", "machine"] {
+            if !request[key].is_null()
+                && !request[key]
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(Value::is_string))
+            {
+                return Err(fail(400, format!("{key}: expected string array")));
+            }
+        }
+        if request["machine"].as_array().is_some_and(|a| a.len() > 1) {
+            return Err(fail(422, "one machine may be selected for a local run"));
+        }
+        for key in ["profile", "name", "after", "log", "workdir"] {
+            if !request[key].is_null() && !request[key].is_string() {
+                return Err(fail(400, format!("{key}: expected string")));
+            }
+        }
+        let name = text(&request, "profile").to_string();
+        Self::require_grant(c, &name)?;
+        let app = self
+            .inner
+            .lock()
+            .apps
+            .get(&name)
+            .filter(|a| !a.removed)
+            .cloned()
+            .ok_or_else(|| fail(404, "unknown batch profile"))?;
+        if app.persistent || app.profile["disabled"].as_bool() == Some(true) {
+            return Err(fail(409, "app does not accept batch jobs"));
+        }
+        let mut selectors = q.clone();
+        selectors
+            .entry("namespace".into())
+            .or_insert(app.namespace.clone());
+        let (namespace, tag) = self.scope(c, &selectors, Some(&app.namespace))?;
+        if !request["command"]
+            .as_array()
+            .is_some_and(|cmd| !cmd.is_empty() && cmd.iter().all(Value::is_string))
+        {
+            return Err(fail(400, "command: a non-empty list of strings"));
+        }
+        let nodes = request["nodes"].as_u64().unwrap_or(1);
+        if nodes != 1 {
+            return Err(fail(
+                422,
+                "cross-machine runs are not supported by local Ray; use one node",
+            ));
+        }
+        let gpus = request["gpus"].as_f64().unwrap_or(1.0);
+        let cpus = request["cpus"].as_u64().unwrap_or(8);
+        if !gpus.is_finite()
+            || gpus < 0.0
+            || cpus < 1
+            || (gpus > 1.0 && gpus.fract() != 0.0)
+            || gpus > app.profile["max_gpus"].as_f64().unwrap_or(8.0)
+        {
+            return Err(fail(
+                400,
+                "invalid GPU/CPU request or profile GPU cap exceeded",
+            ));
+        }
+        let n = self.fleet.namespace(&namespace).unwrap();
+        let tq = n
+            .tag_quotas
+            .get(tag.as_deref().unwrap_or(""))
+            .cloned()
+            .unwrap_or_default();
+        if !n.quota.fits(gpus, cpus as f64) || !tq.fits(gpus, cpus as f64) {
+            return Err(fail(422, "job exceeds namespace/tag quota"));
+        }
+        if let Some(after) = request["after"].as_str() {
+            self.job(after, c, &selectors)?;
+        }
+        let gpu_mem = request["gpu_mem"]
+            .as_u64()
+            .unwrap_or_else(|| app.profile["default_gpu_mem_gb"].as_u64().unwrap_or(0));
+        if gpus > 0.0 && gpus < 1.0 && gpu_mem == 0 {
+            return Err(fail(400, "fractional GPUs require a VRAM limit"));
+        }
+        let mounts = request["mount"].as_array().cloned().unwrap_or_default();
+        let roots = app.profile["allow"].as_array().cloned().unwrap_or_default();
+        if mounts.iter().any(|m| {
+            m.as_str()
+                .is_none_or(|m| !path_allowed(m.split(':').next().unwrap_or(""), &roots))
+        }) {
+            return Err(fail(403, "mount outside app allow roots"));
+        }
+        if c.is_some() && request["log"].is_string() {
+            return Err(fail(403, "users must use job log storage"));
+        }
+        request["gpus"] = json!(gpus);
+        request["cpus"] = json!(cpus);
+        request["gpu_mem"] = json!(gpu_mem);
+        request["nodes"] = json!(1);
+        let base = text(&request, "name");
+        let base = if base.is_empty() { name.as_str() } else { base };
+        let base: String = base
+            .chars()
+            .take(40)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "_-".contains(c) {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let id = format!("{base}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let state = if request["after"].is_string() {
+            "waiting_dependency"
+        } else {
+            "waiting_quota"
+        };
+        let r = Run {
+            id: id.clone(),
+            lease: uuid::Uuid::new_v4().to_string(),
+            owner: c.map_or("admin", |c| c.id.as_str()).into(),
+            namespace,
+            tag,
+            profile: name,
+            policy: app.profile,
+            request,
+            worker: None,
+            status: json!({"id":id,"state":state,"submitted_at":now(),"gpus_requested":gpus,"cpus":cpus,"gpu_mem_gb":gpu_mem,"gpus":[],"nodes":1,"priority":0}),
+            quota_held: false,
+            stop: None,
+            logs_ready: false,
+            purged: false,
+        };
+        self.save("jobs", &id, &r)?;
+        let v = r.value();
+        self.inner.lock().runs.insert(id, r);
+        self.notify.notify_waiters();
+        Ok(v)
+    }
+    async fn report(
+        &self,
+        worker_id: &str,
+        session: &str,
+        report: Report,
+    ) -> anyhow::Result<Vec<String>> {
+        if !is_safe_id(worker_id)
+            || worker_id.len() > 63
+            || session.len() > 80
+            || session.is_empty()
+            || report.version != 1
+        {
+            return Err(fail(400, "invalid worker contract"));
+        }
+        if [
+            report.total_gpus,
+            report.total_cpus,
+            report.free_gpus,
+            report.free_cpus,
+        ]
+        .into_iter()
+        .any(|v| !v.is_finite() || v < 0.0)
+            || report.free_gpus > report.total_gpus + 1e-6
+            || report.free_cpus > report.total_cpus + 1e-6
+        {
+            return Err(fail(400, "invalid capacity"));
+        }
+        let mut report = report;
+        for service in &mut report.services {
+            let reference = service["namespace_ref"]
+                .as_str()
+                .or_else(|| service["namespace"].as_str())
+                .unwrap_or(crate::store::SYSTEM_NAMESPACE)
+                .to_owned();
+            service["namespace_ref"] = json!(reference);
+            if let Some(n) = self.fleet.namespace(&reference) {
+                service["namespace"] = json!(n.id);
+            }
+        }
+        let _ops = self.ops.lock().await;
+        {
+            let mut i = self.inner.lock();
+            if i.workers
+                .get(worker_id)
+                .is_some_and(|w| w.session != session && now() - w.seen < 30.0)
+            {
+                return Err(fail(409, "another agent session is active for this worker"));
+            }
+            let draining = i.workers.get(worker_id).is_some_and(|w| w.draining);
+            i.workers.insert(
+                worker_id.into(),
+                Worker {
+                    session: session.into(),
+                    seen: now(),
+                    report: report.clone(),
+                    draining,
+                },
+            );
+        }
+        for (name, mut profile) in report.profiles.clone().into_iter().chain(
+            report
+                .services
+                .iter()
+                .filter(|s| text(s, "kind") == "app")
+                .map(|s| (text(s, "name").into(), s.clone())),
+        ) {
+            if !is_safe_id(&name) || !profile.is_object() {
+                continue;
+            }
+            let reference = profile["namespace"]
+                .as_str()
+                .unwrap_or(crate::store::SYSTEM_NAMESPACE);
+            let Some(namespace) = self.fleet.namespace(reference) else {
+                continue;
+            };
+            profile["namespace"] = json!(namespace.id);
+            if profile["priority"].is_null() {
+                profile["priority"] = json!(0);
+            }
+            let persistent = text(&profile, "kind") == "app";
+            let mut app = self.inner.lock().apps.get(&name).cloned().unwrap_or(App {
+                name: name.clone(),
+                namespace: namespace.id.clone(),
+                tag: None,
+                profile,
+                persistent,
+                removed: false,
+                workers: HashSet::new(),
+            });
+            if app.namespace != namespace.id {
+                continue;
+            }
+            app.workers.insert(worker_id.into());
+            self.save("apps", &name, &app)?;
+            self.inner.lock().apps.insert(name, app);
+        }
+        for observed in &report.services {
+            let name = text(observed, "name");
+            if !is_safe_id(name)
+                || !matches!(text(observed, "kind"), "app" | "ziren-gpu" | "ziren-cpu")
+            {
+                continue;
+            }
+            let Some(namespace) = self.fleet.namespace(text(observed, "namespace")) else {
+                continue;
+            };
+            let key = format!("{worker_id}-{name}");
+            let existing = { self.inner.lock().services.get(&key).cloned() };
+            let intent = if let Some(intent) = existing {
+                intent
+            } else {
+                let mut service = observed.clone();
+                service["namespace_ref"] = observed["namespace_ref"].clone();
+                service["namespace"] = json!(namespace.id);
+                let intent = ServiceIntent {
+                    worker: worker_id.into(),
+                    service,
+                    disabled: observed["disabled"].as_bool().unwrap_or(false),
+                    scale: None,
+                };
+                self.save("services", &key, &intent)?;
+                self.inner
+                    .lock()
+                    .services
+                    .insert(key.clone(), intent.clone());
+                intent
+            };
+            if text(observed, "kind") == "app" {
+                let id = format!("service:{key}");
+                let replicas = observed["replicas"].as_f64().unwrap_or(1.0);
+                if observed["cleaned"].as_bool() == Some(true) && intent.disabled {
+                    self.fleet.release_run(&namespace.id, &id).await?;
+                } else if observed["ready"].as_bool() == Some(true) {
+                    self.fleet
+                        .reserve_run(
+                            &namespace.id,
+                            observed["tag"].as_str(),
+                            &id,
+                            observed["gpus"].as_f64().unwrap_or(0.0) * replicas,
+                            observed["cpus"].as_f64().unwrap_or(1.0) * replicas,
+                            true,
+                        )
+                        .await?;
+                }
+            }
+            let mismatch = observed["disabled"].as_bool().unwrap_or(false) != intent.disabled
+                || if intent.disabled {
+                    observed["cleaned"].as_bool() != Some(true)
+                } else {
+                    observed["ready"].as_bool() != Some(true)
+                };
+            let pending = {
+                self.inner.lock().commands.values().any(|c| {
+                    !c.done
+                        && c.worker == worker_id
+                        && c.operation == NodeOperation::SetService as i32
+                        && text(&c.parameters["service"], "name") == name
+                })
+            };
+            if !pending && !intent.scale.as_ref().is_some_and(scaling::ScaleState::pending)
+                && !intent.scale.as_ref().is_some_and(scaling::ScaleState::failed)
+                && !scaling::same_resources(observed, &intent.service)
+            {
+                // A node restart or local edit cannot replace the control plane's
+                // desired allocation. Repair drift with the same drain/cleanup fences.
+                let mut repaired = intent.clone();
+                repaired.scale = Some(scaling::ScaleState::new(intent.service.clone(), intent.disabled));
+                self.save("services", &key, &repaired)?;
+                self.inner.lock().services.insert(key.clone(), repaired);
+                continue;
+            }
+            if mismatch && !pending && !intent.scale.as_ref().is_some_and(scaling::ScaleState::pending) {
+                let mut parameters = json!({"service":intent.service,"disabled":intent.disabled});
+                if intent.scale.as_ref().is_some_and(scaling::ScaleState::failed) {
+                    parameters["scale_cleanup"] = json!(true);
+                }
+                self.command(
+                    worker_id,
+                    NodeOperation::SetService,
+                    parameters,
+                )?;
+            }
+        }
+        for incoming in &report.runs {
+            if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
+                continue;
+            }
+            let existing = { self.inner.lock().runs.get(&incoming.id).cloned() };
+            let mut r = if let Some(r) = existing {
+                r
+            } else {
+                let profile = text(&incoming.spec, "profile_name").to_string();
+                let Some(app) = self.inner.lock().apps.get(&profile).cloned() else {
+                    continue;
+                };
+                let mut request = json!({"command":incoming.spec["command"],"gpus":incoming.spec["gpus"],"cpus":incoming.spec["cpus"],"nodes":1});
+                if request["gpus"].is_null() {
+                    request["gpus"] = json!(0);
+                }
+                Run {
+                    id: incoming.id.clone(),
+                    lease: incoming.lease.clone(),
+                    owner: incoming.spec["owner"].as_str().unwrap_or("admin").into(),
+                    namespace: app.namespace,
+                    tag: incoming.spec["tag"].as_str().map(str::to_owned),
+                    profile,
+                    policy: incoming.spec["profile"].clone(),
+                    request,
+                    worker: Some(worker_id.into()),
+                    status: incoming.status.clone(),
+                    quota_held: false,
+                    stop: None,
+                    logs_ready: incoming.logs_ready,
+                    purged: false,
+                }
+            };
+            if r.purged || r.worker.as_deref() != Some(worker_id) || r.lease != incoming.lease {
+                continue;
+            }
+            let accepted = [
+                "queued",
+                "waiting_quota",
+                "waiting_vram",
+                "running",
+                "retrying",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "preempted",
+                "lost",
+            ];
+            if !accepted.contains(&text(&incoming.status, "state")) {
+                continue;
+            }
+            // A reconnect cannot regress terminal state or cancel/preemption intent.
+            if !terminal(r.state()) || r.stop.is_some() {
+                r.status = incoming.status.clone();
+            }
+            r.logs_ready |= incoming.logs_ready;
+            if r.stop.as_deref() == Some("preempt") && terminal(r.state()) {
+                r.stop = None;
+            }
+            if (terminal(r.state()) || r.state() == "preempted") && incoming.cleaned {
+                if r.quota_held {
+                    self.fleet.release_run(&r.namespace, &r.id).await?;
+                    r.quota_held = false;
+                }
+                if r.stop.as_deref() == Some("preempt") {
+                    r.lease = uuid::Uuid::new_v4().to_string();
+                    r.worker = None;
+                    r.logs_ready = false;
+                    r.status["state"] = json!("waiting_quota");
+                    r.status["finished_at"] = Value::Null;
+                    r.stop = None;
+                } else if r.stop.as_deref() == Some("cancel") {
+                    r.status["state"] = json!("cancelled");
+                    r.stop = None;
+                }
+            } else if !r.quota_held
+                && (!incoming.cleaned || !terminal(r.state()) && r.state() != "preempted")
+            {
+                self.fleet
+                    .reserve_run(
+                        &r.namespace,
+                        r.tag.as_deref(),
+                        &r.id,
+                        r.gpus(),
+                        r.cpus(),
+                        true,
+                    )
+                    .await?;
+                r.quota_held = true;
+            }
+            self.save("jobs", &r.id, &r)?;
+            self.inner.lock().runs.insert(r.id.clone(), r);
+        }
+        let mut acknowledged = vec![];
+        for result in &report.results {
+            let Some(mut c) = self.inner.lock().commands.get(&result.id).cloned() else {
+                acknowledged.push(result.id.clone());
+                continue;
+            };
+            if c.worker != worker_id {
+                return Err(fail(403, "command belongs to another worker"));
+            }
+            if !c.done {
+                c.done = true;
+                c.result = result.result.clone();
+                c.error = result.error.clone();
+                if c.operation == NodeOperation::LaunchRun as i32 && c.error.is_some() {
+                    let id = text(&c.parameters, "id");
+                    let run = { self.inner.lock().runs.get(id).cloned() };
+                    if let Some(mut r) = run {
+                        if r.lease == text(&c.parameters, "lease")
+                            && r.worker.as_deref() == Some(worker_id)
+                        {
+                            r.status["state"] = json!("failed");
+                            r.status["error"] = json!(c.error);
+                            r.status["finished_at"] = json!(now());
+                            if c.result["cleaned"].as_bool() == Some(true) && r.quota_held {
+                                self.fleet.release_run(&r.namespace, &r.id).await?;
+                                r.quota_held = false;
+                                r.logs_ready = true;
+                            }
+                            self.save("jobs", &r.id, &r)?;
+                            self.inner.lock().runs.insert(r.id.clone(), r);
+                        }
+                    }
+                }
+                if matches!(
+                    NodeOperation::try_from(c.operation),
+                    Ok(NodeOperation::CancelRun | NodeOperation::PreemptRun)
+                ) && c.error.is_none()
+                    && c.result["cleaned"].as_bool() == Some(true)
+                {
+                    let existing = {
+                        self.inner
+                            .lock()
+                            .runs
+                            .get(text(&c.parameters, "id"))
+                            .cloned()
+                    };
+                    if let Some(mut r) = existing {
+                        if r.lease == text(&c.parameters, "lease")
+                            && r.worker.as_deref() == Some(worker_id)
+                            && r.stop.is_some()
+                        {
+                            if r.quota_held {
+                                self.fleet.release_run(&r.namespace, &r.id).await?;
+                                r.quota_held = false;
+                            }
+                            if r.stop.as_deref() == Some("preempt") {
+                                r.lease = uuid::Uuid::new_v4().to_string();
+                                r.worker = None;
+                                r.status["state"] = json!("waiting_quota");
+                                r.status["finished_at"] = Value::Null;
+                            } else {
+                                r.status["state"] = json!("cancelled");
+                                r.status["finished_at"] = json!(now());
+                            }
+                            r.stop = None;
+                            self.save("jobs", &r.id, &r)?;
+                            self.inner.lock().runs.insert(r.id.clone(), r);
+                        }
+                    }
+                }
+                if c.operation == NodeOperation::SetService as i32 && c.error.is_none() {
+                    let service = &c.parameters["service"];
+                    if text(service, "kind") == "app"
+                        && c.parameters["disabled"].as_bool() == Some(true)
+                        && c.result["cleaned"].as_bool() == Some(true)
+                    {
+                        self.fleet
+                            .release_run(
+                                text(service, "namespace"),
+                                &format!("service:{}-{}", worker_id, text(service, "name")),
+                            )
+                            .await?;
+                    }
+                    if text(service, "kind") == "ziren-gpu"
+                        && c.parameters["disabled"].as_bool() == Some(false)
+                        && c.parameters["scale_id"].is_null()
+                    {
+                        if let Some((tenant, elf)) = text(service, "proof_app").split_once('/') {
+                            self.fleet
+                                .set_app_disabled(text(service, "namespace"), tenant, elf, false)
+                                .await?;
+                        }
+                    }
+                }
+                self.save("commands", &c.id, &c)?;
+                self.inner.lock().commands.insert(c.id.clone(), c);
+            }
+            acknowledged.push(result.id.clone());
+        }
+        self.notify.notify_waiters();
+        Ok(acknowledged)
+    }
+    fn capacity(&self, worker: &str) -> Option<(f64, f64)> {
+        let i = self.inner.lock();
+        let w = i.workers.get(worker)?;
+        if !w.report.ready || w.draining || now() - w.seen > 30.0 {
+            return None;
+        }
+        let pending = i
+            .runs
+            .values()
+            .filter(|r| {
+                r.worker.as_deref() == Some(worker)
+                    && r.quota_held
+                    && !terminal(r.state())
+                    && !w.report.runs.iter().any(|s| {
+                        s.id == r.id
+                            && s.lease == r.lease
+                            && !matches!(text(&s.status, "state"), "queued" | "waiting_quota")
+                    })
+            })
+            .fold((0.0, 0.0), |(g, c), r| (g + r.gpus(), c + r.cpus()));
+        let services = i
+            .commands
+            .values()
+            .filter(|c| {
+                c.worker == worker
+                    && !c.done
+                    && c.admitted
+                    && c.operation == NodeOperation::SetService as i32
+                    && c.parameters["disabled"].as_bool() == Some(false)
+            })
+            .fold((0.0, 0.0), |(g, c), cmd| {
+                let s = &cmd.parameters["service"];
+                let n = s["replicas"].as_f64().unwrap_or(1.0);
+                (
+                    g + s["gpus"].as_f64().unwrap_or(0.0) * n,
+                    c + s["cpus"].as_f64().unwrap_or(1.0) * n,
+                )
+            });
+        Some((
+            (w.report.free_gpus - pending.0 - services.0).max(0.0),
+            (w.report.free_cpus - pending.1 - services.1).max(0.0),
+        ))
+    }
+    fn purge(&self, mut r: Run) -> anyhow::Result<Value> {
+        if !terminal(r.state()) || r.quota_held {
+            return Err(fail(409, "wait for confirmed cleanup before purging"));
+        }
+        r.purged = true;
+        self.save("jobs", &r.id, &r)?;
+        self.inner.lock().runs.insert(r.id.clone(), r.clone());
+        if let Some(worker) = &r.worker {
+            self.command(
+                worker,
+                NodeOperation::PurgeRun,
+                json!({"id":r.id,"lease":r.lease}),
+            )?;
+        }
+        let path = self.dir.join("artifacts").join(&r.id);
+        if path.exists() {
+            fs::remove_dir_all(path)?;
+        }
+        Ok(json!({"id":r.id,"purged":true}))
+    }
+    async fn stop_run(&self, mut r: Run, preempt: bool) -> anyhow::Result<Run> {
+        if terminal(r.state()) && (preempt || !r.quota_held) {
+            return Err(fail(409, "run already finished"));
+        }
+        if let Some(worker) = &r.worker {
+            r.stop = Some(if preempt { "preempt" } else { "cancel" }.into());
+            self.save("jobs", &r.id, &r)?;
+            self.inner.lock().runs.insert(r.id.clone(), r.clone());
+            self.command(
+                worker,
+                if preempt {
+                    NodeOperation::PreemptRun
+                } else {
+                    NodeOperation::CancelRun
+                },
+                json!({"id":r.id,"lease":r.lease}),
+            )?;
+        } else if !preempt {
+            r.status["state"] = json!("cancelled");
+            r.status["finished_at"] = json!(now());
+            r.logs_ready = true;
+            self.save("jobs", &r.id, &r)?;
+            self.inner.lock().runs.insert(r.id.clone(), r.clone());
+        }
+        Ok(r)
+    }
+    async fn preempt_for(
+        &self,
+        namespace: &str,
+        tag: Option<&str>,
+        priority: i32,
+        gpus: f64,
+        cpus: f64,
+        pins: Vec<Option<String>>,
+        exclude: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let (workers, candidates) = {
+            let i = self.inner.lock();
+            let workers = i.workers.keys().cloned().collect::<Vec<_>>();
+            let candidates = i
+                .runs
+                .values()
+                .filter(|r| {
+                    r.quota_held
+                        && r.stop.is_none()
+                        && matches!(r.state(), "running" | "waiting_vram" | "retrying")
+                })
+                .filter_map(|r| {
+                    r.worker.as_ref().map(|w| Candidate {
+                        id: r.id.clone(),
+                        namespace: r.namespace.clone(),
+                        priority: r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                        node_ip: w.clone(),
+                        gpus: r.gpus(),
+                        cpus: r.cpus(),
+                        started_at: r.status["started_at"].as_f64(),
+                        preemptible: r.policy["preemptible"].as_bool().unwrap_or(true),
+                        min_runtime_s: r.policy["min_runtime_s"].as_u64().unwrap_or(300),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (workers, candidates)
+        };
+        let free = workers
+            .into_iter()
+            .filter_map(|w| {
+                self.capacity(&w).map(|(gpus, cpus)| Capacity {
+                    node_ip: w,
+                    gpus,
+                    cpus,
+                })
+            })
+            .collect();
+        let plan = self.fleet.plan_preemption(PreemptionRequest {
+            contract_version: 1,
+            namespace: namespace.into(),
+            tag: tag.map(str::to_owned),
+            priority,
+            gpus,
+            cpus,
+            nodes: 1,
+            pins,
+            now: now(),
+            free,
+            candidates,
+            quota_demand: Some((gpus, cpus)),
+            exclude_allocation: exclude,
+        })?;
+        if !plan.possible || plan.runs.is_empty() {
+            return Ok(false);
+        }
+        for id in plan.runs {
+            let r = { self.inner.lock().runs.get(&id).cloned() };
+            if let Some(r) = r {
+                self.stop_run(r, true).await?;
+            }
+        }
+        Ok(true)
+    }
+    async fn dispatch(&self) -> anyhow::Result<()> {
+        let _ops = self.ops.lock().await;
+        self.advance_scales().await?;
+        let held = {
+            self.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| r.quota_held)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for r in held {
+            self.fleet
+                .reserve_run(
+                    &r.namespace,
+                    r.tag.as_deref(),
+                    &r.id,
+                    r.gpus(),
+                    r.cpus(),
+                    true,
+                )
+                .await?;
+        }
+        let stopping = {
+            self.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| r.stop.is_some() && r.worker.is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for r in stopping {
+            let operation = if r.stop.as_deref() == Some("preempt") {
+                NodeOperation::PreemptRun
+            } else {
+                NodeOperation::CancelRun
+            };
+            let parameters = json!({"id":r.id,"lease":r.lease});
+            let recorded = {
+                self.inner.lock().commands.values().any(|c| {
+                    c.worker == *r.worker.as_ref().unwrap()
+                        && c.operation == operation as i32
+                        && c.parameters == parameters
+                })
+            };
+            if !recorded {
+                self.command(r.worker.as_deref().unwrap(), operation, parameters)?;
+            }
+        }
+        let services = {
+            self.inner
+                .lock()
+                .commands
+                .values()
+                .filter(|c| {
+                    !c.done && !c.admitted && c.operation == NodeOperation::SetService as i32
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for mut c in services {
+            let s = &c.parameters["service"];
+            let disabled = c.parameters["disabled"].as_bool() == Some(true);
+            if disabled && text(s, "kind") == "ziren-gpu" {
+                let names = (0..s["replicas"].as_u64().unwrap_or(1))
+                    .map(|n| format!("{}-{n}", text(s, "name")))
+                    .collect::<HashSet<_>>();
+                if self
+                    .fleet
+                    .status()
+                    .nodes
+                    .iter()
+                    .any(|n| names.contains(&n.name) && n.busy.is_some())
+                {
+                    continue;
+                }
+            }
+            if disabled && text(s, "kind") == "ziren-gpu" {
+                if let Some((tenant, elf)) = text(s, "proof_app").split_once('/') {
+                    let jobs = self
+                        .fleet
+                        .recent_jobs(
+                            &crate::store::JobFilter {
+                                namespace: Some(text(s, "namespace").into()),
+                                tenant: Some(tenant.into()),
+                                elf: Some(elf.into()),
+                                active: true,
+                                ..Default::default()
+                            },
+                            usize::MAX,
+                        )
+                        .await?;
+                    if jobs
+                        .iter()
+                        .any(|j| j.node.is_some() && j.started_ms.is_some())
+                    {
+                        continue;
+                    }
+                }
+            }
+            if !disabled {
+                let already_ready = {
+                    let i = self.inner.lock();
+                    i.workers.get(&c.worker).is_some_and(|w| {
+                        w.report.services.iter().any(|v| {
+                            text(v, "name") == text(s, "name") && v["ready"].as_bool() == Some(true)
+                                && v["disabled"].as_bool() != Some(true)
+                                && scaling::same_resources(v, s)
+                        })
+                    })
+                };
+                let n = s["replicas"].as_f64().unwrap_or(1.0);
+                let g = s["gpus"].as_f64().unwrap_or(0.0) * n;
+                let cpu = s["cpus"].as_f64().unwrap_or(1.0) * n;
+                let fits = already_ready
+                    || self
+                        .capacity(&c.worker)
+                        .is_some_and(|(fg, fc)| fg + 1e-6 >= g && fc + 1e-6 >= cpu);
+                if !fits {
+                    self.preempt_for(
+                        text(s, "namespace"),
+                        s["tag"].as_str(),
+                        s["priority"].as_i64().unwrap_or(0) as i32,
+                        g,
+                        cpu,
+                        vec![Some(c.worker.clone())],
+                        None,
+                    )
+                    .await?;
+                    continue;
+                }
+                if text(s, "kind") == "app"
+                    && self
+                        .fleet
+                        .reserve_run(
+                            text(s, "namespace"),
+                            s["tag"].as_str(),
+                            &format!("service:{}-{}", c.worker, text(s, "name")),
+                            g,
+                            cpu,
+                            false,
+                        )
+                        .await
+                        .is_err()
+                {
+                    continue;
+                }
+            }
+            c.admitted = true;
+            self.save("commands", &c.id, &c)?;
+            self.inner.lock().commands.insert(c.id.clone(), c);
+        }
+        let mut jobs = {
+            self.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| {
+                    r.worker.is_none()
+                        && matches!(r.state(), "waiting_quota" | "waiting_dependency")
+                        && r.stop.is_none()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        jobs.sort_by(|a, b| {
+            b.policy["priority"]
+                .as_i64()
+                .unwrap_or(0)
+                .cmp(&a.policy["priority"].as_i64().unwrap_or(0))
+                .then(
+                    a.status["submitted_at"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        .total_cmp(&b.status["submitted_at"].as_f64().unwrap_or(0.0)),
+                )
+                .then(a.id.cmp(&b.id))
+        });
+        for mut r in jobs {
+            let namespace = self
+                .fleet
+                .namespace(&r.namespace)
+                .ok_or_else(|| fail(404, "job namespace disappeared"))?;
+            let tag_quota = namespace
+                .tag_quotas
+                .get(r.tag.as_deref().unwrap_or(""))
+                .cloned()
+                .unwrap_or_default();
+            if !namespace.quota.fits(r.gpus(), r.cpus()) || !tag_quota.fits(r.gpus(), r.cpus()) {
+                r.status["state"] = json!("failed");
+                r.status["error"] = json!("job exceeds current namespace/tag quota");
+                r.status["finished_at"] = json!(now());
+                self.save("jobs", &r.id, &r)?;
+                self.inner.lock().runs.insert(r.id.clone(), r);
+                continue;
+            }
+            if let Some(after) = r.request["after"].as_str() {
+                let state = self
+                    .inner
+                    .lock()
+                    .runs
+                    .get(after)
+                    .map(|r| r.state().to_owned());
+                if state.as_deref() != Some("succeeded") {
+                    if state.as_deref().is_some_and(terminal) {
+                        r.status["state"] = json!("failed");
+                        r.status["error"] = json!("dependency did not succeed");
+                        r.status["finished_at"] = json!(now());
+                        self.save("jobs", &r.id, &r)?;
+                        self.inner.lock().runs.insert(r.id.clone(), r);
+                    }
+                    continue;
+                }
+            }
+            let allowed = {
+                let i = self.inner.lock();
+                let app = i.apps.get(&r.profile);
+                i.workers
+                    .iter()
+                    .filter(|(id, w)| {
+                        let pin = r.request["machine"]
+                            .as_array()
+                            .and_then(|m| m.first())
+                            .and_then(Value::as_str);
+                        let app_ok =
+                            app.is_none_or(|a| a.workers.is_empty() || a.workers.contains(*id));
+                        app_ok && pin.is_none_or(|p| p == id.as_str() || p == w.report.machine)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>()
+            };
+            if allowed.is_empty() {
+                continue;
+            }
+            let worker = allowed
+                .iter()
+                .find(|w| {
+                    self.capacity(w)
+                        .is_some_and(|(g, c)| g + 1e-6 >= r.gpus() && c + 1e-6 >= r.cpus())
+                })
+                .cloned();
+            let Some(worker) = worker else {
+                self.preempt_for(
+                    &r.namespace,
+                    r.tag.as_deref(),
+                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.gpus(),
+                    r.cpus(),
+                    allowed.into_iter().map(Some).take(1).collect(),
+                    Some(format!("run:{}", r.id)),
+                )
+                .await?;
+                continue;
+            };
+            r.quota_held = true;
+            r.worker = Some(worker.clone());
+            r.status["state"] = json!("queued");
+            r.status["detail"] = json!("assigned; awaiting node acknowledgement");
+            self.save("jobs", &r.id, &r)?;
+            if self
+                .fleet
+                .reserve_run(
+                    &r.namespace,
+                    r.tag.as_deref(),
+                    &r.id,
+                    r.gpus(),
+                    r.cpus(),
+                    false,
+                )
+                .await
+                .is_err()
+            {
+                r.quota_held = false;
+                r.worker = None;
+                r.status["state"] = json!("waiting_quota");
+                self.save("jobs", &r.id, &r)?;
+                self.inner.lock().runs.insert(r.id.clone(), r.clone());
+                self.preempt_for(
+                    &r.namespace,
+                    r.tag.as_deref(),
+                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.gpus(),
+                    r.cpus(),
+                    vec![Some(worker)],
+                    Some(format!("run:{}", r.id)),
+                )
+                .await?;
+                continue;
+            }
+            self.inner.lock().runs.insert(r.id.clone(), r.clone());
+            self.command(&worker,NodeOperation::LaunchRun,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+        }
+        // A durable assigned job whose process died before command persistence still
+        // receives the same lease. Uncertain execution is never moved to another node.
+        let assigned = {
+            self.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| r.worker.is_some() && r.state() == "queued" && r.stop.is_none())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for r in assigned {
+            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchRun,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+        }
+        Ok(())
+    }
+    pub async fn run_dispatcher(self: Arc<Self>) -> anyhow::Result<()> {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Err(e) = self.dispatch().await {
+                tracing::error!(error=%e,"run dispatch retained durable intents");
+            }
+        }
+    }
+}
+
+pub struct WorkerApi(pub Arc<RunControl>);
+#[tonic::async_trait]
+impl WorkerService for WorkerApi {
+    async fn heartbeat(
+        &self,
+        request: tonic::Request<WorkerHeartbeatRequest>,
+    ) -> Result<tonic::Response<WorkerHeartbeatResponse>, tonic::Status> {
+        let r = request.into_inner();
+        let report: Report = serde_json::from_slice(&r.report_json)
+            .map_err(|_| tonic::Status::invalid_argument("invalid worker report"))?;
+        let machine = report.machine.clone();
+        let reported = report
+            .runs
+            .iter()
+            .filter(|r| r.cleaned && r.logs_ready && terminal(text(&r.status, "state")))
+            .map(|r| (r.id.clone(), r.lease.clone()))
+            .collect::<Vec<_>>();
+        let ack = self
+            .0
+            .report(&r.worker_id, &r.session, report)
+            .await
+            .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
+        let r_worker = r.worker_id.clone();
+        let commands = self
+            .0
+            .inner
+            .lock()
+            .commands
+            .values()
+            .filter(|c| c.worker == r.worker_id && !c.done && c.admitted)
+            .take(16)
+            .map(|c| NodeCommand {
+                id: c.id.clone(),
+                operation: c.operation,
+                parameters_json: serde_json::to_vec(&c.parameters).unwrap(),
+            })
+            .collect();
+        Ok(tonic::Response::new(WorkerHeartbeatResponse {
+            proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready),
+            heartbeat_secs: 2,
+            commands,
+            acknowledged_results: ack,
+            acknowledged_runs: reported
+                .into_iter()
+                .filter(|(id, lease)| {
+                    self.0.inner.lock().runs.get(id).is_some_and(|r| {
+                        !r.purged
+                            && r.lease == *lease
+                            && r.worker.as_deref() == Some(r_worker.as_str())
+                            && terminal(r.state())
+                            && r.logs_ready
+                            && !r.quota_held
+                    })
+                })
+                .map(|(id, lease)| format!("{id}/{lease}"))
+                .collect(),
+        }))
+    }
+}
+fn load<T: serde::de::DeserializeOwned>(dir: &Path) -> anyhow::Result<Vec<T>> {
+    fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|e| e == "json"))
+        .map(|e| Ok(serde_json::from_slice(&fs::read(e.path())?)?))
+        .collect()
+}
+fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::create_dir_all(path.parent().unwrap())?;
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    fs::rename(&tmp, path)?;
+    fs::File::open(path.parent().unwrap())?.sync_all()?;
+    Ok(())
+}
+fn path_allowed(path: &str, roots: &[Value]) -> bool {
+    path.starts_with('/')
+        && !path.split('/').any(|p| p == "..")
+        && roots.iter().filter_map(Value::as_str).any(|r| {
+            r != "/"
+                && (path == r.trim_end_matches('/')
+                    || path.starts_with(&format!("{}/", r.trim_end_matches('/'))))
+        })
+}
+
+pub fn router(control: Arc<RunControl>) -> Router {
+    let mut router = Router::new();
+    for root in ["apps", "batch-profiles", "batches", "proof-apps", "internal/runs"] {
+        router = router
+            .route(&format!("/{root}"), any(handle))
+            .route(&format!("/{root}/*path"), any(handle));
+    }
+    router.with_state(control)
+}
+async fn handle(State(s): State<Arc<RunControl>>, request: Request) -> Response {
+    match handle_result(s, request).await {
+        Ok(r) => r,
+        Err(e) => response_error(e),
+    }
+}
+async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<Response> {
+    let uri = request.uri().clone();
+    let method = request.method().clone();
+    let q: BTreeMap<String, String> = reqwest::Url::parse(&format!("http://localhost{uri}"))?
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if q.contains_key("group") {
+        return Err(fail(400, "use optional tag; groups are not a resource"));
+    }
+    let mut parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
+    let batch_profile = parts.first() == Some(&"batch-profiles");
+    if batch_profile { parts[0] = "apps"; }
+    let bearer = request
+        .headers()
+        .get(token::HEADER)
+        .and_then(|v| v.to_str().ok());
+    if parts.first() == Some(&"internal") {
+        return internal_logs(s, request, &parts, &q).await;
+    }
+    let principal = if token::bearer_matches(bearer, &s.admin) {
+        None
+    } else {
+        Some(
+            s.fleet
+                .token_for_token(bearer)
+                .ok_or_else(|| fail(401, "missing or wrong token"))?,
+        )
+    };
+    let c = principal.as_ref();
+    // Scope selectors never widen a token's namespace or tag.
+    if let Some(c) = c {
+        s.scope(Some(c), &q, None)?;
+    }
+    if batch_profile && parts.len() == 3 && parts[2] == "scale" {
+        return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus"));
+    }
+    if parts == ["proof-apps", "scale"]
+        || (parts.len() == 3 && parts[0] == "apps" && parts[2] == "scale")
+    {
+        if c.is_some() { return Err(fail(403, "administrator required")); }
+        let (namespace, _) = s.scope(None, &q, None)?;
+        let app = if parts[0] == "proof-apps" {
+            let tenant = q.get("tenant").ok_or_else(|| fail(400, "tenant required"))?;
+            let elf = q.get("elf_id").ok_or_else(|| fail(400, "elf_id required"))?;
+            if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown proof app")); }
+            format!("{tenant}/{elf}")
+        } else {
+            let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace)
+                .cloned().ok_or_else(|| fail(404, "unknown app"))?;
+            if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus")); }
+            app.name
+        };
+        if method == Method::GET {
+            return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str))?).into_response());
+        }
+        if method == Method::PUT {
+            let body = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
+            return Ok((StatusCode::ACCEPTED, Json(s.request_scale(&namespace, &app, body).await?)).into_response());
+        }
+        return Err(fail(405, "GET or PUT required"));
+    }
+    if method == Method::GET && parts == ["apps"] {
+        let apps = {
+            s.inner
+                .lock()
+                .apps
+                .values()
+                .filter(|a| {
+                    !a.removed
+                        && a.persistent != batch_profile
+                        && s.visible(&a.namespace, c.and_then(|c| c.tag.as_deref()), c, &q)
+                        && a.tag
+                            .as_deref()
+                            .is_none_or(|tag| c.is_none_or(|c| c.tag.as_deref() == Some(tag)))
+                        && RunControl::require_grant(c, &a.name).is_ok()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        return Ok(Json(apps.iter().map(|a| s.app_value(a)).collect::<Vec<_>>()).into_response());
+    }
+    if method == Method::POST && parts == ["apps"] {
+        if !batch_profile {
+            return Err(fail(400, "configure serving deployments in services.yaml; finite profiles use POST /batch-profiles"));
+        }
+        if c.is_some_and(|c| !c.manage_apps) {
+            return Err(fail(403, "app management grant required"));
+        }
+        let mut body: Value =
+            serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+        let name = text(&body, "name").to_string();
+        if !is_safe_id(&name) || name.len() > 63 {
+            return Err(fail(400, "invalid app name"));
+        }
+        let (namespace, tag) = s.scope(c, &q, body["namespace"].as_str())?;
+        if !body["image"].is_string() {
+            return Err(fail(400, "image is required"));
+        }
+        if c.is_some()
+            && (body["allow"].as_array().is_some_and(|a| !a.is_empty())
+                || body["priority"].as_i64().is_some_and(|p| p != 0))
+        {
+            return Err(fail(
+                403,
+                "host mount roots and app priority require an administrator",
+            ));
+        }
+        let allowed = [
+            "name",
+            "namespace",
+            "image",
+            "user",
+            "max_gpus",
+            "default_gpu_mem_gb",
+            "shm_gb",
+            "allow",
+            "env",
+            "disabled",
+            "preemptible",
+            "min_runtime_s",
+            "stop_timeout_s",
+            "priority",
+        ];
+        if body
+            .as_object()
+            .is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
+        {
+            return Err(fail(400, "unknown app fields"));
+        }
+        for (key, default) in [
+            ("max_gpus", json!(8)),
+            ("default_gpu_mem_gb", json!(0)),
+            ("shm_gb", json!(16)),
+            ("priority", json!(0)),
+            ("allow", json!([])),
+            ("env", json!({})),
+            ("disabled", json!(false)),
+            ("preemptible", json!(true)),
+            ("min_runtime_s", json!(300)),
+            ("stop_timeout_s", json!(30)),
+        ] {
+            if body[key].is_null() {
+                body[key] = default;
+            }
+        }
+        if body["priority"]
+            .as_i64()
+            .is_none_or(|p| i32::try_from(p).is_err())
+            || body["max_gpus"].as_u64().is_none()
+            || !body["allow"].is_array()
+            || !body["env"].is_object()
+        {
+            return Err(fail(400, "invalid app policy"));
+        }
+        if ["disabled", "preemptible"]
+            .into_iter()
+            .any(|k| !body[k].is_boolean())
+            || [
+                "default_gpu_mem_gb",
+                "shm_gb",
+                "min_runtime_s",
+                "stop_timeout_s",
+            ]
+            .into_iter()
+            .any(|k| body[k].as_u64().is_none())
+            || body["env"]
+                .as_object()
+                .is_none_or(|v| v.values().any(|v| !v.is_string()))
+            || body["allow"].as_array().is_none_or(|v| {
+                v.iter().any(|v| {
+                    v.as_str().is_none_or(|p| {
+                        !p.starts_with('/') || p == "/" || p.split('/').any(|s| s == "..")
+                    })
+                })
+            })
+            || !body["user"].is_null() && !body["user"].is_string()
+            || text(&body, "image").is_empty()
+        {
+            return Err(fail(400, "invalid app policy fields"));
+        }
+        body["namespace"] = json!(namespace);
+        body.as_object_mut().unwrap().remove("name");
+        let _ops = s.ops.lock().await;
+        if s.inner.lock().apps.get(&name).is_some_and(|a| !a.removed) {
+            return Err(fail(409, "app exists"));
+        }
+        let app = App {
+            name: name.clone(),
+            namespace,
+            tag,
+            profile: body,
+            persistent: false,
+            removed: false,
+            workers: HashSet::new(),
+        };
+        s.save("apps", &name, &app)?;
+        s.inner.lock().apps.insert(name, app.clone());
+        return Ok((StatusCode::CREATED, Json(s.app_value(&app))).into_response());
+    }
+    if parts.first() == Some(&"apps") && parts.len() >= 2 {
+        let name = parts[1];
+        let mut app = s
+            .inner
+            .lock()
+            .apps
+            .get(name)
+            .filter(|a| !a.removed && a.persistent != batch_profile)
+            .cloned()
+            .ok_or_else(|| fail(404, "unknown app"))?;
+        RunControl::require_grant(c, name)?;
+        if !s.visible(&app.namespace, c.and_then(|c| c.tag.as_deref()), c, &q)
+            || app
+                .tag
+                .as_deref()
+                .is_some_and(|tag| c.is_some_and(|c| c.tag.as_deref() != Some(tag)))
+        {
+            return Err(fail(404, "unknown app"));
+        }
+        if method == Method::GET && parts.len() == 2 {
+            return Ok(Json(s.app_value(&app)).into_response());
+        }
+        if method == Method::DELETE && parts.len() == 2 {
+            if c.is_some_and(|c| !c.manage_apps) {
+                return Err(fail(403, "app management grant required"));
+            }
+            let _ops = s.ops.lock().await;
+            s.ensure_not_scaling(&app.namespace, name)?;
+            let persistent_ready_to_remove = !app.persistent
+                || (app.profile["disabled"].as_bool() == Some(true)
+                    && app.workers.iter().all(|id| {
+                        s.inner.lock().workers.get(id).is_some_and(|w| {
+                            now() - w.seen < 30.0
+                                && w.report.services.iter().any(|v| {
+                                    text(v, "name") == name && v["cleaned"].as_bool() == Some(true)
+                                })
+                        })
+                    }));
+            if !persistent_ready_to_remove
+                || s.inner
+                    .lock()
+                    .runs
+                    .values()
+                    .any(|r| r.profile == name && (!terminal(r.state()) || r.quota_held))
+            {
+                return Err(fail(
+                    409,
+                    "disable persistent services or finish/cancel jobs before deleting",
+                ));
+            }
+            app.removed = true;
+            s.save("apps", name, &app)?;
+            s.inner.lock().apps.insert(name.into(), app);
+            return Ok(Json(json!({"name":name,"removed":true})).into_response());
+        }
+        if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {
+            if c.is_some() {
+                return Err(fail(403, "administrator required"));
+            }
+            let body: Value =
+                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            let p = body["priority"]
+                .as_i64()
+                .filter(|p| i32::try_from(*p).is_ok())
+                .ok_or_else(|| fail(400, "priority must be a signed 32-bit integer"))?;
+            let _ops = s.ops.lock().await;
+            app = s
+                .inner
+                .lock()
+                .apps
+                .get(name)
+                .filter(|a| !a.removed && a.persistent != batch_profile)
+                .cloned()
+                .ok_or_else(|| fail(404, "unknown app"))?;
+            app.profile["priority"] = json!(p);
+            s.save("apps", name, &app)?;
+            s.inner.lock().apps.insert(name.into(), app.clone());
+            return Ok(Json(s.app_value(&app)).into_response());
+        }
+        if parts.len() == 3
+            && parts[2] == "disabled"
+            && matches!(method, Method::PUT | Method::DELETE)
+        {
+            if c.is_some() {
+                return Err(fail(403, "administrator required"));
+            }
+            let disabled = method == Method::PUT;
+            let ids = {
+                let _ops = s.ops.lock().await;
+                app = s
+                    .inner
+                    .lock()
+                    .apps
+                    .get(name)
+                    .filter(|a| !a.removed && a.persistent != batch_profile)
+                    .cloned()
+                    .ok_or_else(|| fail(404, "unknown app"))?;
+                s.ensure_not_scaling(&app.namespace, name)?;
+                app.profile["disabled"] = json!(disabled);
+                s.save("apps", name, &app)?;
+                s.inner.lock().apps.insert(name.into(), app.clone());
+                if app.persistent {
+                    let services = {
+                        let i = s.inner.lock();
+                        i.workers
+                            .iter()
+                            .flat_map(|(w, r)| {
+                                r.report
+                                    .services
+                                    .iter()
+                                    .filter(|svc| text(svc, "name") == name)
+                                    .map(|svc| {
+                                        let mut svc = svc.clone();
+                                        svc["priority"] = app.profile["priority"].clone();
+                                        (w.clone(), svc)
+                                    })
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    services
+                        .into_iter()
+                        .map(|(w, svc)| {
+                            s.command(
+                                &w,
+                                NodeOperation::SetService,
+                                json!({"service":svc,"disabled":disabled}),
+                            )
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                } else {
+                    vec![]
+                }
+            };
+            if !ids.is_empty() {
+                s.wait(&ids).await?;
+            }
+            return Ok(Json(s.app_value(&app)).into_response());
+        }
+    }
+    if method == Method::GET && parts == ["batches"] {
+        let limit = q
+            .get("limit")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(50)
+            .min(10000);
+        let active = q.get("active").is_some_and(|a| a == "1" || a == "true");
+        let mut jobs = {
+            s.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| {
+                    !r.purged
+                        && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
+                        && q.get("profile").is_none_or(|p| p == &r.profile)
+                        && (!active || !terminal(r.state()))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        jobs.sort_by(|a, b| {
+            b.status["submitted_at"]
+                .as_f64()
+                .unwrap_or(0.0)
+                .total_cmp(&a.status["submitted_at"].as_f64().unwrap_or(0.0))
+        });
+        return Ok(Json(
+            jobs.into_iter()
+                .take(limit)
+                .map(|r| r.value())
+                .collect::<Vec<_>>(),
+        )
+        .into_response());
+    }
+    if method == Method::DELETE && parts == ["batches"] {
+        let days = q
+            .get("older_than")
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .ok_or_else(|| fail(400, "older_than must be non-negative days"))?;
+        let _ops = s.ops.lock().await;
+        let jobs = {
+            s.inner
+                .lock()
+                .runs
+                .values()
+                .filter(|r| {
+                    !r.purged
+                        && terminal(r.state())
+                        && !r.quota_held
+                        && r.status["finished_at"]
+                            .as_f64()
+                            .is_some_and(|v| v < now() - days * 86400.0)
+                        && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        return Ok(Json(
+            jobs.into_iter()
+                .map(|r| s.purge(r))
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        )
+        .into_response());
+    }
+    if method == Method::POST && parts == ["batches"] {
+        let body = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+        return Ok((StatusCode::CREATED, Json(s.submit(body, c, &q).await?)).into_response());
+    }
+    if parts.first() == Some(&"batches") && parts.len() >= 2 {
+        let r = s.job(parts[1], c, &q)?;
+        if method == Method::GET && parts.len() == 2 {
+            return Ok(Json(r.value()).into_response());
+        }
+        if method == Method::POST && parts.len() == 3 && matches!(parts[2], "cancel" | "preempt") {
+            let preempt = parts[2] == "preempt";
+            if preempt && c.is_some() {
+                return Err(fail(403, "administrator required"));
+            }
+            let _ops = s.ops.lock().await;
+            let r = s.job(parts[1], c, &q)?;
+            return Ok(Json(s.stop_run(r, preempt).await?.value()).into_response());
+        }
+        if method == Method::DELETE && parts.len() == 2 {
+            let _ops = s.ops.lock().await;
+            let r = s.job(parts[1], c, &q)?;
+            return Ok(Json(vec![s.purge(r)?]).into_response());
+        }
+        if method == Method::GET && parts.len() == 3 && parts[2] == "logs" {
+            return log_response(&s, &r, &q).await;
+        }
+    }
+    if parts.first() == Some(&"proof-apps") && parts.len() == 2 {
+        if c.is_some_and(|c| !c.manage_apps) {
+            return Err(fail(403, "app management grant required"));
+        }
+        let (namespace, _) = s.scope(c, &q, None)?;
+        let tenant = q
+            .get("tenant")
+            .ok_or_else(|| fail(400, "tenant required"))?;
+        let elf = q
+            .get("elf_id")
+            .ok_or_else(|| fail(400, "elf_id required"))?;
+        if c.is_some_and(|c| c.tenant != *tenant) {
+            return Err(fail(403, "another tenant cannot be selected"));
+        }
+        let key = format!("{tenant}/{elf}");
+        let services = {
+            let i = s.inner.lock();
+            i.workers
+                .iter()
+                .flat_map(|(w, r)| {
+                    r.report
+                        .services
+                        .iter()
+                        .filter(|svc| {
+                            text(svc, "proof_app") == key && text(svc, "namespace") == namespace
+                        })
+                        .map(|svc| (w.clone(), svc.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        if services.is_empty() {
+            return Err(fail(404, "no dedicated proof service configured"));
+        }
+        if method == Method::GET && parts[1] == "available" {
+            return Ok(Json(json!({"namespace":namespace,"tenant":tenant,"elf_id":elf,"servers":services.iter().map(|(_,s)|text(s,"name")).collect::<Vec<_>>()})).into_response());
+        }
+        if parts[1] == "disabled" && matches!(method, Method::PUT | Method::DELETE) {
+            if c.is_some() {
+                return Err(fail(403, "administrator required"));
+            }
+            let disabled = method == Method::PUT;
+            let ids = {
+                let _ops = s.ops.lock().await;
+                s.ensure_not_scaling(&namespace, &key)?;
+                s.fleet
+                    .set_app_disabled(&namespace, tenant, elf, true)
+                    .await?;
+                services
+                    .into_iter()
+                    .map(|(w, mut svc)| {
+                        svc["namespace"] = json!(namespace);
+                        s.command(
+                            &w,
+                            NodeOperation::SetService,
+                            json!({"service":svc,"disabled":disabled}),
+                        )
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            };
+            s.wait(&ids).await?;
+            return Ok(Json(
+                json!({"namespace":namespace,"app":key,"disabled":disabled,"servers":ids}),
+            )
+            .into_response());
+        }
+    }
+    Err(fail(404, "unknown workload API operation"))
+}
+async fn log_response(
+    s: &RunControl,
+    r: &Run,
+    q: &BTreeMap<String, String>,
+) -> anyhow::Result<Response> {
+    if q.get("rank").is_some_and(|rank| rank != "0") {
+        return Err(fail(400, "batch logs are local to one machine; only rank 0 exists"));
+    }
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let path = s
+        .dir
+        .join("artifacts")
+        .join(&r.id)
+        .join(&r.lease)
+        .join("logs");
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(
+                Json(json!({"data":"","offset":0,"done":terminal(r.state())&&r.logs_ready}))
+                    .into_response(),
+            )
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let length = file.metadata().await?.len();
+    let tail = q.get("offset").is_none();
+    let offset = q
+        .get("offset")
+        .and_then(|o| o.parse::<u64>().ok())
+        .unwrap_or(length.saturating_sub(256 << 10))
+        .min(length);
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    let mut bytes = vec![];
+    file.take(1 << 20).read_to_end(&mut bytes).await?;
+    let end = offset + bytes.len() as u64;
+    let mut data = String::from_utf8_lossy(&bytes).into_owned();
+    if tail {
+        let lines = q
+            .get("lines")
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(50)
+            .min(10000);
+        let chunks = data.lines().collect::<Vec<_>>();
+        data = chunks[chunks.len().saturating_sub(lines)..].join("\n");
+        if !data.is_empty() {
+            data.push('\n');
+        }
+    }
+    Ok(Json(
+        json!({"data":data,"offset":end,"done":terminal(r.state())&&r.logs_ready&&end==length}),
+    )
+    .into_response())
+}
+async fn internal_logs(
+    s: Arc<RunControl>,
+    request: Request,
+    parts: &[&str],
+    q: &BTreeMap<String, String>,
+) -> anyhow::Result<Response> {
+    if !token::bearer_matches(
+        request
+            .headers()
+            .get(token::HEADER)
+            .and_then(|v| v.to_str().ok()),
+        &s.cluster,
+    ) {
+        return Err(fail(401, "internal token required"));
+    }
+    if parts.len() != 4 || parts[1] != "runs" {
+        return Err(fail(404, "unknown artifact"));
+    }
+    let id = parts[2];
+    let name = parts[3];
+    let r = s
+        .inner
+        .lock()
+        .runs
+        .get(id)
+        .cloned()
+        .ok_or_else(|| fail(404, "unknown run"))?;
+    if request
+        .headers()
+        .get("x-fleet-worker")
+        .and_then(|v| v.to_str().ok())
+        != r.worker.as_deref()
+        || request
+            .headers()
+            .get("x-fleet-lease")
+            .and_then(|v| v.to_str().ok())
+            != Some(r.lease.as_str())
+    {
+        return Err(fail(409, "stale or wrong execution lease"));
+    }
+    if !matches!(name, "logs" | "logs-offset") {
+        return Err(fail(404, "unknown log operation"));
+    }
+    let path = s.dir.join("artifacts").join(id).join(&r.lease).join("logs");
+    if request.method() == Method::GET && name == "logs-offset" {
+        return Ok(Json(
+            json!({"offset":tokio::fs::metadata(path).await.map(|m|m.len()).unwrap_or(0)}),
+        )
+        .into_response());
+    }
+    if request.method() != Method::PUT {
+        return Err(fail(405, "PUT required"));
+    }
+    if name == "logs" {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+        let _ops = s.ops.lock().await;
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        let offset = q
+            .get("offset")
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| fail(400, "offset required"))?;
+        let bytes = to_bytes(request.into_body(), 1 << 20).await?;
+        let length = file.metadata().await?.len();
+        if offset > length {
+            return Err(fail(409, "log offset mismatch"));
+        }
+        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        if offset < length {
+            let mut existing = vec![0; bytes.len()];
+            file.read_exact(&mut existing).await?;
+            if existing != bytes {
+                return Err(fail(409, "log contents conflict"));
+            }
+        } else {
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+        }
+        return Ok(Json(json!({"offset":offset+bytes.len() as u64})).into_response());
+    }
+    Err(fail(405, "unsupported log operation"))
+}
+
+#[cfg(test)]
+#[path = "runs_api_tests.rs"]
+mod tests;
+
+#[path = "runs_api_scale.rs"]
+mod scaling;
+
+#[path = "runs_api_views.rs"]
+mod views;

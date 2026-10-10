@@ -23,8 +23,8 @@ pub struct Config {
     pub database_url_file: Option<PathBuf>,
     /// ELFs and job inputs; previously stored SDK results remain readable.
     pub data_dir: PathBuf,
-    /// Shared job-artifact directory: proof nodes write outputs, the SDK adapter reads
-    /// them, and app deletion removes completed jobs' output directories. Defaults to
+    /// Control-host proof output received from nodes; the SDK adapter reads it,
+    /// and app deletion removes completed jobs' output directories. Defaults to
     /// data_dir/proofs.
     #[serde(default)]
     pub proof_output_dir: Option<PathBuf>,
