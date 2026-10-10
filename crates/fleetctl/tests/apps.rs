@@ -132,6 +132,7 @@ fn app_table_shows_configured_resources_without_namespace_quota_columns() {
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
         let text=String::from_utf8(output.stdout).unwrap();
         let header:Vec<_>=text.lines().next().unwrap().split_whitespace().collect();
+        assert_eq!(header[2], "NAME", "{text}");
         assert!(header.windows(4).any(|x|x==["GPUS","CPUS","REPLICAS","NODE"]),"{text}");
         assert!(!text.contains("QUOTA"),"{text}");
         let row:Vec<_>=text.lines().nth(1).unwrap().split_whitespace().collect();

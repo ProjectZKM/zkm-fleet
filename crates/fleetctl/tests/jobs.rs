@@ -189,7 +189,7 @@ fn batch_submission_passes_storage_references_without_uploading_files() {
         .args([
             "batch",
             "submit",
-            "--profile",
+            "--app",
             "training",
             "--env",
             "INPUT_URI=s3://owner-bucket/dataset",
@@ -261,7 +261,6 @@ fn finite_job_commands_are_only_available_under_batch() {
         vec!["job", "cancel", "job-id"],
         vec!["job", "preempt", "job-id"],
         vec!["job", "purge", "job-id"],
-        vec!["batch", "submit", "--app", "training", "--", "true"],
         vec!["batch", "logs", "job-id", "--rank", "1"],
     ] {
         let output = cli().args(&arguments).output().unwrap();

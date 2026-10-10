@@ -86,7 +86,9 @@ Nodes are infrastructure; allocations are internal reservation records. Tenants 
 
 **Apps, batches and jobs.** `fleetctl app` lists only long-running workloads. A proof app is a tenant's registered program (`tenant/<first 8 hex of the ELF id>`) backed by dedicated prover replicas; a serving app keeps a container available for requests. Use `fleetctl app --kind proof` or `--kind serving` to select one kind. Operators initially configure serving deployments in node `services.yaml`; the control plane then manages their enable/disable, priority and scaling.
 
-`fleetctl batch` lists finite executions. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, inspect profiles with `fleetctl batch profiles`, and submit commands with `fleetctl batch submit --profile PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `runs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+`fleetctl batch` lists finite executions. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, list workloads with `fleetctl batch list` and inspect one with `fleetctl batch show NAME`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `runs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+
+Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch “profile” is its reusable workload configuration, not an additional resource. Serving apps keep replicas running; batch workloads execute a command per submission. `--profile`, `batch profiles`, and `batch profile NAME` remain compatibility aliases for `--app`, `batch list`, and `batch show NAME`. `batch submit --name` continues to name an individual job.
 
 Every app and batch profile belongs to an administrator-created namespace. Proof requests require a registered proof app, and batch submissions require an existing batch profile. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
 
@@ -565,8 +567,8 @@ proof fetching even while GPU actors are disabled.
 
 ```bash
 fleetctl app [--kind proof|serving] | app NAME | app add TENANT/ELF … | app scale NAME [--gpus N --cpus N --replicas N --node NODE] | app disable NAME | app enable NAME | app delete NAME --yes
-fleetctl batch [--profile PROFILE --active] | batch JOB_ID | batch add PROFILE --image IMAGE | batch profiles | batch profile PROFILE
-fleetctl batch submit --profile PROFILE --gpus 1 --cpus 4 -- CMD | batch logs JOB_ID -f | batch cancel JOB_ID | batch preempt JOB_ID | batch purge JOB_ID
+fleetctl batch [--app NAME --active] | batch JOB_ID | batch add PROFILE --image IMAGE | batch list | batch show NAME
+fleetctl batch submit --app PROFILE --gpus 1 --cpus 4 -- CMD | batch logs JOB_ID -f | batch cancel JOB_ID | batch preempt JOB_ID | batch purge JOB_ID
 fleetctl batch disable PROFILE | batch enable PROFILE | batch priority PROFILE N | batch delete PROFILE --yes
 fleetctl job [--namespace NAME --type proof|batch] | job ID | job fetch PROOF_JOB --out DIR
 fleetctl node | node NAME | node drain NAME | node undrain NAME
@@ -667,7 +669,7 @@ Ziren server for multiple proof apps. `fleetctl app add TENANT/ELF` requires a
 matching dedicated service to exist first. `services.yaml` supplies initial resource
 settings; administrators then manage allocations through the control plane with
 `fleetctl app scale`. Batch jobs request resources with
-`fleetctl batch submit --profile PROFILE --gpus N --cpus N`. Active proofs cannot resize
+`fleetctl batch submit --app PROFILE --gpus N --cpus N`. Active proofs cannot resize
 their GPU allocation. Resizing a proof already in progress is tracked in
 [issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3).
 

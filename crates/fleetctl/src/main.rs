@@ -54,7 +54,7 @@ struct Conn {
 enum Cmd {
     /// Long-running apps: proof programs and serving deployments.
     App(AppArgs),
-    /// Finite batch jobs and their reusable execution profiles.
+    /// Finite batch workloads and their jobs.
     Batch(BatchArgs),
     /// Execution records: list or inspect proof and batch jobs; fetch proof outputs.
     Job(JobArgs),
@@ -287,8 +287,8 @@ struct TokenBundle {
 /// take the server's defaults.
 #[derive(Args, Serialize)]
 struct BatchSubmission {
-    /// Batch execution profile (image, user, GPU cap and approved mount roots).
-    #[arg(long)]
+    /// Batch workload name (image, user, GPU cap and approved mount roots).
+    #[arg(long = "app", visible_alias = "profile")]
     profile: String,
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -453,8 +453,8 @@ struct BatchArgs {
     limit: usize,
     #[arg(short, long)]
     active: bool,
-    /// Filter batch jobs by their execution profile.
-    #[arg(long)]
+    /// Filter batch jobs by workload name.
+    #[arg(long = "app", visible_alias = "profile")]
     profile: Option<String>,
     #[command(flatten)]
     conn: Conn,
@@ -464,9 +464,11 @@ struct BatchArgs {
 enum BatchCmd {
     /// Register a reusable batch execution profile in an existing namespace.
     Add { #[command(flatten)] add: AddBatch },
-    /// List reusable batch execution profiles.
+    /// List registered batch workloads and their shared execution configuration.
+    #[command(name = "list", visible_alias = "profiles")]
     Profiles,
-    /// Inspect a batch profile and its newest jobs.
+    /// Inspect a batch workload and its newest jobs.
+    #[command(name = "show", visible_alias = "profile")]
     Profile { name: String },
     /// Stop accepting new jobs for this profile; accepted jobs continue.
     Disable { name: String },
@@ -781,7 +783,7 @@ fn node_rows(status: &Value) -> Vec<Value> {
 
 const PS_COLS: &[out::Col] = &[
     col("TYPE", "type"),
-    col("APP", "app"),
+    col("NAME", "app"),
     col("NAMESPACE", "namespace"),
     col("PRIORITY", "priority"),
     col("TAG", "tag"),
@@ -951,7 +953,7 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 const APP_COLS: &[out::Col] = &[
     col("TYPE", "type"),
     col("KIND", "kind"),
-    col("APP", "name"),
+    col("NAME", "name"),
     col("NAMESPACE", "namespace"),
     col("PRIORITY", "priority"),
     col("ENABLED", "enabled"),
@@ -1321,12 +1323,18 @@ fn batch(p: &BatchArgs, out: &Out) -> anyhow::Result<()> {
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
         Some(BatchCmd::Profiles) => {
             let profiles = Admin::control(&p.conn)?.get("/batch-profiles")?;
-            let rows = profiles.as_array().cloned().unwrap_or_default();
+            let rows: Vec<Value> = profiles.as_array().into_iter().flatten().map(|profile| {
+                let mut row = profile.clone();
+                row["enabled"] = json!(profile["disabled"].as_bool() != Some(true));
+                row
+            }).collect();
             out.table(&rows, &[
-                col("PROFILE", "name"), col("NAMESPACE", "namespace"),
+                col("NAME", "name"), col("NAMESPACE", "namespace"),
+                col("ENABLED", "enabled"),
                 col("PRIORITY", "priority"), col("MAX GPUS", "max_gpus"),
-                col("JOBS", "jobs"), col("IMAGE", "image"),
-            ], None);
+                col("ACTIVE", "active"), col("JOBS", "jobs"),
+                col("OK", "succeeded"), col("FAILED", "failed"), col("IMAGE", "image"),
+            ], Some(&profiles));
             return Ok(());
         }
         Some(BatchCmd::Profile { name }) => {
