@@ -1,7 +1,7 @@
 # EthProofs app worker
 
 Fleet pins the worker in the `third_party/reth-processor` Git submodule
-([pinned source](https://github.com/ProjectZKM/reth-processor/tree/26ebf2a4adb5412a765f0dd1ed2cf6ba9bbd5502)).
+([pinned source](https://github.com/ProjectZKM/reth-processor/tree/a75cb337305eac262a31346b4b3086146fed8297)).
 The worker migration is based on
 [reth-processor PR #23](https://github.com/ProjectZKM/reth-processor/pull/23),
 `chore/ziren-v2-stateless`, which includes the Fleet worker integration and
@@ -9,6 +9,10 @@ support for structured or RLP-encoded execution-witness headers. Host and guest
 trie updates preserve untouched storage roots and remove empty accounts. The guest
 accepts omitted storage only when the authenticated account is absent or its
 storage root is empty; missing non-empty storage remains an error.
+If the witness omits contract bytecode, the host fetches it at the parent block,
+checks its hash against the authenticated account, and includes the verified code
+in the guest input. A missing or mismatched response fails preparation and keeps
+the cursor on that block.
 Host and guest Ziren are locked to
 `0dd65a15db3d7bad5cf582c5dbc7492440ea2830`. Initialize it with
 `git submodule update --init --recursive`.
@@ -88,7 +92,7 @@ GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an operator decision; inspect it with `fleetctl --namespace zkm app`.
 
 The package records worker source commit
-`26ebf2a4adb5412a765f0dd1ed2cf6ba9bbd5502` on
+`a75cb337305eac262a31346b4b3086146fed8297` on
 `chore/ziren-v2-stateless`, with PR #23 based on `stateless`. The guest was built
 from `fd9589cd63c15c3671c643c1a34de7341a2201ff`; its SHA-256 is
 `334b45b88d6c60e3354e983a5b26ef39b18feee65da828f277a93e646c78c73b`.
