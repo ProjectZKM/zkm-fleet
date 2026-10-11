@@ -10,11 +10,7 @@ gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
 proof_output_dir: /var/lib/zkm-fleet/proofs # legacy proof jobs only
 services:
-  # Ray hands out the lowest free cards in file order; a hold keeps a card free for
-  # batch jobs by taking it while the services after it start.
-  - name: train-card
-    kind: hold
-    gpus: 1
+  # Resources not reserved by enabled apps remain available to batch jobs.
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user

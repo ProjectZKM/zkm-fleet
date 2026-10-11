@@ -1,0 +1,15 @@
+# Only maintained Fleet source belongs in the control-plane build context.
+.git
+.fleet
+.aws
+.codex
+.agents
+target
+third_party
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/*.egg-info
+bridge/build
+**/.venv
+**/venv

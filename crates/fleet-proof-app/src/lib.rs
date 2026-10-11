@@ -1,5 +1,4 @@
 //! SDK protocol and payload storage belong to the app, outside Fleet's control plane.
-use crate::proof_api::Submit;
 use axum::{
     extract::{Path as HttpPath, State},
     http::StatusCode,
@@ -7,6 +6,7 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
+use fleet_proto::sdk::Submit;
 use fleet_proto::{
     artifacts,
     fleet::v1::{ProofInputs, ProveRequest},
@@ -144,7 +144,7 @@ impl App {
             .token_file
             .as_ref()
             .ok_or_else(|| Status::unauthenticated("user token required"))?;
-        let token = crate::token::load(path)
+        let token = fleet_proto::load_token(path)
             .map_err(|_| Status::unauthenticated("configured user token is unavailable"))?;
         Ok(format!("Bearer {token}"))
     }
@@ -267,55 +267,46 @@ impl App {
         Ok(id)
     }
 
-    async fn fetch_output(
-        &self,
-        bearer: &str,
-        job_id: &str,
-        name: &str,
-    ) -> Result<Vec<u8>, Status> {
-        let response = self
-            .client
-            .get(format!(
-                "{}/admin/jobs/{job_id}/output/{name}",
-                self.scheduler
-            ))
-            .header("authorization", bearer)
-            .send()
-            .await
-            .map_err(|_| Status::unavailable("proof fetch unavailable"))?;
-        if !response.status().is_success() {
-            let code = match response.status().as_u16() {
-                401 => tonic::Code::Unauthenticated,
-                403 => tonic::Code::PermissionDenied,
-                404 => tonic::Code::NotFound,
-                502 => tonic::Code::DataLoss,
-                504 => tonic::Code::DeadlineExceeded,
-                _ => tonic::Code::Unavailable,
-            };
-            return Err(Status::new(code, "proof fetch failed"));
-        }
-        let mut response = response;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| Status::unavailable("proof transfer interrupted"))?
+    /// Read only references from an authenticated job record, under this app's root.
+    async fn read_output(&self, job: &serde_json::Value, name: &str) -> Result<Vec<u8>, Status> {
+        let field = match name {
+            "proof.json" => "proof",
+            "public_values.bin" => "public_values",
+            _ => return Err(Status::invalid_argument("invalid output name")),
+        };
+        if job["state"] != "succeeded"
+            || job["namespace"].as_str() != Some(&self.namespace)
+            || job["tenant"].as_str() != Some(&self.tenant)
+            || !job["elf_id"]
+                .as_str()
+                .is_some_and(|id| self.elf_ids.contains(id))
         {
-            if bytes.len() as u64 + chunk.len() as u64 > artifacts::MAX_OUTPUT {
-                return Err(Status::data_loss("proof output exceeds size limit"));
-            }
-            bytes.extend(chunk);
+            return Err(Status::permission_denied(
+                "output belongs to another app or is not complete",
+            ));
         }
-        Ok(bytes)
+        let outputs: fleet_proto::fleet::v1::ProofOutputs =
+            serde_json::from_value(job["outputs"].clone())
+                .map_err(|_| Status::failed_precondition("local output references unavailable"))?;
+        artifacts::validate_outputs(&outputs).map_err(|e| Status::data_loss(e.to_string()))?;
+        let reference = if field == "proof" {
+            outputs.proof.unwrap()
+        } else {
+            outputs.public_values.unwrap()
+        };
+        let root = self.storage_root.join("outputs");
+        tokio::task::spawn_blocking(move || {
+            artifacts::read(&reference, &root, artifacts::MAX_OUTPUT)
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))?
+        .map_err(|e| Status::data_loss(e.to_string()))
     }
 
     fn prepare(&self, request: &stage::GenerateProofRequest) -> anyhow::Result<Submit> {
-        anyhow::ensure!(
-            crate::blobs::is_safe_id(&request.proof_id),
-            "invalid proof_id"
-        );
+        anyhow::ensure!(artifacts::is_safe_id(&request.proof_id), "invalid proof_id");
         let elf_id = self.select_elf(request)?;
-        let kind = crate::stage::kind_for(request.from_step, request.target_step)
+        let kind = fleet_proto::sdk::kind_for(request.from_step, request.target_step)
             .map_err(anyhow::Error::msg)?;
         let elf = if request.elf_data.is_empty() {
             let path = self.storage_root.join("elf").join(&elf_id);
@@ -424,7 +415,7 @@ impl StageService for AppApi {
         let bearer = self.bearer(&request)?;
         self.authorize(&bearer, None).await?;
         let id = request.into_inner().proof_id;
-        if !crate::blobs::is_safe_id(&id) {
+        if !artifacts::is_safe_id(&id) {
             return Err(Status::invalid_argument("invalid proof_id"));
         }
         let job = match self
@@ -449,12 +440,18 @@ impl StageService for AppApi {
         let elf_id = job["elf_id"]
             .as_str()
             .ok_or_else(|| Status::internal("job ELF missing"))?;
-        if job["tenant"].as_str() != Some(self.tenant.as_str()) || !self.elf_ids.contains(elf_id) {
+        // Fleet records admission failures without an ELF; SDKs still poll their IDs.
+        let rejected = job["state"] == "failed" && elf_id.is_empty();
+        if job["tenant"].as_str() != Some(self.tenant.as_str())
+            || (!rejected && !self.elf_ids.contains(elf_id))
+        {
             return Err(Status::permission_denied(
                 "job belongs to another app endpoint",
             ));
         }
-        self.authorize(&bearer, Some(elf_id)).await?;
+        if !rejected {
+            self.authorize(&bearer, Some(elf_id)).await?;
+        }
         let mut response = stage::GetStatusResponse {
             proof_id: id,
             ..Default::default()
@@ -479,9 +476,7 @@ impl StageService for AppApi {
                 response.step = stage::Step::End as i32;
             }
             "succeeded" => {
-                response.proof_with_public_inputs = self
-                    .fetch_output(&bearer, job["id"].as_str().unwrap(), "proof.json")
-                    .await?;
+                response.proof_with_public_inputs = self.read_output(&job, "proof.json").await?;
                 response.status = stage::Status::Success as i32;
                 response.step = stage::Step::End as i32;
                 response.total_steps = job["cycles"].as_u64().unwrap_or(0);
@@ -532,16 +527,23 @@ async fn values(State(app): State<Arc<App>>, HttpPath(key): HttpPath<String>) ->
         Ok(job) => job,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    match app
-        .fetch_output(
-            &capability.bearer,
-            job["id"].as_str().unwrap(),
-            "public_values.bin",
-        )
+    let Some(elf_id) = job["elf_id"].as_str() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if app
+        .authorize(&capability.bearer, Some(elf_id))
         .await
+        .is_err()
     {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match app.read_output(&job, "public_values.bin").await {
         Ok(bytes) => bytes.into_response(),
-        Err(e) => crate::proof_fetch::response_error(e),
+        Err(e) => (
+            StatusCode::from_u16(fleet_proto::sdk::http_status_code(e.code())).unwrap(),
+            e.message().to_owned(),
+        )
+            .into_response(),
     }
 }
 

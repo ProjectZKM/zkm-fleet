@@ -4,12 +4,12 @@ FROM rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-RUN cargo build --release --locked -p fleet-scheduler -p fleetctl -p fleet-mcp
+RUN cargo build --release --locked -p fleet-scheduler -p fleet-proof-app -p fleetctl -p fleet-mcp
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 fleet && mkdir -p /var/lib/zkm-fleet && chown fleet /var/lib/zkm-fleet
-COPY --from=build /src/target/release/fleet-scheduler /src/target/release/fleetctl /src/target/release/fleet-mcp /src/target/release/fleet-proof-app /src/target/release/fleet-node /usr/local/bin/
+COPY --from=build /src/target/release/fleet-scheduler /src/target/release/fleetctl /src/target/release/fleet-mcp /src/target/release/fleet-proof-app /usr/local/bin/
 USER fleet
 EXPOSE 51000 51001 9191
 HEALTHCHECK --interval=15s --timeout=3s CMD curl -sf http://127.0.0.1:9191/healthz || exit 1

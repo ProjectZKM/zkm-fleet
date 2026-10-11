@@ -8,14 +8,6 @@ publish.workspace = true
 name = "fleet-scheduler"
 path = "src/main.rs"
 
-[[bin]]
-name = "fleet-node"
-path = "src/node_main.rs"
-
-[[bin]]
-name = "fleet-proof-app"
-path = "src/proof_app_main.rs"
-
 [dependencies]
 fleet-proto.workspace = true
 alloy-primitives.workspace = true
@@ -38,9 +30,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
-prost.workspace = true
 
 [dev-dependencies]
+prost.workspace = true
+fleet-proof-app = { path = "../fleet-proof-app" }
 fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
 tokio-stream = { version = "0.1", features = ["net"] }
 k256 = { version = "0.13", features = ["ecdsa"] }

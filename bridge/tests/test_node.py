@@ -130,7 +130,7 @@ def test_storage_inputs_are_passed_to_the_app_without_capturing_code(executor, m
     spec = launch.call_args.args[0]
     assert spec.command == p["request"]["command"]
     assert spec.env["INPUT_URI"] == "s3://owner/dataset"
-    assert spec.code is None and spec.code_dir is None
+    assert "code" not in spec.dump() and "code_dir" not in spec.dump()
 
 
 def test_finished_job_reports_log_completion_without_archiving_outputs(executor, monkeypatch):

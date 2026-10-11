@@ -378,6 +378,16 @@ async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> any
             }
         }
         tokio::select! {
+            result = async {
+                match working.as_mut() {
+                    Some((_, task)) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (assignment, _) = working.take().unwrap();
+                pending = Some((assignment, result.unwrap_or_else(|e| Err(tonic::Status::internal(e.to_string())))));
+                uploaded = false;
+            },
             _ = tokio::time::sleep(period) => {},
             _ = tokio::signal::ctrl_c() => {
                 if let Some(id) = node_id { let _ = client.deregister(DeregisterRequest { node_id: id }).await; }

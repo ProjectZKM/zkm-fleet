@@ -200,6 +200,9 @@ impl RunControl {
         let g = target["gpus"].as_f64().unwrap_or(1.0);
         let cpu = target["cpus"].as_f64().unwrap_or(1.0);
         let replicas = target["replicas"].as_u64().unwrap_or(1);
+        if super::integrated_worker(&target) && replicas != 1 {
+            return Err(fail(400, "integrated app workers require one machine-pinned replica"));
+        }
         if !g.is_finite()
             || g < 0.0
             || !cpu.is_finite()
@@ -229,7 +232,14 @@ impl RunControl {
             {
                 return Err(fail(
                     422,
-                    "requested replicas exceed the node's total GPU/CPU capacity",
+                    format!(
+                        "requested allocation exceeds node {} capacity: requested {total_g} GPUs and {total_cpu} CPUs (replicas: {replicas}); node total {} GPUs and {} CPUs, currently free {} GPUs and {} CPUs",
+                        intent.worker,
+                        worker.report.total_gpus,
+                        worker.report.total_cpus,
+                        worker.report.free_gpus,
+                        worker.report.free_cpus,
+                    ),
                 ));
             }
         }
@@ -242,7 +252,7 @@ impl RunControl {
         }
         // Persistent replicas reserve the whole service. Proof quota is charged
         // per assigned proof; extra replicas can remain idle while that quota is occupied.
-        let (quota_g, quota_cpu) = if text(&target, "kind") == "app" {
+        let (quota_g, quota_cpu) = if text(&target, "kind") == "app" || super::integrated_worker(&target) {
             (total_g, total_cpu)
         } else {
             (g, cpu)

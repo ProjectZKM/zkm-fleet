@@ -88,7 +88,7 @@ def test_preemption_does_not_release_placement_when_container_is_unreachable(tmp
     monkeypatch.setattr(runs, "alive_nodes", lambda: [])
     released = []
     monkeypatch.setattr(runs, "discard_placement", released.append)
-    result = runs.preempt(str(tmp_path), "job", "higher priority", namespace="n", priority=1)
+    result = runs.preempt(str(tmp_path), "job", "higher priority")
     assert result.state is RunState.PREEMPTED and result.preempt_requeue
     assert not result.quota_released and released == []
 

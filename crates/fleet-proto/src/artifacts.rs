@@ -7,6 +7,15 @@ use std::path::{Path, PathBuf};
 pub const MAX_INPUT: u64 = 1 << 30;
 pub const MAX_OUTPUT: u64 = 64 << 20;
 
+/// Execution identifiers are also filesystem components on the control host and nodes.
+pub fn is_safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 pub fn validate(reference: &ArtifactRef, limit: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         reference.uri.len() <= 4096 && reference.uri.starts_with("file:///"),

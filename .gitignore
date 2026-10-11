@@ -1,6 +1,9 @@
 /target
 __pycache__/
 *.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
 *.token
 *.key
 *.env

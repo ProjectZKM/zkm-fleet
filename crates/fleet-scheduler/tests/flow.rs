@@ -825,8 +825,8 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbeat() {
-    use fleet_scheduler::proof_app::{App, AppApi};
+async fn app_endpoint_reads_local_outputs_without_machine_fetch_heartbeats() {
+    use fleet_proof_app::{App, AppApi};
     use std::future::IntoFuture;
     use fleet_proto::stage::v1::stage_service_server::StageServiceServer;
     let h = start().await;
@@ -836,7 +836,6 @@ async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbe
     let (_,_,foreign)=tag_token(&h,"alice",Some("production"),82,&elf);
     let (_, _, proof_node) = add_node_app_session(&h,"app-prover",2,false,150,tonic::Code::Internal,"alice","eth",b"elf").await;
     let storage=tempfile::tempdir().unwrap();
-    let fetch_agent = start_fetch_agent(&h, storage.path().into()).await;
     let http_listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_url=format!("http://{}",http_listener.local_addr().unwrap());
     let namespace:serde_json::Value=serde_json::from_str(&admin_curl(&h,&[&format!("{}/admin/namespaces/alice",h.http)])).unwrap();
@@ -846,7 +845,7 @@ async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbe
         vec![elf, fleet_scheduler::blobs::elf_id_of(b"another-program")],h.http.clone(),http_url).unwrap();
     app.token_file = Some(token_file);
     let app=Arc::new(app);
-    tokio::spawn(axum::serve(http_listener,fleet_scheduler::proof_app::router(app.clone())).into_future());
+    tokio::spawn(axum::serve(http_listener,fleet_proof_app::router(app.clone())).into_future());
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let channel=Channel::from_shared(format!("http://{}",listener.local_addr().unwrap())).unwrap();
     let task=tokio::spawn(tonic::transport::Server::builder().add_service(StageServiceServer::new(AppApi(app)))
@@ -864,8 +863,7 @@ async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbe
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(!status.proof_with_public_inputs.is_empty());
-    // The fake prover reports 100 ms despite slower execution and heartbeat
-    // fetches. Neither admission nor input/output transfers change this value.
+    // The fake prover reports 100 ms despite slower execution. Neither admission nor input/output transfers change this value.
     assert_eq!(status.proving_time, 100);
     assert!(status.total_steps > 0);
     let mut changed=request.clone();
@@ -892,6 +890,14 @@ async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbe
     assert_eq!(user_http(&h,&ungranted,"GET","/admin/jobs/app-storage-proof/output/proof.json").0,404);
     let mut control_stage=h.stage.clone();
     assert_eq!(control_stage.get_status(with_bearer(GetStatusRequest{proof_id:"app-storage-proof".into()},&ungranted)).await.unwrap().into_inner().status,S::Unspecified as i32);
+    // Local reads retain integrity checks and never fall back to the control host.
+    let proof_path = metadata["outputs"]["proof"]["uri"].as_str().unwrap().strip_prefix("file://").unwrap();
+    std::fs::write(proof_path, b"corrupt").unwrap();
+    assert_eq!(client.get_status(with_bearer(GetStatusRequest {proof_id:"app-storage-proof".into()}, &token))
+        .await.unwrap_err().code(), tonic::Code::DataLoss);
+    std::fs::write(proof_path, &status.proof_with_public_inputs).unwrap();
+    // App status and public values succeeded with no machine fetch agent.
+    let fetch_agent = start_fetch_agent(&h, storage.path().into()).await;
     // Stopping the proof actor releases GPU execution, but machine storage still serves files.
     let channel = Channel::from_shared(format!("http://127.0.0.1:{}",h.control_port)).unwrap().connect().await.unwrap();
     let mut ctl = ControlServiceClient::with_interceptor(channel, fleet_scheduler::token::Attach::new(TOKEN).unwrap());
@@ -899,6 +905,13 @@ async fn app_endpoint_submits_references_and_fetches_through_the_machine_heartbe
     assert_eq!(metadata["outputs"]["machine"],"test");
     let elf = metadata["elf_id"].as_str().unwrap();
     admin_curl(&h,&["-X","PUT",&format!("{}/admin/apps/disabled?namespace=alice&tenant=eth&elf_id={elf}",h.http)]);
+    let rejected = client.generate_proof(with_bearer(signed_request("app-disabled-proof", b"elf", &key), &token))
+        .await.unwrap().into_inner();
+    assert_eq!(rejected.status, S::InvalidParameter as i32);
+    let rejected = client.get_status(with_bearer(GetStatusRequest {proof_id:"app-disabled-proof".into()}, &token))
+        .await.unwrap().into_inner();
+    assert_eq!(rejected.status, S::InvalidParameter as i32);
+    assert!(rejected.proof_with_public_inputs.is_empty());
     let fetch = reqwest::Client::new().get(format!("{}/admin/jobs/app-storage-proof/output/proof.json",h.http))
         .bearer_auth(&token).send().await.unwrap();
     assert_eq!(fetch.status().as_u16(),200);assert_eq!(fetch.bytes().await.unwrap().as_ref(),status.proof_with_public_inputs);
@@ -1333,4 +1346,32 @@ async fn machine_heartbeat_requires_cluster_token_and_populates_control_plane_no
     let status = admin_curl(&h,&[&format!("{}/admin/status",h.http)]);
     let status: serde_json::Value = serde_json::from_str(&status).unwrap();
     assert!(status["nodes"].as_array().unwrap().iter().any(|n| n["name"]=="gpu-1" && n["backend"]=="ray-local"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
+    use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerHeartbeatRequest};
+    let mut h = start().await;
+    admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d",
+        r#"{"name":"alice","quota":{"gpus":2,"cpus":8}}"#, &format!("{}/admin/namespaces", h.http)]);
+    let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
+    let (key, _, token) = namespace_token(&h, "alice", 94, &elf);
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port)).unwrap().connect().await.unwrap();
+    let mut agent = WorkerServiceClient::with_interceptor(channel, fleet_scheduler::token::Attach::new(TOKEN).unwrap());
+    let report = serde_json::json!({"version":1,"machine":"test","ready":true,
+        "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"profiles":{},
+        "services":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
+            "proof_app":format!("eth/{elf}"),"worker_command":["/opt/eth-proofs"],
+            "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});
+    agent.heartbeat(WorkerHeartbeatRequest {worker_id:"integrated-worker".into(),session:"session".into(),
+        report_json:serde_json::to_vec(&report).unwrap(),proof_fetch_ready:false}).await.unwrap();
+    let response = h.stage.generate_proof(with_bearer(signed_request("owned-stream", b"elf", &key), &token))
+        .await.unwrap().into_inner();
+    assert_eq!(response.status, S::InvalidParameter as i32);
+    assert!(response.error_message.contains("owns its input stream"));
+    let status = h.stage.get_status(with_bearer(GetStatusRequest {proof_id:"owned-stream".into()}, &token))
+        .await.unwrap().into_inner();
+    assert_eq!(status.status, S::InvalidParameter as i32);
+    let (_, access) = user_http(&h, &token, "GET", "/access");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&access).unwrap()["usage"]["gpus"], 1.0);
 }

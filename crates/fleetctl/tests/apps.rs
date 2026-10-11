@@ -50,6 +50,15 @@ fn batch_profile_creation_with_user_token_leaves_namespace_to_verified_api_scope
             stream.read_exact(&mut byte).unwrap(); request.push(byte[0]);
         }
         let headers = String::from_utf8(request).unwrap();
+        // Drain the request body before closing the socket; unread bytes can
+        // turn an otherwise successful response into a TCP connection reset.
+        let length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        }).unwrap();
+        let mut request_body = vec![0; length];
+        stream.read_exact(&mut request_body).unwrap();
         assert!(headers.starts_with("POST /batch-profiles HTTP/1.1"));
         assert!(headers.to_ascii_lowercase().contains("authorization: bearer owner-token"));
         let body = r#"{"name":"training","namespace":"alice","type":"batch","persistent":false}"#;

@@ -17,13 +17,7 @@ pub const PUBLIC_VALUES: &str = "public_values.bin";
 
 /// Ids are used as path components; accept only what the SDK produces
 /// (uuids, hex digests) so a request cannot escape the data directory.
-pub fn is_safe_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
+pub use fleet_proto::artifacts::is_safe_id;
 
 pub fn elf_id_of(elf: &[u8]) -> String {
     hex::encode(Sha256::digest(elf))

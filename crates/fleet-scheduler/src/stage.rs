@@ -34,19 +34,7 @@ impl ProofCaller {
 }
 
 /// Maps the request's steps to a proof kind, as the SDK's network prover sets them.
-pub fn kind_for(
-    from_step: Option<i32>,
-    target_step: Option<i32>,
-) -> Result<ProofKind, &'static str> {
-    let from = from_step.unwrap_or(Step::Init as i32);
-    let target = target_step.unwrap_or(Step::InSnark as i32);
-    match (Step::try_from(from), Step::try_from(target)) {
-        (Ok(Step::Init), Ok(Step::InAgg)) => Ok(ProofKind::Compressed),
-        (Ok(Step::Init), Ok(Step::InSnark)) => Ok(ProofKind::Groth16),
-        (Ok(Step::InAgg), Ok(Step::InSnark)) => Ok(ProofKind::CompressToGroth16),
-        _ => Err("only Init->InAgg (compressed), Init->InSnark (groth16) and InAgg->InSnark are supported"),
-    }
-}
+pub use fleet_proto::sdk::kind_for;
 
 impl StageApi {
     fn reject(&self, proof_id: &str, status: StageStatus, msg: &str) -> GenerateProofResponse {
@@ -253,6 +241,10 @@ impl StageApi {
                 }
                 given
             };
+            if self.fleet.app_worker_owned(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id) {
+                return Err(fail(StageStatus::InvalidParameter,
+                    "this app owns its input stream; SDK proof submission is unavailable"));
+            }
             if self.fleet.app_disabled(namespace.as_deref().unwrap_or(crate::store::SYSTEM_NAMESPACE), &tenant, &elf_id) {
                 return Err(fail(
                     StageStatus::InvalidParameter,

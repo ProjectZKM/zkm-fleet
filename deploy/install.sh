@@ -1,13 +1,13 @@
 #!/bin/bash
 # One control plane, independent local Ray instances on execution machines.
-# control --public-url https://fleet.example:8905 [--tls-names stage,fleet.example]
+# control --public-url https://fleet.example:8905 [--tls-names stage,fleet.example] [--no-mcp]
 # node --scheduler https://fleet.example:8905 --cluster-token FILE [--cuda 0,1]
 # Common: --prefix DIR --etc DIR --bin DIR --workdir DIR --no-cron
 # Node: --name NAME --cpus N --runs-dir DIR --scheduler-ca FILE
 set -euo pipefail
 ROLE=${1:-}; shift || true
 PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; WORKDIR=""; RUNS_DIR=""
-CUDA=""; CPUS=""; NAME=$(hostname); SCHEDULER=""; TOKEN=""; CA=""; PUBLIC_URL=""; TLS_NAMES=""; CRON=1; PROOF_ROOTS=""
+CUDA=""; CPUS=""; NAME=$(hostname); SCHEDULER=""; TOKEN=""; CA=""; PUBLIC_URL=""; TLS_NAMES=""; CRON=1; PROOF_ROOTS=""; MCP=1
 SUBNET=172.28.250.0/24; IP=$(hostname -I | awk '{print $1}')
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -18,6 +18,7 @@ while [ $# -gt 0 ]; do
     --scheduler) SCHEDULER=$2; shift 2;; --cluster-token) TOKEN=$2; shift 2;; --scheduler-ca) CA=$2; shift 2;;
     --public-url) PUBLIC_URL=$2; shift 2;; --tls-names) TLS_NAMES=$2; shift 2;;
     --subnet) SUBNET=$2; shift 2;; --ip) IP=$2; shift 2;; --no-cron) CRON=0; shift;;
+    --no-mcp) MCP=0; shift;;
     *) echo "unknown option $1" >&2; exit 2;;
   esac
 done
@@ -38,11 +39,15 @@ else
   [[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid --name"
   command -v python3 >/dev/null || die "Python >= 3.10 is required on execution machines"
   python3 -c 'import sys; sys.exit(sys.version_info < (3,10))' || die "Python >= 3.10 is required"
-  for b in fleet-node fleet-ziren-node; do [ -x "$BIN/$b" ] || die "build $b for this machine first"; done
-  install -m 755 "$BIN/fleet-node" "$BIN/fleet-ziren-node" "$PREFIX/bin/"
-  if [ -x "$BIN/fleet-proof-app" ]; then
-    install -m 755 "$BIN/fleet-proof-app" "$PREFIX/bin/"
-  fi
+  [ -x "$BIN/fleet-node" ] || die "build fleet-node for this machine first"
+  [ -z "$PROOF_ROOTS" ] || [ -x "$BIN/fleet-ziren-node" ] || [ -x "$PREFIX/bin/fleet-ziren-node" ] \
+    || die "--proof-storage-roots requires the optional fleet-ziren-node storage handler"
+  install -m 755 "$BIN/fleet-node" "$PREFIX/bin/"
+  # Only SDK proof actors and their storage handler need the native prover.
+  # Ordinary apps, batches and integrated workers carry their own application code.
+  for b in fleet-ziren-node fleet-proof-app; do
+    if [ -x "$BIN/$b" ]; then install -m 755 "$BIN/$b" "$PREFIX/bin/"; fi
+  done
   if [ -n "$CUDA" ]; then
     command -v nvidia-smi >/dev/null || die "NVIDIA driver is required"
     docker info 2>/dev/null | grep -qi nvidia || die "configure nvidia-container-toolkit first"
@@ -50,8 +55,8 @@ else
 fi
 # Copy execution code only to execution machines. The control plane has no Ray dependency.
 mkdir -p "$PREFIX/deploy"
-cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh,docker-compose.yml,gateway.yaml.in,Dockerfile.scheduler} "$PREFIX/deploy/"
 if [ "$ROLE" = control ]; then
+  cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in,Dockerfile.scheduler} "$PREFIX/deploy/"
   FLEETCTL="$PREFIX/bin/fleetctl"
   [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" >/dev/null
   [ -f "$ETC/admin.token" ] || "$FLEETCTL" init token --out "$ETC/admin.token" >/dev/null
@@ -88,6 +93,7 @@ FLEET_GID=$(id -g)
 FLEET_SUBNET=$SUBNET
 FLEET_SCHEDULER_IP=$SCHED_IP
 FLEET_MCP_ALLOWED_HOSTS=$MCP_AUTHORITY,localhost:8906,127.0.0.1:8906
+COMPOSE_PROFILES=$([ "$MCP" = 1 ] && echo mcp || true)
 EOF
   IMG=${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
   if ! docker image inspect "$IMG" >/dev/null 2>&1; then
@@ -100,17 +106,20 @@ EOF
   echo "[install] control plane ready; fleetctl connects to http://127.0.0.1:9191"
   echo "[install] HTTPS gateway: $PUBLIC_URL; MCP: $PUBLIC_URL/mcp"
 else
+  cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh} "$PREFIX/deploy/"
   # The node holds the cluster token, never the administrator or user tokens.
   [ "$(readlink -f "$TOKEN")" = "$(readlink -m "$ETC/cluster.token")" ] || install -m 600 "$TOKEN" "$ETC/cluster.token"
   if [ -n "$CA" ]; then
     [ "$(readlink -f "$CA")" = "$(readlink -m "$ETC/scheduler-ca.pem")" ] || install -m 644 "$CA" "$ETC/scheduler-ca.pem"
     CA="$ETC/scheduler-ca.pem"
   fi
-  cp -r "$SRC/bridge" "$PREFIX/"
-  if ! "$PREFIX/venv/bin/python" -c 'import ray,yaml; assert ray.__version__ == "2.59.0"' 2>/dev/null; then
+  mkdir -p "$PREFIX/bridge"
+  cp "$SRC/bridge/pyproject.toml" "$PREFIX/bridge/"
+  cp -r "$SRC/bridge/fleet_bridge" "$PREFIX/bridge/"
+  if [ ! -x "$PREFIX/venv/bin/python" ]; then
     python3 -m venv "$PREFIX/venv"
-    "$PREFIX/venv/bin/pip" install --timeout 120 --retries 10 'ray==2.59.0' pyyaml
   fi
+  "$PREFIX/venv/bin/pip" install --timeout 120 --retries 10 "$SRC/bridge"
   [ -f "$ETC/services.yaml" ] || cat > "$ETC/services.yaml" <<EOF
 scheduler: $SCHEDULER
 cluster_token_file: $ETC/cluster.token

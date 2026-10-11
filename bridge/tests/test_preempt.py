@@ -38,16 +38,22 @@ def test_a_run_being_preempted_takes_only_the_preemptions_writes_and_a_cancel(tm
     assert run.update(state=RunState.CANCELLED).state is RunState.CANCELLED, "a cancel still wins"
 
 
-def test_automatic_preempt_rechecks_namespace_priority_and_protection(tmp_path, monkeypatch):
+def test_preempted_execution_waits_for_control_plane_admission(tmp_path, monkeypatch):
     import os
-    import pytest
+    from unittest.mock import Mock
     from fleet_bridge import runs
     run = RunDir(str(tmp_path), "protected", must_exist=False)
     os.makedirs(run.out)
-    spec(namespace="n", id=run.id, out=run.out, profile=Profile(image="i", priority=3, preemptible=False)).write(run.spec_path)
+    spec(namespace="n", id=run.id, out=run.out).write(run.spec_path)
     RunStatus(id=run.id, state=RunState.RUNNING, submitted_at=1, started_at=1, gpus_requested=1, cpus=1).write(run.status_path)
     monkeypatch.setattr(runs, "_alive", lambda _: True)
-    for namespace, priority in (("other", 10), ("n", 3), ("n", 10)):
-        with pytest.raises(runs.Conflict):
-            runs.preempt(str(tmp_path), run.id, "automatic", namespace=namespace, priority=priority)
-        assert run.status().state is RunState.RUNNING
+    monkeypatch.setattr(runs, "_stop_ranks", lambda *args: None)
+    monkeypatch.setattr(runs, "_end_actors", lambda *args: None)
+    monkeypatch.setattr(runs, "confirm_cleanup", lambda _: True)
+    launch = Mock()
+    monkeypatch.setattr(runs, "launch", launch)
+    result = runs.preempt(str(tmp_path), run.id, "control-plane preemption")
+    assert result.state is RunState.PREEMPTED and result.preempt_requeue
+    runs.requeue_run(str(tmp_path), run.id)
+    assert run.status().state is RunState.WAITING_QUOTA
+    launch.assert_not_called()

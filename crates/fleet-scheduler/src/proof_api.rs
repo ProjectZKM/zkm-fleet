@@ -6,22 +6,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use fleet_proto::fleet::v1::ProofInputs;
 use fleet_proto::stage::v1::GenerateProofRequest;
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Submit {
-    pub proof_id: String,
-    pub elf_id: String,
-    pub signature: String,
-    pub block_no: Option<u64>,
-    pub seg_size: u32,
-    pub from_step: Option<i32>,
-    pub target_step: Option<i32>,
-    pub inputs: ProofInputs,
-}
+pub use fleet_proto::sdk::Submit;
 
 pub async fn submit(
     State(state): State<HttpState>,

@@ -1,7 +1,9 @@
 //! Outbound machine heartbeats. A slim Python child performs local Ray operations.
 use anyhow::{Context, Result};
 use clap::Parser;
-use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerHeartbeatRequest, ProofFetch};
+use fleet_proto::fleet::v1::{
+    worker_service_client::WorkerServiceClient, ProofFetch, WorkerHeartbeatRequest,
+};
 use serde_json::{json, Value};
 use std::{
     path::PathBuf,
@@ -71,7 +73,7 @@ async fn main() -> Result<()> {
         .init();
     let a = Args::parse();
     anyhow::ensure!(
-        fleet_scheduler::blobs::is_safe_id(&a.name),
+        fleet_proto::artifacts::is_safe_id(&a.name),
         "invalid worker name"
     );
     let url = reqwest::Url::parse(&a.scheduler)?;
@@ -165,7 +167,9 @@ async fn main() -> Result<()> {
         let mut fetching = std::collections::HashSet::new();
         loop {
             while let Some(result) = fetches.try_join_next() {
-                if let Ok(ticket) = result { fetching.remove(&ticket); }
+                if let Ok(ticket) = result {
+                    fetching.remove(&ticket);
+                }
             }
             let report = {
                 let s = snapshot.lock().await;
@@ -198,7 +202,8 @@ async fn main() -> Result<()> {
                 worker_id: a.name.clone(),
                 session: session.clone(),
                 report_json: serde_json::to_vec(&report)?,
-                proof_fetch_ready: a.proof_node_binary.is_some() && !a.proof_storage_root.is_empty(),
+                proof_fetch_ready: a.proof_node_binary.is_some()
+                    && !a.proof_storage_root.is_empty(),
             });
             request.metadata_mut().insert("authorization", auth.clone());
             request.set_timeout(Duration::from_secs(10));
@@ -206,10 +211,16 @@ async fn main() -> Result<()> {
                 Ok(response) => {
                     let response = response.into_inner();
                     for fetch in response.proof_fetches {
-                        if fetching.len() >= 4 || !fetching.insert(fetch.ticket.clone()) { continue; }
-                        let http = http.clone(); let scheduler = a.scheduler.clone();
-                        let secret = secret.clone(); let worker = a.name.clone(); let session = session.clone();
-                        let binary = a.proof_node_binary.clone(); let roots = a.proof_storage_root.clone();
+                        if fetching.len() >= 4 || !fetching.insert(fetch.ticket.clone()) {
+                            continue;
+                        }
+                        let http = http.clone();
+                        let scheduler = a.scheduler.clone();
+                        let secret = secret.clone();
+                        let worker = a.name.clone();
+                        let session = session.clone();
+                        let binary = a.proof_node_binary.clone();
+                        let roots = a.proof_storage_root.clone();
                         fetches.spawn(async move {
                             let ticket = fetch.ticket.clone();
                             if let Some(binary) = binary {
@@ -255,33 +266,70 @@ async fn main() -> Result<()> {
 }
 
 async fn fetch_proof(
-    http: reqwest::Client, scheduler: &str, secret: &str, worker: &str, session: &str,
-    binary: PathBuf, roots: Vec<PathBuf>, fetch: ProofFetch,
+    http: reqwest::Client,
+    scheduler: &str,
+    secret: &str,
+    worker: &str,
+    session: &str,
+    binary: PathBuf,
+    roots: Vec<PathBuf>,
+    fetch: ProofFetch,
 ) -> Result<()> {
-    anyhow::ensure!(fetch.ticket.len() == 64 && fetch.ticket.bytes().all(|b| b.is_ascii_hexdigit()), "invalid fetch ticket");
+    anyhow::ensure!(
+        fetch.ticket.len() == 64 && fetch.ticket.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid fetch ticket"
+    );
     let mut command = tokio::process::Command::new(binary);
     command.arg("fetch-artifact");
-    for root in roots { command.arg("--storage-root").arg(root); }
-    command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null()).kill_on_drop(true);
+    for root in roots {
+        command.arg("--storage-root").arg(root);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
     let result = async {
         let mut child = command.spawn()?;
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(&serde_json::to_vec(&fetch)?).await?;
         drop(stdin);
         let mut bytes = Vec::new();
-        child.stdout.take().unwrap().take(fleet_proto::artifacts::MAX_OUTPUT + 1).read_to_end(&mut bytes).await?;
-        anyhow::ensure!(bytes.len() as u64 <= fleet_proto::artifacts::MAX_OUTPUT, "artifact exceeds size limit");
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .take(fleet_proto::artifacts::MAX_OUTPUT + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= fleet_proto::artifacts::MAX_OUTPUT,
+            "artifact exceeds size limit"
+        );
         let status = child.wait().await?;
         Ok::<_, anyhow::Error>((status, bytes))
     };
     let result = tokio::time::timeout(Duration::from_secs(20), result).await;
-    let mut request = http.post(format!("{}/internal/proof-fetch/{}", scheduler.trim_end_matches('/'), fetch.ticket))
-        .bearer_auth(secret).header("x-fleet-worker", worker).header("x-fleet-session", session)
+    let mut request = http
+        .post(format!(
+            "{}/internal/proof-fetch/{}",
+            scheduler.trim_end_matches('/'),
+            fetch.ticket
+        ))
+        .bearer_auth(secret)
+        .header("x-fleet-worker", worker)
+        .header("x-fleet-session", session)
         .timeout(Duration::from_secs(30));
     request = match result {
         Ok(Ok((status, bytes))) if status.success() => request.body(bytes),
-        Ok(Ok((status, _))) => request.header("x-fleet-fetch-error", if status.code() == Some(4) { "missing" } else { "invalid" }),
+        Ok(Ok((status, _))) => request.header(
+            "x-fleet-fetch-error",
+            if status.code() == Some(4) {
+                "missing"
+            } else {
+                "invalid"
+            },
+        ),
         _ => request.header("x-fleet-fetch-error", "unavailable"),
     };
     request.send().await?.error_for_status()?;
@@ -313,8 +361,8 @@ async fn sync_logs(
                 let Some(lease) = job["lease"].as_str() else {
                     return Ok(());
                 };
-                if !fleet_scheduler::blobs::is_safe_id(id)
-                    || !fleet_scheduler::blobs::is_safe_id(lease)
+                if !fleet_proto::artifacts::is_safe_id(id)
+                    || !fleet_proto::artifacts::is_safe_id(lease)
                 {
                     return Ok(());
                 }

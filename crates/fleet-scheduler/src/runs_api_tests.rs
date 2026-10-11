@@ -433,10 +433,16 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
 #[tokio::test]
 async fn heartbeat_fences_duplicate_sessions_and_registers_local_node_capacity() {
     let (_dir, c, ns) = setup().await;
-    c.report("gpu", "first", inventory(&ns)).await.unwrap();
+    let mut report = inventory(&ns);
+    report.free_gpus = 0.5;
+    report.free_cpus = 0.0;
+    c.report("gpu", "first", report).await.unwrap();
     assert!(c.report("gpu", "second", inventory(&ns)).await.is_err());
     assert_eq!(c.worker_status()[0]["backend"], "ray-local");
     assert_eq!(c.worker_status()[0]["gpus"].as_f64(), Some(2.0));
+    assert_eq!(c.worker_status()[0]["cpus"].as_f64(), Some(8.0));
+    assert_eq!(c.worker_status()[0]["free_gpus"].as_f64(), Some(0.5));
+    assert_eq!(c.worker_status()[0]["free_cpus"].as_f64(), Some(0.0));
     c.drain_worker("gpu", true);
     assert!(!c.worker_status()[0]["ready"].as_bool().unwrap());
     assert!(c.capacity("gpu").is_none());
@@ -724,7 +730,19 @@ async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_pr
     for body in [json!({"replicas":0}),json!({"replicas":65}),json!({"cpus":0}),json!({"gpus":-1}),json!({"image":"other"}),json!({})] {
         assert_eq!(scale_call(c.clone(),"admin","PUT",&path,body).await.status(),StatusCode::BAD_REQUEST);
     }
-    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"gpus":2})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
+    for (body, requested) in [
+        (json!({"gpus":2}), "requested 4 GPUs and 4 CPUs (replicas: 2)"),
+        (json!({"cpus":5}), "requested 2 GPUs and 10 CPUs (replicas: 2)"),
+        (json!({"replicas":5}), "requested 5 GPUs and 10 CPUs (replicas: 5)"),
+    ] {
+        let response = scale_call(c.clone(), "admin", "PUT", &path, body).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let message = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(message.contains("exceeds node gpu capacity"), "{message}");
+        assert!(message.contains(requested), "{message}");
+        assert!(message.contains("node total 2 GPUs and 8 CPUs"), "{message}");
+        assert!(message.contains("currently free 0 GPUs and 4 CPUs"), "{message}");
+    }
     c.fleet.set_quota(&ns,Quota{gpus:Some(1.0),cpus:Some(8.0)}).await.unwrap();
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":3})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
     let other=c.fleet.create_namespace("other",Quota::default()).await.unwrap();
@@ -929,4 +947,50 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
     let path = format!("/batches/{}/logs?rank=1", job.id);
     let response = scale_call(c, "admin", "GET", &path, Value::Null).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admission_guard() {
+    let (_dir, c, ns) = setup().await;
+    let elf = "a".repeat(64);
+    let mut report = scale_inventory(&ns, true, false);
+    report.services[0]["worker_command"] = json!(["/opt/eth-proofs"]);
+    report.services[0]["machine"] = json!("machine");
+    report.services[0]["replicas"] = json!(1);
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(c.fleet.app_worker_owned(&ns, "eth", &elf));
+    assert!(!c.fleet.app_worker_owned(&ns, "goat", &elf));
+    assert_eq!(c.fleet.usage(&ns).gpus, 1.0);
+    assert_eq!(c.fleet.usage(&ns).cpus, 2.0);
+    assert!(c.request_scale(&ns, &format!("eth/{elf}"), request_resources(json!({"replicas":2}))).await.is_err());
+    c.fleet.set_worker_owned_apps(HashSet::new());
+    let _restarted = RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    assert!(c.fleet.app_worker_owned(&ns, "eth", &elf));
+}
+
+#[tokio::test]
+async fn integrated_worker_owner_must_be_cleaned_before_moving() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = scale_inventory(&ns, true, false);
+    report.services[0]["worker_command"] = json!(["/opt/eth-proofs"]);
+    report.services[0]["replicas"] = json!(1);
+    let mut invalid = report.clone();
+    invalid.services[0]["replicas"] = json!(2);
+    assert!(c.report("gpu", "session", invalid).await.is_err());
+    let mut duplicate = report.clone();
+    let mut another = duplicate.services[0].clone();
+    another["name"] = json!("second");
+    duplicate.services.push(another);
+    assert!(c.report("gpu", "session", duplicate).await.is_err());
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert!(c.report("other", "session", report.clone()).await.is_err());
+    let service = report.services[0].clone();
+    assert!(c.command("other", NodeOperation::SetService,
+        json!({"service":service,"disabled":false})).is_err());
+    c.inner.lock().services.get_mut("gpu-service").unwrap().disabled = true;
+    assert!(c.command("other", NodeOperation::SetService,
+        json!({"service":service,"disabled":false})).is_err());
+    c.fleet.release_run(&ns, "service:gpu-service").await.unwrap();
+    assert!(c.command("other", NodeOperation::SetService,
+        json!({"service":service,"disabled":false})).is_ok());
 }

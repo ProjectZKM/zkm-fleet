@@ -6,21 +6,18 @@ Namespace validation, quotas, draining and preemption stay in the control plane.
 
 from __future__ import annotations
 
-import logging
 import uuid
 from typing import Any, Mapping
 
 import ray
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.actor import ActorHandle
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after
 from .model import Bundle, Health, ReplicaSpec, ServiceKind, ServicesFile
-from .rayapi import actor_node_id
 
 NAMESPACE = "zkm-fleet"
-log = logging.getLogger("fleet_bridge")
 
 ACTORS: dict[ServiceKind, Any] = {ServiceKind.ZIREN_GPU: ZirenGpuProver, ServiceKind.ZIREN_CPU: ZirenCpuProver,
                                   ServiceKind.APP: GpuApp}
@@ -124,18 +121,8 @@ def stop(name: str) -> None:
     except ValueError:
         actor = None
     if actor is not None:
-        node_id = actor_node_id(actor)
-        if node_id is None:
-            log.warning("where %s runs is unknown; cleaning up on this machine", name)
         ray.kill(actor, no_restart=True)
-        if node_id:
-            try:
-                task = clean_after.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False))
-                ray.get(task.remote(name), timeout=120)
-            except Exception as e:
-                log.warning("cleaning up after %s: %s", name, e)
-        else:  # the actor's machine is unknown: clean here, which is right on one machine
-            ray.get(clean_after.remote(name), timeout=120)
+        ray.get(clean_after.remote(name), timeout=120)
     # Find all generations because an actor can have been restarted several
     # times. Only remove live groups; Ray retains removed group names forever.
     prefix = f"pg-{name}-"

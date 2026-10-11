@@ -1,4 +1,4 @@
-"""Ray actors that run prover nodes, and GPU apps that serve on their own port.
+"""Ray actors that run prover nodes, and apps that serve on their own port.
 
 A ZirenGpuProver owns one GPU server: the container on exactly the cards Ray
 granted the actor (all on one machine: the server's per-card workers share
@@ -149,11 +149,13 @@ def _kill_orphans(name: str) -> None:
             continue
         try:
             with open(f"/proc/{pid}/comm") as f:
-                if f.read().strip() != comm_name:
-                    continue
+                comm = f.read().strip()
             with open(f"/proc/{pid}/environ", "rb") as f:
-                if f"FLEET_NODE_NAME={name}".encode() not in f.read().split(b"\0"):
-                    continue
+                environ = f.read().split(b"\0")
+            if f"FLEET_NODE_NAME={name}".encode() not in environ:
+                continue
+            if comm != comm_name and b"FLEET_WORKER_ROLE=app" not in environ:
+                continue
         except OSError:
             continue
         os.kill(int(pid), 15)
@@ -166,10 +168,14 @@ def _kill_orphans(name: str) -> None:
 
 
 class _NodeProcess:
-    def __init__(self, binary: str, env: dict[str, str], log_path: str) -> None:
+    def __init__(self, binary: str | list[str], env: dict[str, str], log_path: str,
+                 workdir: str | None = None, stop_timeout_s: int = 20) -> None:
         _kill_orphans(env["FLEET_NODE_NAME"])
         self.log: io.BufferedWriter = open(log_path, "ab")
-        self.proc = subprocess.Popen([binary], env=env, stdout=self.log, stderr=subprocess.STDOUT)
+        self.stop_timeout_s = stop_timeout_s
+        command = [binary] if isinstance(binary, str) else binary
+        self.proc = subprocess.Popen(command, env=env, cwd=workdir,
+                                     stdout=self.log, stderr=subprocess.STDOUT)
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -178,9 +184,11 @@ class _NodeProcess:
         if self.alive():
             self.proc.terminate()
             try:
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=self.stop_timeout_s)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait()
+        self.log.close()
 
 
 def _container_running(container: str) -> bool:
@@ -205,6 +213,38 @@ def _node_binary(spec: ReplicaSpec) -> str:
     return spec.cluster.node_binary
 
 
+def _app_worker_env(spec: ReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
+    """Scoped environment for an integrated worker; never evaluated by a shell."""
+    assert spec.service.proof_app is not None and spec.service.proof_storage_root is not None
+    env = dict(os.environ)
+    if spec.service.worker_env_file:
+        with open(spec.service.worker_env_file) as source:
+            for number, line in enumerate(source, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:]
+                key, separator, value = line.partition("=")
+                if not separator or not key.isidentifier():
+                    raise ValueError(f"invalid worker environment key on line {number}")
+                values = shlex.split(value, comments=True)
+                if len(values) > 1:
+                    raise ValueError(f"quote worker environment values on line {number}")
+                env[key] = values[0] if values else ""
+    # Deployment files cannot override the replica's identity or server binding.
+    tenant, elf_id = spec.service.proof_app.split("/", 1)
+    env.update({"FLEET_NODE_NAME": spec.name, "FLEET_WORKER_ROLE": "app",
+                "FLEET_EXIT_WITH_PARENT": "true", "FLEET_APP_NAMESPACE": spec.service.namespace,
+                "FLEET_APP_TENANT": tenant, "FLEET_APP_ELF_ID": elf_id,
+                "FLEET_APP_STORAGE_ROOT": spec.service.proof_storage_root,
+                "FLEET_GPU_ENDPOINT": gpu_endpoint, "RUST_LOG": spec.service.rust_log,
+                "RAYON_NUM_THREADS": str(max(1, int(spec.service.cpus)))})
+    for key in ("CUDA_VISIBLE_DEVICES", "FLEET_CLUSTER_TOKEN_FILE", "FLEET_SCHEDULER"):
+        env.pop(key, None)
+    return env
+
+
 class _ZirenGpuProver:
     def __init__(self, spec: ReplicaSpec) -> None:
         self.spec = spec
@@ -216,6 +256,7 @@ class _ZirenGpuProver:
         if not svc.image:
             raise RuntimeError(f"{self.name}: a ziren-gpu service needs an image")
 
+        _kill_orphans(self.name)
         _sh(["docker", "rm", "-f", self.container])
         _warn_foreign(self.name, self.gpus)
         env_args: list[str] = []
@@ -252,9 +293,14 @@ class _ZirenGpuProver:
                 raise RuntimeError(f"GPU server did not become ready:\n{_container_logs(self.container)}")
             time.sleep(2)
 
-        env = _node_env(spec, "cuda", gpu_endpoint=f"http://127.0.0.1:{self.gpu_port}/twirp/",
-                        gpus=len(self.gpus), image=svc.image)
-        self.node = _NodeProcess(_node_binary(spec), env, spec.node_log_path())
+        if svc.worker_command:
+            self.node = _NodeProcess(svc.worker_command,
+                                     _app_worker_env(spec, f"http://127.0.0.1:{self.gpu_port}/twirp/"),
+                                     spec.node_log_path(), svc.worker_workdir, svc.worker_stop_timeout_s)
+        else:
+            env = _node_env(spec, "cuda", gpu_endpoint=f"http://127.0.0.1:{self.gpu_port}/twirp/",
+                            gpus=len(self.gpus), image=svc.image)
+            self.node = _NodeProcess(_node_binary(spec), env, spec.node_log_path())
         _watch(lambda: self.node.alive() and _container_running(self.container), self.shutdown)
 
     def health(self) -> dict[str, Any]:
@@ -265,8 +311,13 @@ class _ZirenGpuProver:
         if not (container and node):
             self.shutdown()
             os._exit(1)  # Ray restarts the actor
+        # An integrated worker owns its server continuously, including while proving.
+        # Its processes are the health boundary; probing GPU admission during a proof
+        # can mark the service unready and make reconciliation kill active work.
+        integrated = bool(self.spec.service.worker_command)
         return Health(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, gpu_port=self.gpu_port,
-                      gpu_ready=_gpu_ready(self.gpu_port), machine=socket.gethostname()).dump()
+                      gpu_ready=None if integrated else _gpu_ready(self.gpu_port),
+                      ready=True if integrated else None, machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
         _STOPPING["on"] = True
@@ -289,12 +340,13 @@ def app_command(spec: ReplicaSpec, gpus: list[str]) -> tuple[list[str], int]:
     fill = {"port": port, "index": spec.index, "gpus": ",".join(str(i) for i in range(len(gpus)))}
     cmd = [
         "docker", "run", "-d", "--name", app_container(spec.name),
-        "--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"',
-        "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
         "--network", "host",
         f"--shm-size={svc.shm_gb if svc.shm_gb is not None else 16}g",
         "--label", "zkm-fleet=app", "--label", f"zkm-fleet.node={spec.name}",
     ]
+    if gpus:
+        cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"',
+                "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
     if svc.user:
         cmd += ["--user", svc.user]
     if svc.workdir:
@@ -321,7 +373,7 @@ ZirenGpuProver = ray.remote(_ZirenGpuProver)
 
 
 class _GpuApp:
-    """A GPU container that serves on its own port (ComfyUI, an inference server).
+    """An app container that serves on its own port, with optional GPUs.
 
     It does not register with the scheduler: its clients address it by port, which is
     fixed per replica (`port_base` + replica index), on the machine Ray placed it on.
@@ -331,7 +383,7 @@ class _GpuApp:
         self.spec = spec
         self.name = spec.name
         self.container = app_container(self.name)
-        self.gpus = _granted_gpus()
+        self.gpus = _granted_gpus() if spec.service.gpus else []
         cmd, self.port = app_command(spec, self.gpus)
         self.health_url = f"http://127.0.0.1:{self.port}{spec.service.health_path}"
         _sh(["docker", "rm", "-f", self.container])

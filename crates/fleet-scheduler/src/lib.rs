@@ -6,7 +6,6 @@ pub mod fleet;
 pub mod http;
 pub mod placement;
 pub mod proof_api;
-pub mod proof_app;
 pub mod proof_fetch;
 pub mod preemption;
 pub mod quota;

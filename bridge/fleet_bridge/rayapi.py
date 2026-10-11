@@ -20,11 +20,6 @@ def nodes() -> list[dict[str, Any]]:
 def alive_nodes() -> list[dict[str, Any]]:
     return [n for n in nodes() if n.get("Alive")]
 
-
-def actor_node_id(actor: Any) -> str | None:
-    """The node an actor runs on, from the GCS (works with the dashboard API off)."""
-    try:
-        info = ray._private.state.actors(actor_id=actor._actor_id.hex())
-        return str(info["Address"]["NodeID"])
-    except Exception:
-        return None
+def resources() -> tuple[dict[str, float], dict[str, float]]:
+    """Total and currently available CPU/GPU/resource units on the local runtime."""
+    return dict(ray.cluster_resources()), dict(ray.available_resources())  # type: ignore[no-untyped-call]

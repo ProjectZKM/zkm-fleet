@@ -51,8 +51,17 @@ jobs:
           key: ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-rust-tests-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
-      - name: Test protocol, scheduler, CLI, and MCP server
-        run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleetctl -p fleet-mcp
+      - name: Test protocol, scheduler, machine agent, SDK endpoint, CLI, and MCP server
+        run: cargo test --locked -p fleet-proto -p fleet-scheduler -p fleet-node -p fleet-proof-app -p fleetctl -p fleet-mcp
+      - name: Check execution component dependency boundaries
+        run: |
+          for package in fleet-node fleet-proof-app; do
+            cargo tree --locked -p "$package" --edges normal,build --prefix none > /tmp/fleet-component-dependencies.txt
+            if grep -Eq '^(fleet-scheduler|sqlx([ -]|$)|zkm-|alloy-)' /tmp/fleet-component-dependencies.txt; then
+              cat /tmp/fleet-component-dependencies.txt
+              exit 1
+            fi
+          done
 
   prover-check:
     name: Prover artifact storage and fetching
@@ -97,4 +106,4 @@ jobs:
       - name: Install bridge and test dependencies
         run: python -m pip install ./bridge pytest
       - name: Test bridge
-        run: python -m pytest -q bridge/tests
+        run: python -m pytest -q bridge/tests deploy/tests

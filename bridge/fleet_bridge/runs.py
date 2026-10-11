@@ -8,13 +8,14 @@ belong to the workload owner's storage; no submission or file-upload CLI lives h
 from __future__ import annotations
 
 import fcntl
+import io
 import os
 import re
 import socket
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Any
 
 
@@ -25,7 +26,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .rayapi import alive_nodes, node_ip
 from .model import (Attempt, Bundle, CardState, Cause, Holder,
-                    RankInfo, Record, RunsConfig, RunSpec, RunState, RunStatus)
+                    RankInfo, RunsConfig, RunSpec, RunState, RunStatus)
 
 NAMESPACE = "zkm-fleet"
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
@@ -197,13 +198,9 @@ def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int =
     for m in spec.mounts:
         cmd += ["-v", m.docker()]
     cmd += ["-v", f"{spec.out}:{spec.out}"]
-    if spec.code_dir:
-        cmd += ["-v", f"{spec.code_dir}:{spec.code_dir}:ro"]
     env: dict[str, str] = {"PYTHONUNBUFFERED": "1", **p.env, **spec.env,
                            "FLEET_RUN_ID": spec.id, "FLEET_OUT": spec.out,
                            "FLEET_METRICS": os.path.join(spec.out, METRICS_FILE), "FLEET_ATTEMPT": str(attempt)}
-    if spec.code_dir:
-        env["FLEET_CODE"] = spec.code_dir
     for k, v in env.items():
         cmd += ["-e", f"{k}={spec.expand(v)}"]
     cmd.append(p.image)
@@ -609,48 +606,21 @@ def _end_actors(run_id: str, nodes: int) -> None:
 # FLEET_ATTEMPT counting on; a preemption spends no --retry. Only runs of a
 # `preemptible` app that have run its min_runtime_s are eligible (a run still waiting
 # for card memory has no running work to lose). This module performs the stop,
-# cleanup and requeue; the Rust scheduler chooses the plan.
+# cleanup; the Rust scheduler chooses the plan and authorizes the next launch.
 
 PREEMPTIBLE = (RunState.RUNNING, RunState.WAITING_VRAM, RunState.RETRYING)
 
 
-@dataclass(kw_only=True)
-class Candidate(Record):
-    """A run's share of one machine, as a preemption sees it."""
-
-    id: str
-    namespace: str
-    priority: int
-    node_ip: str
-    gpus: float
-    cpus: float
-    started_at: float | None  # its attempt's start; None while it waits for card memory
-    preemptible: bool
-    min_runtime_s: int
-
-    def takeable(self, now: float) -> bool:
-        return self.preemptible and (self.started_at is None or now - self.started_at >= self.min_runtime_s)
-
-
-def preempt(runs_dir: str, run_id: str, reason: str, requeue: bool = True, *,
-            namespace: str | None = None, priority: int | None = None, defer_requeue: bool = False) -> RunStatus:
-    """Stop with grace, retaining reservations until every container is confirmed stopped.
-    Automatic callers must supply the requesting namespace and priority.
-    """
+def preempt(runs_dir: str, run_id: str, reason: str) -> RunStatus:
+    """Execute an admitted preemption; retain resources until cleanup is confirmed."""
     run = RunDir(runs_dir, run_id)
     spec, before = run.spec(), run.status()
-    if namespace is not None or priority is not None:
-        candidate = Candidate(id=run_id, namespace=spec.namespace or "", priority=spec.profile.priority,
-            node_ip="", gpus=spec.gpus, cpus=spec.cpus, started_at=before.started_at if before.state is RunState.RUNNING else None,
-            preemptible=spec.profile.preemptible, min_runtime_s=spec.profile.min_runtime_s)
-        if namespace != spec.namespace or priority is None or candidate.priority >= priority or not candidate.takeable(time.time()):
-            raise Conflict(f"{run_id}: not an eligible lower-priority run in this namespace")
     if before.state not in PREEMPTIBLE or not _alive(actor_name(run_id)):
         raise Conflict(f"{run_id} is {_state(run_id, before).value}: it holds no card to preempt")
     attempts = list(before.attempts)
     if before.state is RunState.RUNNING:
         attempts.append(Attempt(exit_code=None, cause=Cause.PREEMPTED, evidence=reason))
-    st = run.update(expected_state=before.state, state=RunState.PREEMPTED, preempt_requeue=requeue,
+    st = run.update(expected_state=before.state, state=RunState.PREEMPTED, preempt_requeue=True,
                     attempts=attempts, preemptions=before.preemptions + 1, detail=f"preempted: {reason}")
     if st.state is not RunState.PREEMPTED:
         raise Conflict(f"{run_id} is {st.state.value}: nothing to preempt")
@@ -659,8 +629,6 @@ def preempt(runs_dir: str, run_id: str, reason: str, requeue: bool = True, *,
     _end_actors(run_id, st.nodes)
     if not confirm_cleanup(run):
         return run.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")
-    if requeue and not defer_requeue:
-        requeue_run(runs_dir, run_id)
     return run.status()
 
 
@@ -672,10 +640,5 @@ def requeue_run(runs_dir: str, run_id: str) -> None:
     run.update(force=True, preempt_requeue=True)
     if not confirm_cleanup(run):
         return
-    spec = run.spec()
-    if spec.namespace:
-        run.update(force=True, state=RunState.WAITING_QUOTA, preempt_requeue=False, quota_released=run.status().quota_released, started_at=None,
-                   container=None, detail="preempted: waiting for resources again")
-    else:
-        run.update(force=True, state=RunState.QUEUED, preempt_requeue=False, started_at=None, container=None)
-        launch(spec, run.path)
+    run.update(force=True, state=RunState.WAITING_QUOTA, preempt_requeue=False, quota_released=run.status().quota_released, started_at=None,
+               container=None, detail="preempted: waiting for resources again")

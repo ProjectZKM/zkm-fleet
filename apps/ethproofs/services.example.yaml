@@ -1,0 +1,39 @@
+# Merge this service into the selected machine's existing services.yaml.
+# Replace the legacy EthProofs service only after draining its SDK pipeline.
+# Keep GOAT's service configuration unchanged.
+services:
+  - name: ethproofs-v2-gpu
+    kind: ziren-gpu
+    namespace: REPLACE_WITH_NAMESPACE_ID
+    proof_app: ethproofs/REPLACE_WITH_GUEST_ELF_SHA256
+    proof_storage_root: /srv/zkm-fleet/apps/ethproofs
+    machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP
+    replicas: 1
+    disabled: true
+    gpus: 4
+    cpus: 48
+    shm_gb: 64
+    image: ghcr.io/projectzkm/ziren-gpu@sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655
+    worker_command:
+      - /opt/zkm-fleet/apps/ethproofs/eth-proofs
+      - --eth-proofs-cluster-id
+      - "8"
+      - --block-interval
+      - "1"
+      - --prefetch-depth
+      - "1"
+      - --prepare-concurrency
+      - "1"
+    worker_env_file: /etc/zkm-fleet/ethproofs-worker.env
+    worker_workdir: /srv/zkm-fleet/apps/ethproofs
+    worker_stop_timeout_s: 120
+    env:
+      RUST_LOG: "warn"
+      RUST_BACKTRACE: "1"
+      VERIFY_VK: "true"
+      SHARD_SIZE: "16777216"
+      ZIREN_LEAF_HOST_THREADS: "3"
+      ZIREN_PROCESS_PER_GPU: "1"
+      ZIREN_FUSE_LEAVES: "1"
+      ZIREN_REDUCE_OVERLAP: "1"
+      TMPDIR: /dev/shm

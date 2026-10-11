@@ -23,6 +23,7 @@ import yaml
 
 from . import actors, reconcile, runs
 from .model import Profile, RunSpec, RunState, RunStatus, Mount
+from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ class Executor:
                 self.running.discard(command["id"])
 
     def launch(self, p: dict[str, Any]) -> dict[str, Any]:
-        if len([n for n in ray.nodes() if n.get("Alive")]) != 1:
+        if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         ident, lease = p["id"], p["lease"]
         if not ident or "/" in ident or ".." in ident or not lease or "/" in lease:
@@ -205,7 +206,7 @@ class Executor:
                 raise ValueError("mount outside allowed roots or overlaps fleet state")
             if not os.path.exists(real):
                 raise ValueError("mount is missing on this machine")
-        spec = RunSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"), quota_managed=True,
+        spec = RunSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"),
             profile_name=p["profile_name"], profile=profile, command=request["command"], gpus=request["gpus"], cpus=request["cpus"],
             out=run.out, mounts=mounts, env=dict(e.split("=", 1) for e in request.get("env", []) if "=" in e),
             log=request.get("log"), workdir=request.get("workdir"),
@@ -246,7 +247,7 @@ class Executor:
         state = run.status().state
         if not state.terminal and state is not RunState.PREEMPTED:
             if preempt:
-                runs.preempt(str(self.runs_dir), p["id"], "control-plane preemption", requeue=True, defer_requeue=True)
+                runs.preempt(str(self.runs_dir), p["id"], "control-plane preemption")
             else:
                 runs.cancel(str(self.runs_dir), p["id"])
         if not self.cleanup(run) and state.terminal:
@@ -255,7 +256,7 @@ class Executor:
         return {"cleaned": self.cleanup(run), "state": run.status().state.value}
 
     def service(self, p: dict[str, Any]) -> dict[str, Any]:
-        if len([n for n in ray.nodes() if n.get("Alive")]) != 1:
+        if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         service = p["service"]
         cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
@@ -271,6 +272,8 @@ class Executor:
                 or type(resources["replicas"]) is not int or not 1 <= resources["replicas"] <= 64
                 or (configured.kind.value == "ziren-gpu" and (resources["gpus"] < 1 or resources["gpus"] % 1))):
             raise ValueError("invalid service resources")
+        if configured.worker_command and resources["replicas"] != 1:
+            raise ValueError("integrated app worker supports one machine-pinned replica")
         old_count = configured.replicas
         updates = {k: v for k, v in resources.items() if k in service}
         # Keep the previous replica count durable until every removed replica is
@@ -308,15 +311,13 @@ class Executor:
         return {"disabled": False, "ready": True}
 
     def report(self) -> dict[str, Any]:
-        nodes = [n for n in ray.nodes() if n.get("Alive")]
+        nodes = alive_nodes()
         ready = len(nodes) == 1
-        total, free = ray.cluster_resources(), ray.available_resources()
+        total, free = resources()
         config = runs.load_config(self.profiles)
-        services = yaml.safe_load(self.services.read_text()).get("services", [])
+        services = reconcile.load_services(yaml.safe_load(self.services.read_text())).raw.get("services", [])
         running = reconcile.running()
         for service in services:
-            if service.get("kind") in ("runs-api", "hold"):
-                continue
             names = [f"{service['name']}-{i}" for i in range(service.get("replicas", 1))]
             service.setdefault("namespace", "0" * 32)
             service.setdefault("priority", 0)
@@ -325,7 +326,8 @@ class Executor:
             service["ready"] = True
             for name in names:
                 try:
-                    healthy = name in running and reconcile.health_of(running[name], timeout_s=5).is_ready
+                    health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
+                    healthy = health is not None and health.is_ready
                 except Exception as error:
                     # Starting or restarting one actor must not suppress the
                     # machine heartbeat or another command's cleanup acknowledgment.
@@ -362,7 +364,7 @@ class Executor:
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
             "profiles": {k: v.dump() for k, v in config.profiles.items()},
-            "services": [s for s in services if s.get("kind") not in ("runs-api", "hold")], "runs": jobs, "results": results}
+            "services": services, "runs": jobs, "results": results}
 
     def publish(self) -> None:
         while True:

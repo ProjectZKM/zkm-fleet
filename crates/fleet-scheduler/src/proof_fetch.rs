@@ -279,15 +279,7 @@ async fn receive(
 }
 
 pub fn response_error(error: Status) -> Response {
-    let code = match error.code() {
-        tonic::Code::NotFound => StatusCode::NOT_FOUND,
-        tonic::Code::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
-        tonic::Code::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
-        tonic::Code::DeadlineExceeded => StatusCode::GATEWAY_TIMEOUT,
-        tonic::Code::DataLoss => StatusCode::BAD_GATEWAY,
-        tonic::Code::FailedPrecondition => StatusCode::CONFLICT,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
+    let code = StatusCode::from_u16(fleet_proto::sdk::http_status_code(error.code())).unwrap();
     (code, error.message().to_owned()).into_response()
 }
 

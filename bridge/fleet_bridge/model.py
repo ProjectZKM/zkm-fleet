@@ -1,11 +1,9 @@
 """The bridge's data model: typed records, and one codec that reads and writes them.
 
-Everything the bridge keeps or passes around is a dataclass here (a run's spec and
-status, a service replica, the cluster settings, a health report), with enums for
-the closed sets. Nothing else in the package spells a field name as a string:
-records go to and from JSON / YAML / environment variables through the
-reflection in `from_dict`, `to_dict`, `merge` and `to_env`, which
-read the dataclass fields and their type hints.
+Execution records, workload configuration, replicas and health reports use
+dataclasses, with enums for closed sets. The codecs validate persisted records
+and configuration against their field types. Node command and heartbeat
+envelopes remain protocol mappings.
 
 Loading is lenient about extra keys (an older or newer record still loads) and
 strict about types; `merge` refuses a field the record does not have.
@@ -300,19 +298,6 @@ class RunsConfig(Record):
 
 
 @dataclass(kw_only=True)
-class CodeRecord(Record):
-    """What `--code` captured into the run."""
-
-    source: str
-    repo: str | None = None
-    ref: str | None = None
-    commit: str | None = None
-    sha256: str | None = None
-    bytes: int | None = None
-    note: str | None = None
-
-
-@dataclass(kw_only=True)
 class RunSpec(Record):
     """Everything a run was asked to be; written once at submit, read by its actor."""
 
@@ -321,7 +306,6 @@ class RunSpec(Record):
     owner: str | None = None
     namespace: str | None = None
     tag: str | None = None
-    quota_managed: bool = False  # new API waiters; existing Ray dependency waiters are recovered in place
     profile: Profile
     command: list[str]
     gpus: float
@@ -331,20 +315,15 @@ class RunSpec(Record):
     env: dict[str, str] = field(default_factory=dict)
     log: str | None = None
     workdir: str | None = None
-    code_dir: str | None = None
-    code: CodeRecord | None = None
     gpu_mem_gb: int = 0
     vram_wait_s: int = 1800
     retry: int = 0
     restart_on_oom: int = 0
-    after: str | None = None
     nodes: int = 1
-    machines: list[str] = field(default_factory=list)
-    machine_resources: list[str] = field(default_factory=list)
 
     def expand(self, text: str) -> str:
-        """`{out}` and `{code}` in a command, env value or workdir."""
-        return text.replace("{out}", self.out).replace("{code}", self.code_dir or "{code}")
+        """`{out}` in a command, env value or workdir."""
+        return text.replace("{out}", self.out)
 
     @property
     def need_mib(self) -> int | None:
@@ -431,7 +410,6 @@ class RunStatus(Record):
     cpus: int
     gpu_mem_gb: int | None = None  # None: the whole card
     after: str | None = None
-    code: CodeRecord | None = None
     nodes: int = 1
     machine: str | None = None
     node_ip: str | None = None
@@ -465,7 +443,6 @@ class ServiceKind(str, enum.Enum):
     ZIREN_GPU = "ziren-gpu"
     ZIREN_CPU = "ziren-cpu"
     APP = "app"
-    HOLD = "hold"
 
     @property
     def takes_gpus(self) -> bool:
@@ -509,6 +486,11 @@ class ServiceSpec(Record):
     volumes: list[str] = field(default_factory=list)
     shm_gb: int | None = None
     ready_timeout_s: float = 600
+    # Integrated app worker sharing the replica's dedicated GPU server.
+    worker_command: list[str] = field(default_factory=list)
+    worker_env_file: str | None = None
+    worker_workdir: str | None = None
+    worker_stop_timeout_s: int = 120
     # apps
     port_base: int | None = None
     command: list[str] = field(default_factory=list)
@@ -522,6 +504,14 @@ class ServiceSpec(Record):
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
+        if self.worker_command:
+            if (self.kind is not ServiceKind.ZIREN_GPU or self.replicas != 1
+                    or not self.machine or not self.proof_storage_root):
+                raise ModelError("integrated worker requires a machine-pinned ziren-gpu service with one replica and persistent proof_storage_root")
+            if not os.path.isabs(self.worker_command[0]) or self.worker_stop_timeout_s <= 0:
+                raise ModelError("worker executable must be absolute and stop timeout positive")
+        elif self.worker_env_file or self.worker_workdir:
+            raise ModelError("worker environment and workdir require worker_command")
         if self.proof_app is not None:
             tenant, sep, elf_id = self.proof_app.partition("/")
             if (self.kind is not ServiceKind.ZIREN_GPU or not sep or not tenant

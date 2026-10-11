@@ -128,6 +128,7 @@ pub struct Fleet {
     /// A job runs only for one of them.
     apps: Mutex<HashMap<(String, String, String), bool>>,
     priorities: Mutex<HashMap<(String, String, String), i32>>,
+    worker_owned_apps: Mutex<HashSet<(String, String, String)>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -207,6 +208,7 @@ impl Fleet {
             quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
             priorities: Mutex::new(HashMap::new()),
+            worker_owned_apps: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -231,6 +233,14 @@ impl Fleet {
     /// Whether the app refuses new jobs.
     pub fn app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
         self.apps.lock().get(&(namespace.to_string(), tenant.to_string(), elf_id.to_string())).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn set_worker_owned_apps(&self, apps: HashSet<(String, String, String)>) {
+        *self.worker_owned_apps.lock() = apps;
+    }
+
+    pub(crate) fn app_worker_owned(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
+        self.worker_owned_apps.lock().contains(&(namespace.into(), tenant.into(), elf_id.into()))
     }
 
     pub fn app_priority(&self, namespace: &str, tenant: &str, elf_id: &str) -> i32 {

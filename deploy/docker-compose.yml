@@ -38,6 +38,7 @@ services:
       - "127.0.0.1:9191:9191" # local fleetctl; remote clients enter through HTTPS
 
   mcp:
+    profiles: [mcp]
     image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
     restart: unless-stopped
     user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"

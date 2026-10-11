@@ -204,6 +204,11 @@ pub struct RunControl {
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
 }
+pub(crate) fn integrated_worker(service: &Value) -> bool {
+    text(service, "kind") == "ziren-gpu"
+        && service["worker_command"].as_array().is_some_and(|command| !command.is_empty())
+}
+
 impl RunControl {
     pub fn new(fleet: Arc<Fleet>, admin: String, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("run-control");
@@ -225,6 +230,9 @@ impl RunControl {
                 .services
                 .insert(format!("{}-{}", v.worker, text(&v.service, "name")), v);
         }
+        fleet.set_worker_owned_apps(inner.services.values().filter(|s| integrated_worker(&s.service) && !s.disabled)
+            .filter_map(|s| text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)|
+                (text(&s.service, "namespace").into(), tenant.into(), elf.into()))).collect());
         Ok(Self {
             fleet,
             admin,
@@ -235,6 +243,33 @@ impl RunControl {
             notify: tokio::sync::Notify::new(),
         })
     }
+    fn refresh_worker_owned_apps(&self) {
+        self.update_worker_owned_apps(&self.inner.lock());
+    }
+    fn update_worker_owned_apps(&self, inner: &Inner) {
+        self.fleet.set_worker_owned_apps(inner.services.values()
+            .filter(|s| integrated_worker(&s.service) && !s.disabled)
+            .filter_map(|s| text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)|
+                (text(&s.service, "namespace").into(), tenant.into(), elf.into()))).collect());
+    }
+
+    fn check_worker_owner(&self, inner: &Inner, worker: &str, service: &Value) -> anyhow::Result<()> {
+        if !integrated_worker(service) { return Ok(()); }
+        let namespace = text(service, "namespace");
+        let allocations = self.fleet.allocations(namespace);
+        let key = format!("{}-{}", worker, text(service, "name"));
+        let owner = inner.services.iter().find(|(other_key, intent)| {
+            *other_key != &key && integrated_worker(&intent.service)
+                && text(&intent.service, "namespace") == namespace
+                && text(&intent.service, "proof_app") == text(service, "proof_app")
+                && (!intent.disabled || allocations.iter().any(|a| a.id == format!("service:{other_key}")))
+        });
+        if owner.is_some() {
+            return Err(fail(409, "this app already has an integrated worker; clean up its owner before moving it"));
+        }
+        Ok(())
+    }
+
     fn save(&self, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
         atomic(
             &self.dir.join(kind).join(format!("{id}.json")),
@@ -257,6 +292,9 @@ impl RunControl {
             return Ok(c.id.clone());
         }
         if operation == NodeOperation::SetService {
+            if parameters["disabled"].as_bool() == Some(false) {
+                self.check_worker_owner(&inner, worker, &parameters["service"])?;
+            }
             if inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
                 .and_then(|s| s.scale.as_ref()).is_some_and(|s|
                     s.pending() && parameters["scale_id"].as_str() != Some(s.id())) {
@@ -281,6 +319,7 @@ impl RunControl {
             let key = format!("{}-{}", worker, text(&intent.service, "name"));
             self.save("services", &key, &intent)?;
             inner.services.insert(key, intent);
+            self.update_worker_owned_apps(&inner);
         }
         let c = Command {
             id: uuid::Uuid::new_v4().to_string(),
@@ -312,6 +351,7 @@ impl RunControl {
             }).collect::<Vec<_>>();
             json!({"id":id,"name":id,"backend":"ray-local",
                 "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
+                "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
                 "batch_profiles":w.report.profiles.keys().collect::<Vec<_>>(),
@@ -706,6 +746,18 @@ impl RunControl {
                 service["namespace"] = json!(n.id);
             }
         }
+        let mut worker_streams = HashSet::new();
+        for service in &report.services {
+            if integrated_worker(service) {
+                if service["replicas"].as_u64().unwrap_or(1) != 1 {
+                    return Err(fail(409, "integrated workers require exactly one replica"));
+                }
+                if service["disabled"].as_bool() != Some(true)
+                    && !worker_streams.insert((text(service, "namespace"), text(service, "proof_app"))) {
+                    return Err(fail(409, "duplicate integrated worker stream in node report"));
+                }
+            }
+        }
         let _ops = self.ops.lock().await;
         {
             let mut i = self.inner.lock();
@@ -714,6 +766,11 @@ impl RunControl {
                 .is_some_and(|w| w.session != session && now() - w.seen < 30.0)
             {
                 return Err(fail(409, "another agent session is active for this worker"));
+            }
+            for service in &report.services {
+                if service["disabled"].as_bool() != Some(true) && service["cleaned"].as_bool() != Some(true) {
+                    self.check_worker_owner(&i, worker_id, service)?;
+                }
             }
             let draining = i.workers.get(worker_id).is_some_and(|w| w.draining);
             i.workers.insert(
@@ -775,7 +832,15 @@ impl RunControl {
             };
             let key = format!("{worker_id}-{name}");
             let existing = { self.inner.lock().services.get(&key).cloned() };
-            let intent = if let Some(intent) = existing {
+            let intent = if let Some(mut intent) = existing {
+                // Worker launch settings are node-admin configuration, not resource-scale overrides.
+                for field in ["worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root"] {
+                    if observed.get(field).is_some() || intent.service.get(field).is_some() {
+                        intent.service[field] = observed[field].clone();
+                    }
+                }
+                self.save("services", &key, &intent)?;
+                self.inner.lock().services.insert(key.clone(), intent.clone());
                 intent
             } else {
                 let mut service = observed.clone();
@@ -794,7 +859,7 @@ impl RunControl {
                     .insert(key.clone(), intent.clone());
                 intent
             };
-            if text(observed, "kind") == "app" {
+            if text(observed, "kind") == "app" || integrated_worker(observed) {
                 let id = format!("service:{key}");
                 let replicas = observed["replicas"].as_f64().unwrap_or(1.0);
                 if observed["cleaned"].as_bool() == Some(true) && intent.disabled {
@@ -850,6 +915,7 @@ impl RunControl {
                 )?;
             }
         }
+        self.refresh_worker_owned_apps();
         for incoming in &report.runs {
             if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
                 continue;
@@ -1015,7 +1081,7 @@ impl RunControl {
                 }
                 if c.operation == NodeOperation::SetService as i32 && c.error.is_none() {
                     let service = &c.parameters["service"];
-                    if text(service, "kind") == "app"
+                    if (text(service, "kind") == "app" || integrated_worker(service))
                         && c.parameters["disabled"].as_bool() == Some(true)
                         && c.result["cleaned"].as_bool() == Some(true)
                     {
@@ -1340,7 +1406,7 @@ impl RunControl {
                     .await?;
                     continue;
                 }
-                if text(s, "kind") == "app"
+                if (text(s, "kind") == "app" || integrated_worker(s))
                     && self
                         .fleet
                         .reserve_run(
