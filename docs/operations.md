@@ -75,8 +75,9 @@ flags retain their current values. Disabled apps stay disabled. Use `--node` to
 select a machine when the app has multiple deployments.
 
 Integrated EthProofs uses exactly one replica. SDK-driven proof apps and serving
-apps may use multiple replicas; resources are per replica. An 8-GPU/64-CPU node
-with EthProofs at 6 GPUs/64 CPUs has 2 GPUs and 0 CPUs free for other allocations.
+apps may use multiple replicas; resources are per replica. The current
+`ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 6 GPUs
+and 64 CPUs, 2 GPUs and 64 CPUs remain for other allocations.
 Existing allocations are accounted for when replacing an app's own allocation.
 
 To change the node pool, edit `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in
@@ -124,6 +125,13 @@ The namespace must already exist. See the [reference](reference.md#administrator
 for namespace creation, token issuance and quotas. Use `fleetctl --help` and
 subcommand `--help` for the complete command list. SDK clients use their app's
 endpoint; Fleet CLI and MCP use the control-plane URL.
+
+Reusable batch templates are stored in node `etc/jobs.yaml`; app deployments
+are configured in `etc/services.yaml`. Both share namespace, tag, priority,
+image and resource policy. Each batch gets a workspace under
+`FLEET_JOBS_DIR/JOB_ID/`, normally `~/app/fleet/work/jobs/JOB_ID/`.
+The command's output directory is exposed as `FLEET_OUT`; retrieve artifacts
+from application-owned storage. Fleet supplies status and logs.
 
 ## Logs and recovery
 

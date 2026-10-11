@@ -40,7 +40,7 @@ a small Python adapter performs local Ray/container operations. The control host
 requires no Ray installation. Adding a remote machine requires the control-plane URL
 and cluster token; machines do not join a shared Ray head or use SSH channels.
 
-The proof flow preserves the existing `GenerateProof`/`GetStatus` protocol:
+SDK-driven proof apps preserve the `GenerateProof`/`GetStatus` protocol:
 
 1. The client submits to its **app-owned endpoint**, which stores the inputs and
    sends Fleet only references, SHA-256 hashes and job parameters.
@@ -49,14 +49,16 @@ The proof flow preserves the existing `GenerateProof`/`GetStatus` protocol:
    using its dedicated GPU server.
 3. The node commits outputs to app storage and reports references, hashes, cycles
    and `prove_ms`. Fleet records the storage machine from the authenticated node.
-4. The client polls its app endpoint. When results are requested, Fleet authorizes
-   the fetch, queues a ticket for the storage machine's next heartbeat, and relays
-   its authenticated outbound HTTPS upload. It does not persist the proof bytes.
+4. The client polls its app endpoint, which validates completion references and
+   reads the local proof and public values directly. Remote CLI/MCP fetches use
+   an authorized ticket and the storage node's outbound HTTPS upload through Fleet.
+   Fleet does not persist reference-job proof bytes.
 
 There is no bidirectional RPC stream or control-plane connection to an inbound
-node API. EthProofs can use loopback when its client and app endpoint share a
-machine; its reporting adapter publishes directly to ethproofs.org using the
-completed job's execution timing.
+node API. Integrated EthProofs owns the entire block pipeline: head polling,
+witness preparation, loopback GPU proving, durable outputs and API reporting.
+It needs no separate EthProofs client or SDK proof endpoint. Its saved cursor
+advances one block at a time after output and report records are committed.
 
 Each proof replica owns one GPU server and runs one proof at a time. Fleet places
 jobs across eligible replicas; a single proof does not span servers. Every eligible
@@ -77,7 +79,7 @@ Persistent app ports remain private application endpoints. Fleet controls their
 lifecycle and resource reservations; an authenticated application proxy is required
 for external access to an app's own protocol.
 
-**Who gets a card.** Jobs inherit their app’s priority at submission (default `0`, higher first). A waiting batch job or starting service can preempt eligible lower-priority batch jobs only within its own namespace. Stopped batch jobs queue again after confirmed cleanup, spending no retry. Equal-priority jobs do not preempt each other; pending jobs with equal priority use FIFO order.
+**Priority and preemption.** Jobs inherit their app’s priority at submission (default `0`, higher first). A waiting batch job or starting app can preempt eligible lower-priority batch jobs only within its own namespace. Stopped batch jobs queue again after confirmed cleanup, spending no retry. Equal-priority jobs do not preempt each other; pending jobs with equal priority use FIFO order.
 
 The Python adapter performs local placement, container startup, retries and cleanup
 for commands authorized by Rust. It holds the cluster token for proof heartbeats;
@@ -163,10 +165,9 @@ and relays the node's HTTPS response in bounded memory. `fleet-ziren-node fetch-
 verifies committed files against the job, execution lease and
 hashes; it initializes no prover or GPU. The control host saves no proof files.
 Nodes need only outbound connections. Fetching waits for a heartbeat; an offline
-storage machine returns a retryable error. Older jobs retain their existing
-control-host output path.
+storage machine returns a retryable error.
 Batch logs remain available through Fleet. Each node retains its batch workspace in
-its own `JOBS_DIR`; no shared mount is required for one-machine batch jobs.
+its own `FLEET_JOBS_DIR`; no shared mount is required for one-machine batch jobs.
 
 ### App-owned proof endpoint
 
@@ -211,12 +212,10 @@ file with one absolute root per line; `deploy/install.sh node --proof-storage-ro
 installs this configuration. Keep these roots configured when GPU actors stop.
 The machine agent executes storage-only fetches separately from its heartbeats and Ray operations.
 
-The previous four control-host payload transfers were measured at **45.5 seconds
-per proof on average**. Reference jobs avoid control-host input uploads and
-proactive output publication. A client fetch through Fleet still transfers its
-requested bytes through the control host. A production comparison is required
-before claiming a speedup. The endpoint logs input
-storage and metadata admission time separately from the node's `prove_ms`.
+Reference jobs avoid control-host input uploads and proactive output publication.
+A remote fetch through Fleet still transfers its requested bytes through the
+control host. The app endpoint logs input storage and metadata admission time
+separately from the node's `prove_ms`.
 
 **Proving time is execution time.** For GPU proofs, `prove_ms` comes from the
 GPU server; input/output transfers, queueing, setup and result fetching are
@@ -225,8 +224,8 @@ separately for diagnostics and must not be reported as proving time. A GPU serve
 that omits execution timing fails the job instead of substituting RPC elapsed time.
 The SDK response carries this value in `GetStatus.proving_time`. Reporting clients
 must preserve it (for example, through `take_prove_ms()`); an SDK that only logs
-it needs a timing accessor. The EthProofs adapter requires that metadata and never
-falls back to timing the whole SDK request.
+it needs a timing accessor. Integrated EthProofs takes execution timing directly
+from its GPU response and excludes preparation, queueing and reporting.
 
 ## Namespaces, access and quotas
 
@@ -523,7 +522,7 @@ Proof job identity is required and immutable:
 | `id` | Internal execution and storage identifier. |
 | `owner` | Internal proof signer audit identifier, retained when an access token is refreshed. |
 | `namespace` | Immutable namespace ID controlling resource accounting and access. |
-| `tag` | Isolation label; `""` means untagged. |
+| `tag` | `key=value` isolation label; proof records use `""` for untagged work. |
 | `client_id` | Original SDK proof ID, unique within namespace and tag. |
 | `tenant`, `elf_id`, `kind`, `created_ms` | Submission metadata retained throughout retries. |
 
@@ -582,7 +581,7 @@ and inspect their records.
 Namespace owner tokens can register and remove proof apps for their tenant in
 their namespace, and submit proof/batch jobs inside their namespace and default tag.
 App removal refuses while any proof is queued or running and deletes that app's
-terminal proof records and legacy control-host artifacts. App-owned storage retention remains with the app owner. Administrators can also issue tokens limited
+terminal proof records and control-host artifacts. App-owned storage retention remains with the app owner. Administrators can also issue tokens limited
 to approved apps and a selected namespace/tag. Token refresh preserves access to jobs.
 Namespaces are the resource accounting and billing unit; namespace and optional tag quotas
 cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
@@ -611,11 +610,12 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 | what | where |
 |---|---|
 | proof apps, proof jobs, tokens | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
-| ELFs and proof inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores only references, hashes and parameters. Legacy jobs retain files in the scheduler data dir. |
-| Proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. Fleet stores references, hashes, cycles, `prove_ms` and the storage machine. The node serves requested bytes through a heartbeat ticket and HTTPS relay; disabling its GPU actor preserves fetching. Legacy jobs retain uploaded control-host output. |
+| SDK proof ELFs and inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores references, hashes and parameters. |
+| SDK proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. The local app endpoint reads them directly; remote Fleet fetches use an authorized heartbeat ticket and HTTPS relay. Disabling the GPU actor preserves fetching. |
+| Integrated EthProofs data | Its app-owned storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`; the app manages their format and recovery. |
 | serving apps, batch profiles, jobs and command intents | `data_dir/workloads/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
 | batch inputs, outputs and checkpoints | owner-managed shared or object storage, read and written directly by the batch command |
-| batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in their local `JOBS_DIR/<job-id>/` |
+| batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in `FLEET_JOBS_DIR/<job-id>/` (normally `work/jobs/`) |
 
 ## Tokens
 

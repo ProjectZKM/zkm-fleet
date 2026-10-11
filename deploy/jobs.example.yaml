@@ -3,12 +3,9 @@
 # a profile only bounds them: the roots a request may mount below, plus the
 # image, the user and a GPU cap. A requested mount must already exist.
 #
-# Every batch job gets its own JOBS_DIR/<id>/out, mounted read-write as $FLEET_OUT
+# Every batch job gets its own FLEET_JOBS_DIR/<id>/out, mounted read-write as $FLEET_OUT
 # (`{out}` in the command). App owners retrieve outputs from their own storage;
 # Fleet provides job status and logs with `fleetctl batch` and `fleetctl batch logs`.
-
-# Optional: where node-local model staging puts Hugging Face repos (mount it :ro
-# in jobs), and a token file for gated repos (read by the fleet, never by a job).
 
 profiles:
   trainer:

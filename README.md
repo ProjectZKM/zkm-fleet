@@ -15,6 +15,8 @@ The control host runs the Rust scheduler, Postgres and an HTTPS gateway. MCP is
 optional. Each execution machine runs `fleet-node` and its own local Ray instance.
 Agents connect outward and register automatically. Fleet manages admission,
 quotas, placement and lifecycle; workers own their application data and pipelines.
+The [code model](docs/reference.md#code-names) uses jobs, app deployments and a
+workload controller. Shared records come from protobuf; Kubernetes is not required.
 
 EthProofs prepares witnesses, proves locally and reports from one integrated app
 worker. It resumes its saved cursor and proves every block in sequence.

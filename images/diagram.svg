@@ -34,19 +34,19 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="82" y="345" class="detail">Authentication · namespace scope</text>
 <text x="82" y="378" class="detail">Workload API · SDK proof API</text>
 <rect x="462" y="275" width="600" height="145" rx="10" class="box"/>
-<text x="482" y="310" class="name">Fleet scheduler</text>
+<text x="482" y="310" class="name">Scheduler + workload controller</text>
 <text x="482" y="345" class="detail">Admission · quotas · priority · placement</text>
 <text x="482" y="378" class="detail">App lifecycle · batch queue · recovery · cleanup</text>
 <rect x="1112" y="275" width="425" height="145" rx="10" class="box"/>
 <text x="1132" y="310" class="name">Durable control state</text>
-<text x="1132" y="345" class="detail">Policies · workload records · leases</text>
+<text x="1132" y="345" class="detail">Namespaces · apps · jobs · leases</text>
 <text x="1132" y="378" class="detail">Commands · status · allocation</text>
 <path d="M412 342H462 M1062 342H1112" class="data"/>
 
 <!-- Each machine initiates heartbeats; Fleet sends commands in responses. -->
 <path d="M400 450V525 M1200 450V525" class="control"/>
 <path d="M400 450L392 462H408Z M1200 450L1192 462H1208Z" fill="#64748b"/>
-<text x="435" y="480" class="small">Node-initiated heartbeats: capacity · state · acknowledgments</text>
+<text x="435" y="480" class="small">Node-initiated heartbeats: capacity · status · acknowledgments</text>
 <text x="435" y="505" class="small">Heartbeat responses: launch · stop · service commands</text>
 
 <rect x="40" y="525" width="740" height="350" rx="14" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
@@ -61,7 +61,7 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="82" y="774" class="small">Serving · proving · app pipelines</text>
 <rect x="430" y="685" width="328" height="105" rx="10" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.5"/>
 <text x="450" y="718" class="name">Batch jobs</text>
-<text x="450" y="748" class="detail">Finite commands · queued runs</text>
+<text x="450" y="748" class="detail">Finite commands · queued jobs</text>
 <text x="450" y="774" class="small">Training · rendering · tests</text>
 <rect x="62" y="810" width="696" height="45" rx="10" class="box"/>
 <text x="82" y="840" class="detail">Shared CPU / GPU pool · Ray placement groups</text>
@@ -78,7 +78,7 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="862" y="774" class="small">Reserve resources while enabled</text>
 <rect x="1210" y="685" width="328" height="105" rx="10" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.5"/>
 <text x="1230" y="718" class="name">Batch jobs</text>
-<text x="1230" y="748" class="detail">Finite commands · queued runs</text>
+<text x="1230" y="748" class="detail">Finite commands · queued jobs</text>
 <text x="1230" y="774" class="small">Release after completion + cleanup</text>
 <rect x="842" y="810" width="696" height="45" rx="10" class="box"/>
 <text x="862" y="840" class="detail">Shared CPU / GPU pool · Ray placement groups</text>

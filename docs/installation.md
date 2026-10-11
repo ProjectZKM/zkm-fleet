@@ -4,7 +4,8 @@ Run build and installation commands from the repository root. Use prebuilt
 binaries with `--bin DIR`, or build them for each machine's operating system:
 
 ```bash
-cargo build --locked --release --bins
+cargo build --locked --release \
+  -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node
 ```
 
 For an execution agent alone, build `cargo build --locked --release -p fleet-node`.
@@ -15,6 +16,9 @@ Generic Fleet builds and installations do not need the EthProofs submodule.
 | Control host | Docker and Docker Compose |
 | Execution node | Docker, Python ≥ 3.10 with `venv`, cron; installer adds Ray and PyYAML |
 | GPU node | Execution dependencies, NVIDIA driver ≥ 570 and NVIDIA container toolkit |
+
+Building from source also requires Rust and `protoc`. The control-host Docker
+build supplies them inside its build image. Ray runs only on execution nodes.
 
 SDK-driven proving also needs `fleet-ziren-node`, built explicitly with
 `cargo build --locked --release -p fleet-ziren-node` and its upstream build
@@ -63,6 +67,9 @@ The node needs outbound HTTPS with HTTP/2 on port 8905.
 
 The installer starts Ray and the agent with a cron watchdog. Use `--no-cron` when
 providing your own supervisor for `deploy/node-start.sh` and local Ray.
+When systemd supervises the agent, set `FLEET_NODE_SUPERVISED=1` in
+`etc/watchdog.env`; the watchdog may still keep Ray running. Use only one agent
+supervisor.
 It preserves existing app and batch configuration. A new node starts empty:
 configure `etc/services.yaml` and `etc/jobs.yaml` using the
 [app example](../deploy/services.example.yaml) and
@@ -81,3 +88,4 @@ node registration command is required.
 After registration, use the [operations guide](operations.md) to inspect nodes,
 configure workloads and adjust app allocations. Use [node maintenance](maintenance.md)
 when changing an existing machine’s Ray capacity.
+Use the [upgrade steps](maintenance.md#update-fleet) for an existing installation.

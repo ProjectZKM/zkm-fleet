@@ -1,7 +1,8 @@
 # EthProofs app worker
 
-Fleet pins the worker in the [`third_party/reth-processor`](../../third_party/reth-processor)
-Git submodule. The worker migration is based on
+Fleet pins the worker in the `third_party/reth-processor` Git submodule
+([pinned source](https://github.com/ProjectZKM/reth-processor/tree/26ebf2a4adb5412a765f0dd1ed2cf6ba9bbd5502)).
+The worker migration is based on
 [reth-processor PR #23](https://github.com/ProjectZKM/reth-processor/pull/23),
 `chore/ziren-v2-stateless`, which includes the Fleet worker integration and
 support for structured or RLP-encoded execution-witness headers. Host and guest
@@ -46,13 +47,14 @@ apps/ethproofs/build.sh /absolute/path/to/validated/program.elf /tmp/ethproofs-p
 ```
 
 The script requires committed submodule source and installed upstream Rust
-build dependencies. The former production ELF and GPU image are a different
-revision; validate the new guest and pull `ghcr.io/projectzkm/ziren-gpu:latest`,
-then pin its resolved digest for the EthProofs service. It packages the executable,
-ELF, source revision, and SHA-256 hashes. `ETH_PROOFS_BUILD_ELF` bypasses the upstream guest build;
-building a new guest requires the installed Ziren MIPS toolchain and its
-locked guest dependencies. Guest builds retain PR #23's precompile pins. The example pins the image resolved
-from `latest` on 2026-10-11: `sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655`.
+build dependencies. It packages the executable, existing ELF, source revision
+and SHA-256 hashes; it does not build a new guest. `ETH_PROOFS_BUILD_ELF` supplies
+the existing ELF to the upstream host build. A new guest requires the Ziren MIPS
+toolchain and the locked guest dependencies, including PR #23's precompile pins.
+
+For an image update, pull `ghcr.io/projectzkm/ziren-gpu:latest`, validate it with
+the host and guest, then pin its resolved digest in the service config. The current
+validated image is `sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655`.
 Its Ziren revision label matches the locked host and guest revision.
 
 Install the package at `/opt/zkm-fleet/apps/ethproofs`. Adapt
@@ -63,26 +65,27 @@ and RPC URLs in the private file described by
 [`worker.env.example`](worker.env.example), readable only by the worker account.
 Fleet supplies the scoped identity, state root, and loopback GPU endpoint.
 
-A new guest has a new app identity. Stage its new service disabled alongside the
-legacy service and wait for the node heartbeat to advertise it. Then register `ethproofs/<new ELF digest>` with
-`fleetctl app add ethproofs/ --elf /path/to/program.elf --namespace zkm`, use a
-new service name and state directory, and retain the disabled old app and its
-history for rollback. Keep GOAT's service and image unchanged.
+A new guest has a new app identity. Stage its service disabled and wait for the
+node heartbeat to advertise it. Register it with
+`fleetctl --namespace zkm app add ethproofs/ --elf /path/to/program.elf`.
+Use a new service name and state directory. Keep a temporary rollback package
+until proving and reporting are verified, then remove retired deployment records
+according to the app's retention policy. Keep GOAT's service and image unchanged.
 
-Before live cutover, validate local proving against the deployed GPU image and
-EthProofs reporting with the appropriate test credentials. Drain the external
-client, record its next unproved block, and stop the old app endpoint/prover
-before enabling the replacement service. Bootstrap with `--start-block N`;
-a checkpoint takes precedence on subsequent restarts. Preserve GOAT's service.
-Do not run the external client and integrated worker for the same stream together.
+Before enabling a new worker, validate local proving and API reporting with test
+credentials. For an existing stream, preserve its next unproved block and stop
+the previous worker before starting the replacement. Bootstrap a new state
+directory with `--start-block N`; a checkpoint takes precedence on subsequent
+restarts. Run only one worker for the stream and preserve GOAT's service.
 
 ## Production deployment
 
-The worker runs on `ant-5090-2` as one replica with six GPUs and 64 CPUs. The node
-pool contains eight GPUs and 64 CPUs. Preparation concurrency remains one;
+The worker is configured on `ant-5090-2` as one replica with six GPUs and 64 CPUs.
+The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
 GPU allocation and preparation concurrency are separate settings.
-The old EthProofs endpoint is disabled. GOAT keeps its existing endpoint and
-configuration.
+The external EthProofs client and its old SDK endpoint have been retired.
+GOAT keeps its existing endpoint and configuration. App enable/disable state is
+an operator decision; inspect it with `fleetctl --namespace zkm app`.
 
 The package records worker source commit
 `26ebf2a4adb5412a765f0dd1ed2cf6ba9bbd5502` on
@@ -98,9 +101,10 @@ fleetctl --namespace zkm app scale ethproofs/334b45b8 \
 fleetctl --namespace zkm app scale ethproofs/334b45b8
 ```
 
-The 64-CPU allocation resumed from saved block 26,167,298 after block 26,167,297
-finished during graceful shutdown. Verify new proofs and reporting acknowledgments
-in `~/app/fleet/work/logs/ethproofs-v5-gpu-0.node.log`.
+Inspect `~/app/fleet/work/apps/ethproofs/v5-worker/checkpoint.json` for the saved
+next block. Verify proofs and reporting acknowledgments in
+`~/app/fleet/work/logs/ethproofs-v5-gpu-0.node.log`. Do not edit the checkpoint
+to bypass a failed block.
 
 ## Operate and recover
 
@@ -132,7 +136,7 @@ of an already committed block requires operator reconciliation; this first phase
 does not rewind previously reported proofs automatically.
 
 Source entry points are `bin/eth-proofs/src/main.rs` (pipeline), `latest.rs`
-(bounded preparation and newest-ready selection), `state.rs`
+(bounded preparation, including sequential mode), `state.rs`
 (recovery), `eth_proofs.rs` (reporting), and
 `crates/executor/host/src/full_executor.rs` (preparation/proving) in the submodule.
 Publish source changes first, then commit the exact new gitlink in Fleet.

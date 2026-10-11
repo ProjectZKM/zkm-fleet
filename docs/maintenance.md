@@ -1,4 +1,4 @@
-# Node maintenance
+# Maintenance
 
 Use this procedure when changing a node's Ray capacity or replacing installed
 Fleet programs. Ordinary app scaling needs only `fleetctl app scale`; it does
@@ -30,7 +30,7 @@ package for rollback. Do not change app checkpoints or remove pending reports.
 On the node, edit `~/app/fleet/etc/watchdog.env`:
 
 ```bash
-RAY_NUM_CPUS=64
+RAY_NUM_CPUS=128
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ```
 
@@ -93,6 +93,83 @@ the affected app, inspect its error and restore the prior package/configuration;
 keep the current durable cursor and reports. See the [operations guide](operations.md)
 for log locations and the distinction between node capacity and app allocation.
 
+## Update Fleet
+
+Deploy one tested Git revision to the control host and every node. Shared models
+come from protobuf, and machine reports use version 2; the scheduler, agent and
+Python bridge must agree. Use the pause procedure above before replacing node
+programs. A program update does not require restarting Ray or changing its pool.
+
+Build the generic programs from that revision:
+
+```bash
+cargo build --locked --release \
+  -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node
+```
+
+Keep the existing `etc/`, Postgres database, control `data_dir` and node `work/`.
+Schema 14 installations retain namespaces and tokens across ordinary updates.
+Only an incompatible schema requires an explicit metadata reset; there are no
+database migrations. A reset invalidates namespace access, so recreate and
+redistribute scoped credentials before resuming clients.
+
+### Control host
+
+For the default Docker Compose installation, rebuild the image from the checkout
+and recreate the scheduler. Set `FLEET_PREFIX` to the installed directory:
+
+```bash
+FLEET_PREFIX="$HOME/app/fleet"
+docker build -f deploy/Dockerfile.scheduler -t zkm-fleet-scheduler:local .
+install -m 755 target/release/fleetctl "$FLEET_PREFIX/bin/fleetctl"
+docker compose --env-file "$FLEET_PREFIX/compose.env" -p zkm-fleet \
+  -f "$FLEET_PREFIX/deploy/docker-compose.yml" up -d --no-deps --force-recreate scheduler
+```
+
+If MCP is enabled, repeat the Compose command with `mcp` instead of `scheduler`.
+Use the image tag already configured by the installation if it differs from
+`zkm-fleet-scheduler:local`. Replace installed Compose/gateway templates when
+their configuration changes; rebuilding an image alone does not replace them.
+
+Existing native systemd installations keep their supervisor. For the deployed
+control host, run from the checkout:
+
+```bash
+FLEET_PREFIX="$PWD/.fleet"
+sudo systemctl stop zkm-fleet-mcp.service zkm-scheduler.service
+install -m 755 target/release/fleet-scheduler target/release/fleetctl \
+  target/release/fleet-mcp "$FLEET_PREFIX/bin/"
+sudo systemctl start zkm-scheduler.service zkm-fleet-mcp.service
+```
+
+Verify the gateway's `/healthz`, `fleetctl namespace` and `fleetctl node`.
+When enabled, also check MCP initialization and an authenticated tool call.
+
+### Execution node
+
+Replace `bin/fleet-node`, `bridge/` and the three launch scripts
+(`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`) from the same revision while
+the agent is stopped. Install the tested bridge wheel into the existing virtual
+environment, then start the agent with its existing supervisor:
+
+```bash
+FLEET_PREFIX="$HOME/app/fleet"
+sudo systemctl stop zkm-fleet-node.service
+install -m 755 /path/to/package/bin/fleet-node "$FLEET_PREFIX/bin/fleet-node"
+# Replace bridge/ and the launch scripts from the package before starting.
+"$FLEET_PREFIX/venv/bin/python" -m pip install --no-index --no-deps \
+  --force-reinstall /path/to/package/fleet_bridge-0.1.0-py3-none-any.whl
+sudo systemctl start zkm-fleet-node.service
+```
+
+The offline wheel command assumes Ray and PyYAML are already installed at the
+versions required by the package. For cron installations, pause and restore the
+watchdog as described above. Preserve `etc/watchdog.env`, including node capacity
+and `FLEET_NODE_SUPERVISED`, along with `services.yaml`, `jobs.yaml` and credentials.
+Keep independent app endpoints running when their programs are unchanged.
+Verify the fresh heartbeat, total/free resources, app states and saved progress
+before following [verify and resume](#verify-and-resume).
+
 ## Installed files and backups
 
 Keep source/build files separate from the installed runtime. A node installation
@@ -103,20 +180,18 @@ uses these directories:
 | `bin/`, `bridge/`, `venv/`, `deploy/` | Installed Fleet programs and launch scripts |
 | `apps/` | Packaged application binaries and guest ELFs |
 | `etc/` | Machine configuration and private credentials |
-| `work/` | Ray files, logs, batch workspaces and durable app data |
-| `backup/` | Current rollback snapshot and maintenance records |
+| `work/jobs/` | Local batch job records and output workspaces (`FLEET_JOBS_DIR`) |
+| `work/apps/` | App-owned checkpoints, inputs, outputs and reports |
+| `work/logs/`, `work/ray/`, `work/spill/` | Process logs, Ray runtime and spilled objects |
+| `work/.maintenance/` | Deployment and resource provisioning receipts |
+| `backup/` | Temporary rollback package; remove after successful verification |
 
 Before an update, record running allocations, pause affected workloads and back
 up configuration plus durable app data. Install a tested revision, restart the
 required processes, then verify readiness, resumed progress and report delivery.
 
-For the typed machine protocol (report version 2), update the control host,
-`fleet-node` and `bridge/` together. Older agents are refused. This development
-release also requires fresh schema 14 metadata; it provides no database migration.
-Recreate namespace access after a reset and keep app-owned proof files and checkpoints.
-
 Back up control-host Postgres and its `data_dir` together; batch records and app
-intents live in that directory. Preserve node app checkpoints, prepared inputs,
+intents live under `data_dir/workloads/`. Preserve node app checkpoints, prepared inputs,
 outputs and pending reports. Keep tokens private. Delete obsolete build packages
 and old logs only after checking running processes and rollback needs; keep
 proof retention an explicit app policy.
