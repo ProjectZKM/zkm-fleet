@@ -33,7 +33,7 @@ migration is validated.
 | Guide | Covers |
 |---|---|
 | [Installation](docs/installation.md) | Dependencies, binaries, control host, execution nodes and registration |
-| [Operations](docs/operations.md) | Node capacity, app allocation, scaling, batch commands, logs and troubleshooting |
+| [Operations](docs/operations.md) | Namespace commands, tags, node capacity, app scaling, batches and logs |
 | [Maintenance](docs/maintenance.md) | Pause/resume, Ray capacity changes, upgrades, runtime files and backups |
 | [Reference](docs/reference.md) | Protocols, namespaces, tokens, quotas, APIs, storage and ports |
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |

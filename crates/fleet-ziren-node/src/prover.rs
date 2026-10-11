@@ -15,7 +15,7 @@ use zkm_prover::ZKMProver;
 use zkm_sdk::provers::CudaProver;
 use zkm_sdk::{ProverClient, ZKMProofKind, ZKMProvingKey, ZKMStdin, ZKMVerifyingKey};
 
-use crate::Args;
+use crate::ProverArgs;
 
 type Keys = Arc<(ZKMProvingKey, ZKMVerifyingKey)>;
 type Outcome = Result<ProveResponse, (tonic::Code, String)>;
@@ -26,27 +26,27 @@ const READY_GRACE: Duration = Duration::from_secs(15);
 /// Results kept for jobs whose caller went away (a scheduler restart): it asks again.
 const FINISHED_KEPT: usize = 4;
 
-struct Running {
+struct ActiveProof {
     job_id: String,
     done: watch::Receiver<Option<Outcome>>,
 }
 
-pub struct Node {
+pub struct ZirenProver {
     client: Arc<ProverClient>,
     backend: String,
     gpu_endpoint: String,
     keys: Mutex<LruCache<String, Keys>>,
     /// One proof at a time: the GPU server serialises anyway, and the CPU prover takes every core.
     /// Lock order: `running` before `finished`.
-    running: Mutex<Option<Running>>,
+    running: Mutex<Option<ActiveProof>>,
     finished: Mutex<LruCache<String, Outcome>>,
     http: reqwest::Client,
     /// Last time the GPU server answered Ready.
     last_ready: Mutex<Option<Instant>>,
 }
 
-impl Node {
-    pub async fn start(args: &Args) -> anyhow::Result<Self> {
+impl ZirenProver {
+    pub async fn start(args: &ProverArgs) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
@@ -163,7 +163,7 @@ impl Node {
                 Some(_) => return Err(Status::resource_exhausted("node busy")),
                 None => {
                     let (tx, rx) = watch::channel(None);
-                    *running = Some(Running {
+                    *running = Some(ActiveProof {
                         job_id: req.job_id.clone(),
                         done: rx.clone(),
                     });
@@ -312,15 +312,15 @@ async fn gpu_ready(http: &reqwest::Client, endpoint: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub struct AttachToken(MetadataValue<tonic::metadata::Ascii>);
+pub struct BearerTokenInterceptor(MetadataValue<tonic::metadata::Ascii>);
 
-impl AttachToken {
+impl BearerTokenInterceptor {
     pub fn new(token: &str) -> anyhow::Result<Self> {
         Ok(Self(format!("Bearer {token}").parse()?))
     }
 }
 
-impl tonic::service::Interceptor for AttachToken {
+impl tonic::service::Interceptor for BearerTokenInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         req.metadata_mut().insert("authorization", self.0.clone());
         Ok(req)

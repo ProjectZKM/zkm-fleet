@@ -21,8 +21,8 @@ from typing import Any
 import ray
 import yaml
 
-from . import actors, reconcile, runs
-from .model import Profile, RunSpec, RunState, RunStatus, Mount
+from . import actors, reconcile, jobs
+from .model import JobTemplate, JobSpec, JobState, JobStatus, Mount
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -82,10 +82,10 @@ def set_disabled(path: Path, name: str, disabled: bool, resources: dict[str, Any
         os.close(directory)
 
 
-class Executor:
-    def __init__(self, services: str, profiles: str, runs_dir: str) -> None:
-        self.services, self.profiles, self.runs_dir = Path(services), profiles, Path(runs_dir)
-        self.journal = self.runs_dir / ".node" / "commands"
+class NodeExecutor:
+    def __init__(self, services: str, profiles: str, jobs_dir: str) -> None:
+        self.services, self.profiles, self.jobs_dir = Path(services), profiles, Path(jobs_dir)
+        self.journal = self.jobs_dir / ".node" / "commands"
         self.journal.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.running: set[str] = set()
@@ -98,21 +98,21 @@ class Executor:
         with self.lock:
             return self.resource_locks.setdefault(key, threading.Lock())
 
-    def cleanup(self, run: runs.RunDir) -> bool:
+    def cleanup(self, job: jobs.JobDirectory) -> bool:
         # There is only one execution machine. A persisted old Ray IP must not
         # make local Docker cleanup depend on a vanished Ray node identity.
-        if runs._going(run.id) or not container_gone(runs.container_name(run.id)):
+        if jobs._going(job.id) or not container_gone(jobs.container_name(job.id)):
             return False
-        runs.discard_placement(run.id)
+        jobs.discard_placement(job.id)
         return True
 
     def receive(self, command: dict[str, Any]) -> None:
         ident = command["id"]
-        if not runs._inside(str(self.journal / ident), [str(self.journal)]) or not ident or "/" in ident or ".." in ident:
+        if not jobs._inside(str(self.journal / ident), [str(self.journal)]) or not ident or "/" in ident or ".." in ident:
             raise ValueError("invalid command id")
         if command["operation"] in (2, 3):
             p = command["parameters"]
-            write_json(self.runs_dir / ".node" / "stops" / f"{p['id']}-{p['lease']}.json", {"operation": command["operation"]})
+            write_json(self.jobs_dir / ".node" / "stops" / f"{p['id']}-{p['lease']}.json", {"operation": command["operation"]})
         with self.lock:
             existing = read_json(self.journal / f"{ident}.json")
             if existing and existing["command"] != command:
@@ -139,15 +139,15 @@ class Executor:
                     with self.services_lock:
                         result = self.service(params)
                 elif operation == 5:
-                    directory = self.runs_dir / params["id"]
+                    directory = self.jobs_dir / params["id"]
                     if directory.exists():
                         current = read_json(directory / ".fleet-lease.json", {"lease": "imported"})["lease"]
                         if current != params["lease"]:
                             raise ValueError("stale purge lease")
-                        run = runs.RunDir(str(self.runs_dir), params["id"])
-                        if not self.cleanup(run):
-                            raise ValueError("run cleanup is not confirmed")
-                        shutil.rmtree(run.path)
+                        job = jobs.JobDirectory(str(self.jobs_dir), params["id"])
+                        if not self.cleanup(job):
+                            raise ValueError("job cleanup is not confirmed")
+                        shutil.rmtree(job.path)
                     result = {"cleaned": True}
                 else:
                     raise ValueError("unsupported node operation")
@@ -156,10 +156,10 @@ class Executor:
             ident = params.get("id")
             if ident:
                 try:
-                    run = runs.RunDir(str(self.runs_dir), ident)
-                    result = {"cleaned": self.cleanup(run)}
-                except (runs.NotFound, FileNotFoundError):
-                    result = {"cleaned": not runs._going(ident) and container_gone(runs.container_name(ident))}
+                    job = jobs.JobDirectory(str(self.jobs_dir), ident)
+                    result = {"cleaned": self.cleanup(job)}
+                except (jobs.NotFound, FileNotFoundError):
+                    result = {"cleaned": not jobs._going(ident) and container_gone(jobs.container_name(ident))}
                 except BaseException:
                     pass
             log.exception("node command failed: %s", command["id"])
@@ -174,86 +174,86 @@ class Executor:
         ident, lease = p["id"], p["lease"]
         if not ident or "/" in ident or ".." in ident or not lease or "/" in lease:
             raise ValueError("invalid execution id")
-        if (self.runs_dir / ".node" / "stops" / f"{ident}-{lease}.json").exists():
+        if (self.jobs_dir / ".node" / "stops" / f"{ident}-{lease}.json").exists():
             raise ValueError("execution lease was stopped before launch")
-        directory = self.runs_dir / ident
+        directory = self.jobs_dir / ident
         lease_file = directory / ".fleet-lease.json"
         previous = read_json(lease_file)
         if previous:
-            run = runs.RunDir(str(self.runs_dir), ident)
+            job = jobs.JobDirectory(str(self.jobs_dir), ident)
             if previous["lease"] != lease:
-                if run.status().state is not RunState.PREEMPTED or not self.cleanup(run):
+                if job.status().state is not JobState.PREEMPTED or not self.cleanup(job):
                     raise ValueError("another execution lease is still present")
-                runs.requeue_run(str(self.runs_dir), ident)
-            elif run.status().state.terminal or runs._going(ident):
+                jobs.requeue_job(str(self.jobs_dir), ident)
+            elif job.status().state.terminal or jobs._going(ident):
                 return {"id": ident, "lease": lease}
-            elif run.status().started_at is not None or not container_gone(runs.container_name(ident)):
+            elif job.status().started_at is not None or not container_gone(jobs.container_name(ident)):
                 raise ValueError("execution is uncertain; refusing to relaunch")
         request = p["request"]
         if "code" in request:
-            raise ValueError("run inputs must be prepared by the app owner in storage")
-        profile = Profile.load(p["profile"])
+            raise ValueError("job inputs must be prepared by the app owner in storage")
+        profile = JobTemplate.load(p["profile"])
         if profile.namespace != p["namespace"] or request.get("nodes", 1) != 1:
             raise ValueError("invalid local execution scope")
         directory.mkdir(parents=True, exist_ok=True)
-        run = runs.RunDir(str(self.runs_dir), ident, must_exist=False)
-        os.makedirs(run.out, exist_ok=True)
+        job = jobs.JobDirectory(str(self.jobs_dir), ident, must_exist=False)
+        os.makedirs(job.out, exist_ok=True)
         mounts = [Mount.parse(m) for m in request.get("mount", [])]
-        protected = [str(self.runs_dir), str(self.services.parent)]
+        protected = [str(self.jobs_dir), str(self.services.parent)]
         for mount in mounts:
             real = os.path.realpath(mount.path)
-            if not runs._inside(real, profile.allow) or any(os.path.commonpath([real, root]) in (real, root) for root in protected):
+            if not jobs._inside(real, profile.allow) or any(os.path.commonpath([real, root]) in (real, root) for root in protected):
                 raise ValueError("mount outside allowed roots or overlaps fleet state")
             if not os.path.exists(real):
                 raise ValueError("mount is missing on this machine")
-        spec = RunSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"),
+        spec = JobSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"),
             profile_name=p["profile_name"], profile=profile, command=request["command"], gpus=request["gpus"], cpus=request["cpus"],
-            out=run.out, mounts=mounts, env=dict(e.split("=", 1) for e in request.get("env", []) if "=" in e),
+            out=job.out, mounts=mounts, env=dict(e.split("=", 1) for e in request.get("env", []) if "=" in e),
             log=request.get("log"), workdir=request.get("workdir"),
             gpu_mem_gb=request.get("gpu_mem", 0), vram_wait_s=request.get("vram_wait", 1800),
             retry=request.get("retry", 0), restart_on_oom=request.get("restart_on_oom", 0), nodes=1)
-        roots = [m.path for m in mounts] + [run.out]
-        if spec.workdir and not runs._inside(spec.expand(spec.workdir), roots):
+        roots = [m.path for m in mounts] + [job.out]
+        if spec.workdir and not jobs._inside(spec.expand(spec.workdir), roots):
             raise ValueError("workdir outside job mounts")
-        if spec.log and not runs._inside(spec.log, [m.path for m in mounts if m.mode.value == "rw"] + [run.out]):
+        if spec.log and not jobs._inside(spec.log, [m.path for m in mounts if m.mode.value == "rw"] + [job.out]):
             raise ValueError("log outside writable job mounts")
-        spec.write(run.spec_path)
-        if not os.path.isfile(run.status_path):
-            RunStatus(id=ident, state=RunState.QUEUED, namespace=p["namespace"], tag=p.get("tag"), priority=profile.priority,
-                submitted_at=p["submitted_at"], gpus_requested=spec.gpus, cpus=spec.cpus, launch_pending=True).write(run.status_path)
+        spec.write(job.spec_path)
+        if not os.path.isfile(job.status_path):
+            JobStatus(id=ident, state=JobState.QUEUED, namespace=p["namespace"], tag=p.get("tag"), priority=profile.priority,
+                submitted_at=p["submitted_at"], gpus_requested=spec.gpus, cpus=spec.cpus, launch_pending=True).write(job.status_path)
         write_json(lease_file, {"lease": lease})
-        if not runs.prepare_launch(spec):
-            run.update(state=RunState.FAILED, launch_pending=False, finished_at=time.time(), error="local capacity changed")
+        if not jobs.prepare_launch(spec):
+            job.update(state=JobState.FAILED, launch_pending=False, finished_at=time.time(), error="local capacity changed")
             raise ValueError("local Ray capacity changed before launch")
         # Stable Ray actor name + get_if_exists makes heartbeat replay safe.
         try:
-            runs.launch(spec, run.path)
+            jobs.launch(spec, job.path)
         except BaseException:
-            if not runs._going(ident):
-                run.update(state=RunState.FAILED, launch_pending=False, finished_at=time.time(), error="actor launch failed")
-                runs.discard_placement(ident)
+            if not jobs._going(ident):
+                job.update(state=JobState.FAILED, launch_pending=False, finished_at=time.time(), error="actor launch failed")
+                jobs.discard_placement(ident)
             raise
         return {"id": ident, "lease": lease}
 
     def stop(self, p: dict[str, Any], preempt: bool) -> dict[str, Any]:
-        if not (self.runs_dir / p["id"]).exists():
-            if runs._going(p["id"]) or not container_gone(runs.container_name(p["id"])):
+        if not (self.jobs_dir / p["id"]).exists():
+            if jobs._going(p["id"]) or not container_gone(jobs.container_name(p["id"])):
                 raise ValueError("execution exists without a local record")
             return {"cleaned": True, "state": "cancelled"}
-        run = runs.RunDir(str(self.runs_dir), p["id"])
-        lease = read_json(Path(run.path) / ".fleet-lease.json", {"lease": "imported"})["lease"]
+        job = jobs.JobDirectory(str(self.jobs_dir), p["id"])
+        lease = read_json(Path(job.path) / ".fleet-lease.json", {"lease": "imported"})["lease"]
         if lease != p["lease"]:
             raise ValueError("stale execution lease")
-        state = run.status().state
-        if not state.terminal and state is not RunState.PREEMPTED:
+        state = job.status().state
+        if not state.terminal and state is not JobState.PREEMPTED:
             if preempt:
-                runs.preempt(str(self.runs_dir), p["id"], "control-plane preemption")
+                jobs.preempt(str(self.jobs_dir), p["id"], "control-plane preemption")
             else:
-                runs.cancel(str(self.runs_dir), p["id"])
-        if not self.cleanup(run) and state.terminal:
-            runs._end_actors(run.id, run.status().nodes)
-            subprocess.run(["docker", "stop", "--time", str(run.spec().profile.stop_timeout_s), runs.container_name(run.id)], capture_output=True, timeout=run.spec().profile.stop_timeout_s + 30)
-        return {"cleaned": self.cleanup(run), "state": run.status().state.value}
+                jobs.cancel(str(self.jobs_dir), p["id"])
+        if not self.cleanup(job) and state.terminal:
+            jobs._end_actors(job.id, job.status().nodes)
+            subprocess.run(["docker", "stop", "--time", str(job.spec().profile.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().profile.stop_timeout_s + 30)
+        return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 
     def service(self, p: dict[str, Any]) -> dict[str, Any]:
         if len(alive_nodes()) != 1:
@@ -314,7 +314,7 @@ class Executor:
         nodes = alive_nodes()
         ready = len(nodes) == 1
         total, free = resources()
-        config = runs.load_config(self.profiles)
+        config = jobs.load_config(self.profiles)
         services = reconcile.load_services(yaml.safe_load(self.services.read_text())).raw.get("services", [])
         running = reconcile.running()
         for service in services:
@@ -335,36 +335,36 @@ class Executor:
                     healthy = False
                 service["ready"] &= healthy
             service["cleaned"] = not any(name in running for name in names) and all(container_gone(actors.gpu_container(name)) and container_gone(actors.app_container(name)) for name in names)
-        jobs = []
-        for entry in self.runs_dir.iterdir():
+        job_reports = []
+        for entry in self.jobs_dir.iterdir():
             if entry.name.startswith(".") or not entry.is_dir() or not (entry / "spec.json").is_file():
                 continue
             try:
-                run = runs.RunDir(str(self.runs_dir), entry.name)
-                spec, status = run.spec(), run.status()
+                job = jobs.JobDirectory(str(self.jobs_dir), entry.name)
+                spec, status = job.spec(), job.status()
                 lease = read_json(entry / ".fleet-lease.json", {"lease": "imported"})["lease"]
-                if (entry / f".fleet-reported-{lease}").exists() and (status.state.terminal or status.state is RunState.LOST):
+                if (entry / f".fleet-reported-{lease}").exists() and (status.state.terminal or status.state is JobState.LOST):
                     continue
                 cleaned_file = entry / f".fleet-cleaned-{lease}"
                 cleaned = cleaned_file.exists()
-                if not cleaned and (status.state.terminal or status.state in (RunState.PREEMPTED, RunState.LOST)):
-                    cleaned = self.cleanup(run)
+                if not cleaned and (status.state.terminal or status.state in (JobState.PREEMPTED, JobState.LOST)):
+                    cleaned = self.cleanup(job)
                     if cleaned:
                         cleaned_file.touch()
-                if not status.state.terminal and status.state is not RunState.PREEMPTED and not status.launch_pending and not runs._going(run.id):
-                    status = run.update(state=RunState.LOST, error="local Ray actor disappeared; cleanup must be confirmed")
-                jobs.append({"id": run.id, "lease": lease, "status": status.dump(), "spec": spec.dump(), "cleaned": cleaned,
+                if not status.state.terminal and status.state is not JobState.PREEMPTED and not status.launch_pending and not jobs._going(job.id):
+                    status = job.update(state=JobState.LOST, error="local Ray actor disappeared; cleanup must be confirmed")
+                job_reports.append({"id": job.id, "lease": lease, "status": status.dump(), "spec": spec.dump(), "cleaned": cleaned,
                     "logs_ready": (entry / f".fleet-logs-{lease}").exists()})
             except (OSError, ValueError, SystemExit):
-                log.exception("reading local run %s", entry.name)
+                log.exception("reading local job %s", entry.name)
         with self.lock:
             results = [{"id": p.stem, "result": v["result"], "error": v["error"]}
                 for p in self.journal.glob("*.json") if (v := read_json(p)).get("done")]
-        return {"version": 1, "machine": socket.gethostname(), "ready": ready,
+        return {"version": 2, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
             "profiles": {k: v.dump() for k, v in config.profiles.items()},
-            "services": services, "runs": jobs, "results": results}
+            "services": services, "jobs": job_reports, "results": results}
 
     def publish(self) -> None:
         while True:
@@ -379,7 +379,7 @@ class Executor:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    for name in ["services", "profiles", "runs-dir"]:
+    for name in ["services", "profiles", "jobs-dir"]:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--address", default="127.0.0.1:6379")
     args = parser.parse_args()
@@ -387,7 +387,7 @@ def main() -> None:
     if not args.address.startswith(("127.0.0.1:", "localhost:")):
         raise SystemExit("Ray must be local")
     ray.init(address=args.address, namespace=reconcile.NAMESPACE, log_to_driver=False)
-    executor = Executor(args.services, args.profiles, args.runs_dir)
+    executor = NodeExecutor(args.services, args.profiles, args.jobs_dir)
     for path in executor.journal.glob("*.json"):
         entry = read_json(path)
         if not entry.get("done"):
@@ -401,9 +401,9 @@ def main() -> None:
             with executor.lock:
                 (executor.journal / f"{message['ack']}.json").unlink(missing_ok=True)
         elif "reported" in message:
-            (executor.runs_dir / message["reported"] / f".fleet-reported-{message['lease']}").touch()
+            (executor.jobs_dir / message["reported"] / f".fleet-reported-{message['lease']}").touch()
         elif "logs_ready" in message:
-            (executor.runs_dir / message["logs_ready"] / f".fleet-logs-{message['lease']}").touch()
+            (executor.jobs_dir / message["logs_ready"] / f".fleet-logs-{message['lease']}").touch()
 
 
 if __name__ == "__main__":

@@ -5,7 +5,11 @@
 //! `fleet::v1` is internal: scheduler <-> prover nodes.
 
 pub mod artifacts;
+pub mod json;
+pub mod models;
 pub mod sdk;
+
+pub use fleet::model;
 
 /// Shared file credential handling for endpoints; tokens never enter command arguments.
 pub fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
@@ -21,6 +25,11 @@ pub mod stage {
 }
 
 pub mod fleet {
+    pub mod model {
+        pub mod v1 {
+            tonic::include_proto!("fleet.model.v1");
+        }
+    }
     pub mod v1 {
         tonic::include_proto!("fleet.v1");
     }

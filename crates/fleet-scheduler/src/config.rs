@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct Config {
+pub struct SchedulerConfig {
     /// External stage API (SDK network prover). TLS when `tls` is set.
     #[serde(default = "default_stage_addr")]
     pub stage_addr: String,
@@ -15,7 +15,7 @@ pub struct Config {
     pub http_addr: String,
     /// Base URL clients reach `http_addr` at; public values are served under it.
     pub public_url: String,
-    /// Postgres; the in-memory store is used when absent (tests, local runs).
+    /// Postgres; the in-memory store is used when absent (tests, local jobs).
     #[serde(default)]
     pub database_url: Option<String>,
     /// File holding the Postgres URL (keeps the password out of this file); wins over `database_url`.
@@ -64,16 +64,16 @@ pub struct TenantConfig {
     #[serde(default)]
     pub addresses: Vec<String>,
     #[serde(default)]
-    pub class: Class,
+    pub class: SchedulingClass,
     #[serde(default)]
-    pub anchor: Anchor,
+    pub anchor: AnchorPolicy,
     /// Only nodes proving with this circuit version serve the tenant.
     #[serde(default)]
     pub zkm_version: Option<String>,
     /// Allowed node backends ("cuda", "cpu", "mock"); empty means any.
     #[serde(default)]
     pub backends: Vec<String>,
-    /// Node name prefixes that may run this tenant's jobs, e.g. `[ethproofs-gpu]` for
+    /// Prover name prefixes that may run this tenant's jobs, e.g. `[ethproofs-gpu]` for
     /// the replicas of that service; empty means any. A tenant whose proofs must come
     /// from a particular prover configuration (keys, verification mode) pins it here.
     #[serde(default)]
@@ -84,7 +84,7 @@ pub struct TenantConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Class {
+pub enum SchedulingClass {
     /// Dispatched before every batch job.
     Latency,
     #[default]
@@ -93,7 +93,7 @@ pub enum Class {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Anchor {
+pub enum AnchorPolicy {
     /// Any eligible node.
     #[default]
     None,
@@ -134,10 +134,10 @@ fn default_max_queued() -> usize {
     64
 }
 
-impl Config {
+impl SchedulerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let mut cfg: Config = serde_yaml::from_str(&text)?;
+        let mut cfg: SchedulerConfig = serde_yaml::from_str(&text)?;
         if let Some(f) = &cfg.database_url_file {
             cfg.database_url = Some(std::fs::read_to_string(f)?.trim().to_string());
         }
@@ -186,7 +186,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn cfg(control: &str, tls: &str) -> Config {
+    fn cfg(control: &str, tls: &str) -> SchedulerConfig {
         serde_yaml::from_str(&format!("public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\nadmin_token_file: /tmp/admin\ncontrol_addr: {control}\n{tls}tenants: []\n")).unwrap()
     }
     #[test]

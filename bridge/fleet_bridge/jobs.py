@@ -25,8 +25,8 @@ from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .rayapi import alive_nodes, node_ip
-from .model import (Attempt, Bundle, CardState, Cause, Holder,
-                    RankInfo, RunsConfig, RunSpec, RunState, RunStatus)
+from .model import (JobAttempt, ResourceRequest, GpuMemoryState, FailureCause, GpuProcess,
+                    TaskPlacement, JobTemplates, JobSpec, JobState, JobStatus)
 
 NAMESPACE = "zkm-fleet"
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
@@ -40,18 +40,18 @@ def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:
 
 # ── the cards as they really are ─────────────────────────────────────────────
 
-def card_memory(cards: list[str]) -> dict[str, CardState]:
+def card_memory(cards: list[str]) -> dict[str, GpuMemoryState]:
     """Physical state of host cards: free / total MiB and the processes holding memory
     (pid, MiB, command). Ray's grant is logical; this is what is really on the card."""
     if not cards:
         return {}
     q = _sh(["nvidia-smi", "--query-gpu=index,uuid,memory.free,memory.total",
              "--format=csv,noheader,nounits", "-i", ",".join(cards)])
-    out: dict[str, CardState] = {}
+    out: dict[str, GpuMemoryState] = {}
     by_uuid: dict[str, str] = {}
     for line in q.stdout.strip().splitlines():
         idx, uuid_, free, total = [x.strip() for x in line.split(",")]
-        out[idx] = CardState(index=idx, free_mib=int(free), total_mib=int(total))
+        out[idx] = GpuMemoryState(index=idx, free_mib=int(free), total_mib=int(total))
         by_uuid[uuid_] = idx
     apps = _sh(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"])
     for line in apps.stdout.strip().splitlines():
@@ -62,7 +62,7 @@ def card_memory(cards: list[str]) -> dict[str, CardState]:
                     cmd = f.read().replace(b"\0", b" ").decode(errors="replace").strip()[:80]
             except OSError:
                 cmd = "?"
-            out[by_uuid[uuid_]].holders.append(Holder(pid=int(pid), mib=int(used), cmd=cmd))
+            out[by_uuid[uuid_]].holders.append(GpuProcess(pid=int(pid), mib=int(used), cmd=cmd))
     return out
 
 
@@ -91,20 +91,20 @@ class Conflict(SystemExit):
     """Refused because of the state it is in (the API answers 409)."""
 
 
-# A run id: what a submit makes of the name, never `.`/`..` or a dot entry of the runs dir.
-RUN_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+# A job id: what a submit makes of the name, never `.`/`..` or a dot entry of the jobs dir.
+JOB_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
-class RunDir:
-    """A run's record directory and the files in it."""
+class JobDirectory:
+    """A job's record directory and the files in it."""
 
-    def __init__(self, runs_dir: str, run_id: str, *, must_exist: bool = True) -> None:
-        if not RUN_ID.fullmatch(run_id or ""):
-            raise NotFound(f"no run {run_id!r} (not a run id)")
-        self.id = run_id
-        self.path = os.path.join(runs_dir, run_id)
+    def __init__(self, jobs_dir: str, job_id: str, *, must_exist: bool = True) -> None:
+        if not JOB_ID.fullmatch(job_id or ""):
+            raise NotFound(f"no job {job_id!r} (not a job id)")
+        self.id = job_id
+        self.path = os.path.join(jobs_dir, job_id)
         if must_exist and not os.path.isdir(self.path):
-            raise NotFound(f"no run {run_id}")
+            raise NotFound(f"no job {job_id}")
 
     @property
     def spec_path(self) -> str:
@@ -119,15 +119,15 @@ class RunDir:
         return os.path.join(self.path, OUT_DIR)
 
 
-    def spec(self) -> RunSpec:
-        return RunSpec.read(self.spec_path)
+    def spec(self) -> JobSpec:
+        return JobSpec.read(self.spec_path)
 
-    def status(self) -> RunStatus:
-        return RunStatus.read(self.status_path)
+    def status(self) -> JobStatus:
+        return JobStatus.read(self.status_path)
 
-    def update(self, *, force: bool = False, expected_state: RunState | None = None, **changes: Any) -> RunStatus:
-        """Merges typed changes into status.json, under the run's lock (the actor, a
-        cancel and a preemption write it). Once the run has ended, a late report from the
+    def update(self, *, force: bool = False, expected_state: JobState | None = None, **changes: Any) -> JobStatus:
+        """Merges typed changes into status.json, under the job's lock (the actor, a
+        cancel and a preemption write it). Once the job has ended, a late report from the
         actor that it is going (or ended otherwise) is dropped: a cancel wins. While it
         is being preempted, so is everything but a cancel and the preemption's own
         writes (force): the actor being stopped reports nothing more."""
@@ -139,7 +139,7 @@ class RunDir:
             new_state = changes.get("state")
             if st.state.terminal and new_state not in (None, st.state):
                 return st
-            if st.state is RunState.PREEMPTED and not force and new_state is not RunState.CANCELLED:
+            if st.state is JobState.PREEMPTED and not force and new_state is not JobState.CANCELLED:
                 return st
             if new_state is not None and new_state.terminal:
                 changes.setdefault("preempt_requeue", False)
@@ -150,43 +150,38 @@ class RunDir:
             return st
 
 
-    def state(self) -> RunState | None:
+    def state(self) -> JobState | None:
         try:
             return self.status().state
         except (OSError, ValueError):
             return None
 
 
-# Execution actor names, including waiters retained from earlier records. The services'
-# reconciler leaves every actor with these prefixes alone, and refuses services named so.
-RUN_ACTOR_PREFIX, WAIT_ACTOR_PREFIX = "run-", "wait-"
+# App reconciliation leaves batch job actors alone.
+JOB_ACTOR_PREFIX = "job-"
 
 
-def is_run_actor(name: str) -> bool:
-    return name.startswith((RUN_ACTOR_PREFIX, WAIT_ACTOR_PREFIX))
+def is_job_actor(name: str) -> bool:
+    return name.startswith(JOB_ACTOR_PREFIX)
 
 
-def container_name(run_id: str, rank: int = 0) -> str:
-    return f"fleet-run-{run_id}" + (f"-r{rank}" if rank else "")
+def container_name(job_id: str, rank: int = 0) -> str:
+    return f"fleet-job-{job_id}" + (f"-r{rank}" if rank else "")
 
 
-def actor_name(run_id: str, rank: int = 0) -> str:
-    return f"{RUN_ACTOR_PREFIX}{run_id}" + (f"-r{rank}" if rank else "")
+def actor_name(job_id: str, rank: int = 0) -> str:
+    return f"{JOB_ACTOR_PREFIX}{job_id}" + (f"-r{rank}" if rank else "")
 
 
-def waiter_name(run_id: str) -> str:
-    return f"{WAIT_ACTOR_PREFIX}{run_id}"
+def pg_name(job_id: str) -> str:
+    return f"pg-job-{job_id}"
 
 
-def pg_name(run_id: str) -> str:
-    return f"pg-run-{run_id}"
-
-
-def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int = 0) -> list[str]:
-    """The `docker run` for a run (or one rank of it) on the given host cards."""
+def docker_command(spec: JobSpec, gpus: list[str], attempt: int = 1, rank: int = 0) -> list[str]:
+    """The `docker run` for a job (or one rank of it) on the given host cards."""
     p = spec.profile
     cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", "none" if spec.namespace or spec.owner else "host",
-           f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=run", "--label", f"zkm-fleet.run={spec.id}"]
+           f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=job", "--label", f"zkm-fleet.job={spec.id}"]
     if gpus:
         cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"', "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
     if spec.cpus:
@@ -199,7 +194,7 @@ def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int =
         cmd += ["-v", m.docker()]
     cmd += ["-v", f"{spec.out}:{spec.out}"]
     env: dict[str, str] = {"PYTHONUNBUFFERED": "1", **p.env, **spec.env,
-                           "FLEET_RUN_ID": spec.id, "FLEET_OUT": spec.out,
+                           "FLEET_JOB_ID": spec.id, "FLEET_OUT": spec.out,
                            "FLEET_METRICS": os.path.join(spec.out, METRICS_FILE), "FLEET_ATTEMPT": str(attempt)}
     for k, v in env.items():
         cmd += ["-e", f"{k}={spec.expand(v)}"]
@@ -208,8 +203,8 @@ def docker_command(spec: RunSpec, gpus: list[str], attempt: int = 1, rank: int =
     return cmd
 
 
-def missing_mounts(spec: RunSpec) -> list[str]:
-    """Mounts that do not exist where the run landed; the run fails instead of docker
+def missing_mounts(spec: JobSpec) -> list[str]:
+    """Mounts that do not exist where the job landed; the job fails instead of docker
     creating them, owned by root, in someone's tree."""
     return [m.path for m in spec.mounts if not os.path.exists(m.path)]
 
@@ -219,7 +214,7 @@ def missing_mounts(spec: RunSpec) -> list[str]:
 class _Rank:
     """The cards Ray granted to one local batch container."""
 
-    def __init__(self, spec: RunSpec, rank: int = 0) -> None:
+    def __init__(self, spec: JobSpec, rank: int = 0) -> None:
         self.spec, self.rank = spec, rank
         self.gpus: list[str] = [str(int(g)) for g in ray.get_gpu_ids()]
         self.name = container_name(spec.id, rank)
@@ -228,8 +223,8 @@ class _Rank:
         self.log: io.BufferedWriter | None = None
         self.offset = 0
 
-    def info(self) -> RankInfo:
-        return RankInfo(rank=self.rank, machine=socket.gethostname(), node_ip=node_ip(),
+    def info(self) -> TaskPlacement:
+        return TaskPlacement(rank=self.rank, machine=socket.gethostname(), node_ip=node_ip(),
                         gpus=self.gpus, container=self.name)
 
     def check(self, need: int | None) -> str | None:
@@ -248,9 +243,9 @@ class _Rank:
         """Starts the container; returns docker's error, or None."""
         with open(os.path.join(os.path.dirname(self.spec.out), ".lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            st = RunStatus.read(os.path.join(os.path.dirname(self.spec.out), STATUS_FILE))
-            if st.state.terminal or st.state is RunState.PREEMPTED:
-                return "run stopped before container creation"
+            st = JobStatus.read(os.path.join(os.path.dirname(self.spec.out), STATUS_FILE))
+            if st.state.terminal or st.state is JobState.PREEMPTED:
+                return "job stopped before container creation"
             _sh(["docker", "rm", "-f", self.name])
             out = _sh(docker_command(self.spec, self.gpus, attempt, self.rank))
             if out.returncode != 0:
@@ -260,7 +255,7 @@ class _Rank:
         self.follower = subprocess.Popen(["docker", "logs", "-f", self.name], stdout=self.log, stderr=subprocess.STDOUT)
         return None
 
-    def wait(self) -> Attempt:
+    def wait(self) -> JobAttempt:
         """Waits for the container to end and says how it ended."""
         waited = _sh(["docker", "wait", self.name])
         time.sleep(1)  # let the follower drain the last lines
@@ -269,7 +264,7 @@ class _Rank:
             self.log.close()
         text = waited.stdout.strip()
         code = int(text) if text.lstrip("-").isdigit() else None
-        result = Attempt(exit_code=code)
+        result = JobAttempt(exit_code=code)
         if code != 0:
             insp = _sh(["docker", "inspect", "-f", "{{.State.OOMKilled}}", self.name])
             with open(self.log_path, "rb") as f:
@@ -277,11 +272,11 @@ class _Rank:
                 this_attempt = f.read()[-65536:].decode(errors="replace")
             m = GPU_OOM.search(this_attempt)
             if m:
-                result = replace(result, cause=Cause.GPU_OOM, evidence=m.group(0), card_holders=_holders(self.gpus))
+                result = replace(result, cause=FailureCause.GPU_OOM, evidence=m.group(0), card_holders=_holders(self.gpus))
             elif insp.stdout.strip() == "true":
-                result = replace(result, cause=Cause.HOST_OOM, evidence="docker: OOMKilled")
+                result = replace(result, cause=FailureCause.HOST_OOM, evidence="docker: OOMKilled")
             else:
-                result = replace(result, cause=Cause.EXIT_CODE)
+                result = replace(result, cause=FailureCause.EXIT_CODE)
         _sh(["docker", "rm", "-f", self.name])
         return result
 
@@ -289,68 +284,65 @@ class _Rank:
         _sh(["docker", "rm", "-f", self.name])
 
 
-def stop_command(run_id: str, rank: int, grace_s: int) -> list[str]:
+def stop_command(job_id: str, rank: int, grace_s: int) -> list[str]:
     """SIGTERM to the job, SIGKILL grace_s later (docker stop): a cancel or a preemption
     gives it the time to checkpoint into out/ (FLEET_ATTEMPT tells the next attempt)."""
-    return ["docker", "stop", "-t", str(grace_s), container_name(run_id, rank)]
+    return ["docker", "stop", "-t", str(grace_s), container_name(job_id, rank)]
 
 
-class _GpuRun:
+class _JobActor:
     """Execute one finite job on this machine, including its retry budgets."""
 
-    def __init__(self, spec: RunSpec, run_dir: str) -> None:
+    def __init__(self, spec: JobSpec, job_dir: str) -> None:
         self.spec = spec
-        self.dir = RunDir(os.path.dirname(run_dir), os.path.basename(run_dir))
+        self.dir = JobDirectory(os.path.dirname(job_dir), os.path.basename(job_dir))
         self.local = _Rank(spec)
         self.gpus = self.local.gpus
         info = self.local.info()
         self.dir.update(machine=info.machine, node_ip=info.node_ip, launch_pending=False)
         threading.Thread(target=self._run, daemon=True).start()
 
-    def ping(self) -> RankInfo:
-        return self.local.info()
-
     def _wait_vram(self, need: int | None) -> bool:
         deadline = time.time() + self.spec.vram_wait_s
         while True:
-            if self.dir.state() in (RunState.CANCELLED, RunState.PREEMPTED):
+            if self.dir.state() in (JobState.CANCELLED, JobState.PREEMPTED):
                 return False
             short = self.local.shortfall(need)
             if not short:
                 return True
             if time.time() > deadline:
-                self.dir.update(state=RunState.FAILED, gpus=self.gpus, finished_at=time.time(),
+                self.dir.update(state=JobState.FAILED, gpus=self.gpus, finished_at=time.time(),
                                 error="cards not free in time: " + "; ".join(short))
                 return False
-            self.dir.update(state=RunState.WAITING_VRAM, gpus=self.gpus, detail="; ".join(short))
+            self.dir.update(state=JobState.WAITING_VRAM, gpus=self.gpus, detail="; ".join(short))
             time.sleep(15)
 
-    def _attempt(self, attempt: int) -> Attempt:
+    def _attempt(self, attempt: int) -> JobAttempt:
         error = self.local.start(attempt)
         if error:
             self.local.kill()
-            return Attempt(exit_code=None, cause=Cause.DOCKER_RUN, error=error)
-        self.dir.update(state=RunState.RUNNING, gpus=self.gpus, container=self.local.name, attempt=attempt,
+            return JobAttempt(exit_code=None, cause=FailureCause.DOCKER_RUN, error=error)
+        self.dir.update(state=JobState.RUNNING, gpus=self.gpus, container=self.local.name, attempt=attempt,
                         started_at=time.time(), detail=None)
         try:
             return self.local.wait()
         except Exception as error:
             self.local.kill()
-            return Attempt(exit_code=None, cause=Cause.RANK_LOST, error=repr(error)[:300])
+            return JobAttempt(exit_code=None, cause=FailureCause.RANK_LOST, error=repr(error)[:300])
 
     def _run(self) -> None:
         code: int | None = None
         try:
-            if self.dir.status().state.terminal or self.dir.state() is RunState.PREEMPTED:
+            if self.dir.status().state.terminal or self.dir.state() is JobState.PREEMPTED:
                 return
             need = self.spec.need_mib
             problem = self.local.check(need)
             if problem:
-                self.dir.update(state=RunState.FAILED, gpus=self.gpus, finished_at=time.time(), error=problem)
+                self.dir.update(state=JobState.FAILED, gpus=self.gpus, finished_at=time.time(), error=problem)
                 return
-            # a run queued again after a preemption goes on from its record: FLEET_ATTEMPT
+            # a job queued again after a preemption goes on from its record: FLEET_ATTEMPT
             # counts on, and the budgets are what its earlier attempts left
-            attempts: list[Attempt] = list(self.dir.status().attempts)
+            attempts: list[JobAttempt] = list(self.dir.status().attempts)
             attempt = len(attempts)
             retries, oom_restarts = budgets(self.spec, attempts)
             while True:
@@ -361,23 +353,23 @@ class _GpuRun:
                 attempts.append(result)
                 code = result.exit_code
                 if result.ok:
-                    self.dir.update(state=RunState.SUCCEEDED, exit_code=0, attempts=attempts, finished_at=time.time())
+                    self.dir.update(state=JobState.SUCCEEDED, exit_code=0, attempts=attempts, finished_at=time.time())
                     return
-                if self.dir.state() in (RunState.CANCELLED, RunState.PREEMPTED):
+                if self.dir.state() in (JobState.CANCELLED, JobState.PREEMPTED):
                     return  # the canceller or the preemption records how it ended
                 if result.cause is not None and result.cause.oom and oom_restarts > 0:
                     oom_restarts -= 1
                 elif retries > 0:
                     retries -= 1
                 else:
-                    self.dir.update(state=RunState.FAILED, exit_code=code, cause=result.cause, error=result.reason,
+                    self.dir.update(state=JobState.FAILED, exit_code=code, cause=result.cause, error=result.reason,
                                     attempts=attempts, finished_at=time.time())
                     return
-                self.dir.update(state=RunState.RETRYING, attempts=attempts,
+                self.dir.update(state=JobState.RETRYING, attempts=attempts,
                                 detail=f"attempt {attempt} ended {result.cause.value if result.cause else '?'} "
                                        f"(exit {code}); trying again")
         except Exception as e:  # report, never hang the cards
-            self.dir.update(state=RunState.FAILED, error=repr(e), finished_at=time.time())
+            self.dir.update(state=JobState.FAILED, error=repr(e), finished_at=time.time())
         finally:
             try:
                 self.local.kill()
@@ -386,15 +378,15 @@ class _GpuRun:
                 os._exit(0 if code == 0 else 1)
 
 
-GpuRun = ray.remote(_GpuRun)
+JobActor = ray.remote(_JobActor)
 
 
-def budgets(spec: RunSpec, attempts: list[Attempt]) -> tuple[int, int]:
+def budgets(spec: JobSpec, attempts: list[JobAttempt]) -> tuple[int, int]:
     """--retry and --restart-on-oom left after these attempts: an out-of-memory failure
     spends a restart first, any other failure a retry; a preempted attempt spends none."""
     retries, oom_restarts = spec.retry, spec.restart_on_oom
     for a in attempts:
-        if a.ok or a.cause is Cause.PREEMPTED:
+        if a.ok or a.cause is FailureCause.PREEMPTED:
             continue
         if a.cause is not None and a.cause.oom and oom_restarts > 0:
             oom_restarts -= 1
@@ -408,7 +400,7 @@ def _on_node(argv: list[str]) -> str:
     return _sh(argv).stdout
 
 
-def _on_run_machine(place: RankInfo, argv: list[str], timeout_s: float = 60) -> str | None:
+def _on_job_node(place: TaskPlacement, argv: list[str], timeout_s: float = 60) -> str | None:
     """Runs argv on the machine a rank landed on (its container is there) and returns
     its stdout; None when that machine has left the cluster."""
     if not place.node_ip:  # never landed (or a record from before node_ip): only this machine can have it
@@ -421,9 +413,9 @@ def _on_run_machine(place: RankInfo, argv: list[str], timeout_s: float = 60) -> 
         return None
 
 
-def _stop_ranks(st: RunStatus, run_id: str, grace_s: int) -> None:
+def _stop_ranks(st: JobStatus, job_id: str, grace_s: int) -> None:
     """Every rank's container stopped with grace, all at once (a gang's ranks end together)."""
-    threads = [threading.Thread(target=_on_run_machine, args=(r, stop_command(run_id, r.rank, grace_s), grace_s + 60))
+    threads = [threading.Thread(target=_on_job_node, args=(r, stop_command(job_id, r.rank, grace_s), grace_s + 60))
                for r in st.places()]
     for t in threads:
         t.start()
@@ -431,12 +423,12 @@ def _stop_ranks(st: RunStatus, run_id: str, grace_s: int) -> None:
         t.join()
 
 
-def bundle(spec: RunSpec) -> Bundle:
+def bundle(spec: JobSpec) -> ResourceRequest:
     """CPU/GPU units already assigned to this execution machine."""
-    return Bundle(cpu=float(max(spec.cpus, 1)), gpu=float(spec.gpus))
+    return ResourceRequest(cpu=float(max(spec.cpus, 1)), gpu=float(spec.gpus))
 
 
-def run_placement(spec: RunSpec) -> Any:
+def job_placement(spec: JobSpec) -> Any:
     """Stable local placement identity lets a launch intent survive an agent crash."""
     if spec.nodes != 1:
         raise ValueError("batch execution requires exactly one machine")
@@ -447,16 +439,16 @@ def run_placement(spec: RunSpec) -> Any:
                                name=pg_name(spec.id), lifetime="detached")
 
 
-def discard_placement(run_id: str) -> None:
+def discard_placement(job_id: str) -> None:
     try:
-        remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
+        remove_placement_group(ray.util.get_placement_group(pg_name(job_id)))
     except ValueError:
         pass
 
 
-def prepare_launch(spec: RunSpec) -> bool:
+def prepare_launch(spec: JobSpec) -> bool:
     """Claim actual capacity first; a blocked run must not occupy namespace units."""
-    pg = run_placement(spec)
+    pg = job_placement(spec)
     ready, _ = ray.wait([pg.ready()], timeout=0.05)
     if ready:
         return True
@@ -464,22 +456,22 @@ def prepare_launch(spec: RunSpec) -> bool:
     return False
 
 
-def launch(spec: RunSpec, run_dir: str) -> None:
+def launch(spec: JobSpec, job_dir: str) -> None:
     b = bundle(spec)
-    pg = run_placement(spec)
-    GpuRun.options(
+    pg = job_placement(spec)
+    JobActor.options(
         name=actor_name(spec.id), namespace=NAMESPACE, lifetime="detached", num_cpus=b.cpu, num_gpus=b.gpu,
         get_if_exists=True,
         max_restarts=0, max_task_retries=0,
         scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
-    ).remote(spec, run_dir)
+    ).remote(spec, job_dir)
 
 
 # ── submit ───────────────────────────────────────────────────────────────────
 
-def load_config(path: str) -> RunsConfig:
+def load_config(path: str) -> JobTemplates:
     with open(path) as f:
-        return RunsConfig.load(yaml.safe_load(f) or {})
+        return JobTemplates.load(yaml.safe_load(f) or {})
 
 
 def _inside(path: str, roots: list[str]) -> bool:
@@ -500,7 +492,7 @@ def _machine_resource(machine: str) -> str:
 
 def _alive(name: str) -> bool:
     """Whether the actor exists. Without a connection to the cluster nobody can tell:
-    then it counts as alive (a run is not called lost for that), and get_actor is not
+    then it counts as alive (a job is not called lost for that), and get_actor is not
     asked, which would start a Ray instance of its own on this machine."""
     if not ray.is_initialized():
         return True
@@ -511,21 +503,21 @@ def _alive(name: str) -> bool:
         return False
 
 
-def _going(run_id: str) -> bool:
-    return _alive(actor_name(run_id)) or _alive(waiter_name(run_id))
+def _going(job_id: str) -> bool:
+    return _alive(actor_name(job_id))
 
 
 @ray.remote(num_cpus=0, max_retries=0)
-def _container_stopped(run_id: str, rank: int) -> bool:
-    out = _sh(["docker", "inspect", "-f", "{{.State.Running}}", container_name(run_id, rank)])
+def _container_stopped(job_id: str, rank: int) -> bool:
+    out = _sh(["docker", "inspect", "-f", "{{.State.Running}}", container_name(job_id, rank)])
     return (out.returncode == 0 and out.stdout.strip() == "false"
             or out.returncode != 0 and ("No such object" in out.stderr or "No such container" in out.stderr))
 
 
-def execution_stopped(run: RunDir) -> bool:
+def execution_stopped(job: JobDirectory) -> bool:
     """Actor disappearance alone is not proof that detached Docker work stopped."""
-    st = run.status()
-    if _going(run.id) or any(_alive(actor_name(run.id, i)) for i in range(1, st.nodes)):
+    st = job.status()
+    if _going(job.id) or any(_alive(actor_name(job.id, i)) for i in range(1, st.nodes)):
         return False
     live = {n["NodeManagerAddress"] for n in alive_nodes()} if any(p.node_ip for p in st.places()) else set()
     for place in st.places():
@@ -537,62 +529,62 @@ def execution_stopped(run: RunDir) -> bool:
             return False
         try:
             task = _container_stopped.options(resources={f"node:{place.node_ip}": 0.001})
-            if not ray.get(task.remote(run.id, place.rank), timeout=5):
+            if not ray.get(task.remote(job.id, place.rank), timeout=5):
                 return False
         except Exception:
             return False
     try:
-        discard_placement(run.id)
+        discard_placement(job.id)
     except Exception:
         return False
     return True
 
 
-def confirm_cleanup(run: RunDir) -> bool:
-    st = run.status()
-    if not _going(run.id) and not st.launch_pending and st.state in (RunState.CANCELLED,RunState.PREEMPTED,RunState.WAITING_QUOTA):
+def confirm_cleanup(job: JobDirectory) -> bool:
+    st = job.status()
+    if not _going(job.id) and not st.launch_pending and st.state in (JobState.CANCELLED,JobState.PREEMPTED,JobState.WAITING_QUOTA):
         for p in st.places():
             if p.node_ip:
-                _on_run_machine(p,["docker","rm","-f",container_name(run.id,p.rank)],5)
-    return execution_stopped(run)
+                _on_job_node(p,["docker","rm","-f",container_name(job.id,p.rank)],5)
+    return execution_stopped(job)
 
 
-def _state(run_id: str, st: RunStatus) -> RunState:
-    """The state as it is: a run that has not ended but has no actor any more is lost
+def _state(job_id: str, st: JobStatus) -> JobState:
+    """The state as it is: a job that has not ended but has no actor any more is lost
     (one being preempted has none for a moment, between its stop and its requeue)."""
-    if (st.state.terminal or st.launch_pending or st.state in (RunState.PREEMPTED, RunState.WAITING_QUOTA)
-            or (st.state is RunState.WAITING_DEPENDENCY and st.namespace is not None)):
+    if (st.state.terminal or st.launch_pending or st.state in (JobState.PREEMPTED, JobState.WAITING_QUOTA)
+            or (st.state is JobState.WAITING_DEPENDENCY and st.namespace is not None)):
         return st.state
-    return RunState.LOST if not _going(run_id) else st.state
+    return JobState.LOST if not _going(job_id) else st.state
 
 
-def cancel(runs_dir: str, run_id: str) -> RunStatus:
-    run = RunDir(runs_dir, run_id)
-    st = run.update(state=RunState.CANCELLED, finished_at=time.time())
-    if st.state is not RunState.CANCELLED:
-        raise Conflict(f"{run_id} already {st.state.value}: nothing to cancel")
+def cancel(jobs_dir: str, job_id: str) -> JobStatus:
+    job = JobDirectory(jobs_dir, job_id)
+    st = job.update(state=JobState.CANCELLED, finished_at=time.time())
+    if st.state is not JobState.CANCELLED:
+        raise Conflict(f"{job_id} already {st.state.value}: nothing to cancel")
     if st.node_ip or st.container or st.ranks:  # location is written before container creation
-        _stop_ranks(st, run_id, run.spec().profile.stop_timeout_s)
-    _end_actors(run_id, st.nodes)
+        _stop_ranks(st, job_id, job.spec().profile.stop_timeout_s)
+    _end_actors(job_id, st.nodes)
     gone = [r.machine for r in st.places()
-            if _on_run_machine(r, ["docker", "rm", "-f", container_name(run_id, r.rank)]) is None]
+            if _on_job_node(r, ["docker", "rm", "-f", container_name(job_id, r.rank)]) is None]
     if gone:
-        st = run.update(container=f"not removed: {', '.join(gone)} left the cluster")
+        st = job.update(container=f"not removed: {', '.join(gone)} left the cluster")
     try:
-        remove_placement_group(ray.util.get_placement_group(pg_name(run_id)))
+        remove_placement_group(ray.util.get_placement_group(pg_name(job_id)))
     except Exception:
         pass
     return st
 
 
-def _end_actors(run_id: str, nodes: int) -> None:
-    names = [actor_name(run_id), waiter_name(run_id)] + [actor_name(run_id, i) for i in range(1, nodes)]
+def _end_actors(job_id: str, nodes: int) -> None:
+    names = [actor_name(job_id)] + [actor_name(job_id, i) for i in range(1, nodes)]
     for name in names:
         try:
             ray.kill(ray.get_actor(name, namespace=NAMESPACE), no_restart=True)
         except ValueError:
             pass
-    # the names are free once the kills land (a run queued again reuses them)
+    # the names are free once the kills land (a job queued again reuses them)
     deadline = time.time() + 30
     while any(_alive(n) for n in names) and time.time() < deadline:
         time.sleep(0.5)
@@ -600,45 +592,45 @@ def _end_actors(run_id: str, nodes: int) -> None:
 
 # ── preemption ───────────────────────────────────────────────────────────────
 #
-# The control plane selects victims before starting a higher-priority workload. A run is
+# The control plane selects victims before starting a higher-priority workload. A job is
 # stopped with grace (SIGTERM, SIGKILL its app's stop_timeout_s later), its attempt
 # recorded as preempted, and it queues again for cards with the same id, out/ and
-# FLEET_ATTEMPT counting on; a preemption spends no --retry. Only runs of a
-# `preemptible` app that have run its min_runtime_s are eligible (a run still waiting
+# FLEET_ATTEMPT counting on; a preemption spends no --retry. Only jobs of a
+# `preemptible` app that have run its min_runtime_s are eligible (a job still waiting
 # for card memory has no running work to lose). This module performs the stop,
 # cleanup; the Rust scheduler chooses the plan and authorizes the next launch.
 
-PREEMPTIBLE = (RunState.RUNNING, RunState.WAITING_VRAM, RunState.RETRYING)
+PREEMPTIBLE = (JobState.RUNNING, JobState.WAITING_VRAM, JobState.RETRYING)
 
 
-def preempt(runs_dir: str, run_id: str, reason: str) -> RunStatus:
+def preempt(jobs_dir: str, job_id: str, reason: str) -> JobStatus:
     """Execute an admitted preemption; retain resources until cleanup is confirmed."""
-    run = RunDir(runs_dir, run_id)
-    spec, before = run.spec(), run.status()
-    if before.state not in PREEMPTIBLE or not _alive(actor_name(run_id)):
-        raise Conflict(f"{run_id} is {_state(run_id, before).value}: it holds no card to preempt")
+    job = JobDirectory(jobs_dir, job_id)
+    spec, before = job.spec(), job.status()
+    if before.state not in PREEMPTIBLE or not _alive(actor_name(job_id)):
+        raise Conflict(f"{job_id} is {_state(job_id, before).value}: it holds no card to preempt")
     attempts = list(before.attempts)
-    if before.state is RunState.RUNNING:
-        attempts.append(Attempt(exit_code=None, cause=Cause.PREEMPTED, evidence=reason))
-    st = run.update(expected_state=before.state, state=RunState.PREEMPTED, preempt_requeue=True,
+    if before.state is JobState.RUNNING:
+        attempts.append(JobAttempt(exit_code=None, cause=FailureCause.PREEMPTED, evidence=reason))
+    st = job.update(expected_state=before.state, state=JobState.PREEMPTED, preempt_requeue=True,
                     attempts=attempts, preemptions=before.preemptions + 1, detail=f"preempted: {reason}")
-    if st.state is not RunState.PREEMPTED:
-        raise Conflict(f"{run_id} is {st.state.value}: nothing to preempt")
-    if before.state is RunState.RUNNING:
-        _stop_ranks(st, run_id, spec.profile.stop_timeout_s)
-    _end_actors(run_id, st.nodes)
-    if not confirm_cleanup(run):
-        return run.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")
-    return run.status()
+    if st.state is not JobState.PREEMPTED:
+        raise Conflict(f"{job_id} is {st.state.value}: nothing to preempt")
+    if before.state is JobState.RUNNING:
+        _stop_ranks(st, job_id, spec.profile.stop_timeout_s)
+    _end_actors(job_id, st.nodes)
+    if not confirm_cleanup(job):
+        return job.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")
+    return job.status()
 
 
-def requeue_run(runs_dir: str, run_id: str) -> None:
+def requeue_job(jobs_dir: str, job_id: str) -> None:
     """Persist requeue intent; never restart while a previous container may be alive."""
-    run = RunDir(runs_dir, run_id)
-    if run.state() not in (RunState.QUEUED, RunState.PREEMPTED):
+    job = JobDirectory(jobs_dir, job_id)
+    if job.state() not in (JobState.QUEUED, JobState.PREEMPTED):
         return
-    run.update(force=True, preempt_requeue=True)
-    if not confirm_cleanup(run):
+    job.update(force=True, preempt_requeue=True)
+    if not confirm_cleanup(job):
         return
-    run.update(force=True, state=RunState.WAITING_QUOTA, preempt_requeue=False, quota_released=run.status().quota_released, started_at=None,
+    job.update(force=True, state=JobState.WAITING_QUOTA, preempt_requeue=False, quota_released=job.status().quota_released, started_at=None,
                container=None, detail="preempted: waiting for resources again")

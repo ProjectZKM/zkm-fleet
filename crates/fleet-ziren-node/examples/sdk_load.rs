@@ -1,5 +1,5 @@
 //! Concurrent SDK clients: `sdk_load <elf> <jobs> [compressed|groth16]`, env from a fleetctl env file.
-//! Prints one line per job (index, outcome, seconds) and a summary.
+//! Logs each job's outcome and elapsed time through tracing.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,6 +8,8 @@ use zkm_sdk::{NetworkProver, ZKMProofKind, ZKMStdin};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let a: Vec<String> = std::env::args().collect();
     anyhow::ensure!(
         a.len() >= 3,
@@ -45,20 +47,14 @@ async fn main() -> anyhow::Result<()> {
         match r {
             Ok(()) => {
                 ok += 1;
-                println!("job {i:>3} ok   {secs:>7.2}s");
+                tracing::info!(job=i, elapsed_secs=secs, "proof completed");
             }
             Err(e) => {
                 failed += 1;
-                println!(
-                    "job {i:>3} FAIL {secs:>7.2}s {}",
-                    e.chars().take(120).collect::<String>()
-                );
+                tracing::error!(job=i, elapsed_secs=secs, error=%e, "proof failed");
             }
         }
     }
-    println!(
-        "LOAD {jobs} jobs: {ok} ok, {failed} failed, {:.1}s total",
-        t0.elapsed().as_secs_f64()
-    );
+    tracing::info!(jobs, ok, failed, elapsed_secs=t0.elapsed().as_secs_f64(), "load completed");
     Ok(())
 }

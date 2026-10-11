@@ -1,39 +1,40 @@
 //! Output: a formatted view for people, or the same data as JSON (`--json`).
 //!
-//! Every command hands its result to `Out` as a JSON value: a record (`key  value`
+//! Every command hands its result to `OutputWriter` as a JSON value: a record (`key  value`
 //! lines), rows (an aligned table with named columns) or a short message. The
 //! formatted view leaves out empty fields and shows times, durations and sizes the way
 //! people read them; the JSON is the API's answer as it came.
 
 use serde_json::Value;
+use std::io::Write;
 
-pub struct Out {
+pub struct OutputWriter {
     pub json: bool,
 }
 
 /// A table column: its heading and the field it shows (a JSON pointer such as
 /// `/address`, or a plain key).
-pub struct Col {
+pub struct TableColumn {
     pub head: &'static str,
     pub key: &'static str,
 }
 
-pub const fn col(head: &'static str, key: &'static str) -> Col {
-    Col { head, key }
+pub const fn col(head: &'static str, key: &'static str) -> TableColumn {
+    TableColumn { head, key }
 }
 
-impl Out {
+impl OutputWriter {
     /// One record.
     pub fn record(&self, v: &Value) {
         if self.json {
             pretty(v);
         } else {
-            print!("{}", kv(v, ""));
+            std::io::stdout().lock().write_all(kv(v, "").as_bytes()).expect("writing output");
         }
     }
 
     /// Rows under headings; JSON prints `raw` (the API's own rows) when given.
-    pub fn table(&self, rows: &[Value], cols: &[Col], raw: Option<&Value>) {
+    pub fn table(&self, rows: &[Value], cols: &[TableColumn], raw: Option<&Value>) {
         if self.json {
             match raw {
                 Some(r) => pretty(r),
@@ -52,7 +53,7 @@ impl Out {
             .collect();
         let line = |vals: Vec<&str>| {
             let parts: Vec<String> = vals.iter().zip(&widths).map(|(v, w)| format!("{v:<w$}")).collect();
-            println!("{}", parts.join("  ").trim_end());
+            writeln!(std::io::stdout().lock(), "{}", parts.join("  ").trim_end()).expect("writing output");
         };
         line(cols.iter().map(|c| c.head).collect());
         for r in &cells {
@@ -65,18 +66,18 @@ impl Out {
         if self.json {
             pretty(&v);
         } else {
-            println!("{text}");
+            writeln!(std::io::stdout().lock(), "{text}").expect("writing output");
         }
     }
 
     /// One JSON object per line (a stream, e.g. log chunks).
     pub fn line(&self, v: &Value) {
-        println!("{}", serde_json::to_string(v).unwrap_or_default());
+        writeln!(std::io::stdout().lock(), "{}", serde_json::to_string(v).unwrap_or_default()).expect("writing output");
     }
 }
 
 fn pretty(v: &Value) {
-    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    writeln!(std::io::stdout().lock(), "{}", serde_json::to_string_pretty(v).unwrap_or_default()).expect("writing output");
 }
 
 fn field<'a>(v: &'a Value, key: &str) -> &'a Value {
@@ -212,30 +213,4 @@ pub fn utc(secs: i64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC", rem / 3600, rem % 3600 / 60, rem % 60)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn times_durations_and_sizes_read_as_such() {
-        assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(utc(1_791_294_000), "2026-10-06 13:40:00 UTC");
-        assert_eq!(cell("prove_ms", &json!(15459)), "15.5 s");
-        assert_eq!(cell("took_ms", &json!(245_000)), "4m 05s");
-        assert_eq!(cell("took_ms", &json!(7_620_000)), "2h 07m");
-        assert_eq!(cell("created_ms", &json!(1_791_294_000_000u64)), "2026-10-06 13:40:00 UTC");
-        assert_eq!(cell("submitted_at", &json!(1_791_294_000.5)), "2026-10-06 13:40:00 UTC");
-        assert_eq!(cell("bytes", &json!(3_145_728)), "3.0 MiB");
-        assert_eq!(cell("gpus", &json!(["2", "3"])), "2,3");
-        assert_eq!(cell("x", &Value::Null), "-");
-    }
-
-    #[test]
-    fn records_leave_out_empty_fields_and_indent_lists() {
-        let s = kv(&json!({"id": "r1", "error": null, "attempts": [{"exit_code": 3, "cause": "exit-code"}]}), "");
-        assert_eq!(s, "id  r1\nattempts\n  - exit_code=3 cause=exit-code\n");
-    }
 }

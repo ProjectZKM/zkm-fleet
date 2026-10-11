@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 .mypy_cache/
+/bridge/build/
 *.token
 *.key
 *.env

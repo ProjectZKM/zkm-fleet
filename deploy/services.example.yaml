@@ -14,7 +14,7 @@ services:
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user
-    tag: default
+    tag: scope=default
     proof_app: ethproofs/FULL_ELF_SHA256 # bind this server exclusively to one namespace proof app
     proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1

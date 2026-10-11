@@ -2,17 +2,11 @@ syntax = "proto3";
 
 package fleet.v1;
 
+import "fleet/v1/types.proto";
+import "fleet/model/v1/model.proto";
+
 // Nodes initiate every connection. Heartbeats carry control metadata only;
 // app-owned storage holds payloads. FetchInputs/PublishOutput remain for legacy jobs.
-
-enum ProofKind {
-  PROOF_KIND_UNSPECIFIED = 0;
-  PROOF_KIND_CORE = 1;
-  PROOF_KIND_COMPRESSED = 2;
-  PROOF_KIND_GROTH16 = 3;
-  PROOF_KIND_PLONK = 4;
-  PROOF_KIND_COMPRESS_TO_GROTH16 = 5;
-}
 
 message ProveRequest {
   string job_id = 1;
@@ -67,37 +61,6 @@ message Assignment {
   string elf_id = 3;
   ProofInputs inputs = 4;
   ProofKind kind = 5;
-}
-
-// References only. Fleet never reads the bytes in app-owned storage.
-message ArtifactRef {
-  string uri = 1;
-  string sha256 = 2;
-  uint64 size = 3;
-}
-
-message ProofInputs {
-  ArtifactRef input = 1;
-  ArtifactRef elf = 2;
-  string output_root = 3;
-}
-
-message ProofOutputs {
-  ArtifactRef proof = 1;
-  ArtifactRef public_values = 2;
-  // Stable machine identity, recorded by the scheduler from the proving node.
-  string machine = 3;
-}
-
-// Ephemeral, authorized client fetch. Delivered in a machine heartbeat response.
-message ProofFetch {
-  string ticket = 1;
-  string job_id = 2;
-  string lease = 3;
-  string elf_id = 4;
-  string output_root = 5;
-  string name = 6;
-  ArtifactRef reference = 7;
 }
 
 message Completion {
@@ -177,33 +140,26 @@ service WorkerService {
   rpc Heartbeat(WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
 }
 
-enum NodeOperation {
-  NODE_OPERATION_UNSPECIFIED = 0;
-  NODE_OPERATION_LAUNCH_RUN = 1;
-  NODE_OPERATION_CANCEL_RUN = 2;
-  NODE_OPERATION_PREEMPT_RUN = 3;
-  NODE_OPERATION_SET_SERVICE = 4;
-  NODE_OPERATION_PURGE_RUN = 5;
-  reserved 6;
-  reserved "NODE_OPERATION_STAGE_MODEL";
-}
-
 message NodeCommand {
   string id = 1;
   NodeOperation operation = 2;
-  // Versioned execution parameters, not HTTP requests or user credentials.
-  bytes parameters_json = 3;
+  reserved 3;
+  reserved "parameters_json";
+  // Application execution parameters, not HTTP requests or user credentials.
+  fleet.model.v1.Json parameters = 4;
 }
 
 message WorkerHeartbeatRequest {
   string worker_id = 1;
   // A fresh process session fences duplicate agents on one machine.
   string session = 2;
-  // Capacity, app inventory, job status/leases and command acknowledgements only.
-  // Inputs, logs and outputs use job artifact storage, outside the heartbeat.
-  bytes report_json = 3;
+  reserved 3;
+  reserved "report_json";
   // A storage-only fleet-ziren-node handler is configured on this machine.
   bool proof_fetch_ready = 4;
+  // Capacity, inventories, job leases/status and command acknowledgements only.
+  // Inputs, logs and outputs remain outside the heartbeat. Report version is 2.
+  fleet.model.v1.NodeReport report = 5;
 }
 
 message WorkerHeartbeatResponse {
@@ -211,6 +167,6 @@ message WorkerHeartbeatResponse {
   repeated NodeCommand commands = 2;
   repeated string acknowledged_results = 3;
   // Terminal executions whose metadata and artifact receipts are durable.
-  repeated string acknowledged_runs = 4;
+  repeated string acknowledged_jobs = 4;
   repeated ProofFetch proof_fetches = 5;
 }

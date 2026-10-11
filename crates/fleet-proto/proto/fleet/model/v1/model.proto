@@ -1,0 +1,352 @@
+syntax = "proto2";
+
+package fleet.model.v1;
+
+import "fleet/v1/types.proto";
+import "stage/v1/stage.proto";
+
+// Application-owned settings and execution details remain extensible. This codec
+// preserves JSON integers exactly; ownership, leases and resources are typed below.
+message Json {
+  required bytes utf8 = 1;
+}
+
+// Optional grants distinguish unrestricted access from an explicitly empty list.
+message StringList {
+  repeated string values = 1;
+}
+
+message Quota {
+  optional double gpus = 1;
+  optional double cpus = 2;
+}
+
+message Allocation {
+  required string id = 1;
+  required string namespace = 2;
+  optional string tag = 3;
+  required double gpus = 4;
+  required double cpus = 5;
+}
+
+message Usage {
+  required double gpus = 1;
+  required double cpus = 2;
+}
+
+message Namespace {
+  required string id = 1;
+  required string name = 2;
+  required uint64 created_ms = 3;
+  optional uint64 suspended_ms = 4;
+  required Quota quota = 5;
+  map<string, Quota> tag_quotas = 6;
+}
+
+message Token {
+  required string id = 1;
+  // Internal SDK signer binding and token digest are never serialized to clients.
+  required string address = 2;
+  required string tenant = 3;
+  required string label = 4;
+  required uint64 created_ms = 5;
+  optional uint64 revoked_ms = 6;
+  optional StringList apps = 7;
+  optional string token_hash = 8;
+  optional string namespace = 9;
+  optional string tag = 10;
+  required bool manage_apps = 11;
+}
+
+enum ProofJobState {
+  PROOF_JOB_STATE_QUEUED = 0;
+  PROOF_JOB_STATE_RUNNING = 1;
+  PROOF_JOB_STATE_SUCCEEDED = 2;
+  PROOF_JOB_STATE_FAILED = 3;
+}
+
+message ProofJob {
+  required string id = 1;
+  required string tenant = 2;
+  required string owner = 3;
+  required string namespace = 4;
+  required string tag = 5;
+  required string client_id = 6;
+  required string elf_id = 7;
+  required fleet.v1.ProofKind kind = 8;
+  required int32 priority = 9;
+  required ProofJobState state = 10;
+  optional stage.v1.Status fail_status = 11;
+  required string error = 12;
+  optional string node = 13;
+  required uint32 attempts = 14;
+  repeated string failed_on = 15;
+  required uint64 cycles = 16;
+  required uint64 prove_ms = 17;
+  required uint64 created_ms = 18;
+  optional uint64 started_ms = 19;
+  optional uint64 finished_ms = 20;
+  optional fleet.v1.ProofInputs inputs = 21;
+  optional fleet.v1.ProofOutputs outputs = 22;
+}
+
+message ProofApp {
+  required int32 priority = 1;
+  required string namespace = 2;
+  required string tenant = 3;
+  required string elf_id = 4;
+  required uint64 created_ms = 5;
+  required uint64 jobs = 6;
+  required uint64 active = 7;
+  required uint64 succeeded = 8;
+  required uint64 failed = 9;
+  optional uint64 last_created_ms = 10;
+  optional double mean_prove_ms = 11;
+  required bool disabled = 12;
+}
+
+message WorkloadTemplate {
+  required string name = 1;
+  required string namespace = 2;
+  optional string tag = 3;
+  required Json profile = 4;
+  required bool persistent = 5;
+  required bool removed = 6;
+  repeated string workers = 7;
+}
+
+message Job {
+  required string id = 1;
+  required string lease = 2;
+  required string owner = 3;
+  required string namespace = 4;
+  optional string tag = 5;
+  required string profile = 6;
+  required Json policy = 7;
+  required Json request = 8;
+  optional string worker = 9;
+  required Json status = 10;
+  required bool quota_held = 11;
+  optional string stop = 12;
+  required bool logs_ready = 13;
+  required bool purged = 14;
+}
+
+message CommandRecord {
+  required string id = 1;
+  required string worker = 2;
+  required fleet.v1.NodeOperation operation = 3;
+  required Json parameters = 4;
+  required bool done = 5;
+  required Json result = 6;
+  optional string error = 7;
+  required bool admitted = 8;
+}
+
+message NodeReport {
+  required uint32 version = 1;
+  required string machine = 2;
+  required bool ready = 3;
+  required double total_gpus = 4;
+  required double total_cpus = 5;
+  required double free_gpus = 6;
+  required double free_cpus = 7;
+  map<string, Json> profiles = 8;
+  repeated Json services = 9;
+  repeated JobReport jobs = 10;
+  repeated CommandResult results = 11;
+}
+
+message JobReport {
+  required string id = 1;
+  required string lease = 2;
+  required Json status = 3;
+  required Json spec = 4;
+  required bool cleaned = 5;
+  required bool logs_ready = 6;
+}
+
+message CommandResult {
+  required string id = 1;
+  required Json result = 2;
+  optional string error = 3;
+}
+
+enum ScalePhase {
+  SCALE_PHASE_DRAINING = 0;
+  SCALE_PHASE_STARTING = 1;
+  SCALE_PHASE_COMPLETE = 2;
+  SCALE_PHASE_FAILED = 3;
+}
+
+message ScaleStatus {
+  required string id = 1;
+  required Json target = 2;
+  required bool disabled = 3;
+  required ScalePhase phase = 4;
+  optional string stop = 5;
+  optional string start = 6;
+  optional string error = 7;
+  optional double ready_since = 8;
+}
+
+message AppDeployment {
+  required string worker = 1;
+  required Json service = 2;
+  required bool disabled = 3;
+  optional ScaleStatus scale = 4;
+}
+
+message ScaleRequest {
+  optional double gpus = 1;
+  optional uint32 cpus = 2;
+  optional uint32 replicas = 3;
+  optional string node = 4;
+}
+
+message CreateNamespaceRequest {
+  required string name = 1;
+  required Quota quota = 2;
+}
+
+message AllocationRequest {
+  required string id = 1;
+  optional string tag = 2;
+  required double gpus = 3;
+  required double cpus = 4;
+  required bool restore = 5;
+}
+
+message NamespaceSelector {
+  optional string namespace = 1;
+  optional string tag = 2;
+}
+
+message CreateTokenRequest {
+  required string id = 1;
+  required string tenant = 2;
+  required string address = 3;
+  required string label = 4;
+  optional StringList apps = 5;
+  optional string token_hash = 6;
+  optional string namespace = 7;
+  optional string tag = 8;
+  required bool manage_apps = 9;
+}
+
+message ProofJobsQuery {
+  optional string namespace = 1;
+  optional string tag = 2;
+  optional string tenant = 3;
+  optional string elf = 4;
+  required bool active = 5;
+  required uint64 limit = 6;
+}
+
+message ProofAppRequest {
+  optional string namespace = 1;
+  optional string tag = 2;
+  optional string tenant = 3;
+  optional string elf_id = 4;
+  optional int32 priority = 5;
+}
+
+message PublicValuesQuery {
+  optional string key = 1;
+  optional string token_id = 2;
+}
+
+message SubmitProofRequest {
+  required string proof_id = 1;
+  required string elf_id = 2;
+  required string signature = 3;
+  optional uint64 block_no = 4;
+  required uint32 seg_size = 5;
+  optional stage.v1.Step from_step = 6;
+  optional stage.v1.Step target_step = 7;
+  required fleet.v1.ProofInputs inputs = 8;
+}
+
+message ProofJobFilter {
+  optional string tenant = 1;
+  optional string elf = 2;
+  required bool active = 3;
+  optional string owner = 4;
+  optional string namespace = 5;
+  optional string tag = 6;
+}
+
+message NodeStatus {
+  required string id = 1;
+  required string name = 2;
+  required string backend = 3;
+  required uint32 gpus = 4;
+  required string machine = 5;
+  required string zkm_version = 6;
+  required string image = 7;
+  optional string proof_app = 8;
+  required bool ready = 9;
+  optional string busy = 10;
+  optional string reserved_for = 11;
+  required bool draining = 12;
+  required uint64 cached_elfs = 13;
+  required uint64 heartbeat_age_ms = 14;
+}
+
+message AppAnchor {
+  required string namespace = 1;
+  required string tenant = 2;
+  required string elf_id = 3;
+  required string node = 4;
+}
+
+message FleetStatus {
+  required uint64 queued = 1;
+  required uint64 running = 2;
+  repeated NodeStatus nodes = 3;
+  repeated AppAnchor anchors = 4;
+}
+
+message PreemptionCandidate {
+  required string id = 1;
+  required string namespace = 2;
+  required int32 priority = 3;
+  required string node_ip = 4;
+  required double gpus = 5;
+  required double cpus = 6;
+  optional double started_at = 7;
+  required bool preemptible = 8;
+  required uint64 min_runtime_s = 9;
+}
+
+message NodeCapacity {
+  required string node_ip = 1;
+  required double gpus = 2;
+  required double cpus = 3;
+}
+
+// JSON remains a string or null at the local adapter boundary.
+message NodePin {
+  optional string node_ip = 1;
+}
+
+message PreemptionRequest {
+  required uint32 contract_version = 1;
+  required string namespace = 2;
+  optional string tag = 3;
+  required int32 priority = 4;
+  required double gpus = 5;
+  required double cpus = 6;
+  required uint32 nodes = 7;
+  repeated NodePin pins = 8;
+  required double now = 9;
+  repeated NodeCapacity free = 10;
+  repeated PreemptionCandidate candidates = 11;
+  optional Usage quota_demand = 12;
+  optional string exclude_allocation = 13;
+}
+
+message PreemptionPlan {
+  required bool possible = 1;
+  repeated string jobs = 2;
+}

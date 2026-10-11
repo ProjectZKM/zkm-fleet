@@ -1,7 +1,7 @@
 //! User-facing locations and resource settings. Execution replica IDs remain internal.
 use super::*;
 
-impl RunControl {
+impl WorkloadController {
     /// Resolve a machine identity or proof replica to the machine-agent name.
     fn machine_name(&self, replica: Option<&str>, machine: Option<&str>) -> Option<String> {
         let proof_machine = replica.and_then(|id| {
@@ -42,7 +42,7 @@ impl RunControl {
         })
     }
 
-    pub(crate) fn proof_job_value(&self, job: &crate::store::Job) -> Value {
+    pub(crate) fn proof_job_value(&self, job: &crate::store::ProofJob) -> Value {
         let mut v = serde_json::to_value(job).unwrap_or_default();
         v["node"] = json!(self.machine_name(
             job.node.as_deref(),
@@ -75,6 +75,8 @@ impl RunControl {
         let mut cpus = 0.0;
         let mut replicas = 0u64;
         let mut nodes = std::collections::BTreeSet::new();
+        let mut tags = std::collections::BTreeSet::new();
+        let mut states = std::collections::BTreeSet::new();
         for intent in &services {
             let s = intent
                 .scale
@@ -94,10 +96,36 @@ impl RunControl {
                 * count as f64;
             cpus += s["cpus"].as_f64().unwrap_or(1.0) * count as f64;
             nodes.insert(intent.worker.clone());
+            tags.insert(s["tag"].as_str().unwrap_or("").to_owned());
+            let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
+            let observed = worker.and_then(|w| {
+                w.report.services.iter()
+                .find(|s| text(s, "name") == text(&intent.service, "name"))
+            });
+            let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
+                "failed"
+            } else if worker.is_none() {
+                "offline"
+            } else if let Some(scale) = intent.scale.as_ref().filter(|s| s.pending()) {
+                scale.phase().name()
+            } else if intent.disabled {
+                if observed.is_some_and(|s| s["cleaned"].as_bool() == Some(true)) { "disabled" } else { "draining" }
+            } else if worker.is_some_and(|w| w.report.ready) && observed.is_some_and(|s| {
+                    s["ready"].as_bool() == Some(true) && s["disabled"].as_bool() != Some(true)
+                }) {
+                "running"
+            } else {
+                "starting"
+            };
+            states.insert(state);
         }
+        let state = ["failed", "offline", "draining", "starting", "running", "disabled",
+        ]
+            .into_iter().find(|s| states.contains(s)).unwrap_or("configured");
         let n = self.fleet.namespace(namespace);
         json!({
             "resources":(!services.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
+            "tags":tags, "state":state,
             "namespace_quota":n.as_ref().map(|n|&n.quota),
             "tag_quota":tag.and_then(|tag|n.as_ref()?.tag_quotas.get(tag)),
         })
@@ -110,6 +138,9 @@ impl RunControl {
         app.as_object_mut()
             .unwrap()
             .extend(resources.as_object().unwrap().clone());
+        if app["resources"].is_null() && app["disabled"].as_bool() == Some(true) {
+            app["state"] = json!("disabled");
+        }
         let anchor = app["anchored_on"].as_str();
         let machine = self.machine_name(anchor, None);
         app["diagnostics"] = json!({"anchor_replica":anchor});

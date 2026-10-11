@@ -11,14 +11,14 @@ use std::{
 };
 
 #[derive(Parser)]
-struct Args {
+struct StorageFetchArgs {
     /// Administrator-approved app storage roots, retained independently of actors.
     #[arg(long, required = true)]
     storage_root: Vec<PathBuf>,
 }
 
 pub fn run() -> anyhow::Result<()> {
-    let args = Args::parse_from(std::env::args().skip(1));
+    let args = StorageFetchArgs::parse_from(std::env::args().skip(1));
     let mut input = Vec::new();
     std::io::stdin().take(16 << 10).read_to_end(&mut input)?;
     let request: ProofFetch = serde_json::from_slice(&input)?;
@@ -29,7 +29,7 @@ pub fn run() -> anyhow::Result<()> {
             let missing = e
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-            eprintln!("{}", if missing { "missing" } else { "invalid" });
+            tracing::warn!(reason=if missing { "missing" } else { "invalid" }, "artifact fetch rejected");
             std::process::exit(if missing { 4 } else { 5 });
         }
     }

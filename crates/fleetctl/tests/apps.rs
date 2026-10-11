@@ -74,78 +74,71 @@ fn batch_profile_creation_with_user_token_leaves_namespace_to_verified_api_scope
     assert_eq!(profile["type"], "batch");
 }
 
-#[test]
-fn app_filter_excludes_batch_profiles_and_preserves_serving_lifecycle() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+fn app_list_server(listener: TcpListener) -> std::thread::JoinHandle<()> {
     listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for endpoint in ["/admin/apps", "/apps"] {
+            let mut stream = loop {
+                if let Ok((stream, _)) = listener.accept() { break stream; }
+                assert!(std::time::Instant::now() < deadline, "app list did not contact {endpoint}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            assert!(String::from_utf8(headers).unwrap()
+                .starts_with(&format!("GET {endpoint}?namespace=alice&tag=scope%3Ddefault HTTP/1.1")));
+            let body = if endpoint == "/admin/apps" {
+                serde_json::json!([{
+                    "name":"eth/aaaaaaaa", "type":"app", "namespace":"alice",
+                    "disabled":true, "last_created_ms":2000, "mean_prove_ms":1200, "elf_id":"a".repeat(64),
+                    "tags":["scope=default"], "state":"disabled",
+                    "resources":{"gpus":6,"cpus":48,"replicas":1,"nodes":["gpu-machine"]},
+                    "namespace_quota":{"gpus":0,"cpus":null}
+                }])
+            } else {
+                serde_json::json!([
+                    {"name":"training","type":"run","namespace":"alice","persistent":false},
+                    {"name":"comfyui","type":"app","namespace":"alice",
+                     "persistent":true,"last_submitted_at":3,"image":"comfyui:latest",
+                     "tags":["scope=default"], "state":"running",
+                     "resources":{"gpus":1,"cpus":2,"replicas":1,"nodes":["gpu-machine"]}}
+                ])
+            }.to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    })
+}
+
+#[test]
+fn app_list_unifies_apps_and_excludes_batch_profiles() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = std::env::temp_dir().join(format!("fleet-batch-app-test-{}.token", std::process::id()));
     std::fs::write(&token, "test-admin").unwrap();
-    let server = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut stream = loop {
-            if let Ok((stream, _)) = listener.accept() { break stream; }
-            assert!(std::time::Instant::now() < deadline, "batch filter did not contact the API");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-        let mut headers = Vec::new();
-        let mut byte = [0];
-        while !headers.ends_with(b"\r\n\r\n") {
-            stream.read_exact(&mut byte).unwrap();
-            headers.push(byte[0]);
-        }
-        assert!(String::from_utf8(headers).unwrap()
-            .starts_with("GET /apps?namespace=alice HTTP/1.1"));
-        let body = serde_json::json!([
-            {"name":"training","type":"run","namespace":"alice","persistent":false},
-            {"name":"comfyui","type":"run","namespace":"alice","persistent":true}
-        ]).to_string();
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-    });
+    let server = app_list_server(listener);
     let output = cli().args([
-        "--json", "--namespace", "alice", "--url", &url, "--admin-token-file",
-    ]).arg(&token).args(["app", "--kind", "serving"]).output().unwrap();
+        "--json", "--namespace", "alice", "--tag", "scope=default", "--url", &url, "--admin-token-file",
+    ]).arg(&token).arg("app").output().unwrap();
     server.join().unwrap();
     std::fs::remove_file(token).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(result.get("run").is_none());
-    assert!(result.get("proof").is_none());
-    assert_eq!(result["serving"].as_array().unwrap().len(), 1);
-    for app in result["serving"].as_array().unwrap() { assert_eq!(app["type"], "app"); assert_eq!(app["kind"], "serving"); }
-}
-
-#[test]
-fn app_table_shows_configured_resources_without_namespace_quota_columns() {
-    for kind in ["proof", "serving"] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let token = std::env::temp_dir().join(format!("fleet-app-resource-test-{}-{kind}.token",std::process::id()));
-        std::fs::write(&token,"admin").unwrap();
-        let endpoint = if kind == "proof" {"/admin/apps"} else {"/apps"};
-        let server=std::thread::spawn(move || {
-            let (mut stream,_) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut headers=Vec::new();let mut byte=[0];
-            while !headers.ends_with(b"\r\n\r\n") {stream.read_exact(&mut byte).unwrap();headers.push(byte[0]);}
-            assert!(String::from_utf8(headers).unwrap().starts_with(&format!("GET {endpoint}?namespace=alice ")));
-            let body=serde_json::json!([{"name":"test-app","namespace":"alice","persistent":true,"disabled":true,
-                "resources":{"gpus":6,"cpus":48,"replicas":1,"nodes":["gpu-machine"]},
-                "namespace_quota":{"gpus":0,"cpus":null}}]).to_string();
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
-        });
-        let output=cli().args(["--namespace","alice","--url",&url,"--admin-token-file"])
-            .arg(&token).args(["app","--kind",kind]).output().unwrap();
-        server.join().unwrap();std::fs::remove_file(token).unwrap();
-        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-        let text=String::from_utf8(output.stdout).unwrap();
-        let header:Vec<_>=text.lines().next().unwrap().split_whitespace().collect();
-        assert_eq!(header[2], "NAME", "{text}");
-        assert!(header.windows(4).any(|x|x==["GPUS","CPUS","REPLICAS","NODE"]),"{text}");
-        assert!(!text.contains("QUOTA"),"{text}");
-        let row:Vec<_>=text.lines().nth(1).unwrap().split_whitespace().collect();
-        assert!(row.windows(4).any(|x|x==["6","48","1","gpu-machine"]),"{text}");
+    let apps = result.as_array().unwrap();
+    assert_eq!(apps.len(), 2);
+    assert_eq!(apps[0]["name"], "comfyui");
+    assert_eq!(apps[1]["name"], "eth/aaaaaaaa");
+    assert_eq!(apps[1]["elf_id"], "a".repeat(64));
+    assert_eq!(apps[1]["mean_prove_ms"], 1200);
+    for app in apps {
+        assert_eq!(app["type"], "app");
+        assert!(app.get("kind").is_none());
+        assert_eq!(app["tags"], serde_json::json!(["scope=default"]));
     }
 }
 

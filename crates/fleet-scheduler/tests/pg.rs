@@ -1,12 +1,12 @@
 //! The Postgres store against a real database: FLEET_TEST_PG_URL (a database the test
 //! may fill: it makes and drops the schemas `fresh` and `incompatible`). Skipped without it.
 
-use fleet_scheduler::store::SYSTEM_NAMESPACE;
 use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
-use fleet_scheduler::store::{Token, Job, JobFilter, JobState, Namespace, PgStore, Store};
-use sqlx::{Executor, PgPool, Row};
 use fleet_scheduler::quota::{Allocation, Quota};
+use fleet_scheduler::store::SYSTEM_NAMESPACE;
+use fleet_scheduler::store::{ProofJob, ProofJobFilter, ProofJobState, Namespace, PgStore, Store, Token};
+use sqlx::{Executor, PgPool, Row};
 
 /// An incomplete development schema must be reset, never assigned invented identities.
 const INCOMPATIBLE_SCHEMA: &str = r#"
@@ -53,8 +53,8 @@ async fn ddl(admin: &PgPool, schema: &str) -> Vec<String> {
         .collect()
 }
 
-fn job(id: &str, state: JobState) -> Job {
-    Job {
+fn job(id: &str, state: ProofJobState) -> ProofJob {
+    ProofJob {
                 inputs: None, outputs: None,
         owner: "ab".repeat(20),
         namespace: SYSTEM_NAMESPACE.into(),
@@ -63,9 +63,10 @@ fn job(id: &str, state: JobState) -> Job {
         id: id.into(),
         tenant: "goat".into(),
         elf_id: "b".repeat(64),
-        kind: ProofKind::Groth16,
+        kind: ProofKind::Groth16 as i32,
         priority: 0,
-        state,
+        state: state as i32,
+        fail_status: (state == ProofJobState::Failed).then_some(StageStatus::InternalError as i32),
         error: String::new(),
         node: Some("g0".into()),
         attempts: 1,
@@ -79,26 +80,29 @@ fn job(id: &str, state: JobState) -> Job {
 }
 
 async fn check_job_identity(store: &dyn Store) {
-    let mut original = job("immutable", JobState::Running);
-    let reference = fleet_proto::fleet::v1::ArtifactRef { uri:"file:///app/input".into(), sha256:"b".repeat(64), size:3 };
-    original.inputs = Some(fleet_proto::fleet::v1::ProofInputs {input:Some(reference.clone()),elf:Some(reference.clone()),output_root:"file:///app/outputs".into()});
+    let mut original = job("immutable", ProofJobState::Running);
+    let reference = fleet_proto::fleet::v1::ArtifactRef { uri:"file:///app/input".into(), sha256:"b".repeat(64), size:3,
+    };
+    original.inputs = Some(fleet_proto::fleet::v1::ProofInputs {input:Some(reference.clone()),elf:Some(reference.clone()),output_root:"file:///app/outputs".into(),
+    });
     store.upsert(&original).await.unwrap();
-    assert!(store.recent(&JobFilter::default(),usize::MAX).await.unwrap().iter().any(|j|j.id==original.id),
+    assert!(store.recent(&ProofJobFilter::default(),usize::MAX).await.unwrap().iter().any(|j|j.id==original.id),
         "unbounded drain queries must not produce a negative Postgres LIMIT");
     let mut changed = original.clone();
     changed.owner = "ff".repeat(20);
     changed.namespace = "1".repeat(32);
-    changed.tag = "other".into();
+    changed.tag = "scope=other".into();
     changed.client_id = "replacement".into();
     changed.tenant = "eth".into();
     changed.elf_id = "a".repeat(64);
-    changed.kind = ProofKind::Core;
+    changed.kind = ProofKind::Core as i32;
     changed.priority = 99;
     changed.created_ms += 1;
     changed.inputs.as_mut().unwrap().elf.as_mut().unwrap().sha256 = "a".repeat(64);
     changed.inputs.as_mut().unwrap().input.as_mut().unwrap().uri = "file:///replacement".into();
-    changed.outputs = Some(fleet_proto::fleet::v1::ProofOutputs {machine: String::new(), proof:Some(reference.clone()),public_values:Some(reference)});
-    changed.state = JobState::Succeeded;
+    changed.outputs = Some(fleet_proto::fleet::v1::ProofOutputs {machine: String::new(), proof:Some(reference.clone()),public_values:Some(reference),
+    });
+    changed.state = ProofJobState::Succeeded as i32;
     changed.finished_ms = Some(2003);
     store.upsert(&changed).await.unwrap();
     let restored = store.get(&original.id).await.unwrap().unwrap();
@@ -109,13 +113,13 @@ async fn check_job_identity(store: &dyn Store) {
     assert_eq!(restored.inputs, original.inputs, "input references are immutable");
     assert_eq!(restored.outputs, changed.outputs, "completion metadata survives storage");
     assert_eq!(restored.priority, original.priority);
-    assert_eq!(restored.state, JobState::Succeeded, "execution state can change");
+    assert_eq!(restored.state(), ProofJobState::Succeeded, "execution state can change");
     assert_eq!(restored.finished_ms, Some(2003));
     let mut duplicate = original.clone();
     duplicate.id = "duplicate-identity".into();
     assert!(store.upsert(&duplicate).await.is_err(), "client ID is unique within namespace and tag");
     for field in ["owner", "namespace", "client_id", "tag", "finished_ms"] {
-        let mut invalid = job("invalid", JobState::Queued);
+        let mut invalid = job("invalid", ProofJobState::Queued);
         match field {
             "owner" => invalid.owner.clear(),
             "namespace" => invalid.namespace.clear(),
@@ -136,12 +140,14 @@ async fn memory_store_preserves_job_identity_and_validates_fields() {
 }
 
 async fn check_registered_app_inventory(store: &dyn Store) {
-    let mut rejected = job("unregistered-attempt", JobState::Failed(StageStatus::InvalidParameter));
+    let mut rejected = job("unregistered-attempt", ProofJobState::Failed);
+    rejected.fail_status = Some(StageStatus::InvalidParameter as i32);
     rejected.tenant = "unregistered".into();
     store.upsert(&rejected).await.unwrap();
     assert!(!store.apps().await.unwrap().iter().any(|a| a.tenant == rejected.tenant));
     assert!(store.get(&rejected.id).await.unwrap().is_some(), "rejected requests remain in job history");
-    store.add_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id, 3000, 0).await.unwrap();
+    store.add_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id, 3000, 0,
+        ).await.unwrap();
     let registered = store.apps().await.unwrap().into_iter().find(|a| a.tenant == rejected.tenant).unwrap();
     assert_eq!((registered.jobs, registered.failed, registered.created_ms), (1, 1, 3000));
     store.delete_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id).await.unwrap();
@@ -151,7 +157,7 @@ async fn check_registered_app_inventory(store: &dyn Store) {
 #[tokio::test]
 async fn fresh_schema_requires_complete_job_identity() {
     let Some(url) = url() else {
-        eprintln!("FLEET_TEST_PG_URL unset: skipped");
+        tracing::warn!("FLEET_TEST_PG_URL unset: skipped");
         return;
     };
     let admin = PgPool::connect(&url).await.unwrap();
@@ -169,7 +175,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![13]);
+    assert_eq!(versions, vec![14]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
@@ -177,11 +183,15 @@ async fn fresh_schema_requires_complete_job_identity() {
         assert!(!store.add_app(SYSTEM_NAMESPACE, "goat", &bb, 2000, 0).await.unwrap(), "registered once");
         let fresh_app = store.apps().await.unwrap().into_iter().find(|a| a.elf_id == bb).unwrap();
         assert_eq!((fresh_app.jobs, fresh_app.created_ms, fresh_app.last_created_ms), (0, 1999, None), "listed with no job yet");
-        store.upsert(&job("g1", JobState::Running)).await.unwrap();
-        store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();
-        store.upsert(&job("g2", JobState::Failed(StageStatus::SnarkError))).await.unwrap();
+        store.upsert(&job("g1", ProofJobState::Running)).await.unwrap();
+        let mut failed = job("g2", ProofJobState::Failed);
+        failed.fail_status = Some(StageStatus::SnarkError as i32);
+        store.upsert(&failed).await.unwrap();
+        store.upsert(&failed).await.unwrap();
         let active = store
-            .recent(&JobFilter { tag: None, namespace: None, owner: None, tenant: Some("goat".into()), elf: Some("b".into()), active: true }, 10)
+            .recent(&ProofJobFilter { tag: None, namespace: None, owner: None, tenant: Some("goat".into()), elf: Some("b".into()), active: true,
+                }, 10,
+            )
             .await
             .unwrap();
         assert_eq!(active.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), vec!["g1"]);
@@ -209,10 +219,12 @@ async fn fresh_schema_requires_complete_job_identity() {
     for sql in bad {
         assert!(sqlx::query(sql).execute(&admin).await.is_err(), "accepted: {sql}");
     }
-    let c = Token { id: "84".repeat(16), address: "84".repeat(20), tenant: "eth".into(), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: None, tag: None, namespace: None, manage_apps: false };
+    let c = Token { id: "84".repeat(16), address: "84".repeat(20), tenant: "eth".into(), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: None, tag: None, namespace: None, manage_apps: false,
+    };
     fresh.add_token(&c).await.unwrap();
 
-    let namespace = Namespace { tag_quotas: Default::default(), quota: Default::default(), id: "1".repeat(32), name: "alice".into(), created_ms: 1, suspended_ms: None };
+    let namespace = Namespace { tag_quotas: Default::default(), quota: Default::default(), id: "1".repeat(32), name: "alice".into(), created_ms: 1, suspended_ms: None,
+    };
     fresh.add_namespace(&namespace).await.unwrap();
     check_job_identity(&fresh).await;
     check_registered_app_inventory(&fresh).await;
@@ -221,8 +233,10 @@ async fn fresh_schema_requires_complete_job_identity() {
     fresh.add_app(SYSTEM_NAMESPACE, "goat", &shared_elf, 1, 0).await.unwrap();
     fresh.add_app(&namespace.id, "goat", &shared_elf, 1, 7).await.unwrap();
     fresh.set_app_disabled(&namespace.id, "goat", &shared_elf, true, 2).await.unwrap();
-    let app_priority = |apps: Vec<fleet_scheduler::store::ProofApp>| apps.into_iter()
-        .find(|a| a.namespace == namespace.id && a.elf_id == shared_elf).unwrap().priority;
+    let app_priority = |apps: Vec<fleet_scheduler::store::ProofApp>| {
+        apps.into_iter()
+        .find(|a| a.namespace == namespace.id && a.elf_id == shared_elf).unwrap().priority
+    };
     assert_eq!(app_priority(fresh.apps().await.unwrap()), 7);
     fresh.set_app_priority(&namespace.id, "goat", &shared_elf, -5).await.unwrap();
     let reopened = PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
@@ -233,7 +247,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     assert!(registered.contains(&(SYSTEM_NAMESPACE.into(), "goat".into(), shared_elf.clone(), false)));
     fresh.delete_app(&namespace.id, "goat", &shared_elf).await.unwrap();
     assert!(fresh.registered_apps().await.unwrap().contains(&(SYSTEM_NAMESPACE.into(), "goat".into(), shared_elf, false)));
-    let mut owned = job("owned", JobState::Running);
+    let mut owned = job("owned", ProofJobState::Running);
     owned.namespace = namespace.id.clone();
     owned.tag = String::new();
     owned.client_id = "local-id".into();
@@ -243,32 +257,35 @@ async fn fresh_schema_requires_complete_job_identity() {
     owned.owner = "ff".repeat(20);
     fresh.upsert(&owned).await.unwrap();
     assert_eq!(fresh.get("owned").await.unwrap().unwrap().owner, c.address, "ownership is immutable on update");
-    let filtered = fresh.recent(&JobFilter { tag: None, namespace: None, owner: Some(c.address.clone()), ..Default::default() }, 1).await.unwrap();
+    let filtered = fresh.recent(&ProofJobFilter { tag: None, namespace: None, owner: Some(c.address.clone()), ..Default::default() }, 1,
+        ).await.unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].id, "owned");
-    let scoped = Token { id: "85".repeat(16), namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()]), token_hash: Some("ab".repeat(32)), ..c.clone() };
+    let scoped = Token { id: "85".repeat(16), namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()].into()), token_hash: Some("ab".repeat(32)), ..c.clone() };
     fresh.add_token(&scoped).await.unwrap();
     let restored = fresh.tokens().await.unwrap().into_iter().find(|r| r.address == scoped.address).unwrap();
     assert_eq!(restored.apps, scoped.apps);
     assert_eq!(restored.token_hash, scoped.token_hash);
     assert!(serde_json::to_value(&restored).unwrap().get("token_hash").is_none());
     assert_eq!(fresh.namespace_job(&namespace.id, None, "local-id").await.unwrap().unwrap().id, "owned");
-    let cap = Quota { gpus: Some(0.5), cpus: Some(4.0) };
+    let cap = Quota { gpus: Some(0.5), cpus: Some(4.0),
+    };
     fresh.set_quota(&namespace.id, &cap).await.unwrap();
-    let allocation = Allocation { id:"run:indefinite".into(), namespace:namespace.id.clone(), tag:None, gpus:0.5, cpus:4.0 };
+    let allocation = Allocation { id:"job:indefinite".into(), namespace:namespace.id.clone(), tag:None, gpus:0.5, cpus:4.0,
+    };
     fresh.reserve(&allocation).await.unwrap();
     let restarted = PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(restarted.namespaces().await.unwrap()[0].quota.gpus, Some(0.5));
-    assert_eq!(restarted.allocations().await.unwrap()[0].id, "run:indefinite", "no time expiry; allocation survives a restart");
-    restarted.release("run:indefinite").await.unwrap();
+    assert_eq!(restarted.allocations().await.unwrap()[0].id, "job:indefinite", "no time expiry; allocation survives a restart");
+    restarted.release("job:indefinite").await.unwrap();
     assert!(fresh.allocations().await.unwrap().is_empty());
-    let mut research=owned.clone(); research.id="research-owned".into(); research.tag="research".into();
+    let mut research=owned.clone(); research.id="research-owned".into(); research.tag="scope=research".into();
     fresh.upsert(&research).await.unwrap();
-    assert_eq!(fresh.namespace_job(&namespace.id,Some("research"),"local-id").await.unwrap().unwrap().id,"research-owned");
-    assert_eq!(fresh.recent(&JobFilter { namespace:Some(namespace.id.clone()),tag:Some("research".into()),..Default::default() },10).await.unwrap().len(),1);
-    fresh.set_tag_quota(&namespace.id,"research",&cap).await.unwrap();
+    assert_eq!(fresh.namespace_job(&namespace.id,Some("scope=research"),"local-id").await.unwrap().unwrap().id,"research-owned");
+    assert_eq!(fresh.recent(&ProofJobFilter { namespace:Some(namespace.id.clone()),tag:Some("scope=research".into()),..Default::default() },10).await.unwrap().len(),1);
+    fresh.set_tag_quota(&namespace.id,"scope=research",&cap).await.unwrap();
     let tag_store=PgStore::connect(&in_schema(&url,"fresh")).await.unwrap();
-    assert_eq!(tag_store.namespaces().await.unwrap()[0].tag_quotas["research"].gpus,Some(0.5));
+    assert_eq!(tag_store.namespaces().await.unwrap()[0].tag_quotas["scope=research"].gpus,Some(0.5));
 
     fresh.suspend_namespace(&namespace.id, Some(99)).await.unwrap();
     assert_eq!(fresh.namespaces().await.unwrap()[0].suspended_ms, Some(99));
@@ -278,11 +295,12 @@ async fn fresh_schema_requires_complete_job_identity() {
         let sql = format!("UPDATE fresh.fleet_jobs SET {column}=NULL WHERE id='owned'");
         assert!(sqlx::query(&sql).execute(&admin).await.is_err(), "nullable {column}");
     }
-    for (column, value) in [("owner", "''"), ("owner", "'0xABC'"), ("tag", "'Invalid Tag'"), ("client_id", "''")] {
+    for (column, value) in [("owner", "''"), ("owner", "'0xABC'"), ("tag", "'Invalid Tag'"), ("client_id", "''"),
+    ] {
         let sql = format!("UPDATE fresh.fleet_jobs SET {column}={value} WHERE id='owned'");
         assert!(sqlx::query(&sql).execute(&admin).await.is_err(), "accepted {column}={value}");
     }
-    let mut duplicate = job("duplicate", JobState::Queued);
+    let mut duplicate = job("duplicate", ProofJobState::Queued);
     duplicate.namespace = namespace.id.clone();
     duplicate.client_id = "local-id".into();
     assert!(fresh.upsert(&duplicate).await.is_err(), "untagged client IDs are unique within a namespace");
@@ -293,7 +311,7 @@ async fn fresh_schema_requires_complete_job_identity() {
 #[tokio::test]
 async fn postgres_allows_only_one_scheduler_leader_per_database() {
     let Some(url) = url() else {
-        eprintln!("FLEET_TEST_PG_URL unset: skipped");
+        tracing::warn!("FLEET_TEST_PG_URL unset: skipped");
         return;
     };
     let admin = PgPool::connect(&url).await.unwrap();
@@ -310,21 +328,55 @@ async fn postgres_allows_only_one_scheduler_leader_per_database() {
 }
 
 #[tokio::test]
-async fn schema_12_migrates_without_changing_existing_jobs() {
+async fn incompatible_schema_requires_reset_without_changing_jobs() {
     let Some(url) = url() else { return; };
     let admin = PgPool::connect(&url).await.unwrap();
-    fresh_schema(&admin, "metadata_migration").await;
-    let db = in_schema(&url, "metadata_migration");
+    for version in [12, 13] {
+        let schema = format!("unsupported_{version}");
+        fresh_schema(&admin, &schema).await;
+        let db = in_schema(&url, &schema);
+        let store = PgStore::connect(&db).await.unwrap();
+        let original = job("saved-proof", ProofJobState::Succeeded);
+        store.upsert(&original).await.unwrap();
+        let pool = PgPool::connect(&db).await.unwrap();
+        sqlx::query("UPDATE fleet_schema SET version=$1").bind(version).execute(&pool).await.unwrap();
+        let before = ddl(&admin, &schema).await;
+        assert!(PgStore::connect(&db).await.err().unwrap().to_string().contains("reset the database"));
+        assert_eq!(before, ddl(&admin, &schema).await);
+        assert_eq!(store.get(&original.id).await.unwrap().unwrap().owner, original.owner);
+        let saved_version: i32 = sqlx::query_scalar("SELECT max(version) FROM fleet_schema").fetch_one(&pool).await.unwrap();
+        assert_eq!(saved_version, version);
+    }
+}
+
+#[tokio::test]
+async fn postgres_validates_key_value_tags_for_jobs_tokens_and_allocations() {
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "tags").await;
+    let db = in_schema(&url, "tags");
     let store = PgStore::connect(&db).await.unwrap();
-    store.upsert(&job("pre-migration", JobState::Succeeded)).await.unwrap();
     let pool = PgPool::connect(&db).await.unwrap();
-    sqlx::raw_sql("ALTER TABLE fleet_jobs DROP COLUMN inputs; ALTER TABLE fleet_jobs DROP COLUMN outputs; UPDATE fleet_schema SET version=12").execute(&pool).await.unwrap();
-    let upgraded = PgStore::connect(&db).await.unwrap();
-    let saved = upgraded.get("pre-migration").await.unwrap().unwrap();
-    assert_eq!(saved.state, JobState::Succeeded);
-    assert!(saved.inputs.is_none() && saved.outputs.is_none());
-    let versions:Vec<i32> = sqlx::query_scalar("SELECT version FROM fleet_schema ORDER BY version").fetch_all(&pool).await.unwrap();
-    assert_eq!(versions, vec![12,13]);
+    for (index, tag) in ["scope=default", "network=Ethereum-mainnet", "Team_Name=release.2",
+    ].into_iter().enumerate() {
+        let mut tagged = job(&format!("tagged-{index}"), ProofJobState::Succeeded);
+        tagged.tag = tag.into();
+        store.upsert(&tagged).await.unwrap();
+        let token = Token { id: format!("{index:032x}"), address: format!("{index:040x}"), tenant: "eth".into(), label: tag.into(), created_ms: 1, revoked_ms: None,
+            namespace: Some(SYSTEM_NAMESPACE.into()), tag: Some(tag.into()), apps: None, token_hash: None, manage_apps: false,
+        };
+        store.add_token(&token).await.unwrap();
+        store.reserve(&Allocation { id: format!("allocation-{index}"), namespace: SYSTEM_NAMESPACE.into(), tag: Some(tag.into()), gpus: 1.0, cpus: 4.0,
+            }).await.unwrap();
+    }
+    for tag in ["default", "team=", "=research", "team=one=two", "Invalid Tag", "team=ümlaut",
+    ] {
+        for (table, column, id) in [("fleet_jobs", "id", "tagged-0"), ("fleet_tokens", "label", "scope=default"), ("fleet_namespace_allocations", "id", "allocation-0"),
+        ] {
+            let query = format!("UPDATE {table} SET tag=$1 WHERE {column}=$2");
+            assert!(sqlx::query(&query).bind(tag).bind(id).execute(&pool).await.is_err(), "accepted {table} tag {tag}");
+        }
+    }
     PgStore::connect(&db).await.unwrap();
-    assert_eq!(upgraded.get("pre-migration").await.unwrap().unwrap().owner, saved.owner);
+    assert_eq!(store.get("tagged-0").await.unwrap().unwrap().tag, "scope=default");
 }

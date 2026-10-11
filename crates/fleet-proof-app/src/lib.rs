@@ -6,7 +6,7 @@ use axum::{
     routing::get,
 };
 use clap::Parser;
-use fleet_proto::sdk::Submit;
+use fleet_proto::sdk::SubmitProofRequest;
 use fleet_proto::{
     artifacts,
     fleet::v1::{ProofInputs, ProveRequest},
@@ -26,7 +26,7 @@ use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
 
 #[derive(Parser)]
-pub struct Args {
+pub struct ProofAppArgs {
     #[arg(long, default_value = "127.0.0.1:51010")]
     pub stage_addr: std::net::SocketAddr,
     #[arg(long, default_value = "127.0.0.1:51011")]
@@ -53,13 +53,13 @@ pub struct Args {
 }
 
 #[derive(Clone)]
-struct Capability {
+struct PublicValuesCredential {
     bearer: String,
     job_id: String,
     expires: Instant,
 }
 
-pub struct App {
+pub struct ProofAppServer {
     pub storage_root: PathBuf,
     pub elf_ids: HashSet<String>,
     pub token_file: Option<PathBuf>,
@@ -68,10 +68,10 @@ pub struct App {
     pub scheduler: String,
     pub public_values_url: String,
     client: reqwest::Client,
-    capabilities: Mutex<HashMap<String, Capability>>,
+    capabilities: Mutex<HashMap<String, PublicValuesCredential>>,
 }
 
-impl App {
+impl ProofAppServer {
     pub fn new(
         storage_root: PathBuf,
         namespace: String,
@@ -154,7 +154,7 @@ impl App {
         bearer: &str,
         method: reqwest::Method,
         path: &str,
-        body: Option<&Submit>,
+        body: Option<&SubmitProofRequest>,
     ) -> Result<serde_json::Value, Status> {
         let mut request = self
             .client
@@ -303,7 +303,7 @@ impl App {
         .map_err(|e| Status::data_loss(e.to_string()))
     }
 
-    fn prepare(&self, request: &stage::GenerateProofRequest) -> anyhow::Result<Submit> {
+    fn prepare(&self, request: &stage::GenerateProofRequest) -> anyhow::Result<SubmitProofRequest> {
         anyhow::ensure!(artifacts::is_safe_id(&request.proof_id), "invalid proof_id");
         let elf_id = self.select_elf(request)?;
         let kind = fleet_proto::sdk::kind_for(request.from_step, request.target_step)
@@ -343,7 +343,7 @@ impl App {
             kind: kind as i32,
         };
         let reference = self.store("inputs", &input.encode_to_vec())?;
-        Ok(Submit {
+        Ok(SubmitProofRequest {
             proof_id: request.proof_id.clone(),
             elf_id: elf_id.clone(),
             signature: request.signature.clone(),
@@ -361,16 +361,16 @@ impl App {
 }
 
 #[derive(Clone)]
-pub struct AppApi(pub Arc<App>);
-impl std::ops::Deref for AppApi {
-    type Target = Arc<App>;
+pub struct ProofAppStageService(pub Arc<ProofAppServer>);
+impl std::ops::Deref for ProofAppStageService {
+    type Target = Arc<ProofAppServer>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 #[tonic::async_trait]
-impl StageService for AppApi {
+impl StageService for ProofAppStageService {
     async fn generate_proof(
         &self,
         request: Request<stage::GenerateProofRequest>,
@@ -487,7 +487,7 @@ impl StageService for AppApi {
                 capabilities.retain(|_, c| c.expires > Instant::now());
                 capabilities.insert(
                     key.clone(),
-                    Capability {
+                    PublicValuesCredential {
                         bearer,
                         job_id: job["id"].as_str().unwrap().into(),
                         expires: Instant::now() + Duration::from_secs(300),
@@ -504,7 +504,7 @@ impl StageService for AppApi {
     }
 }
 
-async fn values(State(app): State<Arc<App>>, HttpPath(key): HttpPath<String>) -> HttpResponse {
+async fn values(State(app): State<Arc<ProofAppServer>>, HttpPath(key): HttpPath<String>) -> HttpResponse {
     let capability = app
         .capabilities
         .lock()
@@ -547,18 +547,18 @@ async fn values(State(app): State<Arc<App>>, HttpPath(key): HttpPath<String>) ->
     }
 }
 
-pub fn router(app: Arc<App>) -> axum::Router {
+pub fn router(app: Arc<ProofAppServer>) -> axum::Router {
     axum::Router::new()
         .route("/public-values/:key", get(values))
         .with_state(app)
 }
 
-pub async fn serve(args: Args) -> anyhow::Result<()> {
+pub async fn serve(args: ProofAppArgs) -> anyhow::Result<()> {
     anyhow::ensure!(
         args.stage_addr.ip().is_loopback() && args.http_addr.ip().is_loopback(),
         "app endpoint must bind loopback; use an authenticated HTTPS gateway for external access"
     );
-    let mut app = App::new(
+    let mut app = ProofAppServer::new(
         args.storage_root,
         args.namespace,
         args.tenant,
@@ -588,7 +588,7 @@ pub async fn serve(args: Args) -> anyhow::Result<()> {
     let http = axum::serve(listener, router(app.clone()));
     let stage = Server::builder()
         .add_service(
-            StageServiceServer::new(AppApi(app))
+            StageServiceServer::new(ProofAppStageService(app))
                 .max_decoding_message_size(1 << 30)
                 .max_encoding_message_size(1 << 30),
         )
@@ -606,7 +606,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let first = artifacts::hash(b"first");
         let second = artifacts::hash(b"second");
-        let app = App::new(
+        let app = ProofAppServer::new(
             storage.path().into(),
             "a".repeat(32),
             "app".into(),

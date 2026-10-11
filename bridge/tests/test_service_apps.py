@@ -38,7 +38,7 @@ def test_cpu_serving_actor_starts_without_gpu_discovery(monkeypatch):
 @pytest.mark.parametrize("integrated", [False, True])
 def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrated):
     from fleet_bridge import actors
-    from fleet_bridge.model import Health
+    from fleet_bridge.model import ReplicaHealth
     actor = object.__new__(actors._ZirenGpuProver)
     actor.spec = Mock()
     actor.spec.service.worker_command = ["/opt/eth-proofs"] if integrated else None
@@ -51,7 +51,7 @@ def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrat
     monkeypatch.setattr(actors, "spec_hash", lambda _: "unchanged")
     probe = Mock(return_value=False)
     monkeypatch.setattr(actors, "_gpu_ready", probe)
-    health = Health.load(actor.health())
+    health = ReplicaHealth.load(actor.health())
     assert health.is_ready == integrated
     if integrated:
         probe.assert_not_called()

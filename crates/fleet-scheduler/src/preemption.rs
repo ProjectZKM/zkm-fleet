@@ -1,81 +1,23 @@
-//! Preemption planning for run and persistent-app work.
+//! Preemption planning for job and persistent-app work.
 //!
 //! Ray remains responsible for reporting free capacity and actually stopping actors.
-//! Fleet owns the namespace, priority, and quota decision so those rules have one source.
-
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+//! Scheduler owns the namespace, priority, and quota decision so those rules have one source.
 
 use crate::quota::{Allocation, Quota};
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Candidate {
-    pub id: String,
-    pub namespace: String,
-    pub priority: i32,
-    pub node_ip: String,
-    pub gpus: f64,
-    pub cpus: f64,
-    pub started_at: Option<f64>,
-    pub preemptible: bool,
-    pub min_runtime_s: u64,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Capacity {
-    pub node_ip: String,
-    pub gpus: f64,
-    pub cpus: f64,
-}
-
-/// `quota_demand` is `None` for a persistent service whose quota reservation already
-/// exists, and `Some` for a run being admitted.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Request {
-    pub contract_version: u32,
-    pub namespace: String,
-    pub tag: Option<String>,
-    pub priority: i32,
-    pub gpus: f64,
-    pub cpus: f64,
-    pub nodes: usize,
-    #[serde(default)]
-    pub pins: Vec<Option<String>>,
-    pub now: f64,
-    #[serde(default)]
-    pub free: Vec<Capacity>,
-    #[serde(default)]
-    pub candidates: Vec<Candidate>,
-    #[serde(default)]
-    pub quota_demand: Option<(f64, f64)>,
-    #[serde(default)]
-    pub exclude_allocation: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Plan {
-    pub possible: bool,
-    pub runs: Vec<String>,
-}
-
-impl Plan {
-    pub fn impossible() -> Self {
-        Self {
-            possible: false,
-            runs: Vec::new(),
-        }
-    }
-}
+#[cfg(test)]
+use fleet_proto::model::v1::Usage;
+pub use fleet_proto::model::v1::{
+    NodeCapacity, PreemptionCandidate, PreemptionPlan,
+    PreemptionRequest,
+};
+use std::collections::{HashMap, HashSet};
 
 pub fn plan(
-    request: Request,
+    request: PreemptionRequest,
     namespace_quota: &Quota,
     tag_quota: &Quota,
     allocations: &[Allocation],
-) -> anyhow::Result<Option<Plan>> {
+) -> anyhow::Result<Option<PreemptionPlan>> {
     validate(&request)?;
     let eligible: Vec<_> = request
         .candidates
@@ -89,7 +31,10 @@ pub fn plan(
         .collect();
 
     let quota_fits = |victims: &HashSet<String>| {
-        let (demand_gpus, demand_cpus) = request.quota_demand.unwrap_or((0.0, 0.0));
+        let (demand_gpus, demand_cpus) = request.quota_demand
+            .as_ref()
+            .map(|d| (d.gpus, d.cpus))
+            .unwrap_or((0.0, 0.0));
         let mut namespace_gpus = demand_gpus;
         let mut namespace_cpus = demand_cpus;
         let mut tag_gpus = demand_gpus;
@@ -97,7 +42,7 @@ pub fn plan(
         for allocation in allocations.iter().filter(|a| {
             a.namespace == request.namespace
                 && request.exclude_allocation.as_deref() != Some(a.id.as_str())
-                && !allocation_is_selected_run(&a.id, victims)
+                && !allocation_is_selected_job(&a.id, victims)
         }) {
             namespace_gpus += allocation.gpus;
             namespace_cpus += allocation.cpus;
@@ -125,7 +70,7 @@ pub fn plan(
     let mut placed = Vec::new();
 
     for rank in 0..request.nodes {
-        let pin = request.pins.get(rank).and_then(|p| p.as_deref());
+        let pin = request.pins.get(rank as usize).and_then(|p| p.as_deref());
         let choices = choose_victims(
             request.gpus,
             request.cpus.max(1.0),
@@ -141,7 +86,7 @@ pub fn plan(
             return Ok(None);
         };
         for id in victims {
-            select_run(&id, &eligible, &mut selected, &mut order, &mut available);
+            select_job(&id, &eligible, &mut selected, &mut order, &mut available);
         }
         placed.push(node.clone());
         available.remove(&node);
@@ -153,7 +98,7 @@ pub fn plan(
         if quota_fits(&selected) {
             break;
         }
-        select_run(
+        select_job(
             &candidate.id,
             &eligible,
             &mut selected,
@@ -184,16 +129,16 @@ pub fn plan(
         }
     }
 
-    Ok(Some(Plan {
+    Ok(Some(PreemptionPlan {
         possible: true,
-        runs: order
+        jobs: order
             .into_iter()
             .filter(|id| selected.contains(id))
             .collect(),
     }))
 }
 
-fn validate(r: &Request) -> anyhow::Result<()> {
+fn validate(r: &PreemptionRequest) -> anyhow::Result<()> {
     anyhow::ensure!(
         r.contract_version == 1,
         "unsupported preemption contract version"
@@ -204,7 +149,7 @@ fn validate(r: &Request) -> anyhow::Result<()> {
         "nodes must be between 1 and 256"
     );
     anyhow::ensure!(
-        r.pins.is_empty() || r.pins.len() == r.nodes,
+        r.pins.is_empty() || r.pins.len() == r.nodes as usize,
         "pins must be empty or have one entry per node"
     );
     anyhow::ensure!(
@@ -215,7 +160,8 @@ fn validate(r: &Request) -> anyhow::Result<()> {
             && r.cpus >= 0.0,
         "resource request and time must be finite and non-negative"
     );
-    if let Some((gpus, cpus)) = r.quota_demand {
+    if let Some(d) = &r.quota_demand {
+        let (gpus, cpus) = (d.gpus, d.cpus);
         anyhow::ensure!(
             gpus.is_finite() && cpus.is_finite() && gpus >= 0.0 && cpus >= 0.0,
             "quota demand must be finite and non-negative"
@@ -246,18 +192,18 @@ fn validate(r: &Request) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn allocation_is_selected_run(id: &str, victims: &HashSet<String>) -> bool {
-    id.strip_prefix("run:")
-        .is_some_and(|run_id| victims.contains(run_id))
+fn allocation_is_selected_job(id: &str, victims: &HashSet<String>) -> bool {
+    id.strip_prefix("job:")
+        .is_some_and(|job_id| victims.contains(job_id))
 }
 
-fn takeable(c: &Candidate, now: f64) -> bool {
+fn takeable(c: &PreemptionCandidate, now: f64) -> bool {
     c.preemptible
         && c.started_at
             .is_none_or(|started| now - started >= c.min_runtime_s as f64)
 }
 
-fn candidate_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+fn candidate_order(a: &PreemptionCandidate, b: &PreemptionCandidate) -> std::cmp::Ordering {
     a.priority
         .cmp(&b.priority)
         .then_with(|| a.started_at.is_some().cmp(&b.started_at.is_some()))
@@ -269,9 +215,9 @@ fn candidate_order(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
         .then_with(|| a.id.cmp(&b.id))
 }
 
-fn select_run(
+fn select_job(
     id: &str,
-    eligible: &[Candidate],
+    eligible: &[PreemptionCandidate],
     selected: &mut HashSet<String>,
     order: &mut Vec<String>,
     available: &mut HashMap<String, (f64, f64)>,
@@ -292,7 +238,7 @@ fn choose_victims(
     need_gpus: f64,
     need_cpus: f64,
     free: &HashMap<String, (f64, f64)>,
-    candidates: &[Candidate],
+    candidates: &[PreemptionCandidate],
     selected: &HashSet<String>,
     namespace: &str,
     priority: i32,
@@ -355,8 +301,8 @@ mod tests {
         gpus: f64,
         cpus: f64,
         started_at: Option<f64>,
-    ) -> Candidate {
-        Candidate {
+    ) -> PreemptionCandidate {
+        PreemptionCandidate {
             id: id.into(),
             namespace: "ns".into(),
             priority,
@@ -369,18 +315,18 @@ mod tests {
         }
     }
 
-    fn request() -> Request {
-        Request {
+    fn request() -> PreemptionRequest {
+        PreemptionRequest {
             contract_version: 1,
             namespace: "ns".into(),
-            tag: Some("default".into()),
+            tag: Some("scope=default".into()),
             priority: 10,
             gpus: 1.0,
             cpus: 4.0,
             nodes: 1,
             pins: vec![],
             now: 10_000.0,
-            free: vec![Capacity {
+            free: vec![NodeCapacity {
                 node_ip: "a".into(),
                 gpus: 0.0,
                 cpus: 40.0,
@@ -403,11 +349,11 @@ mod tests {
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["new", "medium"]);
+        assert_eq!(p.jobs, vec!["new", "medium"]);
     }
 
     #[test]
-    fn excludes_other_namespaces_equal_or_higher_priority_and_unpreemptible_runs() {
+    fn excludes_other_namespaces_equal_or_higher_priority_and_unpreemptible_jobs() {
         let mut r = request();
         r.candidates = vec![
             candidate("other", "a", -1, 1.0, 8.0, None),
@@ -433,7 +379,7 @@ mod tests {
     #[test]
     fn uses_free_capacity_without_preempting_and_counts_cpu_shortfalls() {
         let mut r = request();
-        r.free.push(Capacity {
+        r.free.push(NodeCapacity {
             node_ip: "b".into(),
             gpus: 2.0,
             cpus: 40.0,
@@ -443,26 +389,26 @@ mod tests {
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert!(p.runs.is_empty());
+        assert!(p.jobs.is_empty());
 
         let mut r = request();
         r.gpus = 1.0;
         r.cpus = 32.0;
         r.free[0].cpus = 4.0;
         r.candidates = vec![
-            candidate("gpu-run", "a", 0, 1.0, 2.0, None),
-            candidate("cpu-run", "a", 0, 0.0, 30.0, Some(9_000.0)),
+            candidate("gpu-job", "a", 0, 1.0, 2.0, None),
+            candidate("cpu-job", "a", 0, 0.0, 30.0, Some(9_000.0)),
         ];
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs.len(), 2);
-        assert!(p.runs.contains(&"gpu-run".to_string()));
-        assert!(p.runs.contains(&"cpu-run".to_string()));
+        assert_eq!(p.jobs.len(), 2);
+        assert!(p.jobs.contains(&"gpu-job".to_string()));
+        assert!(p.jobs.contains(&"cpu-job".to_string()));
     }
 
     #[test]
-    fn waits_for_min_runtime_but_can_take_unstarted_runs() {
+    fn waits_for_min_runtime_but_can_take_unstarted_jobs() {
         let mut r = request();
         r.candidates = vec![
             candidate("young", "a", 1, 1.0, 8.0, Some(9_990.0)),
@@ -471,19 +417,22 @@ mod tests {
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["waiting"]);
+        assert_eq!(p.jobs, vec!["waiting"]);
     }
 
     #[test]
-    fn quota_victims_are_selected_and_redundant_other_tag_runs_are_not_taken() {
+    fn quota_victims_are_selected_and_redundant_other_tag_jobs_are_not_taken() {
         let mut r = request();
         r.free[0].gpus = 1.0;
-        r.quota_demand = Some((1.0, 8.0));
+        r.quota_demand = Some(Usage {
+            gpus: 1.0,
+            cpus: 8.0,
+        });
         r.candidates = vec![candidate("quota", "a", 1, 0.0, 8.0, Some(1.0))];
         let allocations = vec![Allocation {
-            id: "run:quota".into(),
+            id: "job:quota".into(),
             namespace: "ns".into(),
-            tag: Some("other".into()),
+            tag: Some("scope=other".into()),
             gpus: 0.0,
             cpus: 8.0,
         }];
@@ -498,30 +447,33 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(p.runs, vec!["quota"]);
+        assert_eq!(p.jobs, vec!["quota"]);
     }
 
     #[test]
     fn tag_quota_requires_a_victim_from_that_tag() {
         let mut r = request();
         r.free[0].gpus = 1.0;
-        r.quota_demand = Some((1.0, 0.0));
+        r.quota_demand = Some(Usage {
+            gpus: 1.0,
+            cpus: 0.0,
+        });
         r.candidates = vec![
             candidate("wrong-tag", "a", -2, 0.0, 0.0, None),
             candidate("right-tag", "a", 0, 0.0, 0.0, None),
         ];
         let allocations = vec![
             Allocation {
-                id: "run:wrong-tag".into(),
+                id: "job:wrong-tag".into(),
                 namespace: "ns".into(),
-                tag: Some("other".into()),
+                tag: Some("scope=other".into()),
                 gpus: 0.0,
                 cpus: 0.0,
             },
             Allocation {
-                id: "run:right-tag".into(),
+                id: "job:right-tag".into(),
                 namespace: "ns".into(),
-                tag: Some("default".into()),
+                tag: Some("scope=default".into()),
                 gpus: 1.0,
                 cpus: 0.0,
             },
@@ -533,7 +485,7 @@ mod tests {
         let p = plan(r.clone(), &Quota::default(), &tag_cap, &allocations)
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["right-tag"]);
+        assert_eq!(p.jobs, vec!["right-tag"]);
         r.candidates.pop();
         assert!(plan(r, &Quota::default(), &tag_cap, &allocations)
             .unwrap()
@@ -545,12 +497,12 @@ mod tests {
         let mut r = request();
         r.gpus = 2.0;
         r.free = vec![
-            Capacity {
+            NodeCapacity {
                 node_ip: "a".into(),
                 gpus: 0.0,
                 cpus: 40.0,
             },
-            Capacity {
+            NodeCapacity {
                 node_ip: "b".into(),
                 gpus: 0.0,
                 cpus: 40.0,
@@ -564,31 +516,31 @@ mod tests {
         let p = plan(r.clone(), &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["b1"]);
-        r.pins = vec![Some("a".into())];
+        assert_eq!(p.jobs, vec!["b1"]);
+        r.pins = vec![Some("a".into()).into()];
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["a1", "a2"]);
+        assert_eq!(p.jobs, vec!["a1", "a2"]);
     }
 
     #[test]
     fn respects_machine_pins_and_multi_node_distinctness() {
         let mut r = request();
         r.nodes = 2;
-        r.pins = vec![Some("a".into()), Some("b".into())];
-        r.free.push(Capacity {
+        r.pins = vec![Some("a".into()).into(), Some("b".into()).into()];
+        r.free.push(NodeCapacity {
             node_ip: "b".into(),
             gpus: 0.0,
             cpus: 40.0,
         });
         r.candidates = vec![
-            candidate("a-run", "a", 1, 1.0, 8.0, None),
-            candidate("b-run", "b", 1, 1.0, 8.0, None),
+            candidate("a-job", "a", 1, 1.0, 8.0, None),
+            candidate("b-job", "b", 1, 1.0, 8.0, None),
         ];
         let p = plan(r, &Quota::default(), &Quota::default(), &[])
             .unwrap()
             .unwrap();
-        assert_eq!(p.runs, vec!["a-run", "b-run"]);
+        assert_eq!(p.jobs, vec!["a-job", "b-job"]);
     }
 }

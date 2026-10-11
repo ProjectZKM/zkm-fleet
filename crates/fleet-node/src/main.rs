@@ -17,7 +17,7 @@ use tokio::{
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 #[derive(Parser)]
-struct Args {
+struct NodeAgentArgs {
     #[arg(long, env = "FLEET_SCHEDULER")]
     scheduler: String,
     #[arg(long, env = "FLEET_CLUSTER_TOKEN_FILE")]
@@ -31,7 +31,7 @@ struct Args {
     #[arg(long)]
     profiles: PathBuf,
     #[arg(long)]
-    runs_dir: PathBuf,
+    jobs_dir: PathBuf,
     #[arg(long)]
     bridge: PathBuf,
     #[arg(long)]
@@ -45,7 +45,7 @@ struct Args {
     #[arg(long, requires = "proof_node_binary")]
     proof_storage_root: Vec<PathBuf>,
 }
-struct Snapshot {
+struct BridgeSnapshot {
     report: Value,
     seen: Instant,
 }
@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let a = Args::parse();
+    let a = NodeAgentArgs::parse();
     anyhow::ensure!(
         fleet_proto::artifacts::is_safe_id(&a.name),
         "invalid worker name"
@@ -123,8 +123,8 @@ async fn main() -> Result<()> {
         .arg(&a.services)
         .arg("--profiles")
         .arg(&a.profiles)
-        .arg("--runs-dir")
-        .arg(&a.runs_dir)
+        .arg("--jobs-dir")
+        .arg(&a.jobs_dir)
         .arg("--address")
         .arg(&a.ray_address);
     let mut child = command
@@ -135,14 +135,14 @@ async fn main() -> Result<()> {
         .spawn()
         .context("starting local Ray bridge")?;
     let input = Arc::new(Mutex::new(child.stdin.take().unwrap()));
-    let snapshot = Arc::new(Mutex::new(None::<Snapshot>));
+    let snapshot = Arc::new(Mutex::new(None::<BridgeSnapshot>));
     let reader_snapshot = snapshot.clone();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let reader = tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
             if let Ok(v) = serde_json::from_str::<Value>(&line) {
                 if v["report"].is_object() {
-                    *reader_snapshot.lock().await = Some(Snapshot {
+                    *reader_snapshot.lock().await = Some(BridgeSnapshot {
                         report: v["report"].clone(),
                         seen: Instant::now(),
                     });
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
         a.scheduler.clone(),
         secret.clone(),
         a.name.clone(),
-        a.runs_dir.clone(),
+        a.jobs_dir.clone(),
         snapshot.clone(),
         input.clone(),
     ));
@@ -201,7 +201,7 @@ async fn main() -> Result<()> {
             let mut request = tonic::Request::new(WorkerHeartbeatRequest {
                 worker_id: a.name.clone(),
                 session: session.clone(),
-                report_json: serde_json::to_vec(&report)?,
+                report: Some(serde_json::from_value(report)?),
                 proof_fetch_ready: a.proof_node_binary.is_some()
                     && !a.proof_storage_root.is_empty(),
             });
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
                             ticket
                         });
                     }
-                    for execution in response.acknowledged_runs {
+                    for execution in response.acknowledged_jobs {
                         if let Some((id, lease)) = execution.split_once('/') {
                             send(&input, json!({"reported":id,"lease":lease})).await?;
                         }
@@ -240,7 +240,8 @@ async fn main() -> Result<()> {
                         send(&input, json!({"ack":id})).await?;
                     }
                     for command in response.commands {
-                        let parameters: Value = serde_json::from_slice(&command.parameters_json)?;
+                        let parameters =
+                            command.parameters.context("missing command parameters")?;
                         send(&input,json!({"command":{"id":command.id,"operation":command.operation,"parameters":parameters}})).await?;
                     }
                     tokio::time::sleep(Duration::from_secs(
@@ -340,8 +341,8 @@ async fn sync_logs(
     url: String,
     secret: String,
     worker: String,
-    runs_dir: PathBuf,
-    snapshot: Arc<Mutex<Option<Snapshot>>>,
+    jobs_dir: PathBuf,
+    snapshot: Arc<Mutex<Option<BridgeSnapshot>>>,
     input: Input,
 ) {
     loop {
@@ -350,7 +351,7 @@ async fn sync_logs(
                 .lock()
                 .await
                 .as_ref()
-                .and_then(|s| s.report["runs"].as_array().cloned())
+                .and_then(|s| s.report["jobs"].as_array().cloned())
                 .unwrap_or_default()
         };
         for job in jobs {
@@ -366,7 +367,7 @@ async fn sync_logs(
                 {
                     return Ok(());
                 }
-                let base = format!("{}/internal/runs/{id}", url.trim_end_matches('/'));
+                let base = format!("{}/internal/jobs/{id}", url.trim_end_matches('/'));
                 let request = |method, path: &str| {
                     client
                         .request(method, format!("{base}/{path}"))
@@ -385,7 +386,7 @@ async fn sync_logs(
                 let log = job["spec"]["log"]
                     .as_str()
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| runs_dir.join(id).join("log"));
+                    .unwrap_or_else(|| jobs_dir.join(id).join("log"));
                 let mut logs_done = true;
                 match tokio::fs::File::open(log).await {
                     Ok(mut file) => {

@@ -8,6 +8,8 @@ use std::path::Path;
 use zkm_sdk::{ProverClient, ZKMProof, ZKMProofWithPublicValues, ZKMPublicValues};
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let a: Vec<String> = std::env::args().collect();
     anyhow::ensure!(a.len() >= 3, "usage: verify_proofs <elf> <job-dir>...");
     let elf = std::fs::read(&a[1])?;
@@ -26,14 +28,14 @@ fn main() -> anyhow::Result<()> {
         match client.verify(&proof, &vk) {
             Ok(()) => {
                 ok += 1;
-                println!("{dir} OK");
+                tracing::info!(dir, "proof verified");
             }
             Err(e) => {
                 failed += 1;
-                println!("{dir} FAIL {e:#}");
+                tracing::error!(dir, error=%format!("{e:#}"), "proof verification failed");
             }
         }
     }
-    println!("VERIFIED {ok} ok, {failed} failed");
+    tracing::info!(ok, failed, "verification completed");
     Ok(())
 }

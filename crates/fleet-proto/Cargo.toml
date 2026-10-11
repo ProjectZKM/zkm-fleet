@@ -8,6 +8,7 @@ publish.workspace = true
 prost.workspace = true
 tonic.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 anyhow.workspace = true
 

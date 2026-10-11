@@ -1,22 +1,8 @@
 //! Metadata and step mapping shared by the SDK endpoint and admission adapter.
+pub use crate::model::v1::SubmitProofRequest;
 use crate::{
-    fleet::v1::{ProofInputs, ProofKind},
-    stage::v1::Step,
-};
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Submit {
-    pub proof_id: String,
-    pub elf_id: String,
-    pub signature: String,
-    pub block_no: Option<u64>,
-    pub seg_size: u32,
-    pub from_step: Option<i32>,
-    pub target_step: Option<i32>,
-    pub inputs: ProofInputs,
-}
+    fleet::v1::ProofKind,
+    stage::v1::Step};
 
 pub fn kind_for(
     from_step: Option<i32>,

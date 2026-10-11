@@ -8,6 +8,42 @@ Run these on the control host. Remote operators set `FLEET_URL` to the HTTPS
 gateway and `FLEET_ADMIN_TOKEN_FILE` to their private administrator token file.
 Namespace users use `FLEET_TOKEN_FILE`. Add `--json` for structured output.
 
+## Namespaces and access
+
+A namespace owns apps and batches and shares one GPU/CPU quota across their
+allocations. These administrator commands manage ownership and access:
+
+| Command | Purpose |
+|---|---|
+| `fleetctl namespace` or `namespace list` | List namespaces, quotas and reservations. |
+| `namespace create NAME --tenant TENANT --endpoint URL --out NAME.env` | Create the namespace and its owner bundle for `scope=default`. |
+| `namespace get NAME` | Inspect quotas, reserved resources and known tags. |
+| `namespace quota NAME --gpus N --cpus N` | Replace the namespace's shared limits. |
+| `namespace quota NAME --tag team=research --gpus N --cpus N` | Replace that tag's limits within the namespace. |
+| `namespace suspend NAME` | Block tokens and new submissions; accepted work continues. |
+| `namespace resume NAME` | Restore access; individually revoked tokens remain revoked. |
+
+For example:
+
+```bash
+fleetctl namespace create alice --tenant eth --gpus 6 --cpus 64 \
+  --endpoint https://fleet.example:8905 --domain-name stage \
+  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+fleetctl namespace get alice
+fleetctl namespace quota alice --tag team=research --gpus 2 --cpus 16
+fleetctl namespace get alice --tag team=research
+```
+
+Creation writes `alice.env`, `alice.token` and, when `--server-ca` is supplied,
+`alice.ca.pem` beside the environment file. Give that bundle to the owner securely.
+`--endpoint` is the proof SDK gateway; `--url` selects Fleet's control API.
+Use an existing CA certificate here; `init tls` belongs to control-host installation.
+
+Each `quota` command replaces both limits: an omitted limit becomes unlimited,
+and `namespace quota NAME` clears both. Zero blocks additional resource allocation.
+Quotas limit use of the node pool; [app scaling](#configure-resources) chooses an
+app's allocation, and [node maintenance](maintenance.md) changes the pool itself.
+
 ## Configure resources
 
 There are two limits:
@@ -49,6 +85,17 @@ An empty `RAY_NUM_CPUS` enables automatic detection. Scaling an app does not
 increase node capacity. Follow the [node maintenance procedure](maintenance.md).
 
 ## Apps and batches
+
+Apps and jobs show `TAG` and `STATE`. App state reports service readiness;
+job state reports an execution's progress. App details retain replica settings
+and job counts. Tags use `key=value`, for example `scope=default` or `team=research`.
+The same namespace/tag selectors work for apps, batch profiles and jobs:
+
+```bash
+fleetctl --namespace zkm --tag scope=default app
+fleetctl --namespace pi --tag team=research batch list
+fleetctl --namespace pi --tag team=research job
+```
 
 ```bash
 fleetctl node

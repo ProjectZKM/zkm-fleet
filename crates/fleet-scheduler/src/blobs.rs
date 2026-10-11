@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
-pub struct Blobs {
+pub struct BlobStore {
     root: PathBuf,
     proof_output: Option<PathBuf>,
 }
@@ -23,7 +23,7 @@ pub fn elf_id_of(elf: &[u8]) -> String {
     hex::encode(Sha256::digest(elf))
 }
 
-impl Blobs {
+impl BlobStore {
     pub fn new(root: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(root.join("elf"))?;
         std::fs::create_dir_all(root.join("jobs"))?;
@@ -40,7 +40,7 @@ impl Blobs {
         self
     }
 
-    pub async fn sdk_output(&self, job: &crate::store::Job, name: &'static str) -> anyhow::Result<Vec<u8>> {
+    pub async fn sdk_output(&self, job: &crate::store::ProofJob, name: &'static str) -> anyhow::Result<Vec<u8>> {
         let blobs = self.clone();
         let job = job.clone();
         // A remote mount must not block scheduling or health heartbeats.
@@ -49,7 +49,7 @@ impl Blobs {
         Ok(bytes)
     }
 
-    pub fn publish_output(&self, job: &crate::store::Job, result: &fleet_proto::fleet::v1::ProveResponse) -> anyhow::Result<()> {
+    pub fn publish_output(&self, job: &crate::store::ProofJob, result: &fleet_proto::fleet::v1::ProveResponse) -> anyhow::Result<()> {
         anyhow::ensure!(is_safe_id(&job.id), "bad job id");
         let started = job.started_ms.ok_or_else(|| anyhow::anyhow!("missing execution lease"))?;
         let root = self.proof_output.clone().unwrap_or_else(|| self.root.join("proofs"));
@@ -73,7 +73,7 @@ impl Blobs {
         Ok(())
     }
 
-    pub fn read_output(&self, job: &crate::store::Job, name: &str) -> anyhow::Result<Vec<u8>> {
+    pub fn read_output(&self, job: &crate::store::ProofJob, name: &str) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(matches!(name, PROOF | PUBLIC_VALUES), "unknown proof output");
         anyhow::ensure!(is_safe_id(&job.id), "bad job id");
         if let Some(started) = job.started_ms {
@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn elf_round_trip_is_content_addressed() {
         let dir = tempfile::tempdir().unwrap();
-        let b = Blobs::new(dir.path()).unwrap();
+        let b = BlobStore::new(dir.path()).unwrap();
         let id = b.put_elf(b"elf bytes").unwrap();
         assert_eq!(id, elf_id_of(b"elf bytes"));
         assert!(b.has_elf(&id));

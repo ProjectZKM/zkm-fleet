@@ -6,7 +6,7 @@ memory and keep state on the cards), plus a fleet-ziren-node process that proves
 through the Ziren SDK against it and registers with the scheduler.
 
 If either process dies, the actor exits and Ray restarts it (max_restarts=-1).
-Every actor takes a ReplicaSpec and answers health() with a Health.
+Every actor takes a AppReplicaSpec and answers health() with a ReplicaHealth.
 """
 
 from __future__ import annotations
@@ -25,10 +25,10 @@ from typing import Any, Callable
 
 import ray
 
-from .model import Health, NodeEnv, ReplicaSpec, to_env
+from .model import ReplicaHealth, NodeEnvironment, AppReplicaSpec, to_env
 
 
-def spec_hash(spec: ReplicaSpec) -> str:
+def spec_hash(spec: AppReplicaSpec) -> str:
     """Over the replica's own mapping from the services file: a bridge upgrade never
     replaces a running service by itself. Priority is scheduling metadata and
     does not require restarting a container."""
@@ -61,8 +61,8 @@ def _gpu_ready(port: int) -> bool:
         return False
 
 
-def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extra: object) -> dict[str, str]:
-    """The node's environment: the process's own, plus a NodeEnv (its fields carry the
+def _node_env(spec: AppReplicaSpec, backend: str, service_env: bool = False, **extra: object) -> dict[str, str]:
+    """The node's environment: the process's own, plus a NodeEnvironment (its fields carry the
     variable names); with service_env the service's env too (a CPU prover's node is
     the service; a GPU prover's env goes to its server container instead)."""
     c = spec.cluster
@@ -74,7 +74,7 @@ def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extr
     if spec.service.proof_app:
         app_tenant, app_elf_id = spec.service.proof_app.split("/", 1)
         app_namespace = spec.service.namespace
-    node = NodeEnv(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
+    node = NodeEnvironment(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
                    app_namespace=app_namespace, app_tenant=app_tenant, app_elf_id=app_elf_id,
                    app_storage_root=spec.service.proof_storage_root,
@@ -92,8 +92,8 @@ def _node_env(spec: ReplicaSpec, backend: str, service_env: bool = False, **extr
 def _warn_foreign(name: str, gpus: list[str]) -> None:
     """Ray's grant is logical: say so in the actor log when something outside the fleet
     already holds memory on the granted cards (a service still starts; a one-shot run
-    waits for the memory instead, see runs.py)."""
-    from .runs import card_memory
+    waits for the memory instead, see jobs.py)."""
+    from .jobs import card_memory
 
     for idx, c in card_memory(gpus).items():
         if c.holders:
@@ -207,13 +207,13 @@ def _granted_gpus() -> list[str]:
     return gpus
 
 
-def _node_binary(spec: ReplicaSpec) -> str:
+def _node_binary(spec: AppReplicaSpec) -> str:
     if not spec.cluster.node_binary:
         raise RuntimeError(f"{spec.name}: services.yaml needs node_binary for a prover")
     return spec.cluster.node_binary
 
 
-def _app_worker_env(spec: ReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
+def _app_worker_env(spec: AppReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
     """Scoped environment for an integrated worker; never evaluated by a shell."""
     assert spec.service.proof_app is not None and spec.service.proof_storage_root is not None
     env = dict(os.environ)
@@ -246,7 +246,7 @@ def _app_worker_env(spec: ReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
 
 
 class _ZirenGpuProver:
-    def __init__(self, spec: ReplicaSpec) -> None:
+    def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
         self.name = spec.name
         self.container = gpu_container(self.name)
@@ -307,7 +307,7 @@ class _ZirenGpuProver:
         container = _container_running(self.container)
         node = self.node.alive()
         if _stopping():
-            return Health(name=self.name, stopping=True).dump()
+            return ReplicaHealth(name=self.name, stopping=True).dump()
         if not (container and node):
             self.shutdown()
             os._exit(1)  # Ray restarts the actor
@@ -315,7 +315,7 @@ class _ZirenGpuProver:
         # Its processes are the health boundary; probing GPU admission during a proof
         # can mark the service unready and make reconciliation kill active work.
         integrated = bool(self.spec.service.worker_command)
-        return Health(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, gpu_port=self.gpu_port,
+        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, gpu_port=self.gpu_port,
                       gpu_ready=None if integrated else _gpu_ready(self.gpu_port),
                       ready=True if integrated else None, machine=socket.gethostname()).dump()
 
@@ -325,7 +325,7 @@ class _ZirenGpuProver:
         _sh(["docker", "rm", "-f", self.container])
 
 
-def app_command(spec: ReplicaSpec, gpus: list[str]) -> tuple[list[str], int]:
+def app_command(spec: AppReplicaSpec, gpus: list[str]) -> tuple[list[str], int]:
     """`docker run` for one replica of an app service, and the port it serves on.
 
     Volumes are mounted at the same path inside, so absolute paths baked into the app's
@@ -379,7 +379,7 @@ class _GpuApp:
     fixed per replica (`port_base` + replica index), on the machine Ray placed it on.
     """
 
-    def __init__(self, spec: ReplicaSpec) -> None:
+    def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
         self.name = spec.name
         self.container = app_container(self.name)
@@ -402,11 +402,11 @@ class _GpuApp:
 
     def health(self) -> dict[str, Any]:
         if _stopping():
-            return Health(name=self.name, stopping=True).dump()
+            return ReplicaHealth(name=self.name, stopping=True).dump()
         if not _container_running(self.container):
             self.shutdown()
             os._exit(1)
-        return Health(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, port=self.port,
+        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, port=self.port,
                       ready=_http_ok(self.health_url), machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
@@ -421,7 +421,7 @@ GpuApp = ray.remote(_GpuApp)
 class _ZirenCpuProver:
     """A native (CPU) prover node: the Ziren SDK's CPU prover in fleet-ziren-node."""
 
-    def __init__(self, spec: ReplicaSpec) -> None:
+    def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
         self.name = spec.name
         os.makedirs(spec.cluster.log_dir, exist_ok=True)
@@ -432,10 +432,10 @@ class _ZirenCpuProver:
 
     def health(self) -> dict[str, Any]:
         if _stopping():
-            return Health(name=self.name, stopping=True).dump()
+            return ReplicaHealth(name=self.name, stopping=True).dump()
         if not self.node.alive():
             os._exit(1)
-        return Health(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname()).dump()
+        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
         _STOPPING["on"] = True

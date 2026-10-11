@@ -3,8 +3,8 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from fleet_bridge import actors, node, reconcile, runs
-from fleet_bridge.model import Profile, RunSpec, RunState, RunStatus
+from fleet_bridge import actors, node, reconcile, jobs
+from fleet_bridge.model import JobTemplate, JobSpec, JobState, JobStatus
 
 
 @pytest.fixture
@@ -14,7 +14,7 @@ def executor(tmp_path, monkeypatch):
         "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
         "proof_app": "eth/"+"b"*64, "disabled": True, "replicas": 2,
     }]}))
-    e=node.Executor(str(tmp_path/"services.yaml"),str(tmp_path/"profiles.yaml"),str(tmp_path/"runs"))
+    e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"profiles.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
     e.pool=Mock()
     monkeypatch.setattr(node.ray,"nodes",lambda:[{"Alive":True}])
@@ -49,7 +49,7 @@ def test_cancel_fences_launch_even_if_commands_execute_out_of_order(executor):
 
 
 def test_cancel_before_local_record_confirms_absence_without_launch(executor,monkeypatch):
-    monkeypatch.setattr(runs,"_going",lambda _:False)
+    monkeypatch.setattr(jobs,"_going",lambda _:False)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
     assert executor.stop(command()["parameters"],False)["cleaned"]
     monkeypatch.setattr(node,"container_gone",lambda _:False)
@@ -89,7 +89,7 @@ def test_enable_uses_local_executor_and_no_admin_token(executor,monkeypatch):
 
 
 def test_purge_refuses_an_old_execution_lease(executor):
-    c=command(5);path=executor.runs_dir/c["parameters"]["id"];path.mkdir(parents=True)
+    c=command(5);path=executor.jobs_dir/c["parameters"]["id"];path.mkdir(parents=True)
     node.write_json(path/".fleet-lease.json",{"lease":"new-lease"})
     executor.execute(c)
     assert path.exists()
@@ -113,19 +113,19 @@ def test_pending_launch_refuses_removed_input_capture_without_starting_a_job(exe
     c["parameters"]["request"] = {"code": "upload:" + "a" * 64}
     with pytest.raises(ValueError, match="app owner in storage"):
         executor.launch(c["parameters"])
-    assert not (executor.runs_dir / c["parameters"]["id"]).exists()
+    assert not (executor.jobs_dir / c["parameters"]["id"]).exists()
 
 
 def test_storage_inputs_are_passed_to_the_app_without_capturing_code(executor, monkeypatch):
     p = command()["parameters"]
-    p.update({"owner": "owner", "namespace": "a" * 32, "tag": "default",
+    p.update({"owner": "owner", "namespace": "a" * 32, "tag": "scope=default",
               "profile_name": "training", "profile": {"image": "training:latest", "namespace": "a" * 32},
               "submitted_at": 1,
               "request": {"command": ["train", "--input", "s3://owner/dataset"], "gpus": 0,
                           "cpus": 1, "env": ["INPUT_URI=s3://owner/dataset"]}})
-    monkeypatch.setattr(runs, "prepare_launch", lambda _: True)
+    monkeypatch.setattr(jobs, "prepare_launch", lambda _: True)
     launch = Mock()
-    monkeypatch.setattr(runs, "launch", launch)
+    monkeypatch.setattr(jobs, "launch", launch)
     executor.launch(p)
     spec = launch.call_args.args[0]
     assert spec.command == p["request"]["command"]
@@ -134,34 +134,34 @@ def test_storage_inputs_are_passed_to_the_app_without_capturing_code(executor, m
 
 
 def test_finished_job_reports_log_completion_without_archiving_outputs(executor, monkeypatch):
-    directory = executor.runs_dir / "job-output"
+    directory = executor.jobs_dir / "job-output"
     (directory / "out").mkdir(parents=True)
     (directory / "out/result.txt").write_text("app-owned output")
-    RunSpec(id="job-output", profile_name="training", profile=Profile(image="training:latest"),
+    JobSpec(id="job-output", profile_name="training", profile=JobTemplate(image="training:latest"),
             command=["true"], gpus=0, cpus=1, out=str(directory / "out")).write(str(directory / "spec.json"))
-    RunStatus(id="job-output", state=RunState.SUCCEEDED, submitted_at=1, gpus_requested=0, cpus=1).write(str(directory / "status.json"))
+    JobStatus(id="job-output", state=JobState.SUCCEEDED, submitted_at=1, gpus_requested=0, cpus=1).write(str(directory / "status.json"))
     node.write_json(directory / ".fleet-lease.json", {"lease": "lease-1"})
     monkeypatch.setattr(node.ray, "cluster_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(node.ray, "available_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(reconcile, "running", lambda: {})
     monkeypatch.setattr(node, "container_gone", lambda _: True)
-    monkeypatch.setattr(runs, "_going", lambda _: False)
-    monkeypatch.setattr(runs, "discard_placement", lambda _: None)
-    report = executor.report()["runs"][0]
+    monkeypatch.setattr(jobs, "_going", lambda _: False)
+    monkeypatch.setattr(jobs, "discard_placement", lambda _: None)
+    report = executor.report()["jobs"][0]
     assert report["cleaned"] and not report["logs_ready"]
     assert not list(directory.glob("*.tar.gz"))
     (directory / ".fleet-logs-lease-1").touch()
-    assert executor.report()["runs"][0]["logs_ready"]
+    assert executor.report()["jobs"][0]["logs_ready"]
 
 
 def test_healthy_proof_service_is_ready_and_enable_preserves_actors(executor, monkeypatch):
-    from fleet_bridge.model import Health
+    from fleet_bridge.model import ReplicaHealth
     cfg=yaml.safe_load(executor.services.read_text())
     cfg['services'][0]['disabled']=False
     executor.services.write_text(yaml.safe_dump(cfg))
     specs=reconcile.replica_specs(reconcile.load_services(cfg))
     monkeypatch.setattr(reconcile,'running',lambda:{name:name for name in specs})
-    monkeypatch.setattr(reconcile,'health_of',lambda name, **kwargs:Health(name=name,spec=actors.spec_hash(specs[name]),gpu_ready=True))
+    monkeypatch.setattr(reconcile,'health_of',lambda name, **kwargs:ReplicaHealth(name=name,spec=actors.spec_hash(specs[name]),gpu_ready=True))
     start,stop=Mock(),Mock()
     monkeypatch.setattr(reconcile,'start',start);monkeypatch.setattr(reconcile,'stop',stop)
     monkeypatch.setattr(node.ray,'cluster_resources',lambda:{'GPU':8,'CPU':48})
@@ -169,18 +169,18 @@ def test_healthy_proof_service_is_ready_and_enable_preserves_actors(executor, mo
     assert executor.report()['services'][0]['ready'] is True
     assert executor.service({'service':cfg['services'][0],'disabled':False})['ready']
     start.assert_not_called();stop.assert_not_called()
-    assert not Health(name='gpu',spec='hash',gpu_ready=False).is_ready
-    assert not Health(name='gpu',spec='hash',gpu_ready=True,stopping=True).is_ready
-    assert Health(name='cpu',spec='hash').is_ready
+    assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=False).is_ready
+    assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=True,stopping=True).is_ready
+    assert ReplicaHealth(name='cpu',spec='hash').is_ready
 
 
 def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(executor, monkeypatch):
-    from fleet_bridge.model import Health
+    from fleet_bridge.model import ReplicaHealth
     monkeypatch.setattr(node.ray, 'cluster_resources', lambda: {'GPU': 8, 'CPU': 48})
     monkeypatch.setattr(node.ray, 'available_resources', lambda: {'GPU': 4, 'CPU': 16})
     monkeypatch.setattr(reconcile, 'running', lambda: {'proof-0': 'starting', 'proof-1': 'healthy'})
     health = Mock(side_effect=[node.ray.exceptions.GetTimeoutError('starting'),
-                             Health(name='proof-1', spec='hash', gpu_ready=True)])
+                             ReplicaHealth(name='proof-1', spec='hash', gpu_ready=True)])
     monkeypatch.setattr(reconcile, 'health_of', health)
     node.write_json(executor.journal / 'cleanup.json', {'command': {'id': 'cleanup'},
                                                      'done': True, 'result': {'cleaned': True}, 'error': None})

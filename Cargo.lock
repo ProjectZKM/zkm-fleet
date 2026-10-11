@@ -2567,6 +2567,7 @@ dependencies = [
  "anyhow",
  "prost 0.13.5",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tonic 0.12.3",
@@ -2626,7 +2627,6 @@ dependencies = [
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
- "zkm-core-machine",
  "zkm-cuda",
  "zkm-prover",
  "zkm-sdk",
@@ -2648,6 +2648,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "time",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

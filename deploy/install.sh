@@ -3,17 +3,17 @@
 # control --public-url https://fleet.example:8905 [--tls-names stage,fleet.example] [--no-mcp]
 # node --scheduler https://fleet.example:8905 --cluster-token FILE [--cuda 0,1]
 # Common: --prefix DIR --etc DIR --bin DIR --workdir DIR --no-cron
-# Node: --name NAME --cpus N --runs-dir DIR --scheduler-ca FILE
+# Node: --name NAME --cpus N --jobs-dir DIR --scheduler-ca FILE
 set -euo pipefail
 ROLE=${1:-}; shift || true
-PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; WORKDIR=""; RUNS_DIR=""
+PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; WORKDIR=""; JOBS_DIR=""
 CUDA=""; CPUS=""; NAME=$(hostname); SCHEDULER=""; TOKEN=""; CA=""; PUBLIC_URL=""; TLS_NAMES=""; CRON=1; PROOF_ROOTS=""; MCP=1
 SUBNET=172.28.250.0/24; IP=$(hostname -I | awk '{print $1}')
 while [ $# -gt 0 ]; do
   case "$1" in
     --proof-storage-roots) PROOF_ROOTS=$2; shift 2;;
     --prefix) PREFIX=$2; shift 2;; --etc) ETC=$2; shift 2;; --bin) BIN=$2; shift 2;;
-    --workdir) WORKDIR=$2; shift 2;; --runs-dir) RUNS_DIR=$2; shift 2;;
+    --workdir) WORKDIR=$2; shift 2;; --jobs-dir) JOBS_DIR=$2; shift 2;;
     --cuda) CUDA=$2; shift 2;; --cpus) CPUS=$2; shift 2;; --name) NAME=$2; shift 2;;
     --scheduler) SCHEDULER=$2; shift 2;; --cluster-token) TOKEN=$2; shift 2;; --scheduler-ca) CA=$2; shift 2;;
     --public-url) PUBLIC_URL=$2; shift 2;; --tls-names) TLS_NAMES=$2; shift 2;;
@@ -27,7 +27,7 @@ SRC=$(cd "$(dirname "$0")/.." && pwd)
 die(){ echo "[install] $*" >&2; exit 1; }
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker must be installed and accessible"
 [ -n "$WORKDIR" ] || WORKDIR="$PREFIX/work"
-[ -n "$RUNS_DIR" ] || RUNS_DIR="$WORKDIR/runs"
+[ -n "$JOBS_DIR" ] || JOBS_DIR="$WORKDIR/jobs"
 mkdir -p "$PREFIX/bin" "$ETC" "$WORKDIR/logs"
 chmod 750 "$ETC"
 if [ "$ROLE" = control ]; then
@@ -130,8 +130,8 @@ EOF
   if [ -n "$CA" ] && ! grep -q '^scheduler_ca_file:' "$ETC/services.yaml"; then
     printf '\nscheduler_ca_file: %s\n' "$CA" >> "$ETC/services.yaml"
   fi
-  [ -f "$ETC/runs.yaml" ] || echo 'profiles: {} # initial operator-managed batch profiles' > "$ETC/runs.yaml"
-  mkdir -p "$RUNS_DIR"
+  [ -f "$ETC/jobs.yaml" ] || echo 'profiles: {} # initial operator-managed batch profiles' > "$ETC/jobs.yaml"
+  mkdir -p "$JOBS_DIR"
   if [ -n "$PROOF_ROOTS" ]; then
     [ -f "$PROOF_ROOTS" ] || die "--proof-storage-roots must name a file with one approved root per line"
     if [ "$PROOF_ROOTS" != "$ETC/proof-storage-roots" ]; then
@@ -140,7 +140,7 @@ EOF
   fi
   {
     printf 'FLEET_HOME=%q\nFLEET_ETC=%q\nFLEET_LOG=%q\nFLEET_WORKDIR=%q\n' "$PREFIX" "$ETC" "$WORKDIR/logs" "$WORKDIR"
-    printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_RUNS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$RUNS_DIR" "$CA"
+    printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_JOBS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$JOBS_DIR" "$CA"
     [ ! -f "$ETC/proof-storage-roots" ] || printf 'FLEET_PROOF_STORAGE_ROOTS_FILE=%q\n' "$ETC/proof-storage-roots"
     printf 'RAY_NUM_CPUS=%q\nCUDA_VISIBLE_DEVICES=%q\n' "$CPUS" "$CUDA"
   } > "$ETC/watchdog.env"

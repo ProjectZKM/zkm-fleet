@@ -2,7 +2,7 @@
 stage_addr: 0.0.0.0:51000          # SDK proof API (server TLS; authorize with the user bearer token)
 control_addr: 0.0.0.0:51001        # node-initiated gRPC; TLS uses the certificate below
 http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin (admin token)
-public_url: https://fleet.example.com:9191
+public_url: https://fleet.example.com:8905
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
 proof_output_dir: /var/lib/zkm-fleet/proofs # control-host proof results received from nodes; no shared mount required

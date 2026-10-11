@@ -8,6 +8,7 @@
 //!   builds `NetworkProver::from_env()`, proves, and compares with the expected outcome.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -228,10 +229,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut failures = 0;
-    println!(
+    writeln!(std::io::stdout().lock(),
         "{:<58} {:<6} {:<6} {:>8}  detail",
         "CASE", "EXPECT", "GOT", "SECS"
-    );
+    )?;
     for c in &cases {
         for v in SDK_VARS {
             std::env::remove_var(v);
@@ -282,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
         if !ok {
             failures += 1;
         }
-        println!(
+        writeln!(std::io::stdout().lock(),
             "{:<58} {:<6} {:<6} {:>8.2}  {}{}",
             c.name,
             format!("{:?}", c.expect),
@@ -290,8 +291,8 @@ async fn main() -> anyhow::Result<()> {
             t.elapsed().as_secs_f64(),
             if ok { "" } else { "MISMATCH " },
             detail
-        );
+        )?;
     }
-    println!("MATRIX {} cases, {} mismatches", cases.len(), failures);
+    writeln!(std::io::stdout().lock(), "MATRIX {} cases, {} mismatches", cases.len(), failures)?;
     Ok(())
 }

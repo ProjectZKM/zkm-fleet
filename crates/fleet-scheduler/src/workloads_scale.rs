@@ -1,61 +1,19 @@
 //! Administrator-owned desired resource settings, reconciled through unary heartbeats.
 use super::*;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum Phase {
-    Draining,
-    Starting,
-    Complete,
-    Failed,
-}
+use fleet_proto::model::v1::{ScalePhase as Phase, ScaleRequest, ScaleStatus};
 
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct ScaleState {
-    id: String,
-    target: Value,
-    disabled: bool,
-    phase: Phase,
-    stop: Option<String>,
-    start: Option<String>,
-    error: Option<String>,
-    #[serde(default)]
-    ready_since: Option<f64>,
-}
-impl ScaleState {
-    pub(super) fn pending(&self) -> bool {
-        matches!(self.phase, Phase::Draining | Phase::Starting)
-    }
-    pub(super) fn target(&self) -> &Value {
-        &self.target
-    }
-    pub(super) fn id(&self) -> &str {
-        &self.id
-    }
-    pub(super) fn failed(&self) -> bool {
-        self.phase == Phase::Failed
-    }
-    pub(super) fn new(target: Value, disabled: bool) -> Self {
-        Self {
+pub(super) fn new_scale(target: impl Into<Value>, disabled: bool) -> ScaleStatus {
+    ScaleStatus {
             id: uuid::Uuid::new_v4().to_string(),
-            target,
+            target: target.into().into(),
             disabled,
-            phase: Phase::Draining,
+            phase: Phase::Draining as i32,
             stop: None,
             start: None,
             error: None,
             ready_since: None,
         }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ScaleRequest {
-    gpus: Option<f64>,
-    cpus: Option<u32>,
-    replicas: Option<u32>,
-    node: Option<String>,
 }
 
 pub(super) fn same_resources(a: &Value, b: &Value) -> bool {
@@ -69,7 +27,7 @@ pub(super) fn same_resources(a: &Value, b: &Value) -> bool {
     })
 }
 
-impl RunControl {
+impl WorkloadController {
     pub(crate) async fn app_lifecycle_guard(
         &self,
         namespace: &str,
@@ -84,7 +42,7 @@ impl RunControl {
         if self.inner.lock().services.values().any(|s| {
             text(&s.service, "namespace") == namespace
                 && (text(&s.service, "proof_app") == app || text(&s.service, "name") == app)
-                && s.scale.as_ref().is_some_and(ScaleState::pending)
+                && s.scale.as_ref().is_some_and(ScaleStatus::pending)
         }) {
             return Err(fail(409, "app scaling is already pending"));
         }
@@ -96,7 +54,7 @@ impl RunControl {
         namespace: &str,
         app: &str,
         node: Option<&str>,
-    ) -> anyhow::Result<(String, ServiceIntent)> {
+    ) -> anyhow::Result<(String, AppDeployment)> {
         let i = self.inner.lock();
         let mut services = i.services.iter().filter(|(_, intent)| {
             let s = &intent.service;
@@ -115,7 +73,7 @@ impl RunControl {
         Ok(first)
     }
 
-    fn scale_value(&self, intent: &ServiceIntent) -> Value {
+    fn scale_value(&self, intent: &AppDeployment) -> Value {
         let i = self.inner.lock();
         let observed = i.workers.get(&intent.worker).and_then(|w| {
             w.report
@@ -132,7 +90,7 @@ impl RunControl {
             "namespace":text(&intent.service,"namespace"),
             "gpus":target["gpus"].as_f64().unwrap_or(1.0),"cpus":target["cpus"].as_f64().unwrap_or(1.0),
             "replicas":target["replicas"].as_u64().unwrap_or(1),
-            "state":intent.scale.as_ref().map(|s| serde_json::to_value(&s.phase).unwrap()).unwrap_or(json!("configured")),
+            "state":intent.scale.as_ref().map(|s| serde_json::to_value(&s.phase()).unwrap()).unwrap_or(json!("configured")),
             "disabled":intent.scale.as_ref().map(|s|s.disabled).unwrap_or(intent.disabled),
             "operation":intent.scale.as_ref().map(|s|s.id.clone()),
             "error":intent.scale.as_ref().and_then(|s|s.error.clone()),
@@ -176,7 +134,7 @@ impl RunControl {
         }
         {
             let i = self.inner.lock();
-            if intent.scale.as_ref().is_some_and(ScaleState::pending)
+            if intent.scale.as_ref().is_some_and(ScaleStatus::pending)
                 || i.commands.values().any(|c| {
                     !c.done
                         && c.worker == intent.worker
@@ -201,7 +159,8 @@ impl RunControl {
         let cpu = target["cpus"].as_f64().unwrap_or(1.0);
         let replicas = target["replicas"].as_u64().unwrap_or(1);
         if super::integrated_worker(&target) && replicas != 1 {
-            return Err(fail(400, "integrated app workers require one machine-pinned replica"));
+            return Err(fail(400, "integrated app workers require one machine-pinned replica",
+            ));
         }
         if !g.is_finite()
             || g < 0.0
@@ -272,17 +231,17 @@ impl RunControl {
             && intent
                 .scale
                 .as_ref()
-                .is_none_or(|s| s.phase != Phase::Failed)
+                .is_none_or(|s| s.phase() != Phase::Failed)
         {
             return Ok(self.scale_value(&intent));
         }
         let disabled = intent
             .scale
             .as_ref()
-            .filter(|s| s.phase == Phase::Failed)
+            .filter(|s| s.phase() == Phase::Failed)
             .map(|s| s.disabled)
             .unwrap_or(intent.disabled);
-        intent.scale = Some(ScaleState::new(target, disabled));
+        intent.scale = Some(new_scale(target, disabled));
         // Persist the transition before changing admission or sending any command.
         self.save("services", &key, &intent)?;
         self.inner.lock().services.insert(key, intent.clone());
@@ -292,7 +251,7 @@ impl RunControl {
 
     fn scale_command(
         &self,
-        intent: &ServiceIntent,
+        intent: &AppDeployment,
         service: &Value,
         disabled: bool,
         phase: &str,
@@ -318,7 +277,7 @@ impl RunControl {
         self.command(&intent.worker, NodeOperation::SetService, parameters)
     }
 
-    fn save_scale(&self, key: &str, scale: ScaleState) -> anyhow::Result<()> {
+    fn save_scale(&self, key: &str, scale: ScaleStatus) -> anyhow::Result<()> {
         let mut intent = self.inner.lock().services.get(key).cloned().unwrap();
         intent.scale = Some(scale);
         self.save("services", key, &intent)?;
@@ -332,12 +291,12 @@ impl RunControl {
             .lock()
             .services
             .iter()
-            .filter(|(_, s)| s.scale.as_ref().is_some_and(ScaleState::pending))
+            .filter(|(_, s)| s.scale.as_ref().is_some_and(ScaleStatus::pending))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>();
         for (key, intent) in intents {
             let mut scale = intent.scale.clone().unwrap();
-            if scale.phase == Phase::Draining {
+            if scale.phase() == Phase::Draining {
                 if let Some((tenant, elf)) = text(&intent.service, "proof_app").split_once('/') {
                     self.fleet
                         .set_app_disabled(text(&intent.service, "namespace"), tenant, elf, true)
@@ -371,7 +330,7 @@ impl RunControl {
                     continue;
                 }
                 if command.error.is_some() || command.result["cleaned"].as_bool() != Some(true) {
-                    scale.phase = Phase::Failed;
+                    scale.phase = Phase::Failed as i32;
                     scale.error = Some(
                         command
                             .error
@@ -380,7 +339,7 @@ impl RunControl {
                     self.save_scale(&key, scale)?;
                     continue;
                 }
-                scale.phase = Phase::Starting;
+                scale.phase = Phase::Starting as i32;
                 self.save_scale(&key, scale.clone())?;
             }
             if scale.start.is_none() {
@@ -425,7 +384,7 @@ impl RunControl {
                 )
             };
             if command.error.is_some() || (!applied && connected && now() - ready_since > timeout) {
-                scale.phase = Phase::Failed;
+                scale.phase = Phase::Failed as i32;
                 scale.error=Some(command.error.clone().unwrap_or_else(||"node did not report the requested resources ready before the startup timeout".into()));
                 let mut failed = self.inner.lock().services.get(&key).cloned().unwrap();
                 failed.disabled = true;
@@ -461,7 +420,7 @@ impl RunControl {
                 self.save("apps", &app.name, &app)?;
                 self.inner.lock().apps.insert(app.name.clone(), app);
             }
-            scale.phase = Phase::Complete;
+            scale.phase = Phase::Complete as i32;
             self.save_scale(&key, scale)?;
         }
         Ok(())

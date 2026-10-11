@@ -21,5 +21,5 @@ def alive_nodes() -> list[dict[str, Any]]:
     return [n for n in nodes() if n.get("Alive")]
 
 def resources() -> tuple[dict[str, float], dict[str, float]]:
-    """Total and currently available CPU/GPU/resource units on the local runtime."""
+    """Total and currently available CPU/GPU/resource units on the local jobtime."""
     return dict(ray.cluster_resources()), dict(ray.available_resources())  # type: ignore[no-untyped-call]

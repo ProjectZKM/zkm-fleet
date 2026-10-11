@@ -17,12 +17,12 @@ use std::{
 use tokio::sync::{oneshot, Semaphore};
 use tonic::Status;
 
-struct Worker {
+struct FetchWorkerSession {
     id: String,
     session: String,
     seen: Instant,
 }
-struct Pending {
+struct PendingFetch {
     machine: String,
     worker: String,
     session: String,
@@ -31,35 +31,35 @@ struct Pending {
     reply: Option<oneshot::Sender<Result<Vec<u8>, Status>>>,
 }
 #[derive(Default)]
-struct Inner {
-    workers: HashMap<String, Worker>,
-    pending: HashMap<String, Pending>,
+struct FetchState {
+    workers: HashMap<String, FetchWorkerSession>,
+    pending: HashMap<String, PendingFetch>,
 }
-pub struct Relay {
-    inner: Mutex<Inner>,
+pub struct ProofFetcher {
+    inner: Mutex<FetchState>,
     slots: Semaphore,
 }
-impl Default for Relay {
+impl Default for ProofFetcher {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(FetchState::default()),
             slots: Semaphore::new(4),
         }
     }
 }
 
-/// Pending requests live only as long as the client's request, including cancellation.
-struct FetchGuard<'a> {
-    relay: &'a Relay,
+/// PendingFetch requests live only as long as the client's request, including cancellation.
+struct PendingFetchGuard<'a> {
+    fetcher: &'a ProofFetcher,
     ticket: String,
 }
-impl Drop for FetchGuard<'_> {
+impl Drop for PendingFetchGuard<'_> {
     fn drop(&mut self) {
-        self.relay.inner.lock().pending.remove(&self.ticket);
+        self.fetcher.inner.lock().pending.remove(&self.ticket);
     }
 }
 
-impl Relay {
+impl ProofFetcher {
     pub fn heartbeat(
         &self,
         machine: &str,
@@ -92,7 +92,7 @@ impl Relay {
         }
         inner.workers.insert(
             machine.into(),
-            Worker {
+            FetchWorkerSession {
                 id: worker.into(),
                 session: session.into(),
                 seen: Instant::now(),
@@ -123,8 +123,8 @@ impl Relay {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let guard = FetchGuard {
-            relay: self,
+        let guard = PendingFetchGuard {
+            fetcher: self,
             ticket: request.ticket.clone(),
         };
         {
@@ -142,7 +142,7 @@ impl Relay {
             let session = worker.session.clone();
             inner.pending.insert(
                 guard.ticket.clone(),
-                Pending {
+                PendingFetch {
                     machine: machine.into(),
                     worker: worker_id,
                     session,
@@ -287,7 +287,7 @@ pub fn response_error(error: Status) -> Response {
 mod tests {
     use super::*;
     use crate::{
-        blobs::Blobs, config::Config, fleet::Fleet, http::HttpState, runs_api::RunControl,
+        blobs::BlobStore, config::SchedulerConfig, fleet::Scheduler, http::HttpState, workloads::WorkloadController,
         store::MemoryStore,
     };
     use std::{future::IntoFuture, sync::Arc};
@@ -307,10 +307,10 @@ mod tests {
         }
     }
 
-    async fn queued(relay: &Relay) -> ProofFetch {
+    async fn queued(fetcher: &ProofFetcher) -> ProofFetch {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let commands = relay.heartbeat("gpu-machine", "worker", "session", true);
+            let commands = fetcher.heartbeat("gpu-machine", "worker", "session", true);
             if let Some(c) = commands.first() {
                 return c.clone();
             }
@@ -321,77 +321,77 @@ mod tests {
 
     #[tokio::test]
     async fn tickets_are_session_bound_replayed_until_claimed_and_cancelled_with_the_client() {
-        let relay = Arc::new(Relay::default());
+        let fetcher = Arc::new(ProofFetcher::default());
         assert_eq!(
-            relay
+            fetcher
                 .fetch("gpu-machine", request(b"proof"))
                 .await
                 .unwrap_err()
                 .code(),
             tonic::Code::Unavailable
         );
-        relay.heartbeat("gpu-machine", "worker", "session", true);
-        let r = relay.clone();
+        fetcher.heartbeat("gpu-machine", "worker", "session", true);
+        let r = fetcher.clone();
         let task = tokio::spawn(async move { r.fetch("gpu-machine", request(b"proof")).await });
-        let fetch = queued(&relay).await;
-        assert_eq!(queued(&relay).await, fetch);
+        let fetch = queued(&fetcher).await;
+        assert_eq!(queued(&fetcher).await, fetch);
         assert_eq!(
-            relay.claim(&fetch.ticket, "other", "session").unwrap_err(),
+            fetcher.claim(&fetch.ticket, "other", "session").unwrap_err(),
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            relay.claim(&fetch.ticket, "worker", "stale").unwrap_err(),
+            fetcher.claim(&fetch.ticket, "worker", "stale").unwrap_err(),
             StatusCode::FORBIDDEN
         );
-        let (_, reply) = relay.claim(&fetch.ticket, "worker", "session").unwrap();
-        assert!(relay
+        let (_, reply) = fetcher.claim(&fetch.ticket, "worker", "session").unwrap();
+        assert!(fetcher
             .heartbeat("gpu-machine", "worker", "session", true)
             .is_empty());
         assert_eq!(
-            relay.claim(&fetch.ticket, "worker", "session").unwrap_err(),
+            fetcher.claim(&fetch.ticket, "worker", "session").unwrap_err(),
             StatusCode::CONFLICT
         );
         reply.send(Ok(b"proof".to_vec())).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), b"proof");
         assert_eq!(
-            relay.claim(&fetch.ticket, "worker", "session").unwrap_err(),
+            fetcher.claim(&fetch.ticket, "worker", "session").unwrap_err(),
             StatusCode::NOT_FOUND
         );
-        let r = relay.clone();
+        let r = fetcher.clone();
         let task = tokio::spawn(async move { r.fetch("gpu-machine", request(b"proof")).await });
-        let fetch = queued(&relay).await;
+        let fetch = queued(&fetcher).await;
         task.abort();
         let _ = task.await;
         assert_eq!(
-            relay.claim(&fetch.ticket, "worker", "session").unwrap_err(),
+            fetcher.claim(&fetch.ticket, "worker", "session").unwrap_err(),
             StatusCode::NOT_FOUND
         );
-        assert!(relay.inner.lock().pending.is_empty());
-        let r = relay.clone();
+        assert!(fetcher.inner.lock().pending.is_empty());
+        let r = fetcher.clone();
         let task = tokio::spawn(async move { r.fetch("gpu-machine", request(b"proof")).await });
-        queued(&relay).await;
-        relay.heartbeat("gpu-machine", "worker", "new-session", true);
+        queued(&fetcher).await;
+        fetcher.heartbeat("gpu-machine", "worker", "new-session", true);
         assert_eq!(
             task.await.unwrap().unwrap_err().code(),
             tonic::Code::Unavailable
         );
-        assert!(relay.inner.lock().pending.is_empty());
+        assert!(fetcher.inner.lock().pending.is_empty());
     }
 
     #[tokio::test]
     async fn relay_checks_cluster_auth_fencing_size_hash_and_single_use_without_files() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg: Config = serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nadmin_token_file: unused\ntenants:\n - name: proof\n",dir.path().display())).unwrap();
-        let fleet = Fleet::new(
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nadmin_token_file: unused\ntenants:\n - name: proof\n",dir.path().display())).unwrap();
+        let fleet = Scheduler::new(
             cfg,
             Arc::new(MemoryStore::default()),
-            Blobs::new(dir.path()).unwrap(),
+            BlobStore::new(dir.path()).unwrap(),
             SECRET.into(),
         );
         let state = HttpState {
             fleet: fleet.clone(),
             admin_token: Arc::new(SECRET.into()),
-            runs: Arc::new(RunControl::new(fleet.clone(), SECRET.into(), SECRET.into()).unwrap()),
+            workloads: Arc::new(WorkloadController::new(fleet.clone(), SECRET.into(), SECRET.into()).unwrap()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

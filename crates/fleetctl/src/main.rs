@@ -15,7 +15,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use out::{col, Out};
+use out::{col, OutputWriter};
 
 #[derive(Parser)]
 #[command(about = "Operate a zkm-fleet cluster and issue its tokens")]
@@ -26,13 +26,13 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
     #[command(flatten)]
-    _conn: Conn,
+    _conn: ConnectionOptions,
 }
 
 /// The single control-plane endpoint and its access token: every
 /// command that talks to the cluster has these (the `init` ones work offline and do not).
 #[derive(Args, Clone)]
-struct Conn {
+struct ConnectionOptions {
     /// Control-plane HTTP base URL for every command (admin API under /admin).
     #[arg(long, env = "FLEET_URL", default_value = "http://127.0.0.1:9191", global = true)]
     url: String,
@@ -45,14 +45,14 @@ struct Conn {
     /// User namespace selector (inferred from user tokens; operators may select one).
     #[arg(long, env = "FLEET_NAMESPACE", global = true)]
     namespace: Option<String>,
-    /// Optional tag within the namespace; inferred from user tokens.
-    #[arg(long = "tag", env = "FLEET_TAG", global = true)]
+    /// Optional KEY=VALUE tag within the namespace; inferred from user tokens.
+    #[arg(long = "tag", value_name = "KEY=VALUE", env = "FLEET_TAG", global = true)]
     tag: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Long-running apps: proof programs and serving deployments.
+    /// Long-running workloads.
     App(AppArgs),
     /// Finite batch workloads and their jobs.
     Batch(BatchArgs),
@@ -62,10 +62,10 @@ enum Cmd {
     Node(NodeArgs),
     /// Administrator-managed user access tokens: list, inspect, issue, refresh or revoke.
     Token(TokenArgs),
-    /// Create, inspect, suspend or resume stable user namespaces (administrator only).
+    /// Manage namespace ownership, shared GPU/CPU quotas and user access (administrator only).
     Namespace(NamespaceArgs),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
-    /// certificates (install.sh runs these; no scheduler is needed).
+    /// certificates (install.sh jobs these; no scheduler is needed).
     #[command(subcommand)]
     Init(InitCmd),
 }
@@ -77,11 +77,8 @@ struct AppArgs {
     cmd: Option<AppCmd>,
     /// An app's name: its record and newest jobs. Without one, the list.
     name: Option<String>,
-    /// Only proof programs, or only serving deployments.
-    #[arg(long, value_enum)]
-    kind: Option<AppKind>,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Subcommand)]
@@ -131,7 +128,7 @@ struct ListArgs {
     limit: usize,
     /// Only proof jobs, or only batch jobs.
     #[arg(long = "type", value_enum)]
-    kind: Option<Kind>,
+    kind: Option<JobType>,
     /// Only what is queued or running.
     #[arg(short, long)]
     active: bool,
@@ -144,7 +141,7 @@ struct ListArgs {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum Kind {
+enum JobType {
     Proof,
     Batch,
 }
@@ -159,7 +156,7 @@ struct JobArgs {
     #[command(flatten)]
     list: ListArgs,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Args)]
@@ -170,7 +167,7 @@ struct NodeArgs {
     /// A machine node's name: its capacity, apps and active jobs. Without one, the list.
     name: Option<String>,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Args)]
@@ -181,7 +178,7 @@ struct TokenArgs {
     /// A token's opaque ID: its record. Without one, the list.
     id: Option<String>,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Args)]
@@ -189,12 +186,14 @@ struct NamespaceArgs {
     #[command(subcommand)]
     cmd: Option<NamespaceCmd>,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Subcommand)]
 enum NamespaceCmd {
+    /// Create a namespace and write its owner token bundle for scope=default.
     Create {
+        /// Unique namespace name: lowercase letters, digits and hyphens.
         name: String,
         /// Tenant identity that will sign proof jobs for this namespace.
         #[arg(long)]
@@ -202,20 +201,25 @@ enum NamespaceCmd {
         #[command(flatten)] quota: QuotaArgs,
         #[command(flatten)] bundle: TokenBundle,
     },
-    /// Replace concurrent GPU/CPU caps for the namespace, or for its optional --tag.
+    /// Replace shared GPU/CPU caps; --tag KEY=VALUE changes that tag's caps.
+    /// Omitted caps are unlimited; no cap flags clears both. This does not allocate hardware.
     Quota { name: String, #[command(flatten)] quota: QuotaArgs },
+    /// Inspect quota and reserved resources; --tag KEY=VALUE includes that tag's usage.
     Get { name: String },
+    /// List namespaces, their shared quotas and current reservations (the default).
     List,
+    /// Block namespace tokens and new submissions; accepted jobs keep running.
     Suspend { name: String },
+    /// Restore namespace access; individually revoked tokens remain revoked.
     Resume { name: String },
 }
 
 #[derive(Args)]
 struct QuotaArgs {
-    /// Concurrent GPU units for proof and batch jobs combined; fractions are allowed.
+    /// Shared concurrent GPU cap for apps and batches; fractions are allowed (omitted: unlimited).
     #[arg(long)]
     gpus: Option<f64>,
-    /// Concurrent CPU units for proof and batch jobs combined.
+    /// Shared concurrent CPU cap for apps and batches (omitted: unlimited).
     #[arg(long)]
     cpus: Option<f64>,
 }
@@ -254,7 +258,6 @@ enum TokenCmd {
         bundle: TokenBundle,
     },
     /// Issue a replacement in the same namespace with the same grants; revoke the old key after verification.
-    #[command(alias = "rotate")]
     Refresh {
         id: String,
         #[command(flatten)]
@@ -288,7 +291,7 @@ struct TokenBundle {
 #[derive(Args, Serialize)]
 struct BatchSubmission {
     /// Batch workload name (image, user, GPU cap and approved mount roots).
-    #[arg(long = "app", visible_alias = "profile")]
+    #[arg(long = "app")]
     profile: String,
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -356,12 +359,12 @@ struct AddBatch {
     #[arg(long, allow_hyphen_values = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
-    /// Profile name (letters, digits, _ . -); used with batch submit --profile.
+    /// Profile name (letters, digits, _ . -); used with batch submit --app.
     name: String,
     /// Container image used by this batch profile.
     #[arg(long)]
     image: String,
-    /// UID[:GID] the container runs as (default: the image's).
+    /// UID[:GID] the container jobs as (default: the image's).
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
@@ -390,7 +393,7 @@ struct AddBatch {
 /// What can be done to a batch job (a proof job is the scheduler's and its client's).
 #[derive(Subcommand)]
 enum BatchJobCmd {
-    /// Queue a batch job: fleetctl batch submit --profile film-gpu --gpus 1 --mount /data:ro -- python3 train.py
+    /// Queue a batch job: fleetctl batch submit --app film-gpu --gpus 1 --mount /data:ro -- python3 train.py
     Submit {
         #[command(flatten)]
         submit: BatchSubmission,
@@ -426,12 +429,6 @@ enum JobCmd {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum AppKind {
-    Proof,
-    Serving,
-}
-
 #[derive(Args)]
 struct AddProofApp {
     /// TENANT/<full ELF SHA-256>, or TENANT/ with --elf FILE.
@@ -454,10 +451,10 @@ struct BatchArgs {
     #[arg(short, long)]
     active: bool,
     /// Filter batch jobs by workload name.
-    #[arg(long = "app", visible_alias = "profile")]
+    #[arg(long = "app")]
     profile: Option<String>,
     #[command(flatten)]
-    conn: Conn,
+    conn: ConnectionOptions,
 }
 
 #[derive(Subcommand)]
@@ -465,10 +462,10 @@ enum BatchCmd {
     /// Register a reusable batch execution profile in an existing namespace.
     Add { #[command(flatten)] add: AddBatch },
     /// List registered batch workloads and their shared execution configuration.
-    #[command(name = "list", visible_alias = "profiles")]
+    #[command(name = "list")]
     Profiles,
     /// Inspect a batch workload and its newest jobs.
-    #[command(name = "show", visible_alias = "profile")]
+    #[command(name = "show")]
     Profile { name: String },
     /// Stop accepting new jobs for this profile; accepted jobs continue.
     Disable { name: String },
@@ -501,8 +498,14 @@ enum InitCmd {
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()))
+        .with_target(false)
+        .without_time()
+        .init();
     let cli = Cli::parse();
-    let out = Out { json: cli.json };
+    let out = OutputWriter { json: cli.json };
     match &cli.cmd {
         Cmd::Init(i) => init(i, &out),
         Cmd::Job(j) => job(j, &out),
@@ -514,7 +517,7 @@ fn main() -> anyhow::Result<()> {
 
 impl Cmd {
     /// The connection of a command that talks to the scheduler.
-    fn conn(&self) -> &Conn {
+    fn conn(&self) -> &ConnectionOptions {
         match self {
             Cmd::Node(n) => &n.conn,
             Cmd::Token(c) => &c.conn,
@@ -524,8 +527,9 @@ impl Cmd {
     }
 }
 
-struct Admin {
-    /// Control-plane root or proof/administration API prefix.
+struct FleetClient {
+    /// Authenticated HTTP client shared by administrator and scoped tenant tokens.
+    /// The base selects the control-plane root or proof API prefix.
     base: String,
     token: String,
     http: reqwest::blocking::Client,
@@ -533,14 +537,14 @@ struct Admin {
     tag: Option<String>,
 }
 
-impl Admin {
-    fn new(conn: &Conn) -> anyhow::Result<Self> {
+impl FleetClient {
+    fn new(conn: &ConnectionOptions) -> anyhow::Result<Self> {
         let mut client = Self::control(conn)?;
         client.base.push_str("/admin");
         Ok(client)
     }
 
-    fn control(conn: &Conn) -> anyhow::Result<Self> {
+    fn control(conn: &ConnectionOptions) -> anyhow::Result<Self> {
         let mut client = Self::at(conn.url.trim_end_matches('/'),
             &conn.token_file.clone().or_else(|| conn.admin_token_file.clone()))?;
         client.namespace = conn.namespace.clone();
@@ -552,7 +556,7 @@ impl Admin {
         let path = match token_file {
             Some(p) => p.clone(),
             None => default_admin_token()
-                .context("no admin token: pass --admin-token-file or set FLEET_ADMIN_TOKEN_FILE")?,
+                .context("no token: pass --token-file, --admin-token-file or set FLEET_TOKEN_FILE/FLEET_ADMIN_TOKEN_FILE")?,
         };
         let token = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?
@@ -599,8 +603,8 @@ impl Admin {
     }
 }
 
-fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
-    let a = Admin::new(cmd.conn())?;
+fn admin(cmd: &Cmd, out: &OutputWriter) -> anyhow::Result<()> {
+    let a = FleetClient::new(cmd.conn())?;
     use reqwest::Method as M;
     match cmd {
         Cmd::Node(NodeArgs { cmd: None, name: Some(name), .. }) => {
@@ -631,8 +635,8 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             }
             Some(NamespaceCmd::Create { name, tenant, quota, bundle }) => {
                 let namespace = a.send(a.req(M::POST, "/namespaces").json(&json!({"name": name, "quota": quota.value()?})))?;
-                issue_token(&a, cmd.conn(), out, name, Some("default"), tenant, None, true, "owner", bundle)?;
-                if !out.json { println!("namespace {} is ready with default tag and owner access", namespace["name"].as_str().unwrap_or(name)); }
+                issue_token(&a, cmd.conn(), out, name, Some("scope=default"), tenant, None, true, "owner", bundle)?;
+                if !out.json { writeln!(std::io::stdout().lock(), "namespace {} is ready with scope=default and owner access", namespace["name"].as_str().unwrap_or(name))?; }
             }
             Some(NamespaceCmd::Quota { name, quota }) => out.record(&a.send(a.req(M::PUT, &format!("/namespaces/{name}/quota")).json(&quota.value()?))?),
             Some(NamespaceCmd::Get { name }) => out.record(&a.get(&format!("/namespaces/{name}"))?),
@@ -651,7 +655,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
             let apps: Option<Vec<String>> = if old["apps"].is_null() { None } else { Some(serde_json::from_value(old["apps"].clone())?) };
             issue_token(&a, cmd.conn(), out, namespace, old["tag"].as_str(), old["tenant"].as_str().context("token has no tenant")?, apps.as_deref(),
                 old["manage_apps"].as_bool().unwrap_or(false), old["label"].as_str().unwrap_or_default(), bundle)?;
-            if !out.json { println!("old token {id} remains active; revoke it after verifying the replacement"); }
+            if !out.json { writeln!(std::io::stdout().lock(), "old token {id} remains active; revoke it after verifying the replacement")?; }
         }
         Cmd::Token(TokenArgs { cmd: None, id: Some(id), .. }) => {
             let v = a.get("/tokens")?;
@@ -673,7 +677,7 @@ fn admin(cmd: &Cmd, out: &Out) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn issue_token(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Option<&str>, tenant: &str, apps: Option<&[String]>, manage_apps: bool, label: &str, bundle: &TokenBundle) -> anyhow::Result<()> {
+fn issue_token(a: &FleetClient, conn: &ConnectionOptions, out: &OutputWriter, namespace: &str, tag: Option<&str>, tenant: &str, apps: Option<&[String]>, manage_apps: bool, label: &str, bundle: &TokenBundle) -> anyhow::Result<()> {
     let TokenBundle { out: env_file, endpoint, domain_name, server_ca } = bundle;
     let token_file = env_file.with_extension("token");
     let ca_file = env_file.with_extension("ca.pem");
@@ -728,12 +732,12 @@ fn issue_token(a: &Admin, conn: &Conn, out: &Out, namespace: &str, tag: Option<&
     if out.json {
         out.record(&result);
     } else {
-        println!("issued token {id} for tenant {tenant}; client env in {} (0600)", env_file.display());
+        writeln!(std::io::stdout().lock(), "issued token {id} for tenant {tenant}; client env in {} (0600)", env_file.display())?;
     }
     Ok(())
 }
 
-const NODE_COLS: &[out::Col] = &[
+const NODE_COLS: &[out::TableColumn] = &[
     col("NODE", "name"),
     col("BACKEND", "backend"),
     col("GPUS", "gpus"),
@@ -745,9 +749,9 @@ const NODE_COLS: &[out::Col] = &[
     col("BUSY WITH", "busy"),
     col("HEARTBEAT", "heartbeat_age_ms"),
 ];
-const TOKEN_COLS: &[out::Col] =
+const TOKEN_COLS: &[out::TableColumn] =
     &[col("TOKEN ID", "id"), col("NAMESPACE","namespace"), col("TAG","tag"), col("TENANT", "tenant"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
-const PURGE_COLS: &[out::Col] =
+const PURGE_COLS: &[out::TableColumn] =
     &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
 
 /// Tokens as rows: a STATE column (active / revoked); proof identity stays internal.
@@ -784,7 +788,7 @@ fn node_rows(status: &Value) -> Vec<Value> {
         .collect()
 }
 
-const PS_COLS: &[out::Col] = &[
+const PS_COLS: &[out::TableColumn] = &[
     col("TYPE", "type"),
     col("NAME", "app"),
     col("NAMESPACE", "namespace"),
@@ -866,7 +870,7 @@ impl AppRef {
 }
 
 /// Which jobs to fetch from one side.
-struct Want<'a> {
+struct JobListFilter<'a> {
     limit: usize,
     active: bool,
     tenant: Option<&'a str>,
@@ -875,16 +879,16 @@ struct Want<'a> {
 
 /// The newest proof and batch jobs that `want` asks for, as list rows (none when the
 /// filter can only match the other type).
-fn fetch_rows(kind: Kind, conn: &Conn, want: &Want) -> anyhow::Result<Vec<Value>> {
+fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> anyhow::Result<Vec<Value>> {
     let app = want.app.map(AppRef::parse);
     let mut q: Vec<(&str, String)> = vec![("limit", want.limit.to_string())];
     if want.active {
         q.push(("active", "true".into()));
     }
     let (v, row): (Value, fn(&Value) -> Value) = match (kind, app) {
-        (Kind::Proof, Some(AppRef::Container(_))) | (Kind::Batch, Some(AppRef::Proof { .. })) => return Ok(vec![]),
-        (Kind::Batch, _) if want.tenant.is_some() => return Ok(vec![]), // batch jobs belong to no tenant
-        (Kind::Proof, app) => {
+        (JobType::Proof, Some(AppRef::Container(_))) | (JobType::Batch, Some(AppRef::Proof { .. })) => return Ok(vec![]),
+        (JobType::Batch, _) if want.tenant.is_some() => return Ok(vec![]), // batch jobs belong to no tenant
+        (JobType::Proof, app) => {
             let tenant = match (&app, want.tenant) {
                 (Some(AppRef::Proof { tenant, .. }), Some(t)) if tenant != t => return Ok(vec![]),
                 (Some(AppRef::Proof { tenant, .. }), _) => Some(tenant.as_str()),
@@ -896,13 +900,13 @@ fn fetch_rows(kind: Kind, conn: &Conn, want: &Want) -> anyhow::Result<Vec<Value>
             if let Some(AppRef::Proof { elf, .. }) = &app {
                 q.push(("elf", elf.clone()));
             }
-            (Admin::new(conn)?.get_q("/jobs", &q)?, proof_row)
+            (FleetClient::new(conn)?.get_q("/jobs", &q)?, proof_row)
         }
-        (Kind::Batch, app) => {
+        (JobType::Batch, app) => {
             if let Some(AppRef::Container(name)) = &app {
                 q.push(("profile", name.clone()));
             }
-            (Admin::control(conn)?.get_q("/batches", &q)?, batch_row)
+            (FleetClient::control(conn)?.get_q("/batches", &q)?, batch_row)
         }
     };
     let rows = v.as_array().into_iter().flatten().map(row);
@@ -913,15 +917,15 @@ fn fetch_rows(kind: Kind, conn: &Conn, want: &Want) -> anyhow::Result<Vec<Value>
 }
 
 /// Every job of both types still queued or running, then the newest `-n` of each type.
-fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
-    let kinds: Vec<Kind> = match p.kind {
+fn list(p: &ListArgs, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let kinds: Vec<JobType> = match p.kind {
         Some(k) => vec![k],
-        None => vec![Kind::Proof, Kind::Batch],
+        None => vec![JobType::Proof, JobType::Batch],
     };
     let mut rows: Vec<Value> = Vec::new();
     let mut reached = 0;
     for k in &kinds {
-        let want = |limit, active| Want { limit, active, tenant: p.tenant.as_deref(), app: p.app.as_deref() };
+        let want = |limit, active| JobListFilter { limit, active, tenant: p.tenant.as_deref(), app: p.app.as_deref() };
         // the active ones however old (a long batch job outlives many short proofs), then the newest
         let fetched = fetch_rows(*k, conn, &want(1000, true)).and_then(|mut r| {
             if !p.active {
@@ -938,10 +942,7 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(e) => eprintln!(
-                "{}: not reachable ({e:#}); listing the rest",
-                if *k == Kind::Proof { "the scheduler" } else { "the batch API" }
-            ),
+            Err(e) => tracing::warn!(error=%format!("{e:#}"), api=if *k == JobType::Proof { "scheduler" } else { "batch" }, "API not reachable; listing the rest"),
         }
     }
     if reached == 0 {
@@ -953,27 +954,22 @@ fn list(p: &ListArgs, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     Ok(())
 }
 
-const APP_COLS: &[out::Col] = &[
+const APP_COLS: &[out::TableColumn] = &[
     col("TYPE", "type"),
-    col("KIND", "kind"),
     col("NAME", "name"),
     col("NAMESPACE", "namespace"),
     col("PRIORITY", "priority"),
-    col("ENABLED", "enabled"),
+    col("TAG", "tag"),
+    col("STATE", "state"),
     col("GPUS", "/resources/gpus"),
     col("CPUS", "/resources/cpus"),
-    col("REPLICAS", "/resources/replicas"),
     col("NODE", "/resources/nodes"),
-    col("ACTIVE", "active"),
-    col("JOBS", "jobs"),
-    col("OK", "succeeded"),
-    col("FAILED", "failed"),
     col("LAST JOB", "last_at"),
     col("DETAIL", "detail"),
 ];
 
 /// The one proof app a name means: as the list names it, or `tenant/<full elf id>`.
-fn proof_app_named(a: &Admin, name: &str, tenant: &str) -> anyhow::Result<Value> {
+fn proof_app_named(a: &FleetClient, name: &str, tenant: &str) -> anyhow::Result<Value> {
     let apps = a.get("/apps")?;
     let found: Vec<&Value> = apps
         .as_array()
@@ -985,7 +981,7 @@ fn proof_app_named(a: &Admin, name: &str, tenant: &str) -> anyhow::Result<Value>
         })
         .collect();
     match found.as_slice() {
-        [] => bail!("no proof app {name} (fleetctl app --kind proof lists them)"),
+        [] => bail!("no app {name} (fleetctl app lists them)"),
         [one] => Ok((*one).clone()),
         many => bail!(
             "{name} matches {} registrations; select --namespace NAME and give the full elf id: {}",
@@ -996,7 +992,7 @@ fn proof_app_named(a: &Admin, name: &str, tenant: &str) -> anyhow::Result<Value>
 }
 
 /// A long-running serving deployment from the control plane.
-fn serving_app_named(a: &Admin, name: &str) -> anyhow::Result<Value> {
+fn serving_app_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
     let apps = a.get("/apps")?;
     apps.as_array()
         .into_iter()
@@ -1007,13 +1003,13 @@ fn serving_app_named(a: &Admin, name: &str) -> anyhow::Result<Value> {
 }
 
 /// Disables or enables an app.
-fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn set_app_disabled(name: &str, disabled: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let method = if disabled { reqwest::Method::PUT } else { reqwest::Method::DELETE };
     let v = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let a = Admin::new(conn)?;
+            let a = FleetClient::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
-            let mut manager = Admin::control(conn)?;
+            let mut manager = FleetClient::control(conn)?;
             // The app's canonical namespace is sent explicitly below. Do not append
             // the caller's selector a second time to this lifecycle request.
             manager.namespace = None;
@@ -1027,7 +1023,7 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
                 .query(&key).timeout(Duration::from_secs(1800)))?
         }
         AppRef::Container(_) => {
-            let a = Admin::control(conn)?;
+            let a = FleetClient::control(conn)?;
             serving_app_named(&a, name)?;
             a.send(a.req(method, &format!("/apps/{name}/disabled")).timeout(Duration::from_secs(1800)))?
         }
@@ -1048,10 +1044,10 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &Conn, out: &Out) -> anyho
 }
 
 /// Changes app policy; accepted jobs retain their inherited priority.
-fn set_app_priority(name: &str, priority: i32, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn set_app_priority(name: &str, priority: i32, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let v = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let mut a = Admin::new(conn)?;
+            let mut a = FleetClient::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
             a.namespace = app["namespace"].as_str().map(str::to_owned);
             a.send(a.req(reqwest::Method::PUT, "/apps/priority").query(&[
@@ -1061,7 +1057,7 @@ fn set_app_priority(name: &str, priority: i32, conn: &Conn, out: &Out) -> anyhow
             ]))?
         }
         AppRef::Container(_) => {
-            let a = Admin::control(conn)?;
+            let a = FleetClient::control(conn)?;
             serving_app_named(&a, name)?;
             a.send(a.req(reqwest::Method::PUT, &format!("/apps/{name}/priority")).json(&json!({"priority":priority})))?
         }
@@ -1070,7 +1066,7 @@ fn set_app_priority(name: &str, priority: i32, conn: &Conn, out: &Out) -> anyhow
     Ok(())
 }
 
-fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<u32>, node: Option<&str>, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<u32>, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut body = json!({});
     if let Some(v) = gpus {
         if !v.is_finite() || v < 0.0 { bail!("--gpus must be finite and nonnegative"); }
@@ -1081,10 +1077,10 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     let write = !body.as_object().unwrap().is_empty();
     if let Some(node) = node { body["node"] = json!(node); }
     let method = if write { reqwest::Method::PUT } else { reqwest::Method::GET };
-    let mut a = Admin::control(conn)?;
+    let mut a = FleetClient::control(conn)?;
     let (path, mut query) = match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let proof = proof_app_named(&Admin::new(conn)?, name, &tenant)?;
+            let proof = proof_app_named(&FleetClient::new(conn)?, name, &tenant)?;
             a.namespace = proof["namespace"].as_str().map(str::to_owned);
             ("/proof-apps/scale".to_string(), vec![("tenant", tenant),
                 ("elf_id", proof["elf_id"].as_str().unwrap_or("").to_string())])
@@ -1105,7 +1101,7 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
 }
 
 /// Register a proof program with its long-running dedicated prover.
-fn add_app(add: &AddProofApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn add_app(add: &AddProofApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) {
         bail!("app creation requires --namespace NAME; an administrator must create the namespace first");
     }
@@ -1126,13 +1122,13 @@ fn add_app(add: &AddProofApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
         (None, _) => bail!("give TENANT/<elf id>, or TENANT/ with --elf FILE"),
     };
     let namespace = conn.namespace.as_deref().context("proof app creation requires --namespace")?;
-    let mut manager = Admin::control(conn)?;
+    let mut manager = FleetClient::control(conn)?;
     manager.namespace = None;
     manager.tag = None;
     let _server = manager.get_q("/proof-apps/available", &[
         ("namespace", namespace.to_string()), ("tenant", tenant.clone()), ("elf_id", elf_id.clone()),
     ])?;
-    let a = Admin::new(conn)?;
+    let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str()), ("priority", &add.priority.unwrap_or(0).to_string())]))?;
     out.done(
         &format!("added proof app {}: tenant {tenant}, program {elf_id} (its jobs are accepted from now on{})",
@@ -1143,7 +1139,7 @@ fn add_app(add: &AddProofApp, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add_batch(add: &AddBatch, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
         bail!("batch profile creation requires --namespace NAME; an administrator must create the namespace first");
     }
@@ -1157,7 +1153,7 @@ fn add_batch(add: &AddBatch, conn: &Conn, out: &Out) -> anyhow::Result<()> {
     if !env.is_empty() {
         body["env"] = Value::Object(env);
     }
-    let a = Admin::control(conn)?;
+    let a = FleetClient::control(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/batch-profiles").json(&body))?;
     let gpus = v["max_gpus"].as_u64().unwrap_or(0);
     out.done(
@@ -1170,23 +1166,23 @@ fn add_batch(add: &AddBatch, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 }
 
 /// One app's record, and its newest jobs.
-fn describe_app(name: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let (kind, mut rec) = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => (Kind::Proof, app_record("proof", &proof_app_named(&Admin::new(conn)?, name, &tenant)?)),
+        AppRef::Proof { tenant, .. } => (JobType::Proof, with_type("app", &proof_app_named(&FleetClient::new(conn)?, name, &tenant)?)),
         AppRef::Container(_) => {
-            let app = serving_app_named(&Admin::control(conn)?, name)?;
-            (Kind::Batch, app_record("serving", &app))
+            let app = serving_app_named(&FleetClient::control(conn)?, name)?;
+            (JobType::Batch, with_type("app", &app))
         },
     };
     let full = rec["name"].as_str().unwrap_or(name).to_string();
-    let jobs = if kind == Kind::Proof { fetch_rows(kind, conn, &Want { limit: 5, active: false, tenant: None, app: Some(&full) })? } else { vec![] };
+    let jobs = if kind == JobType::Proof { fetch_rows(kind, conn, &JobListFilter { limit: 5, active: false, tenant: None, app: Some(&full) })? } else { vec![] };
     if out.json {
         rec["newest_jobs"] = Value::Array(jobs);
         out.record(&rec);
     } else {
         out.record(&rec);
         if !jobs.is_empty() {
-            println!();
+            writeln!(std::io::stdout().lock())?;
             out.table(&jobs, PS_COLS, None);
         }
     }
@@ -1194,11 +1190,11 @@ fn describe_app(name: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
 }
 
 /// Deletes an app (after showing what goes with it, until --yes).
-fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     use reqwest::Method as M;
     match AppRef::parse(name) {
         AppRef::Proof { tenant, .. } => {
-            let mut a = Admin::new(conn)?;
+            let mut a = FleetClient::new(conn)?;
             let app = proof_app_named(&a, name, &tenant)?;
             a.namespace = app["namespace"].as_str().map(str::to_string);
             let elf = app["elf_id"].as_str().unwrap_or("");
@@ -1222,7 +1218,7 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
             );
         }
         AppRef::Container(_) => {
-            let a = Admin::control(conn)?;
+            let a = FleetClient::control(conn)?;
             let app = serving_app_named(&a, name)?;
             if !yes {
                 bail!(
@@ -1232,14 +1228,14 @@ fn delete_app(name: &str, yes: bool, conn: &Conn, out: &Out) -> anyhow::Result<(
                 );
             }
             let v = a.send(a.req(M::DELETE, &format!("/apps/{name}")))?;
-            out.done(&format!("deleted serving app {name}; its {} past execution record(s) stay", v["runs_kept"]), v);
+            out.done(&format!("deleted serving app {name}; its {} past execution record(s) stay", v["jobs_kept"]), v);
         }
     }
     Ok(())
 }
 
-/// Long-running proof and serving apps, most recently used first.
-fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
+/// Long-running apps, most recently used first.
+fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match &p.cmd {
         Some(AppCmd::Delete { name, yes }) => return delete_app(name, *yes, &p.conn, out),
         Some(AppCmd::Disable { name }) => return set_app_disabled(name, true, &p.conn, out),
@@ -1252,67 +1248,46 @@ fn app(p: &AppArgs, out: &Out) -> anyhow::Result<()> {
     if let Some(name) = &p.name {
         return describe_app(name, &p.conn, out);
     }
-    let mut rows: Vec<Value> = Vec::new();
-    let mut raw = serde_json::Map::new();
+    let mut apps: Vec<Value> = Vec::new();
     let mut reached = 0;
-    if p.kind != Some(AppKind::Serving) {
-        match Admin::new(&p.conn).and_then(|a| a.get("/apps")) {
-            Ok(v) => {
-                reached += 1;
-                for a in v.as_array().into_iter().flatten() {
-                    let mean = a["mean_prove_ms"].as_f64().map(|m| format!("mean prove {:.1} s", m / 1000.0));
-                    let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
-                    let detail: Vec<String> = [anchored, mean].into_iter().flatten().collect();
-                    rows.push(json!({
-                        "type": "app", "kind": "proof", "name": a["name"], "namespace": a["namespace"], "enabled": a["disabled"].as_bool() != Some(true),
-                        "active": a["active"], "jobs": a["jobs"], "priority": a["priority"],
-                        "succeeded": a["succeeded"], "failed": a["failed"],
-                        "resources":a["resources"],
-                        "last_at": a["last_created_ms"].as_f64().map(|ms| ms / 1000.0), "detail": detail.join(", "),
-                    }));
-                }
-                raw.insert("proof".into(), v);
-            }
-            Err(e) => eprintln!("the scheduler: not reachable ({e:#}); listing the rest"),
+    match FleetClient::new(&p.conn).and_then(|a| a.get("/apps")) {
+        Ok(v) => {
+            reached += 1;
+            apps.extend(v.as_array().into_iter().flatten().map(|a| with_type("app", a)));
         }
+        Err(e) => tracing::warn!(error=%format!("{e:#}"), "scheduler not reachable; listing the rest"),
     }
-    if p.kind != Some(AppKind::Proof) {
-        match Admin::control(&p.conn).and_then(|a| a.get("/apps")) {
-            Ok(mut v) => {
-                reached += 1;
-                if let Some(apps) = v.as_array_mut() {
-                    apps.retain(|app| app["persistent"].as_bool() == Some(true));
-                    for app in apps { *app = app_record("serving", app); }
-                }
-                for a in v.as_array().into_iter().flatten() {
-                    rows.push(json!({
-                        "type": "app", "kind": "serving", "name": a["name"], "namespace": a["namespace"], "enabled": a["disabled"].as_bool() != Some(true),
-                        "active": a["active"], "jobs": a["jobs"], "priority": a["priority"],
-                        "succeeded": a["succeeded"], "failed": a["failed"], "last_at": a["last_submitted_at"],
-                        "resources":a["resources"],
-                        "detail": format!("image {}", a["image"].as_str().unwrap_or("?")),
-                    }));
-                }
-                raw.insert("serving".into(), v);
-            }
-            Err(e) => eprintln!("the serving API: not reachable ({e:#}); listing the rest"),
+    match FleetClient::control(&p.conn).and_then(|a| a.get("/apps")) {
+        Ok(v) => {
+            reached += 1;
+            apps.extend(v.as_array().into_iter().flatten()
+                .filter(|a| a["persistent"].as_bool() == Some(true)).map(|a| with_type("app", a)));
         }
+        Err(e) => tracing::warn!(error=%format!("{e:#}"), "control API not reachable; listing the rest"),
     }
     if reached == 0 {
         bail!("neither proof nor serving app API answered");
     }
-    rows.sort_by(|a, b| b["last_at"].as_f64().unwrap_or(0.0).total_cmp(&a["last_at"].as_f64().unwrap_or(0.0)));
-    out.table(&rows, APP_COLS, Some(&Value::Object(raw)));
+    let last_at = |a: &Value| a["last_created_ms"].as_f64().map(|ms| ms / 1000.0)
+        .or_else(|| a["last_submitted_at"].as_f64());
+    apps.sort_by(|a, b| last_at(b).unwrap_or(0.0).total_cmp(&last_at(a).unwrap_or(0.0)));
+    let rows: Vec<Value> = apps.iter().map(|a| {
+        let mean = a["mean_prove_ms"].as_f64().map(|m| format!("mean prove {:.1} s", m / 1000.0));
+        let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
+        let image = a["image"].as_str().map(|i| format!("image {i}"));
+        let detail: Vec<String> = [anchored, mean, image].into_iter().flatten().collect();
+        json!({
+            "type": "app", "name": a["name"], "namespace": a["namespace"],
+            "tag": a.get("tags").filter(|v| v.as_array().is_some_and(|tags| !tags.is_empty())).unwrap_or(&a["tag"]),
+            "state": a["state"], "priority": a["priority"], "resources": a["resources"],
+            "last_at": last_at(a), "detail": detail.join(", "),
+        })
+    }).collect();
+    out.table(&rows, APP_COLS, Some(&Value::Array(apps)));
     Ok(())
 }
 
-fn app_record(kind: &str, record: &Value) -> Value {
-    let mut value = with_type("app", record);
-    value["kind"] = json!(kind);
-    value
-}
-
-fn batch_profile_named(a: &Admin, name: &str) -> anyhow::Result<Value> {
+fn batch_profile_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
     let profile = a.get(&format!("/batch-profiles/{name}"))?;
     if profile["persistent"].as_bool() == Some(true) {
         bail!("{name} is a long-running app; use fleetctl app");
@@ -1320,35 +1295,36 @@ fn batch_profile_named(a: &Admin, name: &str) -> anyhow::Result<Value> {
     Ok(with_type("batch", &profile))
 }
 
-fn batch(p: &BatchArgs, out: &Out) -> anyhow::Result<()> {
+fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match &p.cmd {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
         Some(BatchCmd::Profiles) => {
-            let profiles = Admin::control(&p.conn)?.get("/batch-profiles")?;
+            let profiles = FleetClient::control(&p.conn)?.get("/batch-profiles")?;
             let rows: Vec<Value> = profiles.as_array().into_iter().flatten().map(|profile| {
                 let mut row = profile.clone();
-                row["enabled"] = json!(profile["disabled"].as_bool() != Some(true));
+                if row["state"].is_null() {
+                    row["state"] = json!(if profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
+                }
                 row
             }).collect();
             out.table(&rows, &[
                 col("NAME", "name"), col("NAMESPACE", "namespace"),
-                col("ENABLED", "enabled"),
+                col("TAG", "tag"), col("STATE", "state"),
                 col("PRIORITY", "priority"), col("MAX GPUS", "max_gpus"),
-                col("ACTIVE", "active"), col("JOBS", "jobs"),
-                col("OK", "succeeded"), col("FAILED", "failed"), col("IMAGE", "image"),
+                col("IMAGE", "image"),
             ], Some(&profiles));
             return Ok(());
         }
         Some(BatchCmd::Profile { name }) => {
-            let mut profile = batch_profile_named(&Admin::control(&p.conn)?, name)?;
-            profile["newest_jobs"] = json!(fetch_rows(Kind::Batch, &p.conn,
-                &Want { limit: 5, active: false, tenant: None, app: Some(name) })?);
+            let mut profile = batch_profile_named(&FleetClient::control(&p.conn)?, name)?;
+            profile["newest_jobs"] = json!(fetch_rows(JobType::Batch, &p.conn,
+                &JobListFilter { limit: 5, active: false, tenant: None, app: Some(name) })?);
             out.record(&profile);
             return Ok(());
         }
         Some(cmd) => {
-            let a = Admin::control(&p.conn)?;
+            let a = FleetClient::control(&p.conn)?;
             let name = match cmd {
                 BatchCmd::Disable { name } | BatchCmd::Enable { name }
                 | BatchCmd::Priority { name, .. } | BatchCmd::Delete { name, .. } => name,
@@ -1374,11 +1350,11 @@ fn batch(p: &BatchArgs, out: &Out) -> anyhow::Result<()> {
         None => {}
     }
     if let Some(id) = &p.id {
-        let value = Admin::control(&p.conn)?.get(&format!("/batches/{id}"))?;
+        let value = FleetClient::control(&p.conn)?.get(&format!("/batches/{id}"))?;
         out.record(&with_type("batch", &value));
         return Ok(());
     }
-    list(&ListArgs { limit: p.limit, active: p.active, kind: Some(Kind::Batch),
+    list(&ListArgs { limit: p.limit, active: p.active, kind: Some(JobType::Batch),
         tenant: None, app: p.profile.clone() }, &p.conn, out)
 }
 
@@ -1393,25 +1369,25 @@ fn with_type(t: &str, record: &Value) -> Value {
 }
 
 /// A proof or batch job, by id: the scheduler is asked first, then the batch API.
-fn record(id: &str, conn: &Conn, out: &Out) -> anyhow::Result<()> {
-    let proof = Admin::new(conn).and_then(|a| a.get(&format!("/jobs/{id}")));
+fn record(id: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let proof = FleetClient::new(conn).and_then(|a| a.get(&format!("/jobs/{id}")));
     if let Ok(v) = &proof {
         out.record(&with_type("proof", v));
         return Ok(());
     }
-    match Admin::control(conn).and_then(|a| a.get(&format!("/batches/{id}"))) {
+    match FleetClient::control(conn).and_then(|a| a.get(&format!("/batches/{id}"))) {
         Ok(v) => {
             out.record(&with_type("batch", &v));
             Ok(())
         }
-        Err(run_err) => bail!(
-            "no proof or batch job {id} (scheduler: {:#}; batch API: {run_err:#})",
+        Err(batch_error) => bail!(
+            "no proof or batch job {id} (scheduler: {:#}; batch API: {batch_error:#})",
             proof.err().unwrap_or_else(|| anyhow::anyhow!("-"))
         ),
     }
 }
 
-fn job(j: &JobArgs, out: &Out) -> anyhow::Result<()> {
+fn job(j: &JobArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match (&j.cmd, &j.id) {
         (None, None) => list(&j.list, &j.conn, out),
         (None, Some(id)) => record(id, &j.conn, out),
@@ -1420,11 +1396,11 @@ fn job(j: &JobArgs, out: &Out) -> anyhow::Result<()> {
 }
 
 /// Download a retained proof through the control-plane relay.
-fn fetch_proof(id: &str, dir: &Path, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn fetch_proof(id: &str, dir: &Path, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if dir.try_exists()? {
         bail!("output directory {} already exists; choose a new directory",dir.display());
     }
-    let proof = Admin::new(conn)?;
+    let proof = FleetClient::new(conn)?;
     let mut files = Vec::new();
     for name in ["proof.json", "public_values.bin"] {
         let response = proof.req(reqwest::Method::GET,&format!("/jobs/{id}/output/{name}")).timeout(Duration::from_secs(75)).send()?;
@@ -1437,9 +1413,9 @@ fn fetch_proof(id: &str, dir: &Path, conn: &Conn, out: &Out) -> anyhow::Result<(
     Ok(())
 }
 
-fn batch_action(cmd: &BatchJobCmd, conn: &Conn, out: &Out) -> anyhow::Result<()> {
+fn batch_action(cmd: &BatchJobCmd, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     use reqwest::Method as M;
-    let a = Admin::control(conn)?;
+    let a = FleetClient::control(conn)?;
     match cmd {
         BatchJobCmd::Submit { submit } => {
             let body = serde_json::to_value(submit)?;
@@ -1481,7 +1457,7 @@ fn batch_action(cmd: &BatchJobCmd, conn: &Conn, out: &Out) -> anyhow::Result<()>
     Ok(())
 }
 
-fn init(cmd: &InitCmd, out: &Out) -> anyhow::Result<()> {
+fn init(cmd: &InitCmd, out: &OutputWriter) -> anyhow::Result<()> {
     match cmd {
         InitCmd::Token { out: path } => {
             let mut bytes = [0u8; 48];

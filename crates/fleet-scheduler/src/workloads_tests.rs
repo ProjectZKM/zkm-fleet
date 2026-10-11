@@ -1,14 +1,16 @@
 use super::*;
-use crate::{blobs::Blobs, config::Config, quota::Quota, store::MemoryStore};
+use crate::{blobs::BlobStore, config::SchedulerConfig, quota::Quota, store::MemoryStore};
 use axum::body::Body;
+use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
+use sha2::Digest;
 
-async fn setup() -> (tempfile::TempDir, Arc<RunControl>, String) {
+async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg: Config = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\nadmin_token_file: admin\ntenants: [{{name: eth}}]\n",dir.path().display())).unwrap();
-    let fleet = Fleet::new(
+    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\nadmin_token_file: admin\ntenants: [{{name: eth}}]\n",dir.path().display())).unwrap();
+    let fleet = Scheduler::new(
         cfg,
         Arc::new(MemoryStore::default()),
-        Blobs::new(dir.path()).unwrap(),
+        BlobStore::new(dir.path()).unwrap(),
         "cluster".into(),
     );
     fleet.load_tokens().await.unwrap();
@@ -23,18 +25,18 @@ async fn setup() -> (tempfile::TempDir, Arc<RunControl>, String) {
         .await
         .unwrap()
         .id;
-    let control = Arc::new(RunControl::new(fleet, "admin".into(), "cluster".into()).unwrap());
+    let control = Arc::new(WorkloadController::new(fleet, "admin".into(), "cluster".into()).unwrap());
     (dir, control, namespace)
 }
-fn inventory(namespace: &str) -> Report {
-    serde_json::from_value(json!({"version":1,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"profiles":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+fn inventory(namespace: &str) -> NodeReport {
+    serde_json::from_value(json!({"version":2,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"profiles":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
 }
-fn incoming(run: &Run, state: &str, cleaned: bool) -> RunReport {
-    RunReport {
-        id: run.id.clone(),
-        lease: run.lease.clone(),
-        status: json!({"state":state,"submitted_at":1,"started_at":1}),
-        spec: json!({"profile_name":run.profile}),
+fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
+    JobReport {
+        id: job.id.clone(),
+        lease: job.lease.clone(),
+        status: json!({"state":state,"submitted_at":1,"started_at":1}).into(),
+        spec: json!({"profile_name":job.profile}).into(),
         cleaned,
         logs_ready: cleaned,
     }
@@ -44,14 +46,13 @@ fn incoming(run: &Run, state: &str, cleaned: bool) -> RunReport {
 async fn apps_and_batches_have_separate_lifecycles_after_restart() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, false, true);
-    report.profiles.get_mut("training").unwrap()["type"] = json!("run");
+    report.profiles.get_mut("training").unwrap()["type"] = json!("job");
     c.report("gpu", "session", report).await.unwrap();
     let mut job = submit(&c).await;
-    job.status["type"] = json!("run");
+    job.status["type"] = json!("job");
     c.save("jobs", &job.id, &job).unwrap();
     let restarted = Arc::new(
-        RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap(),
-    );
+        WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap());
     for path in [
         "/apps".to_string(),
         "/batch-profiles".to_string(),
@@ -63,14 +64,13 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         let response = scale_call(restarted.clone(), "admin", "GET", &path, Value::Null).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let value: Value = serde_json::from_slice(
-            &to_bytes(response.into_body(), 1 << 20).await.unwrap(),
-        ).unwrap();
+            &to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
         let rows = value.as_array().cloned().unwrap_or_else(|| vec![value]);
         assert!(!rows.is_empty(), "{path}");
         for row in rows {
             if path.starts_with("/apps") {
                 assert_eq!(row["type"], "app", "{path}: {row}");
-                assert_eq!(row["kind"], "serving");
+                assert!(row.get("kind").is_none(), "{path}: {row}");
                 assert_eq!(row["name"], "service");
             } else {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
@@ -85,37 +85,119 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
         c.report("gpu", "session", scale_inventory(&ns, proof, true)).await.unwrap();
-        c.fleet.set_tag_quota(&ns, "default", Quota {gpus:Some(1.0),cpus:None}).await.unwrap();
+        c.fleet.set_tag_quota(&ns, "scope=default", Quota {gpus:Some(1.0),cpus:None,
+                },
+            ).await.unwrap();
         let app = if proof {format!("eth/{}", "a".repeat(64))} else {"service".into()};
-        let views = c.app_resources(&ns, &app, Some("default"));
+        let views = c.app_resources(&ns, &app, Some("scope=default"));
         assert_eq!(views["resources"], json!({"gpus":2.0,"cpus":4.0,"replicas":2,"nodes":["gpu"]}));
         assert_eq!(views["namespace_quota"],json!({"gpus":2.0,"cpus":8.0}));
         assert_eq!(views["tag_quota"],json!({"gpus":1.0,"cpus":null}));
-        let restarted = RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
-        assert_eq!(restarted.app_resources(&ns, &app, Some("default")), views);
+        assert_eq!(views["tags"], json!(["scope=default"]));
+        assert_eq!(views["state"], "disabled");
+        let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+        let restored = restarted.app_resources(&ns, &app, Some("scope=default"));
+        for field in ["resources", "namespace_quota", "tag_quota", "tags"] {
+            assert_eq!(restored[field], views[field]);
+        }
+        assert_eq!(restored["state"], "offline");
         let mut second = scale_inventory(&ns,proof,true);
         second.machine="second-machine".into();
         c.report("gpu-2","second-session",second).await.unwrap();
         assert_eq!(c.app_resources(&ns,&app,None)["resources"],json!({"gpus":4.0,"cpus":8.0,"replicas":4,"nodes":["gpu","gpu-2"]}));
-        c.fleet.set_quota(&ns,Quota {gpus:None,cpus:Some(0.0)}).await.unwrap();
+        c.fleet.set_quota(&ns,Quota {gpus:None,cpus:Some(0.0),
+                },
+            ).await.unwrap();
         assert_eq!(c.app_resources(&ns,&app,None)["namespace_quota"],json!({"gpus":null,"cpus":0.0}));
         assert!(c.app_resources(&ns,"unconfigured",None)["resources"].is_null());
         if !proof {
             let response = scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await;
-            let apps:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+            let apps:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap(),
+            ).unwrap();
             assert_eq!(apps[0]["resources"],c.app_resources(&ns,&app,None)["resources"]);
         }
     }
 }
 
 #[tokio::test]
+async fn app_readiness_follows_fresh_reports_for_both_runners() {
+    for proof in [false, true] {
+        let (_dir, c, ns) = setup().await;
+        let name = if proof { format!("eth/{}", "a".repeat(64)) } else { "service".into() };
+        let mut report = scale_inventory(&ns, proof, false);
+        report.services[0]["ready"] = json!(false);
+        c.report("gpu", "session", report).await.unwrap();
+        assert_eq!(c.app_resources(&ns, &name, None)["state"], "starting");
+        c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
+        let view = c.app_resources(&ns, &name, None);
+        assert_eq!(view["state"], "running");
+        assert_eq!(view["tags"], json!(["scope=default"]));
+        c.inner.lock().workers.get_mut("gpu").unwrap().seen = now() - 31.0;
+        assert_eq!(c.app_resources(&ns, &name, None)["state"], "offline");
+    }
+}
+
+#[tokio::test]
+async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    for tag in [Some("scope=default"), Some("team=research"), None] {
+        let q = tag.map(|tag| [("tag".into(), tag.into())].into_iter().collect()).unwrap_or_default();
+        c.submit(json!({"profile":"training","command":["true"],"gpus":0,"cpus":1}), None, &q,
+        ).await.unwrap();
+    }
+    for (path, count) in [
+        (format!("/apps?namespace={ns}&tag=scope%3Ddefault"), 1),
+        (format!("/apps?namespace={ns}&tag=team%3Dresearch"), 0),
+        (format!("/batch-profiles?namespace={ns}&tag=team%3Dresearch"), 1,
+        ),
+    ] {
+        let response = scale_call(c.clone(), "admin", "GET", &path, Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let rows: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), count, "{path}: {rows}");
+        if path.starts_with("/batch-profiles") { assert_eq!(rows[0]["jobs"], 1); }
+    }
+    let secret = "ab".repeat(32);
+    c.fleet.add_user_token("eth", &"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
+        Some(vec!["training".into(), "service".into()]),
+        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.clone()), None, false,
+        ).await.unwrap();
+    let response = scale_call(c.clone(), &secret, "GET", "/batch-profiles/training", Value::Null,
+    ).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let profile: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(profile["jobs"], 1);
+    assert_eq!(scale_call(c.clone(), &secret, "GET", "/apps/service", Value::Null).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(scale_call(c, "admin", "GET", &format!("/apps?namespace={ns}&tag=bare"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn bare_tags_are_rejected_even_if_present_in_stored_quotas() {
+    let (_dir, c, ns) = setup().await;
+    assert!(c.fleet.set_tag_quota(&ns, "default", Quota::default()).await.is_err());
+    c.fleet.store.set_tag_quota(&ns, "default", &Quota::default()).await.unwrap();
+    c.fleet.load_tokens().await.unwrap();
+    assert!(c.fleet.set_tag_quota("test", "default", Quota::default()).await.is_err());
+    assert!(c.fleet.set_tag_quota(&ns, "research", Quota::default()).await.is_err());
+    assert!(c.fleet.set_tag_quota(&ns, "team=research", Quota::default()).await.is_ok());
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    let mut invalid = scale_inventory(&ns, false, true);
+    invalid.services[0]["tag"] = json!("bare");
+    assert!(c.report("gpu", "session", invalid).await.is_err());
+}
+
+#[tokio::test]
 async fn proof_replica_location_is_diagnostic_and_resolves_without_a_live_actor() {
-    use crate::store::{Job, JobState};
+    use crate::store::{ProofJob, ProofJobState};
     use fleet_proto::fleet::v1::ProofKind;
     let (_dir,c,ns)=setup().await;
     c.report("gpu", "session", scale_inventory(&ns,true,true)).await.unwrap();
-    let mut job=Job{inputs:None,outputs:None,id:"proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"proof".into(),elf_id:"a".repeat(64),kind:ProofKind::Compressed,priority:0,state:JobState::Running,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec!["service-1".into()],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None};
-    for control in [&*c, &RunControl::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap()] {
+    let mut job=ProofJob{inputs:None,outputs:None,id:"proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"proof".into(),elf_id:"a".repeat(64),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
+        fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec!["service-1".into()],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
+    };
+    for control in [&*c, &WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap(),
+    ] {
         let view=control.proof_job_value(&job);
         assert_eq!(view["node"],"gpu");
         assert_eq!(view["failed_on"],json!(["gpu"]));
@@ -140,18 +222,25 @@ async fn lifecycle_routes_reject_cross_type_access_and_serving_batch_submissions
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     for (method, path, body, status) in [
         ("GET", "/apps/training", Value::Null, StatusCode::NOT_FOUND),
-        ("GET", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND),
-        ("PUT", "/apps/training/disabled", Value::Null, StatusCode::NOT_FOUND),
-        ("PUT", "/batch-profiles/service/priority", json!({"priority":100}), StatusCode::NOT_FOUND),
-        ("DELETE", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND),
-        ("PUT", "/batch-profiles/service/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST),
-        ("POST", "/apps", json!({"name":"finite","image":"test","namespace":ns}), StatusCode::BAD_REQUEST),
-        ("POST", "/batches", json!({"profile":"service","command":["true"]}), StatusCode::CONFLICT),
+        ("GET", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND,
+        ),
+        ("PUT", "/apps/training/disabled", Value::Null, StatusCode::NOT_FOUND,
+        ),
+        ("PUT", "/batch-profiles/service/priority", json!({"priority":100}), StatusCode::NOT_FOUND,
+        ),
+        ("DELETE", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND,
+        ),
+        ("PUT", "/batch-profiles/service/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST,
+        ),
+        ("POST", "/apps", json!({"name":"finite","image":"test","namespace":ns}), StatusCode::BAD_REQUEST,
+        ),
+        ("POST", "/batches", json!({"profile":"service","command":["true"]}), StatusCode::CONFLICT,
+        ),
     ] {
         let response = scale_call(c.clone(), "admin", method, path, body).await;
         assert_eq!(response.status(), status, "{method} {path}");
     }
-    assert!(c.inner.lock().runs.is_empty());
+    assert!(c.inner.lock().jobs.is_empty());
     assert!(c.inner.lock().commands.is_empty());
     assert_eq!(c.inner.lock().apps["service"].profile["priority"], 0);
 }
@@ -161,10 +250,12 @@ async fn batch_profile_policy_and_job_lifecycle_use_batch_routes() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let response = scale_call(c.clone(), "admin", "PUT", "/batch-profiles/training/priority",
-        json!({"priority":31})).await;
+        json!({"priority":31}),
+    ).await;
     assert_eq!(response.status(), StatusCode::OK);
     let response = scale_call(c.clone(), "admin", "POST", "/batches",
-        json!({"profile":"training","command":["true"],"gpus":1})).await;
+        json!({"profile":"training","command":["true"],"gpus":1}),
+    ).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(job["type"], "batch");
@@ -186,36 +277,36 @@ async fn batch_profile_policy_and_job_lifecycle_use_batch_routes() {
 }
 
 #[tokio::test]
-async fn completed_run_logs_finish_without_output_artifacts() {
+async fn completed_job_logs_finish_without_output_artifacts() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     let mut report = inventory(&ns);
-    let mut finished = incoming(&run, "succeeded", true);
+    let mut finished = incoming(&job, "succeeded", true);
     finished.logs_ready = false;
-    report.runs = vec![finished];
+    report.jobs = vec![finished];
     c.report("gpu", "session", report).await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
-    let path = c.dir.join("artifacts").join(&run.id).join(&run.lease);
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    let path = c.dir.join("artifacts").join(&job.id).join(&job.lease);
     atomic(&path.join("logs"), b"app wrote output to owner storage\n").unwrap();
     let read = |r: Response| async move {
         serde_json::from_slice::<Value>(&to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
     };
-    let first = read(log_response(&c, &run, &BTreeMap::new()).await.unwrap()).await;
+    let first = read(log_response(&c, &job, &BTreeMap::new()).await.unwrap()).await;
     assert_eq!(first["done"], false);
     let mut report = inventory(&ns);
-    report.runs = vec![incoming(&run, "succeeded", true)];
+    report.jobs = vec![incoming(&job, "succeeded", true)];
     c.report("gpu", "session", report).await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
-    let last = read(log_response(&c, &run, &BTreeMap::new()).await.unwrap()).await;
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    let last = read(log_response(&c, &job, &BTreeMap::new()).await.unwrap()).await;
     assert_eq!(last["done"], true);
     assert_eq!(last["data"], "app wrote output to owner storage\n");
-    assert!(!run.quota_held);
+    assert!(!job.quota_held);
     assert!(!path.join("out.tar.gz").exists());
 }
-async fn submit(control: &RunControl) -> Run {
+async fn submit(control: &WorkloadController) -> Job {
     let job = control
         .submit(
             json!({"profile":"training","command":["true"],"gpus":1,"cpus":1}),
@@ -232,24 +323,24 @@ async fn submit(control: &RunControl) -> Run {
 async fn commands_survive_restart_and_completed_launch_is_not_replayed() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let assigned = c.job(&run.id, None, &BTreeMap::new()).unwrap();
+    let assigned = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     let command = c.inner.lock().commands.values().next().unwrap().clone();
-    let restarted = RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
     restarted.dispatch().await.unwrap();
     assert_eq!(restarted.inner.lock().commands.len(), 1);
     assert_eq!(
         restarted
-            .job(&run.id, None, &BTreeMap::new())
+            .job(&job.id, None, &BTreeMap::new())
             .unwrap()
             .lease,
         assigned.lease
     );
     let mut report = inventory(&ns);
-    report.results.push(ResultReport {
+    report.results.push(CommandResult {
         id: command.id.clone(),
-        result: json!({}),
+        result: json!({}).into(),
         error: None,
     });
     restarted.report("gpu", "session", report).await.unwrap();
@@ -261,13 +352,13 @@ async fn commands_survive_restart_and_completed_launch_is_not_replayed() {
 async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     c.inner.lock().workers.get_mut("gpu").unwrap().seen -= 60.0;
     c.dispatch().await.unwrap();
     assert_eq!(
-        c.job(&run.id, None, &BTreeMap::new())
+        c.job(&job.id, None, &BTreeMap::new())
             .unwrap()
             .worker
             .as_deref(),
@@ -275,10 +366,10 @@ async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
     );
     assert_eq!(c.fleet.allocations(&ns).len(), 1);
     let mut report = inventory(&ns);
-    report.runs.push(incoming(&run, "failed", false));
+    report.jobs.push(incoming(&job, "failed", false));
     c.report("gpu", "session", report.clone()).await.unwrap();
     assert_eq!(c.fleet.allocations(&ns).len(), 1);
-    report.runs[0].cleaned = true;
+    report.jobs[0].cleaned = true;
     c.report("gpu", "session", report).await.unwrap();
     assert!(c.fleet.allocations(&ns).is_empty());
 }
@@ -286,21 +377,21 @@ async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
 async fn stale_lease_is_ignored_and_purged_history_cannot_be_imported_again() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     let mut report = inventory(&ns);
-    let mut stale = incoming(&run, "succeeded", true);
+    let mut stale = incoming(&job, "succeeded", true);
     stale.lease = "old".into();
-    report.runs.push(stale);
+    report.jobs.push(stale);
     c.report("gpu", "session", report.clone()).await.unwrap();
     assert_eq!(c.fleet.allocations(&ns).len(), 1);
-    report.runs[0] = incoming(&run, "succeeded", true);
+    report.jobs[0] = incoming(&job, "succeeded", true);
     c.report("gpu", "session", report.clone()).await.unwrap();
-    c.purge(c.job(&run.id, None, &BTreeMap::new()).unwrap())
+    c.purge(c.job(&job.id, None, &BTreeMap::new()).unwrap())
         .unwrap();
     c.report("gpu", "session", report).await.unwrap();
-    assert!(c.job(&run.id, None, &BTreeMap::new()).is_err());
+    assert!(c.job(&job.id, None, &BTreeMap::new()).is_err());
 }
 #[tokio::test]
 async fn quota_priority_and_namespace_scoped_preemption_are_central() {
@@ -312,7 +403,7 @@ async fn quota_priority_and_namespace_scoped_preemption_are_central() {
     let low = c.job(&low.id, None, &BTreeMap::new()).unwrap();
     let mut report = inventory(&ns);
     report.free_gpus = 0.0;
-    report.runs.push(incoming(&low, "running", false));
+    report.jobs.push(incoming(&low, "running", false));
     c.report("gpu", "session", report).await.unwrap();
     let other = c
         .fleet
@@ -348,29 +439,29 @@ async fn quota_priority_and_namespace_scoped_preemption_are_central() {
 async fn cancellation_before_launch_ack_releases_only_after_node_confirms() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
-    c.stop_run(run.clone(), false).await.unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    c.stop_job(job.clone(), false).await.unwrap();
     assert_eq!(c.fleet.allocations(&ns).len(), 1);
     let stop = c
         .inner
         .lock()
         .commands
         .values()
-        .find(|c| c.operation == NodeOperation::CancelRun as i32)
+        .find(|c| c.operation == NodeOperation::CancelJob as i32)
         .unwrap()
         .clone();
     let mut report = inventory(&ns);
-    report.results.push(ResultReport {
+    report.results.push(CommandResult {
         id: stop.id,
-        result: json!({"cleaned":true}),
+        result: json!({"cleaned":true}).into(),
         error: None,
     });
     c.report("gpu", "session", report).await.unwrap();
     assert!(c.fleet.allocations(&ns).is_empty());
     assert_eq!(
-        c.job(&run.id, None, &BTreeMap::new()).unwrap().state(),
+        c.job(&job.id, None, &BTreeMap::new()).unwrap().state(),
         "cancelled"
     );
 }
@@ -390,11 +481,11 @@ async fn invalid_requests_and_cross_machine_jobs_are_refused_before_creation() {
         request[field] = value;
         let err = c.submit(request, None, &BTreeMap::new()).await.unwrap_err();
         assert_eq!(
-            err.downcast_ref::<crate::fleet::Refusal>().unwrap().status,
+            err.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,
             code
         );
     }
-    assert!(c.inner.lock().runs.is_empty());
+    assert!(c.inner.lock().jobs.is_empty());
 }
 #[tokio::test]
 async fn tag_scopes_jobs_and_never_widens_a_token() {
@@ -410,7 +501,7 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
         apps: None,
         token_hash: None,
         namespace: Some(ns.clone()),
-        tag: Some("default".into()),
+        tag: Some("scope=default".into()),
         manage_apps: true,
     };
     let job = c
@@ -422,12 +513,12 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
         .await
         .unwrap();
     let mut other = token.clone();
-    other.tag = Some("research".into());
+    other.tag = Some("scope=research".into());
     assert!(c
         .job(text(&job, "id"), Some(&other), &BTreeMap::new())
         .is_err());
     let mut q = BTreeMap::new();
-    q.insert("tag".into(), "research".into());
+    q.insert("tag".into(), "scope=research".into());
     assert!(c.scope(Some(&token), &q, None).is_err());
 }
 #[tokio::test]
@@ -462,13 +553,13 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
             None,
             Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),
             Some(ns.clone()),
-            Some("default".into()),
+            Some("scope=default".into()),
             true,
         )
         .await
         .unwrap();
     async fn call(
-        c: Arc<RunControl>,
+        c: Arc<WorkloadController>,
         method: &str,
         path: &str,
         token: Option<&str>,
@@ -544,7 +635,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "GET",
-            "/batch-profiles?tag=research",
+            "/batch-profiles?tag=scope=research",
             Some(&secret),
             Value::Null
         )
@@ -565,7 +656,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     let id = text(&body, "id");
     assert_eq!(body["namespace"], ns);
-    assert_eq!(body["tag"], "default");
+    assert_eq!(body["tag"], "scope=default");
     assert_eq!(
         c.job(id, None, &BTreeMap::new()).unwrap().request["env"],
         json!(["INPUT_URI=s3://owner-bucket/dataset"])
@@ -574,7 +665,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
     c.dispatch().await.unwrap();
     let assigned = c.job(id, None, &BTreeMap::new()).unwrap();
     let removed_input = Request::builder()
-        .uri(format!("/internal/runs/{id}/input"))
+        .uri(format!("/internal/jobs/{id}/input"))
         .header("authorization", "Bearer cluster")
         .header("x-fleet-worker", assigned.worker.as_deref().unwrap())
         .header("x-fleet-lease", &assigned.lease)
@@ -598,7 +689,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
     );
     let removed_output = Request::builder()
         .method("PUT")
-        .uri(format!("/internal/runs/{id}/out.tar.gz"))
+        .uri(format!("/internal/jobs/{id}/out.tar.gz"))
         .header("authorization", "Bearer cluster")
         .header("x-fleet-worker", assigned.worker.as_deref().unwrap())
         .header("x-fleet-lease", &assigned.lease)
@@ -612,7 +703,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "GET",
-            &format!("/internal/runs/{id}/logs-offset"),
+            &format!("/internal/jobs/{id}/logs-offset"),
             Some(&secret),
             Value::Null
         )
@@ -624,7 +715,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "GET",
-            &format!("/internal/runs/{id}/logs-offset"),
+            &format!("/internal/jobs/{id}/logs-offset"),
             Some("cluster"),
             Value::Null
         )
@@ -650,69 +741,74 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
 async fn completion_racing_preemption_does_not_restart_completed_work() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
-    c.stop_run(run.clone(), true).await.unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    c.stop_job(job.clone(), true).await.unwrap();
     let command = c
         .inner
         .lock()
         .commands
         .values()
-        .find(|c| c.operation == NodeOperation::PreemptRun as i32)
+        .find(|c| c.operation == NodeOperation::PreemptJob as i32)
         .unwrap()
         .clone();
     let mut report = inventory(&ns);
-    report.runs.push(incoming(&run, "succeeded", true));
-    report.results.push(ResultReport {
+    report.jobs.push(incoming(&job, "succeeded", true));
+    report.results.push(CommandResult {
         id: command.id,
-        result: json!({"cleaned":true}),
+        result: json!({"cleaned":true}).into(),
         error: None,
     });
     c.report("gpu", "session", report).await.unwrap();
-    let done = c.job(&run.id, None, &BTreeMap::new()).unwrap();
+    let done = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     assert_eq!(done.state(), "succeeded");
-    assert_eq!(done.lease, run.lease);
+    assert_eq!(done.lease, job.lease);
     assert!(c.fleet.allocations(&ns).is_empty());
 }
 #[tokio::test]
 async fn restart_repairs_stop_intent_written_before_its_command() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let run = submit(&c).await;
+    let job = submit(&c).await;
     c.dispatch().await.unwrap();
-    let mut run = c.job(&run.id, None, &BTreeMap::new()).unwrap();
-    run.stop = Some("cancel".into());
-    c.save("jobs", &run.id, &run).unwrap();
-    let restarted = RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    let mut job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    job.stop = Some("cancel".into());
+    c.save("jobs", &job.id, &job).unwrap();
+    let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
     restarted.dispatch().await.unwrap();
     assert!(restarted
         .inner
         .lock()
         .commands
         .values()
-        .any(|c| c.operation == NodeOperation::CancelRun as i32
-            && c.parameters["lease"] == run.lease));
+        .any(|c| c.operation == NodeOperation::CancelJob as i32
+            && c.parameters["lease"] == job.lease));
 }
 
-fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> Report {
+fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> NodeReport {
     let mut report = inventory(ns);
     report.services = vec![json!({"name":"service","kind":if proof {"ziren-gpu"}else{"app"},
-        "namespace":ns,"proof_app":if proof {json!(format!("eth/{}","a".repeat(64)))}else{Value::Null},
-        "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled})];
+        "namespace":ns,"tag":"scope=default","proof_app":if proof {json!(format!("eth/{}","a".repeat(64)))}else{Value::Null},
+        "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled}).into()];
     if !disabled { report.free_gpus=0.0;report.free_cpus=4.0; }
     report
 }
-async fn scale_call(c: Arc<RunControl>, token: &str, method: &str, path: &str, body: Value) -> Response {
+async fn scale_call(c: Arc<WorkloadController>, token: &str, method: &str, path: &str, body: Value,
+) -> Response {
     handle(State(c),Request::builder().method(method).uri(path)
         .header("authorization",format!("Bearer {token}"))
-        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap()).await
+        .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap(),
+    ).await
 }
-fn request_resources(body: Value) -> scaling::ScaleRequest { serde_json::from_value(body).unwrap() }
-async fn finish_service_command(c: &RunControl, ns: &str, proof: bool, command: &Command, disabled: bool, target: Option<Value>) {
+fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body).unwrap() }
+async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, command: &CommandRecord, disabled: bool, target: Option<Value>,
+) {
     let mut report=scale_inventory(ns,proof,disabled);
-    if let Some(target)=target { report.services[0]=target; }
-    report.results=vec![ResultReport{id:command.id.clone(),result:if disabled {json!({"cleaned":true})}else{json!({"ready":true})},error:None}];
+    if let Some(target)=target { report.services[0]=target.into(); }
+    report.results=vec![CommandResult {id:command.id.clone(),result: (if disabled {json!({"cleaned":true})}else{json!({"ready":true})})
+        .into(),error:None,
+    }];
     c.report("gpu","session",report).await.unwrap();
 }
 
@@ -723,27 +819,35 @@ async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_pr
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     let secret="1".repeat(64);
     c.fleet.add_user_token("eth",&"a".repeat(32),&"b".repeat(40),"owner",None,
-        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("default".into()),true).await.unwrap();
+        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("scope=default".into()),true,
+        ).await.unwrap();
     let path=format!("/apps/service/scale?namespace={ns}");
     assert_eq!(scale_call(c.clone(),&secret,"PUT",&path,json!({"gpus":1})).await.status(),StatusCode::FORBIDDEN);
     assert_eq!(scale_call(c.clone(),"cluster","PUT",&path,json!({"gpus":1})).await.status(),StatusCode::UNAUTHORIZED);
-    for body in [json!({"replicas":0}),json!({"replicas":65}),json!({"cpus":0}),json!({"gpus":-1}),json!({"image":"other"}),json!({})] {
+    for body in [json!({"replicas":0}),json!({"replicas":65}),json!({"cpus":0}),json!({"gpus":-1}),json!({"image":"other"}),json!({}),
+    ] {
         assert_eq!(scale_call(c.clone(),"admin","PUT",&path,body).await.status(),StatusCode::BAD_REQUEST);
     }
     for (body, requested) in [
-        (json!({"gpus":2}), "requested 4 GPUs and 4 CPUs (replicas: 2)"),
-        (json!({"cpus":5}), "requested 2 GPUs and 10 CPUs (replicas: 2)"),
-        (json!({"replicas":5}), "requested 5 GPUs and 10 CPUs (replicas: 5)"),
+        (json!({"gpus":2}), "requested 4 GPUs and 4 CPUs (replicas: 2)",
+        ),
+        (json!({"cpus":5}), "requested 2 GPUs and 10 CPUs (replicas: 2)",
+        ),
+        (json!({"replicas":5}), "requested 5 GPUs and 10 CPUs (replicas: 5)",
+        ),
     ] {
         let response = scale_call(c.clone(), "admin", "PUT", &path, body).await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let message = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        let message = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec(),
+        ).unwrap();
         assert!(message.contains("exceeds node gpu capacity"), "{message}");
         assert!(message.contains(requested), "{message}");
         assert!(message.contains("node total 2 GPUs and 8 CPUs"), "{message}");
         assert!(message.contains("currently free 0 GPUs and 4 CPUs"), "{message}");
     }
-    c.fleet.set_quota(&ns,Quota{gpus:Some(1.0),cpus:Some(8.0)}).await.unwrap();
+    c.fleet.set_quota(&ns,Quota{gpus:Some(1.0),cpus:Some(8.0),
+            },
+        ).await.unwrap();
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":3})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
     let other=c.fleet.create_namespace("other",Quota::default()).await.unwrap();
     assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/scale?namespace={}",other.id),json!({"replicas":1})).await.status(),StatusCode::NOT_FOUND);
@@ -757,16 +861,18 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
-    let value=c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1}))).await.unwrap();
+    let value=c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
+        ).await.unwrap();
     assert_eq!(value["state"],"draining");
     for (method, path) in [("PUT", format!("/apps/service/disabled?namespace={ns}")),
         ("DELETE", format!("/apps/service/disabled?namespace={ns}")),
-        ("DELETE", format!("/apps/service?namespace={ns}"))] {
+        ("DELETE", format!("/apps/service?namespace={ns}")),
+    ] {
         assert_eq!(scale_call(c.clone(),"admin",method,&path,json!({})).await.status(),StatusCode::CONFLICT);
     }
     assert_eq!(c.inner.lock().apps["service"].profile["disabled"],false);
     assert!(c.request_scale(&ns,"service",request_resources(json!({"replicas":1}))).await.is_err());
-    let c=Arc::new(RunControl::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="stop").unwrap().clone();
@@ -784,7 +890,7 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
     assert!(!start.admitted);
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
-    let c=Arc::new(RunControl::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();c.dispatch().await.unwrap();
     assert_eq!(c.inner.lock().commands.len(),2);
     assert!(c.inner.lock().commands[&start.id].admitted);
@@ -806,25 +912,31 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
 
 #[tokio::test]
 async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled_apps_disabled() {
-    use crate::store::{Job,JobState};
+    use crate::store::{ProofJob,ProofJobState};
     use fleet_proto::fleet::v1::ProofKind;
     let (_dir,c,ns)=setup().await;let elf="a".repeat(64);
     c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
-    let mut job=Job{inputs:None,outputs:None,id:"active-proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"active-proof".into(),elf_id:elf.clone(),kind:ProofKind::Compressed,priority:0,state:JobState::Running,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None};
+    let mut job=ProofJob{inputs:None,outputs:None,id:"active-proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"active-proof".into(),elf_id:elf.clone(),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
+        fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
+    };
     c.fleet.store.upsert(&job).await.unwrap();
-    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"replicas":1}))).await.unwrap();
+    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"replicas":1})),
+    ).await.unwrap();
     for method in ["PUT", "DELETE"] {
         assert_eq!(scale_call(c.clone(),"admin",method,&format!("/proof-apps/disabled?namespace={ns}&tenant=eth&elf_id={elf}"),json!({})).await.status(),StatusCode::CONFLICT);
     }
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
-    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),runs:c.clone(),admin_token:Arc::new("admin".into())});
+    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),workloads:c.clone(),admin_token:Arc::new("admin".into()),
+    });
     let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
     for (method,path) in [(reqwest::Method::PUT,"/admin/apps/disabled"),
-        (reqwest::Method::DELETE,"/admin/apps/disabled"),(reqwest::Method::DELETE,"/admin/apps")] {
+        (reqwest::Method::DELETE,"/admin/apps/disabled"),(reqwest::Method::DELETE,"/admin/apps"),
+    ] {
         let response=reqwest::Client::new().request(method,format!("{url}{path}"))
-            .bearer_auth("admin").query(&[("namespace",&ns),("tenant",&"eth".to_string()),("elf_id",&elf)]).send().await.unwrap();
+            .bearer_auth("admin").query(&[("namespace",&ns),("tenant",&"eth".to_string()),("elf_id",&elf),
+            ]).send().await.unwrap();
         assert_eq!(response.status(),StatusCode::CONFLICT);
     }
     server.abort();
@@ -834,7 +946,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     assert!(c.fleet.app_disabled(&ns,"eth",&elf));
     let stop=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="stop").unwrap().clone();
     assert!(!stop.admitted);
-    job.state=JobState::Succeeded;job.finished_ms=Some(2);c.fleet.store.upsert(&job).await.unwrap();
+    job.state=ProofJobState::Succeeded as i32;job.finished_ms=Some(2);c.fleet.store.upsert(&job).await.unwrap();
     c.dispatch().await.unwrap();assert!(c.inner.lock().commands[&stop.id].admitted);
     finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
@@ -847,10 +959,12 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     // The authoritative lifecycle intent, not an old observed flag, determines whether scaling resumes the app.
     let mut stopped=start.parameters["service"].clone();
     stopped["disabled"]=json!(true);stopped["ready"]=json!(false);stopped["cleaned"]=json!(true);
-    c.command("gpu",NodeOperation::SetService,json!({"service":stopped,"disabled":true})).unwrap();
+    c.command("gpu",NodeOperation::SetService,json!({"service":stopped,"disabled":true}),
+    ).unwrap();
     let normal=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,true,&normal,true,Some(stopped)).await;
-    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"gpus":2,"replicas":1}))).await.unwrap();
+    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"gpus":2,"replicas":1})),
+    ).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
@@ -866,7 +980,8 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
 async fn scale_failure_retains_new_reservation_until_confirmed_cleanup_and_can_be_retried() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1}))).await.unwrap();
+    c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
+    ).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
@@ -874,12 +989,13 @@ async fn scale_failure_retains_new_reservation_until_confirmed_cleanup_and_can_b
     assert!(apply.admitted);assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     let mut failed=scale_inventory(&ns,false,true);
     let mut partial=apply.parameters["service"].clone();partial["disabled"]=json!(false);partial["ready"]=json!(false);partial["cleaned"]=json!(false);
-    failed.services=vec![partial.clone()];
-    failed.results=vec![ResultReport{id:apply.id,error:Some("container start failed".into()),result:Value::Null}];
+    failed.services=vec![partial.clone().into()];
+    failed.results=vec![CommandResult {id:apply.id,error:Some("container start failed".into()),result:Value::Null.into(),
+    }];
     c.report("gpu","session",failed).await.unwrap();c.dispatch().await.unwrap();
     assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"failed");
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
-    let mut report=scale_inventory(&ns,false,true);report.services=vec![partial];
+    let mut report=scale_inventory(&ns,false,true);report.services=vec![partial.into()];
     c.report("gpu","session",report).await.unwrap();c.dispatch().await.unwrap();
     let cleanup=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     assert_eq!(cleanup.parameters["disabled"],true);
@@ -899,7 +1015,7 @@ async fn public_nodes_are_machines_and_machine_drain_covers_current_and_future_p
     c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
     let mut report=inventory(&ns);
     report.services=vec![json!({"name":"proof","kind":"ziren-gpu","namespace":ns,
-        "proof_app":format!("eth/{elf}"),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true})];
+        "proof_app":format!("eth/{elf}"),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
     c.report("gpu","session",report).await.unwrap();
     let replica=NodeInfo{name:"proof-0".into(),machine:"machine".into(),backend:"cuda".into(),
         gpus:1,cpus:2,control_version:1,app_namespace:ns,app_tenant:"eth".into(),app_elf_id:elf.clone(),..Default::default()};
@@ -908,7 +1024,8 @@ async fn public_nodes_are_machines_and_machine_drain_covers_current_and_future_p
     c.fleet.register(NodeInfo{name:"other-0".into(),machine:"other-machine".into(),..replica.clone()}).unwrap();
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
-    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),runs:c.clone(),admin_token:Arc::new("admin".into())});
+    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),workloads:c.clone(),admin_token:Arc::new("admin".into()),
+    });
     let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
     let client=reqwest::Client::new();
     let status:Value=client.get(format!("{url}/admin/status")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
@@ -938,7 +1055,7 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let job = submit(&c).await;
-    for path in ["/runs", "/models"] {
+    for path in ["/jobs", "/models"] {
         for method in ["GET", "POST", "DELETE"] {
             let response = scale_call(c.clone(), "admin", method, path, json!({})).await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
@@ -964,7 +1081,7 @@ async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admissi
     assert_eq!(c.fleet.usage(&ns).cpus, 2.0);
     assert!(c.request_scale(&ns, &format!("eth/{elf}"), request_resources(json!({"replicas":2}))).await.is_err());
     c.fleet.set_worker_owned_apps(HashSet::new());
-    let _restarted = RunControl::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    let _restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
     assert!(c.fleet.app_worker_owned(&ns, "eth", &elf));
 }
 
@@ -990,7 +1107,7 @@ async fn integrated_worker_owner_must_be_cleaned_before_moving() {
     c.inner.lock().services.get_mut("gpu-service").unwrap().disabled = true;
     assert!(c.command("other", NodeOperation::SetService,
         json!({"service":service,"disabled":false})).is_err());
-    c.fleet.release_run(&ns, "service:gpu-service").await.unwrap();
+    c.fleet.release_job(&ns, "service:gpu-service").await.unwrap();
     assert!(c.command("other", NodeOperation::SetService,
         json!({"service":service,"disabled":false})).is_ok());
 }

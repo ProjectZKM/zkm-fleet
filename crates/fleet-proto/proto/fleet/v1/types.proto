@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package fleet.v1;
+
+enum ProofKind {
+  PROOF_KIND_UNSPECIFIED = 0;
+  PROOF_KIND_CORE = 1;
+  PROOF_KIND_COMPRESSED = 2;
+  PROOF_KIND_GROTH16 = 3;
+  PROOF_KIND_PLONK = 4;
+  PROOF_KIND_COMPRESS_TO_GROTH16 = 5;
+}
+
+message ArtifactRef {
+  string uri = 1;
+  string sha256 = 2;
+  uint64 size = 3;
+}
+
+message ProofInputs {
+  ArtifactRef input = 1;
+  ArtifactRef elf = 2;
+  string output_root = 3;
+}
+
+message ProofOutputs {
+  ArtifactRef proof = 1;
+  ArtifactRef public_values = 2;
+  // Stable machine identity, recorded by the scheduler from the proving node.
+  string machine = 3;
+}
+
+message ProofFetch {
+  string ticket = 1;
+  string job_id = 2;
+  string lease = 3;
+  string elf_id = 4;
+  string output_root = 5;
+  string name = 6;
+  ArtifactRef reference = 7;
+}
+
+enum NodeOperation {
+  NODE_OPERATION_UNSPECIFIED = 0;
+  NODE_OPERATION_LAUNCH_JOB = 1;
+  NODE_OPERATION_CANCEL_JOB = 2;
+  NODE_OPERATION_PREEMPT_JOB = 3;
+  NODE_OPERATION_SET_SERVICE = 4;
+  NODE_OPERATION_PURGE_JOB = 5;
+  reserved 6;
+  reserved "NODE_OPERATION_STAGE_MODEL";
+}

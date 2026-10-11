@@ -3,6 +3,32 @@
 See [installation](installation.md), [operations](operations.md) and
 [node maintenance](maintenance.md) for practical instructions.
 
+## Code names
+
+Fleet follows Kubernetes workload terminology while keeping its own small API:
+a `Job` finishes a command, an `AppDeployment` holds desired app replica state,
+and `WorkloadController` reconciles that state with node reports.
+`JobSpec` describes execution; `JobStatus` records what happened. `ProofJob`
+is the proof-specific record. Shared records and requests are generated from
+[model.proto](../crates/fleet-proto/proto/fleet/model/v1/model.proto).
+
+| Name | Responsibility |
+| --- | --- |
+| `Scheduler` | Places proofs on registered provers |
+| `WorkloadController` | Admits and reconciles apps and batch jobs |
+| `NodeExecutor` | Applies authorized commands through local Ray |
+| `ProofFetcher` | Coordinates bounded proof downloads from storage nodes |
+| `FleetClient` / `FleetctlClient` | HTTP client / MCP's CLI subprocess client |
+
+These names follow Kubernetes' [workload](https://kubernetes.io/docs/concepts/workloads/controllers/)
+and [controller](https://kubernetes.io/docs/concepts/architecture/controller/) concepts.
+Fleet keeps `fleetctl app` and `fleetctl batch`; it needs no Kubernetes runtime.
+Node execution configuration is currently `services.yaml`; its entries describe
+apps, whereas a Kubernetes [Service](https://kubernetes.io/docs/concepts/services-networking/service/)
+is a network endpoint. Batch templates use `jobs.yaml`, and local job records use
+`FLEET_JOBS_DIR`. This release replaces the previous execution names and paths
+without compatibility aliases.
+
 ## Execution and proof protocols
 
 Each execution machine runs an **independent local Ray instance** and `fleet-node`.
@@ -78,6 +104,14 @@ not interpret an app's checkpoint format. Inspect application progress and
 failures through its logs. Apps and batches share ownership and container
 configuration, while retaining their distinct persistent and finite lifecycles.
 
+Shared data records and requests are defined in
+[`model.proto`](../crates/fleet-proto/proto/fleet/model/v1/model.proto), which generates
+the Rust types for jobs, apps, namespaces, tokens, resources, scaling and node reports.
+The scheduler and machine agent exchange a typed protobuf report. App-owned settings
+and execution details use lossless JSON extension fields; the local Python adapter
+needs no protobuf package. Rust owns runtime handles and scheduling behavior.
+Machine report version 2 requires updating the scheduler, agent and adapter together.
+
 Further simplification should move batch and service command persistence behind
 the same store interface as proof records, and separate retained artifact fetching
 from the native prover package. Both require recovery and compatibility checks;
@@ -88,18 +122,25 @@ the current storage formats and GOAT execution path are preserved.
 | Resource | Purpose |
 |---|---|
 | **Namespace** | Administrator-created ownership and billing boundary. |
-| **App** | Long-running workload in one namespace, with `proof` or `serving` kind. |
+| **App** | Long-running workload in one namespace. |
 | **Batch** | Finite workload in one namespace, using a reusable execution profile. |
 | **Job** | Execution record for a proof request or batch command, with namespace and tag ownership. |
 | **Token** | Belongs to one namespace, with explicit app grants and an optional tag. |
 
 Nodes are infrastructure; allocations are internal reservation records. Tenants configure proof scheduling, quotas configure namespace limits, and tags are optional attributes for isolating work and applying additional limits. There is no Group resource. See [namespaces, access and quotas](#namespaces-access-and-quotas) for details.
 
-**Apps, batches and jobs.** `fleetctl app` lists only long-running workloads. A proof app is a tenant's registered program (`tenant/<first 8 hex of the ELF id>`) backed by dedicated prover replicas; a serving app keeps a container available for requests. Use `fleetctl app --kind proof` or `--kind serving` to select one kind. Operators initially configure serving deployments in node `services.yaml`; the control plane then manages their enable/disable, priority and scaling.
+**Apps, batches and jobs.** `fleetctl app` lists all long-running workloads together. `fleetctl --json app` returns one array of app records, each with `type: app`. Inspect and manage an app by name, without a kind selector. A registered proving program uses `tenant/<first 8 hex of the ELF id>` as its name. Operators initially configure container deployments in node `services.yaml`; the control plane then manages their enable/disable, priority and scaling. Node service configuration still selects the execution backend internally.
 
-`fleetctl batch` lists finite executions. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, list workloads with `fleetctl batch list` and inspect one with `fleetctl batch show NAME`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `runs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+App and job tables both show `TAG` and `STATE`. An app's state describes its service:
+`configured`, `starting`, `running`, `draining`, `disabled`, `offline` or `failed`.
+The app table shows total configured GPUs and CPUs without a replica column;
+replica settings and job counts remain in app details. An app with services using
+multiple tags shows their tags together. Batch profiles show `enabled` or
+`disabled`; their execution states appear in the job table.
 
-Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch “profile” is its reusable workload configuration, not an additional resource. Serving apps keep replicas running; batch workloads execute a command per submission. `--profile`, `batch profiles`, and `batch profile NAME` remain compatibility aliases for `--app`, `batch list`, and `batch show NAME`. `batch submit --name` continues to name an individual job.
+`fleetctl batch` lists finite executions. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, list workloads with `fleetctl batch list` and inspect one with `fleetctl batch show NAME`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `jobs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+
+Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch “profile” is its reusable workload configuration, not an additional resource. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
 Every app and batch profile belongs to an administrator-created namespace. Proof requests require a registered proof app, and batch submissions require an existing batch profile. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
 
@@ -125,7 +166,7 @@ Nodes need only outbound connections. Fetching waits for a heartbeat; an offline
 storage machine returns a retryable error. Older jobs retain their existing
 control-host output path.
 Batch logs remain available through Fleet. Each node retains its batch workspace in
-its own `RUNS_DIR`; no shared mount is required for one-machine batch jobs.
+its own `JOBS_DIR`; no shared mount is required for one-machine batch jobs.
 
 ### App-owned proof endpoint
 
@@ -194,7 +235,7 @@ one namespace and may optionally have a tag. Tokens with the same tag share
 proofs and batch jobs; different tags isolate that work. Untagged tokens
 share the namespace's untagged work. Refreshing preserves the namespace and optional
 tag, including access to earlier work. Proof tenants still define scheduling policy.
-The workload types are `app` and `batch`; long-running apps have `proof` or `serving` kind.
+The workload types are `app` and `batch`.
 
 ### Token access and permissions
 
@@ -205,6 +246,10 @@ reserved. Renaming and deleting namespaces are not currently supported.
 
 A token belongs to a namespace, with an optional tag. Several tokens
 can share a tag, for example teammates, laptop keys and automation keys.
+New tags use `KEY=VALUE`, such as `scope=default` or `team=research`. The key
+starts with a letter; each part contains up to 63 letters, digits, dots,
+underscores or hyphens. Tags match exactly: `team=research` and `team=production`
+are separate scopes. Apps and batches use the same tag rules. Bare tags are rejected.
 Members can access that tag's existing jobs; another tag in the
 same namespace cannot. App grants remain explicit on each token, and
 submission requires the relevant app grant. Only administrators create
@@ -225,15 +270,15 @@ GPU/CPU quota, described below.
 ### Workload ownership
 
 Every app belongs to an existing namespace. An administrator creates the namespace
-and issues its owner token for the built-in `default` tag. The owner can then
+and issues its owner token for the built-in `scope=default` tag. The owner can then
 register proof apps and batch profiles inside that namespace and submit jobs under that tag:
 
 ```bash
 fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
   --endpoint https://fleet.example:8905 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
-fleetctl --token-file alice.token --namespace alice --tag default batch add training --image IMAGE
-fleetctl --token-file alice.token --namespace alice --tag default app add eth/FULL_ELF_SHA256
+fleetctl --token-file alice.token --namespace alice --tag scope=default batch add training --image IMAGE
+fleetctl --token-file alice.token --namespace alice --tag scope=default app add eth/FULL_ELF_SHA256
 ```
 
 Omitting the namespace during app creation is refused; an unknown namespace is not
@@ -244,12 +289,12 @@ registration leaves the others and their jobs intact. Batch profile names remain
 App and batch grants are explicit; a grant from another namespace cannot authorize submission. Admin batch submissions
 also inherit the app's namespace and participate in its quota.
 
-The proof API uses `POST /admin/apps?namespace=alice&tag=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
+The proof API uses `POST /admin/apps?namespace=alice&tag=scope=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
 The control-plane batch API accepts `POST /batch-profiles?namespace=alice` with the profile JSON, or a
 `namespace` field in the JSON. Names and immutable namespace IDs are accepted;
 registrations persist the ID. A configured batch profile or persistent `kind: app`
 entry can also specify `namespace: alice`; its namespace is verified before launch.
-The owner token is bound to `default`; jobs inherit that tag. Batch owners
+The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
 Host mount roots require administrator approval. Submit batch jobs through
 `fleetctl batch submit` or `POST /batches`; their reported type is `batch`.
@@ -370,13 +415,13 @@ control namespace, while Fleet namespace IDs scope policy and accounting.
 fleetctl namespace create team --tenant eth --gpus 8 --cpus 64 \
   --endpoint https://fleet.example:8905 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out team.env
-fleetctl namespace quota team --tag research --gpus 2 --cpus 16
-fleetctl namespace quota team --tag production --gpus 6 --cpus 48
+fleetctl namespace quota team --tag scope=research --gpus 2 --cpus 16
+fleetctl namespace quota team --tag scope=production --gpus 6 --cpus 48
 fleetctl namespace get team                  # namespace quota, usage and tags
-fleetctl namespace get team --tag research   # namespace totals and tag quota/usage
-fleetctl token issue --namespace team --tag research --tenant eth \
+fleetctl namespace get team --tag scope=research   # namespace totals and tag quota/usage
+fleetctl token issue --namespace team --tag scope=research --tenant eth \
   --app training --endpoint https://fleet.example:8905 --out alice.env
-fleetctl --namespace team --tag research job
+fleetctl --namespace team --tag scope=research job
 ```
 
 Both research and production contribute to the team's shared quota. If production
@@ -385,12 +430,12 @@ neither can admit another GPU job. Jobs can retain admitted units indefinitely. 
 either quota lets admitted work finish and blocks further admissions as needed.
 
 Tags use the same character and length rules as namespace names and are scoped
-to their namespace. The `default` tag is created with each namespace. Additional
+to their namespace. The `scope=default` tag is created with each namespace. Additional
 tags are introduced when an administrator assigns one to a token or sets its
 optional cap. A newly used tag has no extra cap unless the administrator sets one.
 
 Membership cannot change for an existing key. Refresh copies the original tag,
-independently of CLI selectors. Namespace owner bundles use `FLEET_TAG=default`.
+independently of CLI selectors. Namespace owner bundles use `FLEET_TAG=scope=default`.
 Users cannot select another tag or spoof it in a submission body.
 
 ### Administrator workflow
@@ -402,7 +447,7 @@ fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
 fleetctl namespace list
 fleetctl namespace get alice
 # Give alice.env, alice.token, and alice.ca.pem (if generated) to the owner securely.
-FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=default \
+FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=scope=default \
   fleetctl batch add training --image APPROVED_IMAGE
 
 # Copies the namespace, optional tag, tenant, app grants and label to a new key/token.
@@ -416,7 +461,7 @@ fleetctl namespace resume alice
 ```
 
 Namespace creation requires the HTTPS stage gateway details so the owner bundle
-can submit proofs. `refresh` also accepts the alias `rotate`. It does not revoke
+can submit proofs. `refresh` does not revoke
 the old key automatically or overwrite an existing bundle.
 
 Issuance requires an existing, active namespace. A typo cannot silently create a
@@ -434,13 +479,13 @@ Administrator HTTP endpoints, on the existing private scheduler listener:
 | `GET /admin/namespaces/alice` | Inspect quota, total usage and tags |
 | `PUT /admin/namespaces/alice/quota` with `{"gpus":2,"cpus":16}` | Replace caps |
 | `GET /admin/namespaces/alice/allocations` | Inspect reservations across tags |
-| `GET /admin/namespaces/alice?tag=research` | Inspect namespace totals and tag caps/usage |
-| `PUT /admin/namespaces/alice/quota?tag=research` with `{"gpus":2,"cpus":16}` | Replace tag caps, recording a new tag if needed |
+| `GET /admin/namespaces/alice?tag=scope=research` | Inspect namespace totals and tag caps/usage |
+| `PUT /admin/namespaces/alice/quota?tag=scope=research` with `{"gpus":2,"cpus":16}` | Replace tag caps, recording a new tag if needed |
 | `PUT /admin/namespaces/alice/suspended` | Suspend |
 | `DELETE /admin/namespaces/alice/suspended` | Resume |
 
 Token registration accepts a namespace name or ID and an optional `tag`. Tokens have opaque IDs; proof signer bindings are internal and are not exposed through the token API.
-Job/app lists and job reads accept `?namespace=alice&tag=research`; the batch API supports the same selectors. Refresh
+Job/app lists and job reads accept `?namespace=alice&tag=scope=research`; the batch API supports the same selectors. Refresh
 is a CLI operation using administrator token lookup and registration.
 No additional listener or public port is required.
 
@@ -466,7 +511,7 @@ A verified replacement token can read accepted batch jobs from earlier keys.
 For a batch command that uses `INPUT_URI` and `OUTPUT_URI` from its environment:
 
 ```bash
-fleetctl --token-file alice.token batch submit --profile training --gpus 1 \
+fleetctl --token-file alice.token batch submit --app training --gpus 1 \
   --env INPUT_URI=s3://alice-inputs/dataset \
   --env OUTPUT_URI=s3://alice-results/job-output -- python /app/train.py
 ```
@@ -492,7 +537,10 @@ Public-values URLs for namespaced proofs are bound to the issuing token.
 Revoking that key or suspending its namespace invalidates its URLs. A replacement
 token can poll the same job to obtain a fresh URL.
 
-Postgres creates the current schema directly and checks its version at startup. Schema 12 upgrades to 13 by adding input/output reference columns; older incompatible development schemas require a reset.
+Postgres creates schema 14 directly and checks its version at startup. Incompatible
+schemas require an explicit metadata reset; Fleet does not run database migrations.
+Tags must use `key=value`. A reset removes job history and access registrations;
+recreate namespaces and tokens, and preserve app-owned proofs and checkpoints.
 Operator-managed proof apps use the reserved `system` namespace. User tokens
 cannot be issued in `system`.
 
@@ -540,11 +588,11 @@ Namespaces are the resource accounting and billing unit; namespace and optional 
 cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
 
 
-LLM serving and ComfyUI appear as `type: app`, `kind: serving` in `fleetctl app`. Proof programs appear as `type: app`, `kind: proof`. Batch profiles and executions appear only under `fleetctl batch`, with `type: batch`.
+LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`, without a `kind` field. Batch profiles and executions appear only under `fleetctl batch`, with `type: batch`.
 `fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
 app has its own dedicated Ziren GPU server: disable blocks new submissions,
 drains its active proofs, then stops that server and releases its GPUs. Queued
-proofs wait until the app is enabled again. Enabling either app kind starts its
+proofs wait until the app is enabled again. Enabling an app starts its
 service before accepting work. Disabling a batch profile only blocks new
 batch jobs; accepted batch jobs finish.
 
@@ -565,9 +613,9 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 | proof apps, proof jobs, tokens | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
 | ELFs and proof inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores only references, hashes and parameters. Legacy jobs retain files in the scheduler data dir. |
 | Proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. Fleet stores references, hashes, cycles, `prove_ms` and the storage machine. The node serves requested bytes through a heartbeat ticket and HTTPS relay; disabling its GPU actor preserves fetching. Legacy jobs retain uploaded control-host output. |
-| serving apps, batch profiles, jobs and command intents | `data_dir/run-control/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
+| serving apps, batch profiles, jobs and command intents | `data_dir/workloads/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
 | batch inputs, outputs and checkpoints | owner-managed shared or object storage, read and written directly by the batch command |
-| batch logs | `data_dir/run-control/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in their local `RUNS_DIR/<job-id>/` |
+| batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in their local `JOBS_DIR/<job-id>/` |
 
 ## Tokens
 

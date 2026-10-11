@@ -1,4 +1,4 @@
-//! Node registration and heartbeats (cluster-internal, cluster token required).
+//! Prover registration and heartbeats (cluster-internal, cluster token required).
 
 use std::sync::Arc;
 
@@ -10,14 +10,14 @@ use fleet_proto::fleet::v1::{
     RegisterResponse, PublishOutputRequest, PublishOutputResponse,
 };
 
-use crate::fleet::Fleet;
+use crate::fleet::Scheduler;
 
-pub struct ControlApi {
-    pub fleet: Arc<Fleet>,
+pub struct ProverControlService {
+    pub fleet: Arc<Scheduler>,
 }
 
 #[tonic::async_trait]
-impl ControlService for ControlApi {
+impl ControlService for ProverControlService {
     async fn publish_output(
         &self,
         request: Request<PublishOutputRequest>,

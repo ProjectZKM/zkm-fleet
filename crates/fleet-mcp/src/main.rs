@@ -20,13 +20,13 @@ use tokio::{io::AsyncReadExt, process::Command, time::timeout};
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
-struct Fleet {
+struct FleetctlClient {
     fleetctl: PathBuf,
     fleet_url: Option<String>,
 }
 
-impl Fleet {
-    fn from_env() -> Result<Self> {
+impl FleetctlClient {
+    fn from_env() -> Self {
         let fleetctl = env::var_os("FLEETCTL_BIN")
             .map(PathBuf::from)
             .or_else(|| {
@@ -37,10 +37,10 @@ impl Fleet {
             })
             .unwrap_or_else(|| PathBuf::from("fleetctl"));
 
-        Ok(Self {
+        Self {
             fleetctl,
             fleet_url: env::var("FLEET_URL").ok(),
-        })
+        }
     }
 
     async fn run(&self, user_token: &str, args: &[String]) -> Result<Value> {
@@ -189,14 +189,14 @@ fn default_log_lines() -> usize { 50 }
 
 #[derive(Clone)]
 struct FleetMcp {
-    fleet: Fleet,
+    fleet: FleetctlClient,
 }
 
 #[tool_router]
 impl FleetMcp {
     #[tool(
         name = "fleet_apps_list",
-        description = "List long-running proof and serving apps available to the authenticated namespace and token.",
+        description = "List long-running apps available to the authenticated namespace and token.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn apps_list(
@@ -208,7 +208,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_app_get",
-        description = "Get a long-running proof or serving app visible to the authenticated token.",
+        description = "Get a long-running app visible to the authenticated token.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn app_get(
@@ -265,7 +265,7 @@ impl FleetMcp {
     async fn batches_list(&self, Parameters(input): Parameters<BatchesFilter>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         if !(1..=100).contains(&input.limit) { return Err(tool_error("limit must be between 1 and 100")); }
         let mut args = vec!["batch".into(), "--limit".into(), input.limit.to_string()];
-        if let Some(profile) = input.profile { args.extend(["--profile".into(), profile]); }
+        if let Some(profile) = input.profile { args.extend(["--app".into(), profile]); }
         if input.active { args.push("--active".into()); }
         self.call(parts, args).await
     }
@@ -328,7 +328,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_batch_submit",
-        description = "Submit a finite batch job using a profile available to the authenticated token. Commands read inputs and write outputs directly in owner-managed storage. Fleet provides job status and logs. The command is passed directly without a shell.",
+        description = "Submit a finite batch job using a profile available to the authenticated token. Commands read inputs and write outputs directly in owner-managed storage. FleetctlClient provides job status and logs. The command is passed directly without a shell.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn batch_submit(
@@ -342,7 +342,7 @@ impl FleetMcp {
         if input.command.iter().any(|part| part.contains('\0')) {
             return Err(tool_error("command arguments cannot contain NUL bytes"));
         }
-        let mut args = vec!["batch".into(), "submit".into(), "--profile".into(), input.profile];
+        let mut args = vec!["batch".into(), "submit".into(), "--app".into(), input.profile];
         if let Some(name) = input.name {
             args.extend(["--name".into(), name]);
         }
@@ -408,7 +408,7 @@ fn bearer_token(parts: &Parts) -> std::result::Result<String, String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let fleet = Fleet::from_env()?;
+    let fleet = FleetctlClient::from_env();
     let bind = env::var("FLEET_MCP_BIND").unwrap_or_else(|_| "127.0.0.1:8906".into());
     let allowed_hosts = env::var("FLEET_MCP_ALLOWED_HOSTS")
         .unwrap_or_else(|_| "127.0.0.1:8906,localhost:8906,34.215.238.232".into());

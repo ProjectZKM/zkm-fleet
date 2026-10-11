@@ -1,5 +1,5 @@
 //! Metadata-only admission for an app's SDK endpoint.
-use crate::{http::HttpState, stage::StageApi, store::Token};
+use crate::{http::HttpState, stage::ProofStageService, store::Token};
 use axum::{
     extract::{Extension, State},
     http::StatusCode,
@@ -7,17 +7,17 @@ use axum::{
     Json,
 };
 use fleet_proto::stage::v1::GenerateProofRequest;
-pub use fleet_proto::sdk::Submit;
+pub use fleet_proto::sdk::SubmitProofRequest;
 
 pub async fn submit(
     State(state): State<HttpState>,
     Extension(token): Extension<Option<Token>>,
-    Json(body): Json<Submit>,
+    Json(body): Json<SubmitProofRequest>,
 ) -> Response {
     if token.is_none() {
         return (StatusCode::FORBIDDEN, "namespace token required").into_response();
     }
-    let api = StageApi {
+    let api = ProofStageService {
         fleet: state.fleet.clone(),
     };
     // Reuse the proof caller checks, including SDK signer binding, after HTTP auth.

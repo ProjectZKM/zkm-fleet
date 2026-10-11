@@ -110,6 +110,11 @@ Before an update, record running allocations, pause affected workloads and back
 up configuration plus durable app data. Install a tested revision, restart the
 required processes, then verify readiness, resumed progress and report delivery.
 
+For the typed machine protocol (report version 2), update the control host,
+`fleet-node` and `bridge/` together. Older agents are refused. This development
+release also requires fresh schema 14 metadata; it provides no database migration.
+Recreate namespace access after a reset and keep app-owned proof files and checkpoints.
+
 Back up control-host Postgres and its `data_dir` together; batch records and app
 intents live in that directory. Preserve node app checkpoints, prepared inputs,
 outputs and pending reports. Keep tokens private. Delete obsolete build packages

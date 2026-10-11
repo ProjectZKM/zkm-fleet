@@ -198,9 +198,9 @@ class Record:
         return merge(self, **changes)
 
 
-# ── one-shot runs ────────────────────────────────────────────────────────────
+# ── batch jobs ────────────────────────────────────────────────────────────
 
-class RunState(str, enum.Enum):
+class JobState(str, enum.Enum):
     WAITING_DEPENDENCY = "waiting_dependency"
     WAITING_QUOTA = "waiting_quota"
     QUEUED = "queued"
@@ -215,15 +215,10 @@ class RunState(str, enum.Enum):
 
     @property
     def terminal(self) -> bool:
-        return self in (RunState.SUCCEEDED, RunState.FAILED, RunState.CANCELLED)
-
-    @property
-    def active(self) -> bool:
-        """Queued or running (a lost run is neither: nothing is running it any more)."""
-        return not self.terminal and self is not RunState.LOST
+        return self in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED)
 
 
-class Cause(str, enum.Enum):
+class FailureCause(str, enum.Enum):
     """Why an attempt ended short of exit 0."""
 
     GPU_OOM = "gpu-oom"
@@ -235,7 +230,7 @@ class Cause(str, enum.Enum):
 
     @property
     def oom(self) -> bool:
-        return self in (Cause.GPU_OOM, Cause.HOST_OOM)
+        return self in (FailureCause.GPU_OOM, FailureCause.HOST_OOM)
 
 
 class MountMode(str, enum.Enum):
@@ -263,8 +258,8 @@ class Mount(Record):
 
 
 @dataclass(kw_only=True)
-class Profile(Record):
-    """A runs.yaml profile: what a request may ask for, and the container it gets."""
+class JobTemplate(Record):
+    """A jobs.yaml profile: what a request may ask for, and the container it gets."""
 
     image: str
     # Operator-managed YAML defaults to the reserved system namespace.
@@ -277,9 +272,9 @@ class Profile(Record):
     shm_gb: int = 16
     allow: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    disabled: bool = False  # takes no new runs (fleetctl batch disable); the ones going finish
-    # A higher-priority requester in this namespace may stop a run once it has run
-    # min_runtime_s; the run queues again (FLEET_ATTEMPT goes on) and spends no --retry.
+    disabled: bool = False  # takes no new jobs (fleetctl batch disable); the ones going finish
+    # A higher-priority requester in this namespace may stop a job once it has run
+    # min_runtime_s; the job queues again (FLEET_ATTEMPT goes on) and spends no --retry.
     preemptible: bool = True
     min_runtime_s: int = 300
     # SIGTERM, then SIGKILL this much later: on cancel and on preemption (time to checkpoint).
@@ -291,22 +286,22 @@ class Profile(Record):
 
 
 @dataclass(kw_only=True)
-class RunsConfig(Record):
-    """runs.yaml."""
+class JobTemplates(Record):
+    """jobs.yaml."""
 
-    profiles: dict[str, Profile] = field(default_factory=dict)
+    profiles: dict[str, JobTemplate] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
-class RunSpec(Record):
-    """Everything a run was asked to be; written once at submit, read by its actor."""
+class JobSpec(Record):
+    """Everything a job was asked to be; written once at submit, read by its actor."""
 
     id: str
     profile_name: str
     owner: str | None = None
     namespace: str | None = None
     tag: str | None = None
-    profile: Profile
+    profile: JobTemplate
     command: list[str]
     gpus: float
     cpus: int
@@ -339,7 +334,7 @@ class RunSpec(Record):
 
 
 @dataclass(kw_only=True)
-class Holder(Record):
+class GpuProcess(Record):
     pid: int
     mib: int
     cmd: str
@@ -349,21 +344,21 @@ class Holder(Record):
 
 
 @dataclass(kw_only=True)
-class CardState(Record):
+class GpuMemoryState(Record):
     """A host card as nvidia-smi sees it."""
 
     index: str
     free_mib: int
     total_mib: int
-    holders: list[Holder] = field(default_factory=list)
+    holders: list[GpuProcess] = field(default_factory=list)
 
     def held_by(self) -> str:
         return ", ".join(map(str, self.holders)) or "no process"
 
 
 @dataclass(kw_only=True)
-class RankInfo(Record):
-    """Where one rank of a run lives."""
+class TaskPlacement(Record):
+    """Where one rank of a job lives."""
 
     rank: int
     machine: str
@@ -373,11 +368,11 @@ class RankInfo(Record):
 
 
 @dataclass(kw_only=True)
-class Attempt(Record):
+class JobAttempt(Record):
     """How one start of the job ended."""
 
     exit_code: int | None
-    cause: Cause | None = None
+    cause: FailureCause | None = None
     evidence: str | None = None
     error: str | None = None
     card_holders: str | None = None
@@ -394,11 +389,11 @@ class Attempt(Record):
 
 
 @dataclass(kw_only=True)
-class RunStatus(Record):
+class JobStatus(Record):
     """status.json: written by submit, the waiter, the actor and cancel; read by all."""
 
     id: str
-    state: RunState
+    state: JobState
     namespace: str | None = None
     tag: str | None = None
     priority: int = 0  # inherited from the app at submission
@@ -413,44 +408,44 @@ class RunStatus(Record):
     nodes: int = 1
     machine: str | None = None
     node_ip: str | None = None
-    ranks: list[RankInfo] = field(default_factory=list)
+    ranks: list[TaskPlacement] = field(default_factory=list)
     gpus: list[str] = field(default_factory=list)
     container: str | None = None
     attempt: int | None = None
-    attempts: list[Attempt] = field(default_factory=list)
+    attempts: list[JobAttempt] = field(default_factory=list)
     preemptions: int = 0
     started_at: float | None = None
     finished_at: float | None = None
     exit_code: int | None = None
-    cause: Cause | None = None
+    cause: FailureCause | None = None
     error: str | None = None
     detail: str | None = None
     # filled in by `status` for the reader, never stored
     metrics: dict[str, Any] | None = None
     out: str | None = None
 
-    def places(self) -> list[RankInfo]:
-        """Every rank's place (rank 0's from the top-level fields for a single-node run)."""
+    def places(self) -> list[TaskPlacement]:
+        """Every rank's place (rank 0's from the top-level fields for a single-node job)."""
         if self.ranks:
             return self.ranks
-        return [RankInfo(rank=0, machine=self.machine or "", node_ip=self.node_ip or "", gpus=self.gpus,
+        return [TaskPlacement(rank=0, machine=self.machine or "", node_ip=self.node_ip or "", gpus=self.gpus,
                          container=self.container or "")]
 
 
 # ── services ─────────────────────────────────────────────────────────────────
 
-class ServiceKind(str, enum.Enum):
+class AppRuntime(str, enum.Enum):
     ZIREN_GPU = "ziren-gpu"
     ZIREN_CPU = "ziren-cpu"
     APP = "app"
 
     @property
     def takes_gpus(self) -> bool:
-        return self is not ServiceKind.ZIREN_CPU
+        return self is not AppRuntime.ZIREN_CPU
 
 
 @dataclass(kw_only=True)
-class ClusterConfig(Record):
+class ControlPlaneConfig(Record):
     """The top of services.yaml: what every replica shares."""
 
     scheduler: str | None = None
@@ -463,14 +458,14 @@ class ClusterConfig(Record):
 
 
 @dataclass(kw_only=True)
-class ServiceSpec(Record):
+class AppSpec(Record):
     """One entry of `services:`."""
 
     name: str
     namespace: str = "00000000000000000000000000000000"
     tag: str | None = None
     priority: int = 0
-    kind: ServiceKind = ServiceKind.ZIREN_GPU
+    kind: AppRuntime = AppRuntime.ZIREN_GPU
     replicas: int = 1
     disabled: bool = False  # persistent app or proof app: release resources until enabled
     # A Ziren prover service is dedicated to this one proof app (tenant/full ELF id).
@@ -505,7 +500,7 @@ class ServiceSpec(Record):
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
         if self.worker_command:
-            if (self.kind is not ServiceKind.ZIREN_GPU or self.replicas != 1
+            if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):
                 raise ModelError("integrated worker requires a machine-pinned ziren-gpu service with one replica and persistent proof_storage_root")
             if not os.path.isabs(self.worker_command[0]) or self.worker_stop_timeout_s <= 0:
@@ -514,30 +509,30 @@ class ServiceSpec(Record):
             raise ModelError("worker environment and workdir require worker_command")
         if self.proof_app is not None:
             tenant, sep, elf_id = self.proof_app.partition("/")
-            if (self.kind is not ServiceKind.ZIREN_GPU or not sep or not tenant
+            if (self.kind is not AppRuntime.ZIREN_GPU or not sep or not tenant
                     or not re.fullmatch(r"[0-9a-fA-F]{64}", elf_id)):
                 raise ModelError("proof_app must be TENANT/FULL_ELF_SHA256 on a ziren-gpu service")
-        elif self.kind is ServiceKind.ZIREN_GPU:
+        elif self.kind is AppRuntime.ZIREN_GPU:
             raise ModelError("every ziren-gpu service must name its dedicated proof_app")
 
 
 @dataclass(kw_only=True)
-class ServicesFile(Record):
+class AppsConfig(Record):
     """services.yaml as a whole."""
 
-    cluster: ClusterConfig
-    services: list[ServiceSpec]
+    cluster: ControlPlaneConfig
+    services: list[AppSpec]
     raw: dict[str, Any] = field(default_factory=dict)  # the file's own mapping, for the spec hash
 
     @classmethod
-    def parse(cls, data: Mapping[str, Any]) -> ServicesFile:
-        cluster = from_dict(ClusterConfig, {k: v for k, v in data.items() if k != "services"})
-        services = [from_dict(ServiceSpec, s, where=f"service {s.get('name', '?')}") for s in data.get("services", [])]
+    def parse(cls, data: Mapping[str, Any]) -> AppsConfig:
+        cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "services"})
+        services = [from_dict(AppSpec, s, where=f"service {s.get('name', '?')}") for s in data.get("services", [])]
         return cls(cluster=cluster, services=services, raw=dict(data))
 
 
 @dataclass(kw_only=True)
-class ReplicaSpec(Record):
+class AppReplicaSpec(Record):
     """One actor: a service's replica `index`, named `<service>-<index>`, with the
     cluster settings it needs. `config` is the file's own mapping for this replica,
     which the spec hash is taken from: a change in the bridge's code never counts as
@@ -545,12 +540,12 @@ class ReplicaSpec(Record):
 
     name: str
     index: int
-    service: ServiceSpec
-    cluster: ClusterConfig
+    service: AppSpec
+    cluster: ControlPlaneConfig
     config: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def kind(self) -> ServiceKind:
+    def kind(self) -> AppRuntime:
         return self.service.kind
 
     @property
@@ -562,7 +557,7 @@ class ReplicaSpec(Record):
 
 
 @dataclass(kw_only=True)
-class Bundle(Record):
+class ResourceRequest(Record):
     """One machine's share of a placement group, in Ray's resource names."""
 
     cpu: float
@@ -582,7 +577,7 @@ class Bundle(Record):
 
 
 @dataclass(kw_only=True)
-class NodeEnv(Record):
+class NodeEnvironment(Record):
     """What fleet-ziren-node reads from its environment."""
 
     name: str = field(metadata={"env": "FLEET_NODE_NAME"})
@@ -606,7 +601,7 @@ class NodeEnv(Record):
 
 
 @dataclass(kw_only=True)
-class Health(Record):
+class ReplicaHealth(Record):
     """What an actor answers to `health()`."""
 
     name: str

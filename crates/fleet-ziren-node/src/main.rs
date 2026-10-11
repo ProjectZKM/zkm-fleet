@@ -20,7 +20,7 @@ use prost::Message;
 
 #[derive(Parser, Clone)]
 #[command(about = "zkm-fleet prover node")]
-pub struct Args {
+pub struct ProverArgs {
     /// Unique, stable name (e.g. the Ray actor name).
     #[arg(long, env = "FLEET_NODE_NAME")]
     name: String,
@@ -79,18 +79,19 @@ pub struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("fetch-artifact") {
-        return fleet_ziren_node::fetch::run();
-    }
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    let args = Args::parse();
-    let token = load_token(&args.cluster_token_file)?;
+    if std::env::args().nth(1).as_deref() == Some("fetch-artifact") {
+        return fleet_ziren_node::fetch::run();
+    }
+    let args = ProverArgs::parse();
+    let token = fleet_proto::load_token(&args.cluster_token_file)?;
 
-    let node = Arc::new(prover::Node::start(&args).await?);
+    let node = Arc::new(prover::ZirenProver::start(&args).await?);
     tracing::info!(backend = %args.backend, "worker ready; contacting scheduler through heartbeats");
     let control = tokio::spawn(control_loop(args.clone(), token, node.clone()));
     tokio::select! {
@@ -116,27 +117,14 @@ async fn parent_gone(watch: bool) {
     }
 }
 
-fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
-    let t = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("reading the cluster token {}: {e}", path.display()))?
-        .trim()
-        .to_string();
-    anyhow::ensure!(
-        t.len() >= 32,
-        "cluster token in {} is shorter than 32 characters",
-        path.display()
-    );
-    Ok(t)
-}
-
 type Control =
-    ControlServiceClient<tonic::codegen::InterceptedService<Channel, prover::AttachToken>>;
+    ControlServiceClient<tonic::codegen::InterceptedService<Channel, prover::BearerTokenInterceptor>>;
 
 type Outcome = Result<(u64, u64, Option<ProofOutputs>), tonic::Status>;
 
 /// All scheduler connections originate here. Proof work and output persistence
 /// run separately so neither can block health and ownership heartbeats.
-async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> anyhow::Result<()> {
+async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenProver>) -> anyhow::Result<()> {
     let mut endpoint =
         Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5));
     if endpoint.uri().scheme_str() == Some("https") {
@@ -156,13 +144,13 @@ async fn control_loop(args: Args, token: String, node: Arc<prover::Node>) -> any
     }
     let mut client: Control = ControlServiceClient::with_interceptor(
         endpoint.clone().connect_lazy(),
-        prover::AttachToken::new(&token)?,
+        prover::BearerTokenInterceptor::new(&token)?,
     )
     .max_decoding_message_size(1 << 30)
     .max_encoding_message_size(1 << 30);
     let inputs: Control = ControlServiceClient::with_interceptor(
         endpoint.connect_lazy(),
-        prover::AttachToken::new(&token)?,
+        prover::BearerTokenInterceptor::new(&token)?,
     )
     .max_decoding_message_size(1 << 30)
     .max_encoding_message_size(1 << 30);

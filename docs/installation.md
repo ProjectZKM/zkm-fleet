@@ -33,6 +33,16 @@ Omit `--no-mcp` to enable MCP at `/mcp`. The installer creates credentials and p
 `fleetctl` on the control host's PATH. Operator commands use the administrator
 token; namespace users receive their own scoped tokens.
 
+Use [fleet.example.yaml](../deploy/fleet.example.yaml) for the scheduler settings
+and proof tenant configuration. Fleet creates schema 14 for a fresh database;
+an incompatible database requires a metadata reset and new namespace/token setup.
+
+The installer runs `fleetctl init token` and `fleetctl init tls` only when their
+files are missing. `init tls` creates a private CA and server certificate for the
+Fleet backend; `--tls-names` supplies the certificate's hostnames and IPs.
+These are installation commands. Normal namespace operations use the existing
+server certificate and copy its public CA into client bundles when needed.
+
 ## Execution node
 
 Securely copy the existing control host's `etc/cluster.token` to the new machine,
@@ -54,9 +64,9 @@ The node needs outbound HTTPS with HTTP/2 on port 8905.
 The installer starts Ray and the agent with a cron watchdog. Use `--no-cron` when
 providing your own supervisor for `deploy/node-start.sh` and local Ray.
 It preserves existing app and batch configuration. A new node starts empty:
-configure `etc/services.yaml` and `etc/runs.yaml` using the
+configure `etc/services.yaml` and `etc/jobs.yaml` using the
 [app example](../deploy/services.example.yaml) and
-[batch example](../deploy/runs.example.yaml).
+[batch example](../deploy/jobs.example.yaml).
 
 On the control host, verify registration:
 

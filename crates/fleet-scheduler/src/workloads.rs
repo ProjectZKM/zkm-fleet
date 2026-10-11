@@ -2,8 +2,8 @@
 //! commands with their own Ray instance and initiate every control connection.
 use crate::{
     blobs::is_safe_id,
-    fleet::Fleet,
-    preemption::{Candidate, Capacity, Request as PreemptionRequest},
+    fleet::Scheduler,
+    preemption::{PreemptionCandidate, NodeCapacity, PreemptionRequest},
     store::Token,
     token,
 };
@@ -20,7 +20,7 @@ use fleet_proto::fleet::v1::{
     WorkerHeartbeatResponse,
 };
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -43,7 +43,7 @@ fn terminal(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "cancelled" | "lost")
 }
 fn fail(code: u16, message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(crate::fleet::Refusal {
+    anyhow::Error::new(crate::fleet::RequestRejection {
         status: code,
         message: message.into(),
     })
@@ -52,7 +52,7 @@ fn response_error(e: anyhow::Error) -> Response {
     if e.downcast_ref::<serde_json::Error>().is_some() {
         return (StatusCode::BAD_REQUEST, "invalid JSON request").into_response();
     }
-    if let Some(e) = e.downcast_ref::<crate::fleet::Refusal>() {
+    if let Some(e) = e.downcast_ref::<crate::fleet::RequestRejection>() {
         (StatusCode::from_u16(e.status).unwrap(), e.message.clone()).into_response()
     } else {
         tracing::error!(error=%e, "batch control operation failed");
@@ -64,143 +64,29 @@ fn response_error(e: anyhow::Error) -> Response {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct App {
-    name: String,
-    namespace: String,
-    tag: Option<String>,
-    profile: Value,
-    persistent: bool,
-    #[serde(default)]
-    removed: bool,
-    workers: HashSet<String>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-struct Run {
-    id: String,
-    lease: String,
-    owner: String,
-    namespace: String,
-    tag: Option<String>,
-    profile: String,
-    policy: Value,
-    request: Value,
-    worker: Option<String>,
-    status: Value,
-    quota_held: bool,
-    #[serde(default)]
-    stop: Option<String>,
-    #[serde(default, alias = "artifacts_ready")]
-    logs_ready: bool,
-    #[serde(default)]
-    purged: bool,
-}
-impl Run {
-    fn value(&self) -> Value {
-        let mut v = self.status.clone();
-        for (k, x) in [
-            ("type", json!("batch")),
-            ("id", json!(self.id)),
-            ("profile", json!(self.profile)),
-            ("namespace", json!(self.namespace)),
-            ("tag", json!(self.tag)),
-            ("owner", json!(self.owner)),
-            ("priority", self.policy["priority"].clone()),
-            ("worker", json!(self.worker)),
-            ("node", json!(self.worker)),
-        ] {
-            v[k] = x;
-        }
-        v
-    }
-    fn state(&self) -> &str {
-        text(&self.status, "state")
-    }
-    fn gpus(&self) -> f64 {
-        self.request["gpus"].as_f64().unwrap_or(0.0)
-    }
-    fn cpus(&self) -> f64 {
-        self.request["cpus"].as_f64().unwrap_or(1.0)
-    }
-}
-#[derive(Clone, Serialize, Deserialize)]
-struct Command {
-    id: String,
-    worker: String,
-    operation: i32,
-    parameters: Value,
-    done: bool,
-    result: Value,
-    error: Option<String>,
-    #[serde(default)]
-    admitted: bool,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Report {
-    version: u32,
-    machine: String,
-    ready: bool,
-    total_gpus: f64,
-    total_cpus: f64,
-    free_gpus: f64,
-    free_cpus: f64,
-    #[serde(default)]
-    profiles: BTreeMap<String, Value>,
-    #[serde(default)]
-    services: Vec<Value>,
-    #[serde(default)]
-    runs: Vec<RunReport>,
-    #[serde(default)]
-    results: Vec<ResultReport>,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunReport {
-    id: String,
-    lease: String,
-    status: Value,
-    spec: Value,
-    cleaned: bool,
-    #[serde(alias = "artifacts_ready")]
-    logs_ready: bool,
-}
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ResultReport {
-    id: String,
-    result: Value,
-    error: Option<String>,
-}
-struct Worker {
+use fleet_proto::model::v1::{WorkloadTemplate, Job, CommandRecord, NodeReport, ScaleStatus, AppDeployment};
+
+struct NodeSession {
     session: String,
     seen: f64,
-    report: Report,
+    report: NodeReport,
     draining: bool,
 }
-#[derive(Clone, Serialize, Deserialize)]
-struct ServiceIntent {
-    worker: String,
-    service: Value,
-    disabled: bool,
-    #[serde(default)]
-    scale: Option<scaling::ScaleState>,
-}
 #[derive(Default)]
-struct Inner {
-    apps: BTreeMap<String, App>,
-    runs: BTreeMap<String, Run>,
-    commands: BTreeMap<String, Command>,
-    workers: BTreeMap<String, Worker>,
-    services: BTreeMap<String, ServiceIntent>,
+struct WorkloadState {
+    apps: BTreeMap<String, WorkloadTemplate>,
+    jobs: BTreeMap<String, Job>,
+    commands: BTreeMap<String, CommandRecord>,
+    workers: BTreeMap<String, NodeSession>,
+    services: BTreeMap<String, AppDeployment>,
 }
 
-pub struct RunControl {
-    fleet: Arc<Fleet>,
+pub struct WorkloadController {
+    fleet: Arc<Scheduler>,
     admin: String,
     cluster: String,
     dir: PathBuf,
-    inner: Mutex<Inner>,
+    inner: Mutex<WorkloadState>,
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
 }
@@ -209,30 +95,35 @@ pub(crate) fn integrated_worker(service: &Value) -> bool {
         && service["worker_command"].as_array().is_some_and(|command| !command.is_empty())
 }
 
-impl RunControl {
-    pub fn new(fleet: Arc<Fleet>, admin: String, cluster: String) -> anyhow::Result<Self> {
-        let dir = fleet.cfg.data_dir.join("run-control");
+impl WorkloadController {
+    pub fn new(fleet: Arc<Scheduler>, admin: String, cluster: String) -> anyhow::Result<Self> {
+        let dir = fleet.cfg.data_dir.join("workloads");
         for name in ["apps", "jobs", "commands", "artifacts", "services"] {
             fs::create_dir_all(dir.join(name))?;
         }
-        let mut inner = Inner::default();
-        for v in load::<App>(&dir.join("apps"))? {
+        let mut inner = WorkloadState::default();
+        for v in load::<WorkloadTemplate>(&dir.join("apps"))? {
             inner.apps.insert(v.name.clone(), v);
         }
-        for v in load::<Run>(&dir.join("jobs"))? {
-            inner.runs.insert(v.id.clone(), v);
+        for v in load::<Job>(&dir.join("jobs"))? {
+            inner.jobs.insert(v.id.clone(), v);
         }
-        for v in load::<Command>(&dir.join("commands"))? {
+        for v in load::<CommandRecord>(&dir.join("commands"))? {
             inner.commands.insert(v.id.clone(), v);
         }
-        for v in load::<ServiceIntent>(&dir.join("services"))? {
+        for v in load::<AppDeployment>(&dir.join("services"))? {
             inner
                 .services
                 .insert(format!("{}-{}", v.worker, text(&v.service, "name")), v);
         }
         fleet.set_worker_owned_apps(inner.services.values().filter(|s| integrated_worker(&s.service) && !s.disabled)
-            .filter_map(|s| text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)|
-                (text(&s.service, "namespace").into(), tenant.into(), elf.into()))).collect());
+            .filter_map(|s| {
+                    text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)| {
+                            (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
+                            )
+                        })
+                }).collect(),
+        );
         Ok(Self {
             fleet,
             admin,
@@ -246,14 +137,20 @@ impl RunControl {
     fn refresh_worker_owned_apps(&self) {
         self.update_worker_owned_apps(&self.inner.lock());
     }
-    fn update_worker_owned_apps(&self, inner: &Inner) {
+    fn update_worker_owned_apps(&self, inner: &WorkloadState) {
         self.fleet.set_worker_owned_apps(inner.services.values()
             .filter(|s| integrated_worker(&s.service) && !s.disabled)
-            .filter_map(|s| text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)|
-                (text(&s.service, "namespace").into(), tenant.into(), elf.into()))).collect());
+            .filter_map(|s| {
+                    text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)| {
+                            (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
+                            )
+                        })
+                }).collect(),
+        );
     }
 
-    fn check_worker_owner(&self, inner: &Inner, worker: &str, service: &Value) -> anyhow::Result<()> {
+    fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, service: &Value,
+    ) -> anyhow::Result<()> {
         if !integrated_worker(service) { return Ok(()); }
         let namespace = text(service, "namespace");
         let allocations = self.fleet.allocations(namespace);
@@ -265,7 +162,8 @@ impl RunControl {
                 && (!intent.disabled || allocations.iter().any(|a| a.id == format!("service:{other_key}")))
         });
         if owner.is_some() {
-            return Err(fail(409, "this app already has an integrated worker; clean up its owner before moving it"));
+            return Err(fail(409, "this app already has an integrated worker; clean up its owner before moving it",
+            ));
         }
         Ok(())
     }
@@ -284,7 +182,7 @@ impl RunControl {
     ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock();
         if let Some(c) = inner.commands.values().find(|c| {
-            (!c.done || operation == NodeOperation::LaunchRun)
+            (!c.done || operation == NodeOperation::LaunchJob)
                 && c.worker == worker
                 && c.operation == operation as i32
                 && c.parameters == parameters
@@ -309,25 +207,29 @@ impl RunControl {
             }) {
                 return Err(fail(409, "a service operation is already pending"));
             }
-            let intent = ServiceIntent {
+            let intent = AppDeployment {
                 worker: worker.into(),
-                service: parameters["service"].clone(),
+                service: parameters["service"].clone().into(),
                 disabled: parameters["disabled"].as_bool().unwrap_or(true),
                 scale: inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
-                    .and_then(|s| s.scale.as_ref().filter(|_| parameters["scale_id"].is_string() || parameters["scale_cleanup"].as_bool() == Some(true)).cloned()),
+                    .and_then(|s| {
+                        s.scale.as_ref().filter(|_| {
+                                parameters["scale_id"].is_string() || parameters["scale_cleanup"].as_bool() == Some(true)
+                            }).cloned()
+                    }),
             };
             let key = format!("{}-{}", worker, text(&intent.service, "name"));
             self.save("services", &key, &intent)?;
             inner.services.insert(key, intent);
             self.update_worker_owned_apps(&inner);
         }
-        let c = Command {
+        let c = CommandRecord {
             id: uuid::Uuid::new_v4().to_string(),
             worker: worker.into(),
             operation: operation as i32,
-            parameters,
+            parameters: parameters.into(),
             done: false,
-            result: Value::Null,
+            result: Value::Null.into(),
             error: None,
             admitted: operation != NodeOperation::SetService,
         };
@@ -341,10 +243,11 @@ impl RunControl {
         let proofs = self.fleet.status().nodes;
         let inner = self.inner.lock();
         inner.workers.iter().map(|(id, w)| {
-            let busy = inner.runs.values()
+            let busy = inner.jobs.values()
                 .filter(|r| r.worker.as_deref() == Some(id) && !terminal(r.state()))
                 .map(|r| r.id.clone())
-                .chain(proofs.iter().filter(|n| n.machine == w.report.machine).filter_map(|n| n.busy.clone()))
+                .chain(proofs.iter().filter(|n| n.machine == w.report.machine).filter_map(|n| n.busy.clone()),
+                    )
                 .collect::<Vec<_>>();
             let apps = w.report.services.iter().map(|s| {
                 if text(s, "proof_app").is_empty() { text(s, "name") } else { text(s, "proof_app") }
@@ -389,6 +292,18 @@ impl RunControl {
         }
         true
     }
+    fn app_visible(&self, app: &WorkloadTemplate, principal: Option<&Token>, q: &BTreeMap<String, String>,
+    ) -> bool {
+        let selected = principal.and_then(|c| c.tag.as_deref())
+            .or_else(|| q.get("tag").map(String::as_str));
+        let fixed = app.tag.as_deref().or_else(|| app.profile["tag"].as_str());
+        self.visible(&app.namespace, selected, principal, q)
+            && fixed.is_none_or(|tag| {
+                if principal.is_some() { selected == Some(tag) }
+                else { selected.is_none_or(|selected| selected == tag)
+                }
+            })
+    }
     fn scope(
         &self,
         principal: Option<&Token>,
@@ -413,7 +328,7 @@ impl RunControl {
             return Err(fail(403, "another namespace or tag cannot be selected"));
         }
         if let Some(t) = &tag {
-            Fleet::validate_tag(t)?;
+            crate::fleet::Scheduler::validate_tag(t).map_err(|e| fail(400, e.to_string()))?;
         }
         Ok((n.id, tag))
     }
@@ -432,11 +347,11 @@ impl RunControl {
         id: &str,
         c: Option<&Token>,
         q: &BTreeMap<String, String>,
-    ) -> anyhow::Result<Run> {
+    ) -> anyhow::Result<Job> {
         let r = self
             .inner
             .lock()
-            .runs
+            .jobs
             .get(id)
             .filter(|r| !r.purged)
             .cloned()
@@ -450,7 +365,7 @@ impl RunControl {
         tokio::time::timeout(Duration::from_secs(1800), async {
             loop {
                 let notified = self.notify.notified();
-                let results: Option<Vec<Command>> = {
+                let results: Option<Vec<CommandRecord>> = {
                     let i = self.inner.lock();
                     ids.iter()
                         .map(|id| i.commands.get(id).filter(|c| c.done).cloned())
@@ -459,7 +374,7 @@ impl RunControl {
                 if let Some(results) = results {
                     return results
                         .into_iter()
-                        .map(|c| c.error.map_or(Ok(c.result), |e| Err(fail(503, e))))
+                        .map(|c| c.error.map_or(Ok(c.result.into()), |e| Err(fail(503, e))))
                         .collect();
                 }
                 notified.await;
@@ -473,29 +388,34 @@ impl RunControl {
             )
         })?
     }
-    fn app_value(&self, app: &App) -> Value {
-        let resources = app.persistent.then(|| self.app_resources(&app.namespace, &app.name, app.tag.as_deref()));
+    fn app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let resources = app.persistent.then(|| self.app_resources(&app.namespace, &app.name, tag));
         let i = self.inner.lock();
         let jobs: Vec<_> = i
-            .runs
+            .jobs
             .values()
-            .filter(|r| !r.purged && r.profile == app.name && r.namespace == app.namespace)
+            .filter(|r| {
+                !r.purged && r.profile == app.name && r.namespace == app.namespace
+                && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag)
+            })
             .collect();
-        let mut v = app.profile.clone();
+        let mut v = app.profile.0.clone();
         if let Some(resources) = resources {
             v.as_object_mut().unwrap().extend(resources.as_object().unwrap().clone());
         }
-        v["tag"] = json!(app.tag);
+        v["tag"] = json!(app.tag.as_deref().or_else(|| app.profile["tag"].as_str()));
         v["last_submitted_at"] = json!(jobs
             .iter()
             .filter_map(|r| r.status["submitted_at"].as_f64())
             .max_by(f64::total_cmp));
         if app.persistent {
-            v["kind"] = json!("serving");
+            v.as_object_mut().unwrap().remove("kind");
             v["max_gpus"] = json!(
                 app.profile["gpus"].as_f64().unwrap_or(0.0)
                     * app.profile["replicas"].as_f64().unwrap_or(1.0)
             );
+        } else {
+            v["state"] = json!(if app.profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
         }
 
         for (k, value) in [
@@ -582,7 +502,7 @@ impl RunControl {
             }
         }
         if request["machine"].as_array().is_some_and(|a| a.len() > 1) {
-            return Err(fail(422, "one machine may be selected for a local run"));
+            return Err(fail(422, "one machine may be selected for a local job"));
         }
         for key in ["profile", "name", "after", "log", "workdir"] {
             if !request[key].is_null() && !request[key].is_string() {
@@ -617,7 +537,7 @@ impl RunControl {
         if nodes != 1 {
             return Err(fail(
                 422,
-                "cross-machine runs are not supported by local Ray; use one node",
+                "cross-machine jobs are not supported by local Ray; use one node",
             ));
         }
         let gpus = request["gpus"].as_f64().unwrap_or(1.0);
@@ -685,7 +605,7 @@ impl RunControl {
         } else {
             "waiting_quota"
         };
-        let r = Run {
+        let r = Job {
             id: id.clone(),
             lease: uuid::Uuid::new_v4().to_string(),
             owner: c.map_or("admin", |c| c.id.as_str()).into(),
@@ -693,9 +613,9 @@ impl RunControl {
             tag,
             profile: name,
             policy: app.profile,
-            request,
+            request: request.into(),
             worker: None,
-            status: json!({"id":id,"state":state,"submitted_at":now(),"gpus_requested":gpus,"cpus":cpus,"gpu_mem_gb":gpu_mem,"gpus":[],"nodes":1,"priority":0}),
+            status: json!({"id":id,"state":state,"submitted_at":now(),"gpus_requested":gpus,"cpus":cpus,"gpu_mem_gb":gpu_mem,"gpus":[],"nodes":1,"priority":0}).into(),
             quota_held: false,
             stop: None,
             logs_ready: false,
@@ -703,7 +623,7 @@ impl RunControl {
         };
         self.save("jobs", &id, &r)?;
         let v = r.value();
-        self.inner.lock().runs.insert(id, r);
+        self.inner.lock().jobs.insert(id, r);
         self.notify.notify_waiters();
         Ok(v)
     }
@@ -711,13 +631,13 @@ impl RunControl {
         &self,
         worker_id: &str,
         session: &str,
-        report: Report,
+        report: NodeReport,
     ) -> anyhow::Result<Vec<String>> {
         if !is_safe_id(worker_id)
             || worker_id.len() > 63
             || session.len() > 80
             || session.is_empty()
-            || report.version != 1
+            || report.version != 2
         {
             return Err(fail(400, "invalid worker contract"));
         }
@@ -746,6 +666,11 @@ impl RunControl {
                 service["namespace"] = json!(n.id);
             }
         }
+        for profile in report.profiles.values().chain(report.services.iter()) {
+            if let Some(tag) = profile["tag"].as_str() {
+                crate::fleet::Scheduler::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
+            }
+        }
         let mut worker_streams = HashSet::new();
         for service in &report.services {
             if integrated_worker(service) {
@@ -754,7 +679,8 @@ impl RunControl {
                 }
                 if service["disabled"].as_bool() != Some(true)
                     && !worker_streams.insert((text(service, "namespace"), text(service, "proof_app"))) {
-                    return Err(fail(409, "duplicate integrated worker stream in node report"));
+                    return Err(fail(409, "duplicate integrated worker stream in node report",
+                    ));
                 }
             }
         }
@@ -775,7 +701,7 @@ impl RunControl {
             let draining = i.workers.get(worker_id).is_some_and(|w| w.draining);
             i.workers.insert(
                 worker_id.into(),
-                Worker {
+                NodeSession {
                     session: session.into(),
                     seen: now(),
                     report: report.clone(),
@@ -804,19 +730,21 @@ impl RunControl {
                 profile["priority"] = json!(0);
             }
             let persistent = text(&profile, "kind") == "app";
-            let mut app = self.inner.lock().apps.get(&name).cloned().unwrap_or(App {
+            let mut app = self.inner.lock().apps.get(&name).cloned().unwrap_or(WorkloadTemplate {
                 name: name.clone(),
                 namespace: namespace.id.clone(),
                 tag: None,
                 profile,
                 persistent,
                 removed: false,
-                workers: HashSet::new(),
+                workers: Vec::new(),
             });
             if app.namespace != namespace.id {
                 continue;
             }
-            app.workers.insert(worker_id.into());
+            if !app.workers.iter().any(|id| id == worker_id) {
+                app.workers.push(worker_id.into());
+            }
             self.save("apps", &name, &app)?;
             self.inner.lock().apps.insert(name, app);
         }
@@ -833,8 +761,9 @@ impl RunControl {
             let key = format!("{worker_id}-{name}");
             let existing = { self.inner.lock().services.get(&key).cloned() };
             let intent = if let Some(mut intent) = existing {
-                // Worker launch settings are node-admin configuration, not resource-scale overrides.
-                for field in ["worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root"] {
+                // NodeSession launch settings are node-admin configuration, not resource-scale overrides.
+                for field in ["worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root",
+                ] {
                     if observed.get(field).is_some() || intent.service.get(field).is_some() {
                         intent.service[field] = observed[field].clone();
                     }
@@ -846,7 +775,7 @@ impl RunControl {
                 let mut service = observed.clone();
                 service["namespace_ref"] = observed["namespace_ref"].clone();
                 service["namespace"] = json!(namespace.id);
-                let intent = ServiceIntent {
+                let intent = AppDeployment {
                     worker: worker_id.into(),
                     service,
                     disabled: observed["disabled"].as_bool().unwrap_or(false),
@@ -863,10 +792,10 @@ impl RunControl {
                 let id = format!("service:{key}");
                 let replicas = observed["replicas"].as_f64().unwrap_or(1.0);
                 if observed["cleaned"].as_bool() == Some(true) && intent.disabled {
-                    self.fleet.release_run(&namespace.id, &id).await?;
+                    self.fleet.release_job(&namespace.id, &id).await?;
                 } else if observed["ready"].as_bool() == Some(true) {
                     self.fleet
-                        .reserve_run(
+                        .reserve_job(
                             &namespace.id,
                             observed["tag"].as_str(),
                             &id,
@@ -891,36 +820,35 @@ impl RunControl {
                         && text(&c.parameters["service"], "name") == name
                 })
             };
-            if !pending && !intent.scale.as_ref().is_some_and(scaling::ScaleState::pending)
-                && !intent.scale.as_ref().is_some_and(scaling::ScaleState::failed)
+            if !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
+                && !intent.scale.as_ref().is_some_and(ScaleStatus::failed)
                 && !scaling::same_resources(observed, &intent.service)
             {
                 // A node restart or local edit cannot replace the control plane's
                 // desired allocation. Repair drift with the same drain/cleanup fences.
                 let mut repaired = intent.clone();
-                repaired.scale = Some(scaling::ScaleState::new(intent.service.clone(), intent.disabled));
+                repaired.scale = Some(scaling::new_scale(intent.service.clone(), intent.disabled));
                 self.save("services", &key, &repaired)?;
                 self.inner.lock().services.insert(key.clone(), repaired);
                 continue;
             }
-            if mismatch && !pending && !intent.scale.as_ref().is_some_and(scaling::ScaleState::pending) {
+            if mismatch && !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending) {
                 let mut parameters = json!({"service":intent.service,"disabled":intent.disabled});
-                if intent.scale.as_ref().is_some_and(scaling::ScaleState::failed) {
+                if intent.scale.as_ref().is_some_and(ScaleStatus::failed) {
                     parameters["scale_cleanup"] = json!(true);
                 }
                 self.command(
                     worker_id,
                     NodeOperation::SetService,
-                    parameters,
-                )?;
+                    parameters)?;
             }
         }
         self.refresh_worker_owned_apps();
-        for incoming in &report.runs {
+        for incoming in &report.jobs {
             if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
                 continue;
             }
-            let existing = { self.inner.lock().runs.get(&incoming.id).cloned() };
+            let existing = { self.inner.lock().jobs.get(&incoming.id).cloned() };
             let mut r = if let Some(r) = existing {
                 r
             } else {
@@ -932,15 +860,15 @@ impl RunControl {
                 if request["gpus"].is_null() {
                     request["gpus"] = json!(0);
                 }
-                Run {
+                Job {
                     id: incoming.id.clone(),
                     lease: incoming.lease.clone(),
                     owner: incoming.spec["owner"].as_str().unwrap_or("admin").into(),
                     namespace: app.namespace,
                     tag: incoming.spec["tag"].as_str().map(str::to_owned),
                     profile,
-                    policy: incoming.spec["profile"].clone(),
-                    request,
+                    policy: incoming.spec["profile"].clone().into(),
+                    request: request.into(),
                     worker: Some(worker_id.into()),
                     status: incoming.status.clone(),
                     quota_held: false,
@@ -977,7 +905,7 @@ impl RunControl {
             }
             if (terminal(r.state()) || r.state() == "preempted") && incoming.cleaned {
                 if r.quota_held {
-                    self.fleet.release_run(&r.namespace, &r.id).await?;
+                    self.fleet.release_job(&r.namespace, &r.id).await?;
                     r.quota_held = false;
                 }
                 if r.stop.as_deref() == Some("preempt") {
@@ -995,7 +923,7 @@ impl RunControl {
                 && (!incoming.cleaned || !terminal(r.state()) && r.state() != "preempted")
             {
                 self.fleet
-                    .reserve_run(
+                    .reserve_job(
                         &r.namespace,
                         r.tag.as_deref(),
                         &r.id,
@@ -1007,7 +935,7 @@ impl RunControl {
                 r.quota_held = true;
             }
             self.save("jobs", &r.id, &r)?;
-            self.inner.lock().runs.insert(r.id.clone(), r);
+            self.inner.lock().jobs.insert(r.id.clone(), r);
         }
         let mut acknowledged = vec![];
         for result in &report.results {
@@ -1022,10 +950,10 @@ impl RunControl {
                 c.done = true;
                 c.result = result.result.clone();
                 c.error = result.error.clone();
-                if c.operation == NodeOperation::LaunchRun as i32 && c.error.is_some() {
+                if c.operation == NodeOperation::LaunchJob as i32 && c.error.is_some() {
                     let id = text(&c.parameters, "id");
-                    let run = { self.inner.lock().runs.get(id).cloned() };
-                    if let Some(mut r) = run {
+                    let job = { self.inner.lock().jobs.get(id).cloned() };
+                    if let Some(mut r) = job {
                         if r.lease == text(&c.parameters, "lease")
                             && r.worker.as_deref() == Some(worker_id)
                         {
@@ -1033,25 +961,25 @@ impl RunControl {
                             r.status["error"] = json!(c.error);
                             r.status["finished_at"] = json!(now());
                             if c.result["cleaned"].as_bool() == Some(true) && r.quota_held {
-                                self.fleet.release_run(&r.namespace, &r.id).await?;
+                                self.fleet.release_job(&r.namespace, &r.id).await?;
                                 r.quota_held = false;
                                 r.logs_ready = true;
                             }
                             self.save("jobs", &r.id, &r)?;
-                            self.inner.lock().runs.insert(r.id.clone(), r);
+                            self.inner.lock().jobs.insert(r.id.clone(), r);
                         }
                     }
                 }
                 if matches!(
                     NodeOperation::try_from(c.operation),
-                    Ok(NodeOperation::CancelRun | NodeOperation::PreemptRun)
+                    Ok(NodeOperation::CancelJob | NodeOperation::PreemptJob)
                 ) && c.error.is_none()
                     && c.result["cleaned"].as_bool() == Some(true)
                 {
                     let existing = {
                         self.inner
                             .lock()
-                            .runs
+                            .jobs
                             .get(text(&c.parameters, "id"))
                             .cloned()
                     };
@@ -1061,7 +989,7 @@ impl RunControl {
                             && r.stop.is_some()
                         {
                             if r.quota_held {
-                                self.fleet.release_run(&r.namespace, &r.id).await?;
+                                self.fleet.release_job(&r.namespace, &r.id).await?;
                                 r.quota_held = false;
                             }
                             if r.stop.as_deref() == Some("preempt") {
@@ -1075,7 +1003,7 @@ impl RunControl {
                             }
                             r.stop = None;
                             self.save("jobs", &r.id, &r)?;
-                            self.inner.lock().runs.insert(r.id.clone(), r);
+                            self.inner.lock().jobs.insert(r.id.clone(), r);
                         }
                     }
                 }
@@ -1086,7 +1014,7 @@ impl RunControl {
                         && c.result["cleaned"].as_bool() == Some(true)
                     {
                         self.fleet
-                            .release_run(
+                            .release_job(
                                 text(service, "namespace"),
                                 &format!("service:{}-{}", worker_id, text(service, "name")),
                             )
@@ -1118,13 +1046,13 @@ impl RunControl {
             return None;
         }
         let pending = i
-            .runs
+            .jobs
             .values()
             .filter(|r| {
                 r.worker.as_deref() == Some(worker)
                     && r.quota_held
                     && !terminal(r.state())
-                    && !w.report.runs.iter().any(|s| {
+                    && !w.report.jobs.iter().any(|s| {
                         s.id == r.id
                             && s.lease == r.lease
                             && !matches!(text(&s.status, "state"), "queued" | "waiting_quota")
@@ -1154,17 +1082,17 @@ impl RunControl {
             (w.report.free_cpus - pending.1 - services.1).max(0.0),
         ))
     }
-    fn purge(&self, mut r: Run) -> anyhow::Result<Value> {
+    fn purge(&self, mut r: Job) -> anyhow::Result<Value> {
         if !terminal(r.state()) || r.quota_held {
             return Err(fail(409, "wait for confirmed cleanup before purging"));
         }
         r.purged = true;
         self.save("jobs", &r.id, &r)?;
-        self.inner.lock().runs.insert(r.id.clone(), r.clone());
+        self.inner.lock().jobs.insert(r.id.clone(), r.clone());
         if let Some(worker) = &r.worker {
             self.command(
                 worker,
-                NodeOperation::PurgeRun,
+                NodeOperation::PurgeJob,
                 json!({"id":r.id,"lease":r.lease}),
             )?;
         }
@@ -1174,20 +1102,20 @@ impl RunControl {
         }
         Ok(json!({"id":r.id,"purged":true}))
     }
-    async fn stop_run(&self, mut r: Run, preempt: bool) -> anyhow::Result<Run> {
+    async fn stop_job(&self, mut r: Job, preempt: bool) -> anyhow::Result<Job> {
         if terminal(r.state()) && (preempt || !r.quota_held) {
-            return Err(fail(409, "run already finished"));
+            return Err(fail(409, "job already finished"));
         }
         if let Some(worker) = &r.worker {
             r.stop = Some(if preempt { "preempt" } else { "cancel" }.into());
             self.save("jobs", &r.id, &r)?;
-            self.inner.lock().runs.insert(r.id.clone(), r.clone());
+            self.inner.lock().jobs.insert(r.id.clone(), r.clone());
             self.command(
                 worker,
                 if preempt {
-                    NodeOperation::PreemptRun
+                    NodeOperation::PreemptJob
                 } else {
-                    NodeOperation::CancelRun
+                    NodeOperation::CancelJob
                 },
                 json!({"id":r.id,"lease":r.lease}),
             )?;
@@ -1196,7 +1124,7 @@ impl RunControl {
             r.status["finished_at"] = json!(now());
             r.logs_ready = true;
             self.save("jobs", &r.id, &r)?;
-            self.inner.lock().runs.insert(r.id.clone(), r.clone());
+            self.inner.lock().jobs.insert(r.id.clone(), r.clone());
         }
         Ok(r)
     }
@@ -1214,7 +1142,7 @@ impl RunControl {
             let i = self.inner.lock();
             let workers = i.workers.keys().cloned().collect::<Vec<_>>();
             let candidates = i
-                .runs
+                .jobs
                 .values()
                 .filter(|r| {
                     r.quota_held
@@ -1222,7 +1150,7 @@ impl RunControl {
                         && matches!(r.state(), "running" | "waiting_vram" | "retrying")
                 })
                 .filter_map(|r| {
-                    r.worker.as_ref().map(|w| Candidate {
+                    r.worker.as_ref().map(|w| PreemptionCandidate {
                         id: r.id.clone(),
                         namespace: r.namespace.clone(),
                         priority: r.policy["priority"].as_i64().unwrap_or(0) as i32,
@@ -1240,7 +1168,7 @@ impl RunControl {
         let free = workers
             .into_iter()
             .filter_map(|w| {
-                self.capacity(&w).map(|(gpus, cpus)| Capacity {
+                self.capacity(&w).map(|(gpus, cpus)| NodeCapacity {
                     node_ip: w,
                     gpus,
                     cpus,
@@ -1255,20 +1183,20 @@ impl RunControl {
             gpus,
             cpus,
             nodes: 1,
-            pins,
+            pins: pins.into_iter().map(Into::into).collect(),
             now: now(),
             free,
             candidates,
-            quota_demand: Some((gpus, cpus)),
+            quota_demand: Some(crate::quota::Usage { gpus, cpus }),
             exclude_allocation: exclude,
         })?;
-        if !plan.possible || plan.runs.is_empty() {
+        if !plan.possible || plan.jobs.is_empty() {
             return Ok(false);
         }
-        for id in plan.runs {
-            let r = { self.inner.lock().runs.get(&id).cloned() };
+        for id in plan.jobs {
+            let r = { self.inner.lock().jobs.get(&id).cloned() };
             if let Some(r) = r {
-                self.stop_run(r, true).await?;
+                self.stop_job(r, true).await?;
             }
         }
         Ok(true)
@@ -1279,7 +1207,7 @@ impl RunControl {
         let held = {
             self.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| r.quota_held)
                 .cloned()
@@ -1287,7 +1215,7 @@ impl RunControl {
         };
         for r in held {
             self.fleet
-                .reserve_run(
+                .reserve_job(
                     &r.namespace,
                     r.tag.as_deref(),
                     &r.id,
@@ -1300,7 +1228,7 @@ impl RunControl {
         let stopping = {
             self.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| r.stop.is_some() && r.worker.is_some())
                 .cloned()
@@ -1308,9 +1236,9 @@ impl RunControl {
         };
         for r in stopping {
             let operation = if r.stop.as_deref() == Some("preempt") {
-                NodeOperation::PreemptRun
+                NodeOperation::PreemptJob
             } else {
-                NodeOperation::CancelRun
+                NodeOperation::CancelJob
             };
             let parameters = json!({"id":r.id,"lease":r.lease});
             let recorded = {
@@ -1357,7 +1285,7 @@ impl RunControl {
                     let jobs = self
                         .fleet
                         .recent_jobs(
-                            &crate::store::JobFilter {
+                            &crate::store::ProofJobFilter {
                                 namespace: Some(text(s, "namespace").into()),
                                 tenant: Some(tenant.into()),
                                 elf: Some(elf.into()),
@@ -1409,7 +1337,7 @@ impl RunControl {
                 if (text(s, "kind") == "app" || integrated_worker(s))
                     && self
                         .fleet
-                        .reserve_run(
+                        .reserve_job(
                             text(s, "namespace"),
                             s["tag"].as_str(),
                             &format!("service:{}-{}", c.worker, text(s, "name")),
@@ -1430,7 +1358,7 @@ impl RunControl {
         let mut jobs = {
             self.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| {
                     r.worker.is_none()
@@ -1468,14 +1396,14 @@ impl RunControl {
                 r.status["error"] = json!("job exceeds current namespace/tag quota");
                 r.status["finished_at"] = json!(now());
                 self.save("jobs", &r.id, &r)?;
-                self.inner.lock().runs.insert(r.id.clone(), r);
+                self.inner.lock().jobs.insert(r.id.clone(), r);
                 continue;
             }
             if let Some(after) = r.request["after"].as_str() {
                 let state = self
                     .inner
                     .lock()
-                    .runs
+                    .jobs
                     .get(after)
                     .map(|r| r.state().to_owned());
                 if state.as_deref() != Some("succeeded") {
@@ -1484,7 +1412,7 @@ impl RunControl {
                         r.status["error"] = json!("dependency did not succeed");
                         r.status["finished_at"] = json!(now());
                         self.save("jobs", &r.id, &r)?;
-                        self.inner.lock().runs.insert(r.id.clone(), r);
+                        self.inner.lock().jobs.insert(r.id.clone(), r);
                     }
                     continue;
                 }
@@ -1524,7 +1452,7 @@ impl RunControl {
                     r.gpus(),
                     r.cpus(),
                     allowed.into_iter().map(Some).take(1).collect(),
-                    Some(format!("run:{}", r.id)),
+                    Some(format!("job:{}", r.id)),
                 )
                 .await?;
                 continue;
@@ -1536,7 +1464,7 @@ impl RunControl {
             self.save("jobs", &r.id, &r)?;
             if self
                 .fleet
-                .reserve_run(
+                .reserve_job(
                     &r.namespace,
                     r.tag.as_deref(),
                     &r.id,
@@ -1551,7 +1479,7 @@ impl RunControl {
                 r.worker = None;
                 r.status["state"] = json!("waiting_quota");
                 self.save("jobs", &r.id, &r)?;
-                self.inner.lock().runs.insert(r.id.clone(), r.clone());
+                self.inner.lock().jobs.insert(r.id.clone(), r.clone());
                 self.preempt_for(
                     &r.namespace,
                     r.tag.as_deref(),
@@ -1559,53 +1487,53 @@ impl RunControl {
                     r.gpus(),
                     r.cpus(),
                     vec![Some(worker)],
-                    Some(format!("run:{}", r.id)),
+                    Some(format!("job:{}", r.id)),
                 )
                 .await?;
                 continue;
             }
-            self.inner.lock().runs.insert(r.id.clone(), r.clone());
-            self.command(&worker,NodeOperation::LaunchRun,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.inner.lock().jobs.insert(r.id.clone(), r.clone());
+            self.command(&worker,NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
         }
         // A durable assigned job whose process died before command persistence still
         // receives the same lease. Uncertain execution is never moved to another node.
         let assigned = {
             self.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| r.worker.is_some() && r.state() == "queued" && r.stop.is_none())
                 .cloned()
                 .collect::<Vec<_>>()
         };
         for r in assigned {
-            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchRun,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
         }
         Ok(())
     }
-    pub async fn run_dispatcher(self: Arc<Self>) -> anyhow::Result<()> {
+    pub async fn dispatch_loop(self: Arc<Self>) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = self.dispatch().await {
-                tracing::error!(error=%e,"run dispatch retained durable intents");
+                tracing::error!(error=%e,"job dispatch retained durable intents");
             }
         }
     }
 }
 
-pub struct WorkerApi(pub Arc<RunControl>);
+pub struct NodeControlService(pub Arc<WorkloadController>);
 #[tonic::async_trait]
-impl WorkerService for WorkerApi {
+impl WorkerService for NodeControlService {
     async fn heartbeat(
         &self,
         request: tonic::Request<WorkerHeartbeatRequest>,
     ) -> Result<tonic::Response<WorkerHeartbeatResponse>, tonic::Status> {
         let r = request.into_inner();
-        let report: Report = serde_json::from_slice(&r.report_json)
-            .map_err(|_| tonic::Status::invalid_argument("invalid worker report"))?;
+        let report = r.report
+            .ok_or_else(|| tonic::Status::invalid_argument("missing worker report"))?;
         let machine = report.machine.clone();
         let reported = report
-            .runs
+            .jobs
             .iter()
             .filter(|r| r.cleaned && r.logs_ready && terminal(text(&r.status, "state")))
             .map(|r| (r.id.clone(), r.lease.clone()))
@@ -1627,18 +1555,19 @@ impl WorkerService for WorkerApi {
             .map(|c| NodeCommand {
                 id: c.id.clone(),
                 operation: c.operation,
-                parameters_json: serde_json::to_vec(&c.parameters).unwrap(),
+                parameters: Some(c.parameters.clone()),
             })
             .collect();
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
-            proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready),
+            proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
+            ),
             heartbeat_secs: 2,
             commands,
             acknowledged_results: ack,
-            acknowledged_runs: reported
+            acknowledged_jobs: reported
                 .into_iter()
                 .filter(|(id, lease)| {
-                    self.0.inner.lock().runs.get(id).is_some_and(|r| {
+                    self.0.inner.lock().jobs.get(id).is_some_and(|r| {
                         !r.purged
                             && r.lease == *lease
                             && r.worker.as_deref() == Some(r_worker.as_str())
@@ -1685,22 +1614,23 @@ fn path_allowed(path: &str, roots: &[Value]) -> bool {
         })
 }
 
-pub fn router(control: Arc<RunControl>) -> Router {
+pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batch-profiles", "batches", "proof-apps", "internal/runs"] {
+    for root in ["apps", "batch-profiles", "batches", "proof-apps", "internal/jobs",
+    ] {
         router = router
             .route(&format!("/{root}"), any(handle))
             .route(&format!("/{root}/*path"), any(handle));
     }
     router.with_state(control)
 }
-async fn handle(State(s): State<Arc<RunControl>>, request: Request) -> Response {
+async fn handle(State(s): State<Arc<WorkloadController>>, request: Request) -> Response {
     match handle_result(s, request).await {
         Ok(r) => r,
         Err(e) => response_error(e),
     }
 }
-async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<Response> {
+async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::Result<Response> {
     let uri = request.uri().clone();
     let method = request.method().clone();
     let q: BTreeMap<String, String> = reqwest::Url::parse(&format!("http://localhost{uri}"))?
@@ -1735,7 +1665,8 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
         s.scope(Some(c), &q, None)?;
     }
     if batch_profile && parts.len() == 3 && parts[2] == "scale" {
-        return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus"));
+        return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus",
+        ));
     }
     if parts == ["proof-apps", "scale"]
         || (parts.len() == 3 && parts[0] == "apps" && parts[2] == "scale")
@@ -1750,19 +1681,23 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
         } else {
             let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace)
                 .cloned().ok_or_else(|| fail(404, "unknown app"))?;
-            if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus")); }
+            if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
+                )); }
             app.name
         };
         if method == Method::GET {
-            return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str))?).into_response());
+            return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str),
+            )?).into_response());
         }
         if method == Method::PUT {
             let body = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
-            return Ok((StatusCode::ACCEPTED, Json(s.request_scale(&namespace, &app, body).await?)).into_response());
+            return Ok((StatusCode::ACCEPTED, Json(s.request_scale(&namespace, &app, body).await?),
+            ).into_response());
         }
         return Err(fail(405, "GET or PUT required"));
     }
     if method == Method::GET && parts == ["apps"] {
+        if q.contains_key("tag") { s.scope(c, &q, None)?; }
         let apps = {
             s.inner
                 .lock()
@@ -1771,16 +1706,15 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
                 .filter(|a| {
                     !a.removed
                         && a.persistent != batch_profile
-                        && s.visible(&a.namespace, c.and_then(|c| c.tag.as_deref()), c, &q)
-                        && a.tag
-                            .as_deref()
-                            .is_none_or(|tag| c.is_none_or(|c| c.tag.as_deref() == Some(tag)))
-                        && RunControl::require_grant(c, &a.name).is_ok()
+                        && s.app_visible(a, c, &q)
+                        && WorkloadController::require_grant(c, &a.name).is_ok()
                 })
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        return Ok(Json(apps.iter().map(|a| s.app_value(a)).collect::<Vec<_>>()).into_response());
+        let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
+        return Ok(Json(apps.iter().map(|a| s.app_value(a, tag)).collect::<Vec<_>>()).into_response(),
+        );
     }
     if method == Method::POST && parts == ["apps"] {
         if !batch_profile {
@@ -1887,18 +1821,19 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
         if s.inner.lock().apps.get(&name).is_some_and(|a| !a.removed) {
             return Err(fail(409, "app exists"));
         }
-        let app = App {
+        let app = WorkloadTemplate {
             name: name.clone(),
             namespace,
             tag,
-            profile: body,
+            profile: body.into(),
             persistent: false,
             removed: false,
-            workers: HashSet::new(),
+            workers: Vec::new(),
         };
         s.save("apps", &name, &app)?;
         s.inner.lock().apps.insert(name, app.clone());
-        return Ok((StatusCode::CREATED, Json(s.app_value(&app))).into_response());
+        return Ok((StatusCode::CREATED, Json(s.app_value(&app, app.tag.as_deref())),
+        ).into_response());
     }
     if parts.first() == Some(&"apps") && parts.len() >= 2 {
         let name = parts[1];
@@ -1910,17 +1845,13 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
             .filter(|a| !a.removed && a.persistent != batch_profile)
             .cloned()
             .ok_or_else(|| fail(404, "unknown app"))?;
-        RunControl::require_grant(c, name)?;
-        if !s.visible(&app.namespace, c.and_then(|c| c.tag.as_deref()), c, &q)
-            || app
-                .tag
-                .as_deref()
-                .is_some_and(|tag| c.is_some_and(|c| c.tag.as_deref() != Some(tag)))
-        {
+        WorkloadController::require_grant(c, name)?;
+        if !s.app_visible(&app, c, &q) {
             return Err(fail(404, "unknown app"));
         }
+        let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
         if method == Method::GET && parts.len() == 2 {
-            return Ok(Json(s.app_value(&app)).into_response());
+            return Ok(Json(s.app_value(&app, tag)).into_response());
         }
         if method == Method::DELETE && parts.len() == 2 {
             if c.is_some_and(|c| !c.manage_apps) {
@@ -1941,7 +1872,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
             if !persistent_ready_to_remove
                 || s.inner
                     .lock()
-                    .runs
+                    .jobs
                     .values()
                     .any(|r| r.profile == name && (!terminal(r.state()) || r.quota_held))
             {
@@ -1977,7 +1908,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
             app.profile["priority"] = json!(p);
             s.save("apps", name, &app)?;
             s.inner.lock().apps.insert(name.into(), app.clone());
-            return Ok(Json(s.app_value(&app)).into_response());
+            return Ok(Json(s.app_value(&app, tag)).into_response());
         }
         if parts.len() == 3
             && parts[2] == "disabled"
@@ -2036,7 +1967,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
             if !ids.is_empty() {
                 s.wait(&ids).await?;
             }
-            return Ok(Json(s.app_value(&app)).into_response());
+            return Ok(Json(s.app_value(&app, tag)).into_response());
         }
     }
     if method == Method::GET && parts == ["batches"] {
@@ -2049,7 +1980,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
         let mut jobs = {
             s.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| {
                     !r.purged
@@ -2084,7 +2015,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
         let jobs = {
             s.inner
                 .lock()
-                .runs
+                .jobs
                 .values()
                 .filter(|r| {
                     !r.purged
@@ -2121,7 +2052,7 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
             }
             let _ops = s.ops.lock().await;
             let r = s.job(parts[1], c, &q)?;
-            return Ok(Json(s.stop_run(r, preempt).await?.value()).into_response());
+            return Ok(Json(s.stop_job(r, preempt).await?.value()).into_response());
         }
         if method == Method::DELETE && parts.len() == 2 {
             let _ops = s.ops.lock().await;
@@ -2201,12 +2132,13 @@ async fn handle_result(s: Arc<RunControl>, request: Request) -> anyhow::Result<R
     Err(fail(404, "unknown workload API operation"))
 }
 async fn log_response(
-    s: &RunControl,
-    r: &Run,
+    s: &WorkloadController,
+    r: &Job,
     q: &BTreeMap<String, String>,
 ) -> anyhow::Result<Response> {
     if q.get("rank").is_some_and(|rank| rank != "0") {
-        return Err(fail(400, "batch logs are local to one machine; only rank 0 exists"));
+        return Err(fail(400, "batch logs are local to one machine; only rank 0 exists",
+        ));
     }
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let path = s
@@ -2255,7 +2187,7 @@ async fn log_response(
     .into_response())
 }
 async fn internal_logs(
-    s: Arc<RunControl>,
+    s: Arc<WorkloadController>,
     request: Request,
     parts: &[&str],
     q: &BTreeMap<String, String>,
@@ -2269,7 +2201,7 @@ async fn internal_logs(
     ) {
         return Err(fail(401, "internal token required"));
     }
-    if parts.len() != 4 || parts[1] != "runs" {
+    if parts.len() != 4 || parts[1] != "jobs" {
         return Err(fail(404, "unknown artifact"));
     }
     let id = parts[2];
@@ -2277,10 +2209,10 @@ async fn internal_logs(
     let r = s
         .inner
         .lock()
-        .runs
+        .jobs
         .get(id)
         .cloned()
-        .ok_or_else(|| fail(404, "unknown run"))?;
+        .ok_or_else(|| fail(404, "unknown job"))?;
     if request
         .headers()
         .get("x-fleet-worker")
@@ -2344,11 +2276,11 @@ async fn internal_logs(
 }
 
 #[cfg(test)]
-#[path = "runs_api_tests.rs"]
+#[path = "workloads_tests.rs"]
 mod tests;
 
-#[path = "runs_api_scale.rs"]
+#[path = "workloads_scale.rs"]
 mod scaling;
 
-#[path = "runs_api_views.rs"]
+#[path = "workloads_views.rs"]
 mod views;

@@ -21,3 +21,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 time = "0.3"
+tracing.workspace = true
+tracing-subscriber.workspace = true

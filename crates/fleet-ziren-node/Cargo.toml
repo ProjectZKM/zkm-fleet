@@ -11,7 +11,7 @@ required-features = ["prover-runtime"]
 
 [features]
 default = ["prover-runtime"]
-prover-runtime = ["dep:zkm-sdk", "dep:zkm-prover", "dep:zkm-cuda", "dep:zkm-core-machine"]
+prover-runtime = ["dep:zkm-sdk", "dep:zkm-prover", "dep:zkm-cuda"]
 
 [dependencies]
 fleet-proto.workspace = true
@@ -32,7 +32,6 @@ prost.workspace = true
 zkm-sdk = { workspace = true, optional = true }
 zkm-prover = { workspace = true, optional = true }
 zkm-cuda = { workspace = true, optional = true }
-zkm-core-machine = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

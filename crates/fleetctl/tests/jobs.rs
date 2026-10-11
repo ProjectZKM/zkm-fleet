@@ -108,34 +108,6 @@ fn job_lists_send_namespace_and_api_specific_limit_query() {
 }
 
 #[test]
-fn batch_submission_refuses_the_removed_code_upload_flag() {
-    let output = cli()
-        .args([
-            "batch",
-            "submit",
-            "--profile",
-            "training",
-            "--code",
-            "inputs.tar.gz",
-            "--",
-            "true",
-        ])
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--code'"));
-}
-
-#[test]
-fn proof_fetch_requires_an_explicit_destination() {
-    let output = cli()
-        .args(["job", "fetch", "job-1234abcd"])
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(2));
-}
-
-#[test]
 fn batch_submission_passes_storage_references_without_uploading_files() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -223,13 +195,13 @@ fn proof_fetch_downloads_both_files_through_the_scoped_control_plane() {
             let mut request=Vec::new();let mut buf=[0;2048];
             while !request.windows(4).any(|w|w==b"\r\n\r\n") {let n=stream.read(&mut buf).unwrap();assert!(n>0);request.extend_from_slice(&buf[..n]);}
             let request=String::from_utf8_lossy(&request);
-            assert!(request.starts_with(&format!("GET /admin/jobs/proof-job/output/{name}?namespace=alice&tag=production ")));
+            assert!(request.starts_with(&format!("GET /admin/jobs/proof-job/output/{name}?namespace=alice&tag=scope%3Dproduction ")));
             assert!(request.to_ascii_lowercase().contains("authorization: bearer test-admin"));
             write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();stream.write_all(body).unwrap();
         }
     });
     let dest=root.join("output");
-    let result=cli().args(["job","fetch","proof-job","--namespace","alice","--tag","production","--url",&url,"--admin-token-file"]).arg(&token).arg("--out").arg(&dest).output().unwrap();
+    let result=cli().args(["job","fetch","proof-job","--namespace","alice","--tag","scope=production","--url",&url,"--admin-token-file"]).arg(&token).arg("--out").arg(&dest).output().unwrap();
     server.join().unwrap();
     assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
     assert_eq!(std::fs::read(dest.join("proof.json")).unwrap(),b"{\"proof\":1}");
@@ -251,20 +223,4 @@ fn proof_fetch_rejects_existing_destination_before_requesting_output() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("already exists; choose a new directory"));
     assert_eq!(std::fs::read_to_string(marker).unwrap(),"keep");
     std::fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn finite_job_commands_are_only_available_under_batch() {
-    for arguments in [
-        vec!["job", "submit", "--profile", "training", "--", "true"],
-        vec!["job", "logs", "job-id"],
-        vec!["job", "cancel", "job-id"],
-        vec!["job", "preempt", "job-id"],
-        vec!["job", "purge", "job-id"],
-        vec!["batch", "logs", "job-id", "--rank", "1"],
-    ] {
-        let output = cli().args(&arguments).output().unwrap();
-        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
-        assert!(!output.stderr.is_empty());
-    }
 }

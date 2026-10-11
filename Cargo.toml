@@ -40,7 +40,6 @@ alloy-primitives = { version = "1", features = ["k256"] }
 zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
 zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
 zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
-zkm-core-machine = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
 
 [profile.release]
 debug = 1

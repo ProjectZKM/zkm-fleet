@@ -8,6 +8,8 @@ use zkm_sdk::{NetworkProver, ZKMProofKind, ZKMStdin};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     let args: Vec<String> = std::env::args().collect();
     anyhow::ensure!(
         args.len() >= 3,
@@ -31,11 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let (proof, cycles) = prover
         .prove_with_cycles(&elf, stdin, kind, elf_id, Some(Duration::from_secs(3600)))
         .await?;
-    println!(
-        "PROOF_RECEIVED kind={kind:?} cycles={cycles} public_values={} bytes, elapsed={:.2}s, variant={:?}",
-        proof.public_values.as_slice().len(),
-        t.elapsed().as_secs_f64(),
-        std::mem::discriminant(&proof.proof)
-    );
+    tracing::info!(?kind, cycles, public_values_bytes=proof.public_values.as_slice().len(),
+        elapsed_secs=t.elapsed().as_secs_f64(), variant=?std::mem::discriminant(&proof.proof), "proof received");
     Ok(())
 }

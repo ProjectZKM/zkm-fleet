@@ -51,7 +51,7 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
                 if let Some(pos) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&bytes[..pos]).to_ascii_lowercase();
                     assert!(headers.contains("authorization: bearer operator-token\r\n"));
-                    if step == 0 { assert!(headers.starts_with("post /admin/tokens?namespace=alice&tag=research ")); }
+                    if step == 0 { assert!(headers.starts_with("post /admin/tokens?namespace=alice&tag=scope%3dresearch ")); }
                     if step == 1 { assert!(headers.starts_with("get /admin/tokens ")); }
                     if step == 2 { assert!(headers.starts_with("post /admin/tokens ")); }
                     if step == 3 { assert!(headers.starts_with("post /admin/tokens?namespace=alice ")); }
@@ -82,7 +82,7 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     let env_file = dir.0.join("alice.env");
     let mut issue = cli();
     issue.args(["--json", "token", "issue", "--tenant", "eth", "--label", "alice",
-        "--namespace", "alice", "--tag", "research", "--app", "training", "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url,
+        "--namespace", "alice", "--tag", "scope=research", "--app", "training", "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url,
         "--admin-token-file"]).arg(&admin).arg("--server-ca").arg(tls.join("ca.pem")).arg("--out").arg(&env_file);
     let output = issue.output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -90,7 +90,7 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     let token_file = env_file.with_extension("token");
     let token = std::fs::read_to_string(&token_file).unwrap();
     assert_eq!(registered["namespace"], "alice");
-    assert_eq!(registered["tag"], "research");
+    assert_eq!(registered["tag"], "scope=research");
     assert_eq!(registered["apps"], serde_json::json!(["training"]));
     assert_eq!(registered["token_hash"], hex::encode(sha2::Sha256::digest(token.as_bytes())));
     assert!(!String::from_utf8_lossy(&output.stdout).contains(&token));
@@ -126,7 +126,7 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     let tag = Command::new("bash").args(["-c", "set -a; . \"$1\"; printf '%s' \"$FLEET_TAG\"", "tag-test"])
         .arg(dir.0.join("replacement.env")).output().unwrap();
     assert!(tag.status.success());
-    assert_eq!(String::from_utf8(tag.stdout).unwrap(),"research");
+    assert_eq!(String::from_utf8(tag.stdout).unwrap(),"scope=research");
     let untagged_env = dir.0.join("untagged.env");
     let untagged = cli().args(["token","issue","--namespace","alice","--tenant","eth","--app","training",
         "--endpoint","http://127.0.0.1:51000","--url",&url,"--admin-token-file"])
@@ -254,22 +254,22 @@ fn namespace_quota_cli_attaches_unit_caps_and_can_clear_them() {
     assert_eq!(std::fs::read(owner_env.with_extension("ca.pem")).unwrap(), b"gateway trust bundle");
     for args in [vec!["namespace", "quota", "alice", "--gpus", "2", "--cpus", "8"],
                  vec!["namespace", "quota", "alice"],
-                 vec!["namespace","quota","alice","--tag","research","--gpus","1","--cpus","4"],
-                 vec!["namespace","quota","alice","--tag","research","--gpus","2"],
-                 vec!["namespace","quota","alice","--tag","research"]] {
+                 vec!["namespace","quota","alice","--tag","scope=research","--gpus","1","--cpus","4"],
+                 vec!["namespace","quota","alice","--tag","scope=research","--gpus","2"],
+                 vec!["namespace","quota","alice","--tag","scope=research"]] {
         let result = cli().args(args).args(["--url", &url, "--admin-token-file"]).arg(&admin).output().unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
     let requests = server.join().unwrap();
     assert_eq!(requests[0].1["quota"], serde_json::json!({"gpus":0.5,"cpus":4.0}));
     assert_eq!(requests[1].1["manage_apps"], true);
-    assert_eq!(requests[1].1["tag"], "default");
+    assert_eq!(requests[1].1["tag"], "scope=default");
     assert!(requests[2].0.starts_with("put /admin/namespaces/alice/quota "));
     assert_eq!(requests[2].1, serde_json::json!({"gpus":2.0,"cpus":8.0}));
     assert_eq!(requests[3].1, serde_json::json!({"gpus":null,"cpus":null}));
-    assert!(requests[4].0.starts_with("put /admin/namespaces/alice/quota?tag=research "));
+    assert!(requests[4].0.starts_with("put /admin/namespaces/alice/quota?tag=scope%3dresearch "));
     assert_eq!(requests[4].1,serde_json::json!({"gpus":1.0,"cpus":4.0}));
-    assert!(requests[5].0.starts_with("put /admin/namespaces/alice/quota?tag=research "));
+    assert!(requests[5].0.starts_with("put /admin/namespaces/alice/quota?tag=scope%3dresearch "));
     assert_eq!(requests[5].1,serde_json::json!({"gpus":2.0,"cpus":null}));
     assert_eq!(requests[6].1,serde_json::json!({"gpus":null,"cpus":null}));
     let invalid = cli().args(["namespace", "quota", "alice", "--gpus", "NaN", "--url", &url, "--admin-token-file"]).arg(admin).output().unwrap();
