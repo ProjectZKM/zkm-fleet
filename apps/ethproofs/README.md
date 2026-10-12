@@ -1,7 +1,7 @@
 # EthProofs app worker
 
 Fleet pins the worker in the `third_party/reth-processor` Git submodule
-([pinned source](https://github.com/ProjectZKM/reth-processor/tree/a75cb337305eac262a31346b4b3086146fed8297)).
+([pinned source](https://github.com/ProjectZKM/reth-processor/tree/85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9)).
 The worker migration is based on
 [reth-processor PR #23](https://github.com/ProjectZKM/reth-processor/pull/23),
 `chore/ziren-v2-stateless`, which includes the Fleet worker integration and
@@ -13,6 +13,9 @@ If the witness omits contract bytecode, the host fetches it at the parent block,
 checks its hash against the authenticated account, and includes the verified code
 in the guest input. A missing or mismatched response fails preparation and keeps
 the cursor on that block.
+The host RPC provider advertises gzip support and decodes compressed responses
+through reqwest. Witness providers can return compressed or plain JSON; the
+decoded witness, guest ELF and proof semantics remain the same.
 Host and guest Ziren are locked to
 `0dd65a15db3d7bad5cf582c5dbc7492440ea2830`. Initialize it with
 `git submodule update --init --recursive`.
@@ -84,7 +87,7 @@ restarts. Run only one worker for the stream and preserve GOAT's service.
 
 ## Production deployment
 
-The worker is configured on `ant-5090-2` as one replica with six GPUs and 64 CPUs.
+The worker is configured on `ant-5090-2` as one replica with seven GPUs and 126 CPUs.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
 GPU allocation and preparation concurrency are separate settings.
 The external EthProofs client and its old SDK endpoint have been retired.
@@ -92,7 +95,7 @@ GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an operator decision; inspect it with `fleetctl --namespace zkm app`.
 
 The package records worker source commit
-`a75cb337305eac262a31346b4b3086146fed8297` on
+`85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9` on
 `chore/ziren-v2-stateless`, with PR #23 based on `stateless`. The guest was built
 from `fd9589cd63c15c3671c643c1a34de7341a2201ff`; its SHA-256 is
 `334b45b88d6c60e3354e983a5b26ef39b18feee65da828f277a93e646c78c73b`.
@@ -101,7 +104,7 @@ above; package checksums and `source-revision` record the worker separately.
 
 ```bash
 fleetctl --namespace zkm app scale ethproofs/334b45b8 \
-  --gpus 6 --cpus 64 --replicas 1 --node ant-5090-2
+  --gpus 7 --cpus 126 --replicas 1 --node ant-5090-2
 fleetctl --namespace zkm app scale ethproofs/334b45b8
 ```
 
