@@ -1,17 +1,18 @@
 # Maintenance
 
 Use this procedure when changing a node's Ray capacity or replacing installed
-Fleet programs. Ordinary app scaling needs only `fleetctl app scale`; it does
-not require restarting Ray.
+Fleet programs. Ordinary app scaling uses the app owner's token with
+`fleetctl app scale`; it does not require restarting Ray.
 
 ## Pause execution
 
-On the control host:
+On the control host, use administrator credentials for node commands and the
+app owner's token for workload actions:
 
 ```bash
 fleetctl node drain NODE
 fleetctl node NODE
-fleetctl --namespace NAMESPACE app disable APP
+fleetctl --token-file owner.token --namespace NAMESPACE app disable APP
 ```
 
 Disable each enabled app on that node. Wait for active proof/batch jobs to finish
@@ -77,9 +78,9 @@ On the control host:
 ```bash
 fleetctl node NODE
 fleetctl node undrain NODE
-fleetctl --namespace NAMESPACE app scale APP --gpus GPU_COUNT --cpus CPU_COUNT
-fleetctl --namespace NAMESPACE app scale APP
-fleetctl --namespace NAMESPACE app enable APP
+fleetctl --token-file owner.token --namespace NAMESPACE app scale APP --gpus GPU_COUNT --cpus CPU_COUNT
+fleetctl --token-file owner.token --namespace NAMESPACE app scale APP
+fleetctl --token-file owner.token --namespace NAMESPACE app enable APP
 ```
 
 Wait for the node to be ready with the expected total capacity before scaling.
@@ -95,10 +96,12 @@ for log locations and the distinction between node capacity and app allocation.
 
 ## Update Fleet
 
-Deploy one tested Git revision to the control host and every node. Shared models
-come from protobuf, and machine reports use version 2; the scheduler, agent and
-Python bridge must agree. Use the pause procedure above before replacing node
-programs. A program update does not require restarting Ray or changing its pool.
+Deploy a tested Git revision. Changes to shared models or execution protocols
+require updating the control host and nodes together: the scheduler, agent and
+Python bridge must agree on machine report version 2. A compatible change limited
+to scheduler permissions, CLI or MCP needs only a control-host update. Use the
+pause procedure above before replacing node programs. A program update does not
+require restarting Ray or changing its pool.
 
 Build the generic programs from that revision:
 
@@ -132,18 +135,25 @@ Use the image tag already configured by the installation if it differs from
 their configuration changes; rebuilding an image alone does not replace them.
 
 Existing native systemd installations keep their supervisor. For the deployed
-control host, run from the checkout:
+control host, run from the build checkout and select the installed runtime path
+explicitly; a separate worktree does not contain that installation:
 
 ```bash
-FLEET_PREFIX="$PWD/.fleet"
+FLEET_PREFIX="/data/stephen/zkm-fleet/.fleet"
+FLEET_BIN_DIR="${CARGO_TARGET_DIR:-target}/release"
 sudo systemctl stop zkm-fleet-mcp.service zkm-scheduler.service
-install -m 755 target/release/fleet-scheduler target/release/fleetctl \
-  target/release/fleet-mcp "$FLEET_PREFIX/bin/"
+install -m 755 "$FLEET_BIN_DIR/fleet-scheduler" "$FLEET_BIN_DIR/fleetctl" \
+  "$FLEET_BIN_DIR/fleet-mcp" "$FLEET_PREFIX/bin/"
 sudo systemctl start zkm-scheduler.service zkm-fleet-mcp.service
 ```
 
 Verify the gateway's `/healthz`, `fleetctl namespace` and `fleetctl node`.
 When enabled, also check MCP initialization and an authenticated tool call.
+For an owner-permission update, use a temporary workload to check owner metadata
+changes and ordinary-token rejection, and confirm that owner quota updates are
+refused. Remove the smoke workload and revoke temporary tokens afterward. Compare
+namespace quotas and existing app allocations with the pre-update snapshot;
+record the deployed control revision and binary checksums.
 
 ### Execution node
 

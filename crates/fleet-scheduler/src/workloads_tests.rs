@@ -613,11 +613,11 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
             "POST",
             "/batch-profiles",
             Some(&secret),
-            json!({"name":"unsafe","image":"python:3","namespace":ns,"allow":["/etc"]})
+            json!({"name":"mounted","image":"python:3","namespace":ns,"allow":["/data/models"],"priority":17})
         )
         .await
         .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
     assert_eq!(
         call(
@@ -629,7 +629,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         )
         .await
         .status(),
-        StatusCode::FORBIDDEN
+        StatusCode::OK
     );
     assert_eq!(
         call(
@@ -801,6 +801,180 @@ async fn scale_call(c: Arc<WorkloadController>, token: &str, method: &str, path:
         .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap(),
     ).await
 }
+async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tenant: &str, tag: &str, apps: Option<Vec<String>>, manage_apps: bool,
+) -> String {
+    let secret = format!("{seed:02x}").repeat(32);
+    c.fleet.add_user_token(tenant, &format!("{seed:02x}").repeat(16), &format!("{seed:02x}").repeat(20), "test",
+        apps, Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.into()), Some(tag.into()), manage_apps,
+    ).await.unwrap();
+    secret
+}
+
+#[tokio::test]
+async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
+    let (_dir, c, ns) = setup().await;
+    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec!["training".into()]), false).await;
+    let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
+    let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
+    let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
+    let foreign_ns = user_token(&c, &other_ns, 5, "eth", "scope=default", None, true).await;
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batch-profiles",
+        json!({"name":"training","image":"python:3","allow":["/data/models"],"priority":17})).await.status(), StatusCode::CREATED);
+    for token in [&consumer, &restricted, &foreign_tag, &foreign_ns] {
+        for (method, path, body) in [
+            ("PUT", "/batch-profiles/training/priority", json!({"priority":99})),
+            ("PUT", "/batch-profiles/training/disabled", Value::Null),
+            ("DELETE", "/batch-profiles/training/disabled", Value::Null),
+            ("DELETE", "/batch-profiles/training", Value::Null),
+        ] {
+            let status = scale_call(c.clone(), token, method, path, body).await.status();
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{method} {path}: {status}");
+        }
+    }
+    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batch-profiles",
+        json!({"name":"consumer","image":"test"})).await.status(), StatusCode::FORBIDDEN);
+    for body in [json!({"name":"invalid","image":"test","allow":["/"]}),
+        json!({"name":"invalid","image":"test","allow":["/data/../etc"]}),
+        json!({"name":"invalid","image":"test","priority":2147483648_i64}),
+    ] {
+        assert_eq!(scale_call(c.clone(), &owner, "POST", "/batch-profiles", body).await.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batch-profiles/training/disabled", Value::Null).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches",
+        json!({"profile":"training","command":["true"]})).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), &owner, "DELETE", "/batch-profiles/training/disabled", Value::Null).await.status(), StatusCode::OK);
+    let response = scale_call(c.clone(), &consumer, "POST", "/batches",
+        json!({"profile":"training","gpus":0,"cpus":1,"mount":["/data/models:ro"],"command":["true"]})).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(job["priority"], 17);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batch-profiles/training/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+    assert_eq!(c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().policy["priority"], 17);
+    assert_eq!(c.inner.lock().apps["training"].profile["allow"], json!(["/data/models"]));
+    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batches",
+        json!({"profile":"training","gpus":0,"cpus":1,"mount":["/etc:ro"],"command":["true"]})).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/{}/cancel", text(&job, "id")), Value::Null).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c, &owner, "DELETE", "/batch-profiles/training", Value::Null).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() {
+    for proof in [false, true] {
+        let (_dir, c, ns) = setup().await;
+        let elf = "a".repeat(64);
+        c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
+        c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
+        let app = if proof { format!("eth/{elf}") } else { "service".into() };
+        let owner = user_token(&c, &ns, 1, "eth", "scope=default", Some(vec![app.clone()]), true).await;
+        let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
+        let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
+        let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
+        let scale = if proof { format!("/proof-apps/scale?tenant=eth&elf_id={elf}") } else { "/apps/service/scale".into() };
+        let disabled = if proof { format!("/proof-apps/disabled?tenant=eth&elf_id={elf}") } else { "/apps/service/disabled".into() };
+        for token in [&consumer, &restricted, &foreign_tag] {
+            for (method, path, body) in [
+                ("PUT", scale.as_str(), json!({"replicas":1})),
+                ("PUT", disabled.as_str(), Value::Null),
+                ("DELETE", disabled.as_str(), Value::Null),
+            ] {
+                let status = scale_call(c.clone(), token, method, path, body).await.status();
+                assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{method} {path}: {status}");
+            }
+        }
+        assert_eq!(scale_call(c.clone(), &consumer, "GET", &scale, Value::Null).await.status(), StatusCode::OK);
+        for token in [&restricted, &foreign_tag] {
+            let status = scale_call(c.clone(), token, "GET", &scale, Value::Null).await.status();
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND));
+        }
+        c.fleet.create_namespace("other", Quota::default()).await.unwrap();
+        assert_eq!(scale_call(c.clone(), &owner, "PUT", &format!("{scale}{}namespace=other", if proof { "&" } else { "?" }),
+            json!({"replicas":1})).await.status(), StatusCode::FORBIDDEN);
+        if !proof {
+            assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+            assert_eq!(c.inner.lock().apps["service"].profile["priority"], 31);
+        }
+        for (method, disabled_state) in [("PUT", true), ("DELETE", false)] {
+            let control = c.clone();
+            let token = owner.clone();
+            let path = disabled.clone();
+            let request = tokio::spawn(async move { scale_call(control, &token, method, &path, Value::Null).await });
+            let command = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(command) = c.inner.lock().commands.values().find(|v| !v.done).cloned() { break command; }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let mut observed = command.parameters["service"].clone();
+            observed["disabled"] = json!(disabled_state);
+            observed["ready"] = json!(!disabled_state);
+            observed["cleaned"] = json!(disabled_state);
+            finish_service_command(&c, &ns, proof, &command, disabled_state, Some(observed)).await;
+            assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(scale_call(c.clone(), &owner, "PUT", &scale, json!({"replicas":1})).await.status(), StatusCode::ACCEPTED);
+        assert_eq!(scale_call(c, &owner, "PUT", &disabled, Value::Null).await.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[tokio::test]
+async fn proof_app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
+    let (_dir, c, ns) = setup().await;
+    let elf = "a".repeat(64);
+    let other_elf = "b".repeat(64);
+    c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
+    c.fleet.add_app(&ns, "eth", &other_elf, 0).await.unwrap();
+    let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
+    c.fleet.add_app(&other_ns, "eth", &elf, 0).await.unwrap();
+    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), false).await;
+    let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), true).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone(), admin_token: Arc::new("admin".into()) });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let client = reqwest::Client::new();
+    let own = format!("namespace={ns}&tenant=eth&elf_id={elf}");
+    for (method, path) in [
+        (reqwest::Method::PUT, "apps/priority"),
+        (reqwest::Method::PUT, "apps/disabled"),
+        (reqwest::Method::DELETE, "apps/disabled"),
+        (reqwest::Method::DELETE, "apps"),
+    ] {
+        for (token, selector) in [
+            (&consumer, own.clone()),
+            (&owner, format!("namespace={other_ns}&tenant=eth&elf_id={elf}")),
+            (&owner, format!("namespace={ns}&tenant=other&elf_id={elf}")),
+            (&owner, format!("{own}&tag=scope=research")),
+            (&restricted, format!("namespace={ns}&tenant=eth&elf_id={other_elf}")),
+        ] {
+            let response = client.request(method.clone(), format!("{url}/admin/{path}?{selector}&priority=31"))
+                .bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}?{selector}");
+        }
+    }
+    assert_eq!(client.put(format!("{url}/admin/apps/priority?{own}&priority=31")).bearer_auth(&restricted).send().await.unwrap().status(), StatusCode::OK);
+    for (method, disabled) in [(reqwest::Method::PUT, true), (reqwest::Method::DELETE, false)] {
+        let response = client.request(method, format!("{url}/admin/apps/disabled?{own}"))
+            .bearer_auth(&owner).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let app: Value = response.json().await.unwrap();
+        assert_eq!(app["disabled"], disabled);
+        let apps = c.fleet.apps().await.unwrap();
+        assert_eq!(apps.iter().find(|a| a["namespace"] == ns && a["elf_id"] == elf).unwrap()["priority"], 31);
+    }
+    for selector in [String::new(), "?tag=scope=default".into()] {
+        let path = format!("{url}/admin/namespaces/{ns}/quota{selector}");
+        for token in [&owner, &consumer, &restricted] {
+            assert_eq!(client.put(&path).bearer_auth(token).json(&json!({"gpus":1,"cpus":4})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(client.put(&path).bearer_auth("admin").json(&json!({"gpus":1,"cpus":4})).send().await.unwrap().status(), StatusCode::OK);
+    }
+    assert_eq!(client.delete(format!("{url}/admin/apps?{own}")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::OK);
+    assert!(c.fleet.app_known(&other_ns, "eth", &elf));
+    assert_eq!(client.post(format!("{url}/admin/apps?{own}&tag=scope=default&priority=17")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::OK);
+    server.abort();
+}
 fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body).unwrap() }
 async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, command: &CommandRecord, disabled: bool, target: Option<Value>,
 ) {
@@ -813,7 +987,7 @@ async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, c
 }
 
 #[tokio::test]
-async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_profiles() {
+async fn owner_scale_rejects_invalid_capacity_quota_and_one_shot_profiles() {
     use sha2::Digest;
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
@@ -822,11 +996,11 @@ async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_pr
         Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("scope=default".into()),true,
         ).await.unwrap();
     let path=format!("/apps/service/scale?namespace={ns}");
-    assert_eq!(scale_call(c.clone(),&secret,"PUT",&path,json!({"gpus":1})).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(),&secret,"GET",&path,Value::Null).await.status(),StatusCode::OK);
     assert_eq!(scale_call(c.clone(),"cluster","PUT",&path,json!({"gpus":1})).await.status(),StatusCode::UNAUTHORIZED);
     for body in [json!({"replicas":0}),json!({"replicas":65}),json!({"cpus":0}),json!({"gpus":-1}),json!({"image":"other"}),json!({}),
     ] {
-        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,body).await.status(),StatusCode::BAD_REQUEST);
+        assert_eq!(scale_call(c.clone(),&secret,"PUT",&path,body).await.status(),StatusCode::BAD_REQUEST);
     }
     for (body, requested) in [
         (json!({"gpus":2}), "requested 4 GPUs and 4 CPUs (replicas: 2)",
@@ -836,7 +1010,7 @@ async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_pr
         (json!({"replicas":5}), "requested 5 GPUs and 10 CPUs (replicas: 5)",
         ),
     ] {
-        let response = scale_call(c.clone(), "admin", "PUT", &path, body).await;
+        let response = scale_call(c.clone(), &secret, "PUT", &path, body).await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let message = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec(),
         ).unwrap();
@@ -848,7 +1022,7 @@ async fn scale_requires_admin_and_rejects_invalid_capacity_quota_and_one_shot_pr
     c.fleet.set_quota(&ns,Quota{gpus:Some(1.0),cpus:Some(8.0),
             },
         ).await.unwrap();
-    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":3})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(scale_call(c.clone(),&secret,"PUT",&path,json!({"cpus":3})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
     let other=c.fleet.create_namespace("other",Quota::default()).await.unwrap();
     assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/scale?namespace={}",other.id),json!({"replicas":1})).await.status(),StatusCode::NOT_FOUND);
     assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/training/scale?namespace={ns}"),json!({"replicas":1})).await.status(),StatusCode::BAD_REQUEST);

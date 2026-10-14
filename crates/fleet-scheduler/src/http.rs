@@ -1,5 +1,5 @@
 //! HTTP: public values for the SDK (`/{proof_id}/wrap/public_values.bin`), health,
-//! and the fleetctl API: operators administer, scoped users read their own jobs.
+//! and the fleetctl API: operators manage quotas, owners manage scoped app policy.
 
 use std::sync::Arc;
 
@@ -87,9 +87,9 @@ async fn authorize_http(
                     !parts[0].is_empty() && (parts.len() == 1 ||
                         (parts.len() == 3 && parts[1] == "output" && matches!(parts[2], blobs::PROOF | blobs::PUBLIC_VALUES)))
                 }));
-        let create_app = req.method() == axum::http::Method::POST && path == "/apps" && c.manage_apps;
-        let delete_app = req.method() == axum::http::Method::DELETE && path == "/apps" && c.manage_apps;
-        if !read_scoped && !create_app && !delete_app && !(path == "/proof-jobs" && req.method() == axum::http::Method::POST) {
+        let manage_app = c.manage_apps && matches!((req.method().as_str(), path),
+            ("POST" | "DELETE", "/apps") | ("PUT" | "DELETE", "/apps/disabled") | ("PUT", "/apps/priority"));
+        if !read_scoped && !manage_app && !(path == "/proof-jobs" && req.method() == axum::http::Method::POST) {
             return StatusCode::FORBIDDEN.into_response();
         }
         Some(c)
@@ -366,6 +366,18 @@ fn app_parts(key: &ProofAppRequest, fleet: &Scheduler) -> Result<(String, String
     }
 }
 
+fn authorize_app_management(c: Option<&Token>, key: &ProofAppRequest, namespace: &str, tenant: &str, elf: &str,
+) -> Result<(), Response> {
+    if let Some(c) = c {
+        if !c.manage_apps || c.namespace.as_deref() != Some(namespace) || c.tenant != tenant
+            || key.tag.as_deref().is_some_and(|tag| c.tag.as_deref() != Some(tag))
+            || c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{tenant}/{elf}"))) {
+            return Err(StatusCode::FORBIDDEN.into_response());
+        }
+    }
+    Ok(())
+}
+
 /// An app action's outcome: its JSON, a refusal with its status, or 500.
 fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
     match r {
@@ -382,12 +394,7 @@ async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<T
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {
-            if let Some(c) = c {
-                if c.namespace.as_deref() != Some(n.as_str()) || c.tenant != t
-                    || k.tag.as_deref().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
-                    return StatusCode::FORBIDDEN.into_response();
-                }
-            }
+            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
             let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
                 Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
             };
@@ -403,8 +410,8 @@ async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Toke
     if let Some(c) = c {
         if !c.manage_apps { return StatusCode::FORBIDDEN.into_response(); }
         match app_parts(&k, &s.fleet) {
-            Ok((namespace, tenant, _)) if c.namespace.as_deref() == Some(namespace.as_str())
-                && k.tag.as_deref() == c.tag.as_deref() && tenant == c.tenant => {}
+            Ok((namespace, tenant, elf)) if k.tag.as_deref() == c.tag.as_deref()
+                && authorize_app_management(Some(&c), &k, &namespace, &tenant, &elf).is_ok() => {}
             _ => return StatusCode::FORBIDDEN.into_response(),
         }
     }
@@ -414,21 +421,24 @@ async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Toke
     }
 }
 
-async fn set_app_priority(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn set_app_priority(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
 ) -> Response {
     let Some(priority) = k.priority else { return (StatusCode::BAD_REQUEST, "priority is required").into_response(); };
     match app_parts(&k, &s.fleet) {
-        Ok((n,t,e)) if s.fleet.app_known(&n,&t,&e) => {
+        Ok((n,t,e)) => {
+            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
+            if !s.fleet.app_known(&n, &t, &e) { return StatusCode::NOT_FOUND.into_response(); }
             app_outcome(s.fleet.set_app_priority(&n,&t,&e,priority).await)
         }
-        Ok(_) => StatusCode::NOT_FOUND.into_response(), Err(r) => r,
+        Err(r) => r,
     }
 }
 
-async fn disable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn disable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {
+            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
             let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
                 Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
             };
@@ -438,10 +448,11 @@ async fn disable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::
     }
 }
 
-async fn enable_app(State(s): State<HttpState>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn enable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {
+            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
             let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
                 Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
             };

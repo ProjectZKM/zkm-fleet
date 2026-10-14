@@ -342,6 +342,22 @@ impl WorkloadController {
         }
         Ok(())
     }
+    fn require_management(c: Option<&Token>, name: &str) -> anyhow::Result<()> {
+        if c.is_some_and(|c| !c.manage_apps) {
+            return Err(fail(403, "app management grant required"));
+        }
+        Self::require_grant(c, name)
+    }
+    fn require_service_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(c) = c {
+            let (_, deployment) = self.scale_service(namespace, app, node)?;
+            if deployment.service["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
+                return Err(fail(403, "another tag cannot be selected"));
+            }
+        }
+        Ok(())
+    }
     fn job(
         &self,
         id: &str,
@@ -1671,26 +1687,32 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     if parts == ["proof-apps", "scale"]
         || (parts.len() == 3 && parts[0] == "apps" && parts[2] == "scale")
     {
-        if c.is_some() { return Err(fail(403, "administrator required")); }
-        let (namespace, _) = s.scope(None, &q, None)?;
+        let (namespace, _) = s.scope(c, &q, None)?;
         let app = if parts[0] == "proof-apps" {
             let tenant = q.get("tenant").ok_or_else(|| fail(400, "tenant required"))?;
             let elf = q.get("elf_id").ok_or_else(|| fail(400, "elf_id required"))?;
+            if c.is_some_and(|c| c.tenant != *tenant) {
+                return Err(fail(403, "another tenant cannot be selected"));
+            }
             if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown proof app")); }
             format!("{tenant}/{elf}")
         } else {
-            let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace)
+            let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace && s.app_visible(a, c, &q))
                 .cloned().ok_or_else(|| fail(404, "unknown app"))?;
             if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
                 )); }
             app.name
         };
+        WorkloadController::require_grant(c, &app)?;
         if method == Method::GET {
+            s.require_service_scope(c, &namespace, &app, q.get("node").map(String::as_str))?;
             return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str),
             )?).into_response());
         }
         if method == Method::PUT {
-            let body = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
+            WorkloadController::require_management(c, &app)?;
+            let body: fleet_proto::model::v1::ScaleRequest = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
+            s.require_service_scope(c, &namespace, &app, body.node.as_deref())?;
             return Ok((StatusCode::ACCEPTED, Json(s.request_scale(&namespace, &app, body).await?),
             ).into_response());
         }
@@ -1733,15 +1755,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if !body["image"].is_string() {
             return Err(fail(400, "image is required"));
         }
-        if c.is_some()
-            && (body["allow"].as_array().is_some_and(|a| !a.is_empty())
-                || body["priority"].as_i64().is_some_and(|p| p != 0))
-        {
-            return Err(fail(
-                403,
-                "host mount roots and app priority require an administrator",
-            ));
-        }
+        WorkloadController::require_management(c, &name)?;
         let allowed = [
             "name",
             "namespace",
@@ -1887,9 +1901,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(json!({"name":name,"removed":true})).into_response());
         }
         if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {
-            if c.is_some() {
-                return Err(fail(403, "administrator required"));
-            }
+            WorkloadController::require_management(c, name)?;
             let body: Value =
                 serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
             let p = body["priority"]
@@ -1914,9 +1926,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             && parts[2] == "disabled"
             && matches!(method, Method::PUT | Method::DELETE)
         {
-            if c.is_some() {
-                return Err(fail(403, "administrator required"));
-            }
+            WorkloadController::require_management(c, name)?;
             let disabled = method == Method::PUT;
             let ids = {
                 let _ops = s.ops.lock().await;
@@ -2078,6 +2088,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Err(fail(403, "another tenant cannot be selected"));
         }
         let key = format!("{tenant}/{elf}");
+        WorkloadController::require_grant(c, &key)?;
         let services = {
             let i = s.inner.lock();
             i.workers
@@ -2088,6 +2099,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                         .iter()
                         .filter(|svc| {
                             text(svc, "proof_app") == key && text(svc, "namespace") == namespace
+                                && c.is_none_or(|c| svc["tag"].as_str().is_none_or(|tag| c.tag.as_deref() == Some(tag)))
                         })
                         .map(|svc| (w.clone(), svc.clone()))
                 })
@@ -2100,9 +2112,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(json!({"namespace":namespace,"tenant":tenant,"elf_id":elf,"servers":services.iter().map(|(_,s)|text(s,"name")).collect::<Vec<_>>()})).into_response());
         }
         if parts[1] == "disabled" && matches!(method, Method::PUT | Method::DELETE) {
-            if c.is_some() {
-                return Err(fail(403, "administrator required"));
-            }
+            WorkloadController::require_management(c, &key)?;
             let disabled = method == Method::PUT;
             let ids = {
                 let _ops = s.ops.lock().await;

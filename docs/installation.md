@@ -34,8 +34,11 @@ deploy/install.sh control --public-url https://fleet.example:8905 \
 ```
 
 Omit `--no-mcp` to enable MCP at `/mcp`. The installer creates credentials and puts
-`fleetctl` on the control host's PATH. Operator commands use the administrator
-token; namespace users receive their own scoped tokens.
+`fleetctl` on the control host's PATH. Administrators use their token for namespace
+quotas, access and node administration. Workload owners receive scoped owner
+tokens (`manage_apps: true`) for app and batch metadata, priority, mount roots,
+enable/disable and scaling. App-granted user tokens can use workloads but cannot
+change their metadata. See [workload ownership](reference.md#workload-ownership).
 
 Use [fleet.example.yaml](../deploy/fleet.example.yaml) for the scheduler settings
 and proof tenant configuration. Fleet creates schema 14 for a fresh database;

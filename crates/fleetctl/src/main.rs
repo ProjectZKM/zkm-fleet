@@ -95,7 +95,7 @@ enum AppCmd {
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
     /// The app takes jobs again.
     Enable { name: String },
-    /// Administrator-only: change a proof or persistent app's resources through the control plane.
+    /// App owners: change a proof or persistent app's resources within namespace quotas.
     /// Without resource flags, inspect its desired resources and scaling status.
     Scale {
         name: String,
@@ -380,7 +380,7 @@ struct AddBatch {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     shm_gb: Option<u32>,
-    /// Approved absolute mount root for this profile (administrator only).
+    /// Absolute mount root allowed by the profile owner.
     #[arg(long)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
@@ -471,7 +471,7 @@ enum BatchCmd {
     Disable { name: String },
     /// Accept new jobs for this profile again.
     Enable { name: String },
-    /// Administrator-only: set the priority inherited by new jobs.
+    /// App owners: set the priority inherited by new jobs.
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
     /// Delete a profile after all accepted jobs finish; keep job history.
     Delete { name: String, #[arg(long)] yes: bool },

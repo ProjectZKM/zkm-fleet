@@ -74,7 +74,7 @@ Fleet supplies the scoped identity, state root, and loopback GPU endpoint.
 
 A new guest has a new app identity. Stage its service disabled and wait for the
 node heartbeat to advertise it. Register it with
-`fleetctl --namespace zkm app add ethproofs/ --elf /path/to/program.elf`.
+`fleetctl --token-file ethproofs-owner.token --namespace zkm app add ethproofs/ --elf /path/to/program.elf`.
 Use a new service name and state directory. Keep a temporary rollback package
 until proving and reporting are verified, then remove retired deployment records
 according to the app's retention policy. Keep GOAT's service and image unchanged.
@@ -87,12 +87,13 @@ restarts. Run only one worker for the stream and preserve GOAT's service.
 
 ## Production deployment
 
-The worker is configured on `ant-5090-2` as one replica with seven GPUs and 126 CPUs.
+The worker is configured on `ant-5090-2` as one replica with six GPUs and 96 CPUs.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
 GPU allocation and preparation concurrency are separate settings.
 The external EthProofs client and its old SDK endpoint have been retired.
 GOAT keeps its existing endpoint and configuration. App enable/disable state is
-an operator decision; inspect it with `fleetctl --namespace zkm app`.
+an app-owner decision; inspect it with `fleetctl --namespace zkm app` using an
+owner token for the `ethproofs` tenant in namespace `zkm`.
 
 The package records worker source commit
 `85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9` on
@@ -103,9 +104,9 @@ Worker updates preserve this guest and app identity. The image digest is listed
 above; package checksums and `source-revision` record the worker separately.
 
 ```bash
-fleetctl --namespace zkm app scale ethproofs/334b45b8 \
-  --gpus 7 --cpus 126 --replicas 1 --node ant-5090-2
-fleetctl --namespace zkm app scale ethproofs/334b45b8
+fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8 \
+  --gpus 6 --cpus 96 --replicas 1 --node ant-5090-2
+fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8
 ```
 
 Inspect `~/app/fleet/work/apps/ethproofs/v5-worker/checkpoint.json` for the saved
@@ -149,7 +150,8 @@ Source entry points are `bin/eth-proofs/src/main.rs` (pipeline), `latest.rs`
 Publish source changes first, then commit the exact new gitlink in Fleet.
 Deployment and CI must use the committed pin, never `git submodule update --remote`.
 
-For allocation changes, use the administrator CLI. For node capacity or installed
+For allocation changes, use `fleetctl app scale` with the app owner's token.
+Namespace and tag quotas remain administrator-managed. For node capacity or installed
 Fleet changes, follow the [maintenance procedure](../../docs/maintenance.md).
 After any restart, check that the first proof equals the saved next block, outputs
 are checksummed, reports are acknowledged, and the outbox drains. A witness or

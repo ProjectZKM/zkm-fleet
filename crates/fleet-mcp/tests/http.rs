@@ -181,10 +181,14 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .contains("--json job --limit 20 --type batch"));
 
     for (id, name, arguments, expected) in [
+        (10, "fleet_batch_profiles_list", json!({}), "--json batch list"),
+        (11, "fleet_batch_profile_get", json!({"name":"training"}), "--json batch show training"),
         (7, "fleet_batches_list", json!({"profile":"training","active":true,"limit":3}),
             "--json batch --limit 3 --app training --active"),
         (8, "fleet_batch_submit", json!({"profile":"training","gpus":1,"cpus":4,"command":["python","train.py"]}),
             "--json batch submit --app training --gpus 1 --cpus 4 -- python train.py"),
+        (12, "fleet_batch_submit", json!({"profile":"training","mounts":["/approved:ro"],"command":["python","train.py"]}),
+            "--json batch submit --app training --mount /approved:ro -- python train.py"),
         (9, "fleet_batch_logs", json!({"id":"training-job","lines":25}),
             "--json batch logs training-job --lines 25"),
     ] {

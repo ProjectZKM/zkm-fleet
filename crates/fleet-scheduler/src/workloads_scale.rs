@@ -1,4 +1,4 @@
-//! Administrator-owned desired resource settings, reconciled through unary heartbeats.
+//! App-owner desired resource settings, reconciled through unary heartbeats.
 use super::*;
 
 use fleet_proto::model::v1::{ScalePhase as Phase, ScaleRequest, ScaleStatus};
@@ -49,7 +49,7 @@ impl WorkloadController {
         Ok(())
     }
 
-    fn scale_service(
+    pub(super) fn scale_service(
         &self,
         namespace: &str,
         app: &str,

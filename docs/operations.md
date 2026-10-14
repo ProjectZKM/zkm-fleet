@@ -6,7 +6,11 @@ needed for app scaling.
 
 Run these on the control host. Remote operators set `FLEET_URL` to the HTTPS
 gateway and `FLEET_ADMIN_TOKEN_FILE` to their private administrator token file.
-Namespace users use `FLEET_TOKEN_FILE`. Add `--json` for structured output.
+Namespace users use `FLEET_TOKEN_FILE`. Owner tokens (`manage_apps: true`) manage
+app and batch metadata; ordinary app tokens submit and inspect permitted jobs.
+Node and namespace administration require the administrator token. Clear
+`FLEET_TOKEN_FILE` when switching to administrator commands: it takes precedence
+over `FLEET_ADMIN_TOKEN_FILE`. Add `--json` for structured output.
 
 ## Namespaces and access
 
@@ -58,26 +62,30 @@ CPU units are logical CPUs. Ray's configured pool can be smaller than the hardwa
 configured allocations, including disabled apps; they do not show live utilization.
 Namespace and optional tag quotas further limit allocation.
 
-For example, allocate six GPUs and 64 CPUs to the existing EthProofs worker:
+For example, set the EthProofs worker's allocation to six GPUs and 96 CPUs using
+an owner token for the `ethproofs` tenant in namespace `zkm`:
 
 ```bash
-fleetctl --namespace zkm app scale ethproofs/334b45b8 \
-  --gpus 6 --cpus 64 --replicas 1 --node ant-5090-2
+fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8 \
+  --gpus 6 --cpus 96 --replicas 1 --node ant-5090-2
 
 # Read desired/observed allocation and operation status.
-fleetctl --namespace zkm app scale ethproofs/334b45b8
+fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8
+# Node inspection uses administrator credentials.
 fleetctl node ant-5090-2
 ```
 
-Scaling requires administrator access and an online, ready node. Requests are
-asynchronous; inspect until the state is `complete` or `failed`. Omitted resource
-flags retain their current values. Disabled apps stay disabled. Use `--node` to
+Scaling requires app-owner access (`manage_apps: true`) and an online, ready node.
+The token must cover the app's namespace, tenant, tag and app grant; namespace and
+tag quotas remain administrator-managed. Requests are asynchronous; inspect until
+the state is `complete` or `failed`. Omitted resource flags retain their current
+values. Disabled apps stay disabled. Use `--node` to
 select a machine when the app has multiple deployments.
 
 Integrated EthProofs uses exactly one replica. SDK-driven proof apps and serving
 apps may use multiple replicas; resources are per replica. The current
 `ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 6 GPUs
-and 64 CPUs, 2 GPUs and 64 CPUs remain for other allocations.
+and 96 CPUs, 2 GPUs and 32 CPUs remain for other allocations.
 Existing allocations are accounted for when replacing an app's own allocation.
 
 To change the node pool, edit `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in
@@ -90,7 +98,13 @@ increase node capacity. Follow the [node maintenance procedure](maintenance.md).
 Apps and jobs show `TAG` and `STATE`. App state reports service readiness;
 job state reports an execution's progress. App details retain replica settings
 and job counts. Tags use `key=value`, for example `scope=default` or `team=research`.
-The same namespace/tag selectors work for apps, batch profiles and jobs:
+The same namespace/tag selectors work for apps, batch profiles and jobs.
+
+Owner tokens can register and remove workloads, set priority, enable/disable them
+and scale apps within their grants. Batch owners set image, environment, resource
+policy and allowed mount roots when registering a profile. Profile disabling
+blocks new submissions; accepted batch jobs continue. App disabling drains the
+configured services before releasing their reservations.
 
 ```bash
 fleetctl --namespace zkm --tag scope=default app
@@ -102,8 +116,8 @@ fleetctl --namespace pi --tag team=research job
 fleetctl node
 fleetctl --namespace zkm app
 fleetctl --namespace zkm job
-fleetctl --namespace zkm app disable ethproofs/334b45b8
-fleetctl --namespace zkm app enable ethproofs/334b45b8
+fleetctl --token-file ethproofs-owner.token --namespace zkm app disable ethproofs/334b45b8
+fleetctl --token-file ethproofs-owner.token --namespace zkm app enable ethproofs/334b45b8
 ```
 
 Disabling releases the app's execution resources after cleanup. Durable app data
@@ -115,10 +129,15 @@ placements; it does not pause an integrated app's own block stream.
 For a batch, first register reusable configuration, then submit and inspect jobs:
 
 ```bash
-fleetctl --namespace pi batch add gpu-test --image nvidia/cuda:12.8.0-base-ubuntu22.04
-fleetctl --namespace pi batch submit --app gpu-test --gpus 1 --cpus 2 -- nvidia-smi
-fleetctl --namespace pi batch logs JOB_ID -f
-fleetctl --namespace pi batch cancel JOB_ID
+fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
+  --image nvidia/cuda:12.8.0-base-ubuntu22.04 --allow /data/models --priority 10
+fleetctl --token-file pi-owner.token batch list
+fleetctl --token-file pi-owner.token batch show gpu-test
+fleetctl --token-file pi-owner.token batch priority gpu-test 20
+fleetctl --token-file pi-owner.token batch submit --app gpu-test --gpus 1 --cpus 2 \
+  --mount /data/models:ro -- nvidia-smi
+fleetctl --token-file pi-owner.token batch logs JOB_ID -f
+fleetctl --token-file pi-owner.token batch cancel JOB_ID
 ```
 
 The namespace must already exist. See the [reference](reference.md#administrator-workflow)

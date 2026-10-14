@@ -270,7 +270,8 @@ GPU/CPU quota, described below.
 
 Every app belongs to an existing namespace. An administrator creates the namespace
 and issues its owner token for the built-in `scope=default` tag. The owner can then
-register proof apps and batch profiles inside that namespace and submit jobs under that tag:
+register proof apps and batch profiles, manage their metadata and submit jobs
+inside that namespace and tag:
 
 ```bash
 fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
@@ -279,6 +280,42 @@ fleetctl namespace create alice --tenant eth --gpus 2 --cpus 16 \
 fleetctl --token-file alice.token --namespace alice --tag scope=default batch add training --image IMAGE
 fleetctl --token-file alice.token --namespace alice --tag scope=default app add eth/FULL_ELF_SHA256
 ```
+
+Owner tokens carry `manage_apps: true`. Metadata changes still enforce the
+token's namespace, tenant for proof apps, tag and any explicit app grants.
+Tokens with app grants alone can submit and inspect permitted jobs and read
+granted scaling status; they cannot change workload metadata.
+
+| Action | Required access |
+|---|---|
+| Namespace creation, token issuance, namespace/tag quotas and node administration | Administrator token |
+| Proof app registration, removal, priority and enable/disable | Owner token for the namespace and proof tenant |
+| Batch profile creation, mount roots, priority, enable/disable and removal | Owner token for the namespace, tag and profile |
+| App GPU/CPU and replica changes | Owner token for the app; namespace/tag quotas and node capacity still apply |
+| Job submission and inspection; batch logs and cancellation | App-granted or owner token within its scope |
+
+Batch image, environment, resource policy and mount roots are supplied when
+registering a profile. Existing profiles have priority and enable/disable
+endpoints; changing other fields requires removing the profile after its jobs
+finish and registering it again. Serving deployments start from node
+`services.yaml`; owners manage their lifecycle, priority and allocation through
+the control plane.
+
+Owner metadata routes use the same authenticated API as the CLI:
+
+| Workload | Routes |
+|---|---|
+| Proof registration | `POST` / `DELETE /admin/apps` and `PUT /admin/apps/priority`, with namespace, tenant and full `elf_id` selectors |
+| Proof enable/disable | `PUT` / `DELETE /admin/apps/disabled`; dedicated services use `PUT` / `DELETE /proof-apps/disabled` |
+| Batch profiles | `POST /batch-profiles`, `DELETE /batch-profiles/NAME`, `PUT /batch-profiles/NAME/priority`, `PUT` / `DELETE /batch-profiles/NAME/disabled` |
+| Persistent apps | `PUT /apps/NAME/priority`, `PUT` / `DELETE /apps/NAME/disabled`, `DELETE /apps/NAME` |
+| Allocation and status | `PUT` / `GET /apps/NAME/scale`, or `/proof-apps/scale` with tenant and full `elf_id` selectors |
+
+The `/admin` prefix on proof metadata routes does not require an administrator
+token for these owner actions. Namespace and tag quota endpoints remain
+administrator-only. Disabling a batch profile blocks new submissions and lets
+accepted jobs continue; disabling an app drains its services before releasing
+their reservations.
 
 Omitting the namespace during app creation is refused; an unknown namespace is not
 automatically created. Batch profile creation can infer the namespace from a verified
@@ -295,7 +332,7 @@ registrations persist the ID. A configured batch profile or persistent `kind: ap
 entry can also specify `namespace: alice`; its namespace is verified before launch.
 The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
-Host mount roots require administrator approval. Submit batch jobs through
+Owners configure host mount roots for their batch profiles. Submit batch jobs through
 `fleetctl batch submit` or `POST /batches`; their reported type is `batch`.
 
 ### GPU and CPU quotas
@@ -354,7 +391,7 @@ A proof stays queued until an eligible replica fits both remaining quotas. A tim
 out or disconnected proof keeps its reservation and rejoins its original prover;
 it cannot fail over to another prover while the original execution is uncertain.
 The replica's entire allocation must fit; an active proof keeps its allocation.
-Administrators can use `fleetctl app scale` to adjust the app's GPU/CPU units
+App owners can use `fleetctl app scale` to adjust the app's GPU/CPU units
 between proofs to fit user quotas. Persistent service replicas reserve their configured GPU/CPU units
 against the namespace and tag they are assigned to. Shared infrastructure
 configured in the `system` namespace is accounted there.
@@ -369,12 +406,14 @@ with an explanation. Operators can inspect reservations, including each tag, thr
 
 ### App priority and preemption
 
-Administrators set app policy; users cannot supply a job priority:
+App owners set workload priority with their owner token. Individual job
+submissions inherit this policy and cannot supply a separate priority:
 
 ```bash
-fleetctl --namespace alice batch add training --image python:3 --allow /srv/training --priority 10
-fleetctl --namespace alice batch priority training 20
-fleetctl --namespace alice app priority eth/FULL_ELF_ID 100
+fleetctl --token-file alice.token --namespace alice batch add training \
+  --image python:3 --allow /srv/training --priority 10
+fleetctl --token-file alice.token batch priority training 20
+fleetctl --token-file alice.token --namespace alice app priority eth/FULL_ELF_SHA256 100
 ```
 
 Proof and batch jobs retain the priority inherited when submitted, including across
@@ -499,9 +538,9 @@ Resubmission within a tag returns the existing job without replacing input. Refe
 Batch job IDs and directories retain their existing flat layout, with namespace
 and tag ownership recorded in each batch spec. Namespace names are never host paths.
 App owners prepare batch inputs in shared or object storage and manage access to
-that storage. The app reads inputs directly using its own storage client, or an
-administrator-approved mount. Fleet passes command arguments and environment
-variables to the app. The app writes outputs and checkpoints directly to its owner's
+that storage. The app reads inputs directly using its own storage client or a
+mount permitted by the owner's batch profile. Fleet passes command arguments
+and environment variables to the app. The app writes outputs and checkpoints directly to its owner's
 storage, including any files staged in its local `{out}` workspace. Fleet does not
 transfer batch inputs or outputs. Dependencies, logs and mutations check both namespace
 and tag membership.
@@ -575,11 +614,20 @@ Batch tools are `fleet_batch_profile_create`, `fleet_batch_profiles_list`,
 `fleet_batch_submit`, `fleet_batch_logs` and `fleet_batch_cancel`. Batch submission
 uses a `profile` name and a command. `fleet_jobs_list` remains a combined execution
 view with `kind: "batch"` or `kind: "proof"`. Profile creation requires a
-workload-management grant. Proof jobs remain submitted through the Ziren network SDK; MCP can list
-and inspect their records.
+workload-management grant. Its `priority` and `allow` fields are owner-managed.
+The list/get tools use `fleetctl batch list` and `fleetctl batch show NAME`.
+`fleet_batch_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
+each path must be inside the profile's allowed roots. Existing metadata changes
+and app scaling use the CLI or HTTP API; MCP currently exposes profile creation
+and job operations. Proof jobs remain submitted through the Ziren network SDK;
+MCP can list and inspect their records.
 
-Namespace owner tokens can register and remove proof apps for their tenant in
-their namespace, and submit proof/batch jobs inside their namespace and default tag.
+Namespace owner tokens (`manage_apps: true`) manage proof app and batch profile
+metadata within their namespace, tenant and app grants: registration, priority,
+enable/disable, removal and batch mount roots. Owners can scale their proof and
+persistent apps within namespace and tag quotas, and submit jobs in their tag.
+Tokens with app grants alone can use those apps but cannot change their metadata.
+Administrators manage namespace and tag quotas, namespace access and token issuance.
 App removal refuses while any proof is queued or running and deletes that app's
 terminal proof records and control-host artifacts. App-owned storage retention remains with the app owner. Administrators can also issue tokens limited
 to approved apps and a selected namespace/tag. Token refresh preserves access to jobs.
@@ -599,7 +647,7 @@ Each `ziren-gpu` entry in `services.yaml` must bind its server to one proof app
 using `namespace` and `proof_app: TENANT/FULL_ELF_SHA256`. Do not configure a
 Ziren server for multiple proof apps. `fleetctl app add TENANT/ELF` requires a
 matching dedicated service to exist first. `services.yaml` supplies initial resource
-settings; administrators then manage allocations through the control plane with
+settings; app owners then manage allocations through the control plane with
 `fleetctl app scale`. Batch jobs request resources with
 `fleetctl batch submit --app PROFILE --gpus N --cpus N`. Active proofs cannot resize
 their GPU allocation. Resizing a proof already in progress is tracked in
@@ -629,8 +677,8 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 
 Proof clients use bundled SDK signing material and bearer authorization at their
 app endpoint. Loopback clients use local HTTP; external clients require an authenticated HTTPS app gateway. The token API exposes only opaque IDs and access
-scopes. Namespace-owner tokens can register apps, while app-limited tokens can
-use only approved programs and profiles. Revocation applies to both proofs and
+scopes. Namespace-owner tokens can register apps and manage their metadata;
+app-limited tokens can use only granted programs and profiles. Revocation applies to both proofs and
 batch jobs.
 
 The scheduler’s backend listeners stay private behind the HTTPS gateway. Node control gRPC uses TLS with the scheduler

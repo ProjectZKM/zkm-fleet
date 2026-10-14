@@ -166,6 +166,8 @@ struct SubmitBatch {
     gpus: Option<f64>,
     #[serde(default)]
     cpus: Option<u32>,
+    #[serde(default)]
+    mounts: Vec<String>,
     command: Vec<String>,
 }
 
@@ -221,7 +223,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_batch_profile_create",
-        description = "Create a batch profile in the authenticated namespace. The token must have workload-management access; mount roots are checked by the scheduler.",
+        description = "Create an owner-managed batch profile in the authenticated namespace, including priority and allowed mount roots. The token must have workload-management access; the scheduler validates the profile and enforces namespace quotas.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn batch_profile_create(
@@ -251,13 +253,13 @@ impl FleetMcp {
     #[tool(name = "fleet_batch_profiles_list", description = "List reusable finite batch execution profiles in the authenticated namespace.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batch_profiles_list(&self, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), "profiles".into()]).await
+        self.call(parts, vec!["batch".into(), "list".into()]).await
     }
 
     #[tool(name = "fleet_batch_profile_get", description = "Inspect a batch execution profile and its newest jobs.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batch_profile_get(&self, Parameters(input): Parameters<AppName>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), "profile".into(), input.name]).await
+        self.call(parts, vec!["batch".into(), "show".into(), input.name]).await
     }
 
     #[tool(name = "fleet_batches_list", description = "List finite batch jobs visible to the authenticated token.",
@@ -354,6 +356,9 @@ impl FleetMcp {
         }
         if let Some(cpus) = input.cpus {
             args.extend(["--cpus".into(), cpus.to_string()]);
+        }
+        for mount in input.mounts {
+            args.extend(["--mount".into(), mount]);
         }
         args.push("--".into());
         args.extend(input.command);
