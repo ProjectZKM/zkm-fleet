@@ -282,14 +282,17 @@ fleetctl --token-file alice.token --namespace alice --tag scope=default app add 
 ```
 
 Owner tokens carry `manage_apps: true`. Metadata changes still enforce the
-token's namespace, tenant for proof apps, tag and any explicit app grants.
+token's namespace, tag and any explicit app grants. Owners can manage proof
+apps from any registered tenant in that namespace. The token's `tenant` binds
+SDK proof-signing identity; it does not restrict owner metadata or scaling.
 Tokens with app grants alone can submit and inspect permitted jobs and read
 granted scaling status; they cannot change workload metadata.
 
 | Action | Required access |
 |---|---|
 | Namespace creation, token issuance, namespace/tag quotas and node administration | Administrator token |
-| Proof app registration, removal, priority and enable/disable | Owner token for the namespace and proof tenant |
+| Namespace listing and quota/usage inspection | Any scoped token for its own namespace and tag; administrators can inspect all |
+| Proof app registration, removal, priority and enable/disable | Owner token for the namespace, with any explicit app grants |
 | Batch profile creation, mount roots, priority, enable/disable and removal | Owner token for the namespace, tag and profile |
 | App GPU/CPU and replica changes | Owner token for the app; namespace/tag quotas and node capacity still apply |
 | Job submission and inspection; batch logs and cancellation | App-granted or owner token within its scope |
@@ -505,7 +508,11 @@ the old key automatically or overwrite an existing bundle.
 Issuance requires an existing, active namespace. A typo cannot silently create a
 new owner. Token namespace and optional tag cannot be changed after issuance.
 
-Administrator HTTP endpoints, on the existing private scheduler listener:
+Namespace and access HTTP endpoints, on the existing private scheduler listener.
+Writes require administrator credentials. Scoped tokens can read their own
+namespace by name or immutable ID; lists return only that namespace. Shared
+namespace quota and usage are visible, with tag caps and usage restricted to the
+token's tag. Another namespace or tag selector is refused:
 
 | Method and path | Action |
 |---|---|
@@ -513,11 +520,11 @@ Administrator HTTP endpoints, on the existing private scheduler listener:
 | `GET /admin/tokens` | List opaque token IDs and access scopes |
 | `POST /admin/tokens` | Issue an access token (administrator only) |
 | `DELETE /admin/tokens/TOKEN_ID` | Revoke a token |
-| `GET /admin/namespaces` | List |
-| `GET /admin/namespaces/alice` | Inspect quota, total usage and tags |
+| `GET /admin/namespaces` | Scoped users: own namespace; administrators: all |
+| `GET /admin/namespaces/alice` | Scoped users: own namespace quota, total usage and own tag; administrators: all tags |
 | `PUT /admin/namespaces/alice/quota` with `{"gpus":2,"cpus":16}` | Replace caps |
-| `GET /admin/namespaces/alice/allocations` | Inspect reservations across tags |
-| `GET /admin/namespaces/alice?tag=scope=research` | Inspect namespace totals and tag caps/usage |
+| `GET /admin/namespaces/alice/allocations` | Administrator-only: inspect reservations across tags |
+| `GET /admin/namespaces/alice?tag=scope=research` | Inspect namespace totals and tag caps/usage; scoped tokens must match that namespace/tag |
 | `PUT /admin/namespaces/alice/quota?tag=scope=research` with `{"gpus":2,"cpus":16}` | Replace tag caps, recording a new tag if needed |
 | `PUT /admin/namespaces/alice/suspended` | Suspend |
 | `DELETE /admin/namespaces/alice/suspended` | Resume |
@@ -603,8 +610,9 @@ securely. Do not give external users the administrator token.
 
 Initialization and `tools/list` are available without a token, so clients can
 discover the available tools and input schemas before adding a token. `tools/call`
-requires a current user token; the scheduler applies its namespace, tag, tenant,
-and app grants. MCP has no administrator token. Clients must support remote
+requires a current user token; the scheduler applies its namespace, tag and
+app grants. Proof submissions also check the token's signing tenant. MCP has no
+administrator token. Clients must support remote
 Streamable HTTP and allow the Bearer header to be configured. Clients that only
 support local `stdio` servers cannot connect directly to this endpoint.
 
@@ -623,9 +631,10 @@ and job operations. Proof jobs remain submitted through the Ziren network SDK;
 MCP can list and inspect their records.
 
 Namespace owner tokens (`manage_apps: true`) manage proof app and batch profile
-metadata within their namespace, tenant and app grants: registration, priority,
-enable/disable, removal and batch mount roots. Owners can scale their proof and
-persistent apps within namespace and tag quotas, and submit jobs in their tag.
+metadata across proof tenants within their namespace, tag and app grants:
+registration, priority, enable/disable, removal and batch mount roots. Owners can
+scale their proof and persistent apps within namespace and tag quotas, and submit
+batch jobs in their tag. SDK proof submissions retain their signing-tenant binding.
 Tokens with app grants alone can use those apps but cannot change their metadata.
 Administrators manage namespace and tag quotas, namespace access and token issuance.
 App removal refuses while any proof is queued or running and deletes that app's

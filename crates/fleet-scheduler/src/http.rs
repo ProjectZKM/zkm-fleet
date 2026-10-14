@@ -81,7 +81,8 @@ async fn authorize_http(
     } else if let Some(c) = s.fleet.token_for_token(header) {
         let path = req.uri().path().strip_prefix("/admin").unwrap_or(req.uri().path());
         let read_scoped = req.method() == axum::http::Method::GET
-            && (path == "/apps" || path == "/jobs"
+            && (path == "/apps" || path == "/jobs" || path == "/namespaces"
+                || path.strip_prefix("/namespaces/").is_some_and(|name| !name.is_empty() && !name.contains('/'))
                 || path.strip_prefix("/jobs/").is_some_and(|id| {
                     let parts = id.split('/').collect::<Vec<_>>();
                     !parts[0].is_empty() && (parts.len() == 1 ||
@@ -147,8 +148,18 @@ async fn status(State(s): State<HttpState>) -> Response {
     Json(status).into_response()
 }
 
-async fn namespaces(State(s): State<HttpState>) -> Response {
-    Json(s.fleet.namespaces()).into_response()
+async fn namespaces(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(q): axum::extract::Query<NamespaceSelector>,
+) -> Response {
+    let mut namespaces = s.fleet.namespaces();
+    if let Some(c) = c {
+        let namespace = match selected_namespace(&s, Some(&c), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r };
+        if let Err(r) = selected_tag(&s, Some(&c), namespace.as_deref(), q.tag.as_deref()) { return r; }
+        namespaces.retain(|n| Some(n.id.as_str()) == namespace.as_deref());
+        for n in &mut namespaces {
+            n.tag_quotas.retain(|tag, _| c.tag.as_deref() == Some(tag.as_str()));
+        }
+    }
+    Json(namespaces).into_response()
 }
 
 async fn create_namespace(State(s): State<HttpState>, Json(n): Json<CreateNamespaceRequest>) -> Response {
@@ -159,9 +170,12 @@ async fn create_namespace(State(s): State<HttpState>, Json(n): Json<CreateNamesp
     }
 }
 
-fn namespace_record(s: &HttpState, name: &str, tag: Option<&str>) -> Response {
+fn namespace_record(s: &HttpState, name: &str, tag: Option<&str>, c: Option<&Token>) -> Response {
     match s.fleet.namespace(name) {
-        Some(n) => {
+        Some(mut n) => {
+            if let Some(c) = c {
+                n.tag_quotas.retain(|tag, _| c.tag.as_deref() == Some(tag.as_str()));
+            }
             let mut v = serde_json::to_value(&n).unwrap();
             v["usage"] = serde_json::json!(s.fleet.usage(&n.id));
             if let Some(tag) = tag {
@@ -181,9 +195,15 @@ fn namespace_record(s: &HttpState, name: &str, tag: Option<&str>) -> Response {
     }
 }
 
-async fn namespace(State(s): State<HttpState>, Path(name): Path<String>, axum::extract::Query(query): axum::extract::Query<NamespaceSelector>,
+async fn namespace(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path(name): Path<String>, axum::extract::Query(query): axum::extract::Query<NamespaceSelector>,
 ) -> Response {
-    namespace_record(&s,&name,query.tag.as_deref())
+    if let Some(c) = c.as_ref() {
+        let namespace = match selected_namespace(&s, Some(c), Some(&name)) { Ok(n) => n, Err(r) => return r };
+        if let Err(r) = selected_namespace(&s, Some(c), query.namespace.as_deref()) { return r; }
+        let tag = match selected_tag(&s, Some(c), namespace.as_deref(), query.tag.as_deref()) { Ok(tag) => tag, Err(r) => return r };
+        return namespace_record(&s, &name, tag.as_deref(), Some(c));
+    }
+    namespace_record(&s,&name,query.tag.as_deref(), None)
 }
 
 async fn set_quota(State(s): State<HttpState>, Path(name): Path<String>, axum::extract::Query(query): axum::extract::Query<NamespaceSelector>, Json(q): Json<crate::quota::Quota>,
@@ -191,7 +211,7 @@ async fn set_quota(State(s): State<HttpState>, Path(name): Path<String>, axum::e
     if let Err(e) = q.validate() { return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(); }
     if let Some(tag) = query.tag {
         return match s.fleet.set_tag_quota(&name,&tag,q).await {
-            Ok(_) => namespace_record(&s,&name,Some(&tag)), Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            Ok(_) => namespace_record(&s,&name,Some(&tag), None), Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         };
     }
     match s.fleet.set_quota(&name, q).await {
@@ -369,7 +389,7 @@ fn app_parts(key: &ProofAppRequest, fleet: &Scheduler) -> Result<(String, String
 fn authorize_app_management(c: Option<&Token>, key: &ProofAppRequest, namespace: &str, tenant: &str, elf: &str,
 ) -> Result<(), Response> {
     if let Some(c) = c {
-        if !c.manage_apps || c.namespace.as_deref() != Some(namespace) || c.tenant != tenant
+        if !c.manage_apps || c.namespace.as_deref() != Some(namespace)
             || key.tag.as_deref().is_some_and(|tag| c.tag.as_deref() != Some(tag))
             || c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{tenant}/{elf}"))) {
             return Err(StatusCode::FORBIDDEN.into_response());

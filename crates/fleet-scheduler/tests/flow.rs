@@ -1449,7 +1449,7 @@ async fn jobs_inherit_app_priority_and_dispatch_highest_then_fifo() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn app_management_token_can_delete_only_its_namespace_and_tenant_apps() {
+async fn namespace_owner_can_manage_all_proof_tenants_only_in_its_namespace() {
     let h = start().await;
     let elf = fleet_scheduler::blobs::elf_id_of(b"owner-managed-app");
     for name in ["owner-scope", "other-scope"] {
@@ -1480,7 +1480,7 @@ async fn app_management_token_can_delete_only_its_namespace_and_tenant_apps() {
     let other_tenant = format!("/admin/apps?namespace=owner-scope&tenant=eth&elf_id={elf}");
     let other_namespace = format!("/admin/apps?namespace=other-scope&tenant=goat&elf_id={elf}");
     assert_eq!(user_http(&h, &bearer, "DELETE", &own).0, 200);
-    assert_eq!(user_http(&h, &bearer, "DELETE", &other_tenant).0, 403);
+    assert_eq!(user_http(&h, &bearer, "DELETE", &other_tenant).0, 200);
     assert_eq!(user_http(&h, &bearer, "DELETE", &other_namespace).0, 403);
 }
 

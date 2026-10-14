@@ -6,7 +6,7 @@ use sha2::Digest;
 
 async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\nadmin_token_file: admin\ntenants: [{{name: eth}}]\n",dir.path().display())).unwrap();
+    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\nadmin_token_file: admin\ntenants: [{{name: eth}}, {{name: goat}}]\n",dir.path().display())).unwrap();
     let fleet = Scheduler::new(
         cfg,
         Arc::new(MemoryStore::default()),
@@ -866,10 +866,11 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
         c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
         let app = if proof { format!("eth/{elf}") } else { "service".into() };
-        let owner = user_token(&c, &ns, 1, "eth", "scope=default", Some(vec![app.clone()]), true).await;
+        let owner = user_token(&c, &ns, 1, "goat", "scope=default", None, true).await;
         let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
         let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
         let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
+        let other_signer = user_token(&c, &ns, 5, "goat", "scope=default", Some(vec!["service".into()]), false).await;
         let scale = if proof { format!("/proof-apps/scale?tenant=eth&elf_id={elf}") } else { "/apps/service/scale".into() };
         let disabled = if proof { format!("/proof-apps/disabled?tenant=eth&elf_id={elf}") } else { "/apps/service/disabled".into() };
         for token in [&consumer, &restricted, &foreign_tag] {
@@ -883,6 +884,10 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
             }
         }
         assert_eq!(scale_call(c.clone(), &consumer, "GET", &scale, Value::Null).await.status(), StatusCode::OK);
+        assert_eq!(scale_call(c.clone(), &owner, "GET", &scale, Value::Null).await.status(), StatusCode::OK);
+        if proof {
+            assert_eq!(scale_call(c.clone(), &other_signer, "GET", &scale, Value::Null).await.status(), StatusCode::FORBIDDEN);
+        }
         for token in [&restricted, &foreign_tag] {
             let status = scale_call(c.clone(), token, "GET", &scale, Value::Null).await.status();
             assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND));
@@ -918,15 +923,81 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
 }
 
 #[tokio::test]
+async fn namespace_reads_are_scoped_for_owners_and_app_tokens_while_writes_require_admin() {
+    let (_dir, c, ns) = setup().await;
+    let other = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
+    c.fleet.set_tag_quota(&ns, "scope=default", Quota { gpus: Some(0.5), cpus: Some(2.0) }).await.unwrap();
+    c.fleet.set_tag_quota(&ns, "scope=research", Quota { gpus: Some(1.0), cpus: Some(4.0) }).await.unwrap();
+    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec!["training".into()]), false).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone(), admin_token: Arc::new("admin".into()) });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let client = reqwest::Client::new();
+    for token in [&owner, &consumer] {
+        for selector in [String::new(), "?namespace=test".into(), format!("?namespace={ns}&tag=scope%3Ddefault")] {
+            let response = client.get(format!("{url}/admin/namespaces{selector}")).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let rows: Value = response.json().await.unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), 1);
+            assert_eq!(rows[0]["id"], ns);
+            assert_eq!(rows[0]["quota"], json!({"gpus":2.0,"cpus":8.0}));
+            assert_eq!(rows[0]["tag_quotas"], json!({"scope=default":{"gpus":0.5,"cpus":2.0}}));
+        }
+        for selector in ["test".to_string(), ns.clone(), "test?tag=scope%3Ddefault".into()] {
+            let response = client.get(format!("{url}/admin/namespaces/{selector}")).bearer_auth(token).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let record: Value = response.json().await.unwrap();
+            assert_eq!(record["id"], ns);
+            assert_eq!(record["quota"], json!({"gpus":2.0,"cpus":8.0}));
+            assert_eq!(record["usage"], json!({"gpus":0.0,"cpus":0.0}));
+            assert_eq!(record["tag"], "scope=default");
+            assert_eq!(record["tag_quota"], json!({"gpus":0.5,"cpus":2.0}));
+            assert_eq!(record["tag_quotas"].as_object().unwrap().len(), 1);
+            assert!(record.get("tags").is_none());
+        }
+        for path in ["/admin/namespaces/other".into(), format!("/admin/namespaces/{other}"),
+            "/admin/namespaces?namespace=other".into(), "/admin/namespaces/test?namespace=other".into(),
+            "/admin/namespaces?tag=scope%3Dresearch".into(), "/admin/namespaces/test?tag=scope%3Dresearch".into(),
+            "/admin/namespaces/test/allocations".into(), "/admin/namespaces/test/quota".into(), "/admin/tokens".into(),
+        ] {
+            assert_eq!(client.get(format!("{url}{path}")).bearer_auth(token).send().await.unwrap().status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        for (method, path) in [
+            (reqwest::Method::POST, "/admin/namespaces"),
+            (reqwest::Method::PUT, "/admin/namespaces/test/quota"),
+            (reqwest::Method::PUT, "/admin/namespaces/test/quota?tag=scope%3Ddefault"),
+            (reqwest::Method::PUT, "/admin/namespaces/test/suspended"),
+            (reqwest::Method::DELETE, "/admin/namespaces/test/suspended"),
+        ] {
+            assert_eq!(client.request(method, format!("{url}{path}")).bearer_auth(token).json(&json!({"gpus":0,"cpus":0})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+        }
+    }
+    let all: Value = client.get(format!("{url}/admin/namespaces")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 3);
+    let full: Value = client.get(format!("{url}/admin/namespaces/test")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+    assert_eq!(full["tag_quotas"].as_object().unwrap().len(), 2);
+    assert!(full["tags"].as_array().unwrap().contains(&json!("scope=research")));
+    assert_eq!(client.get(format!("{url}/admin/namespaces")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    c.fleet.revoke_token(&"01".repeat(16)).await.unwrap();
+    assert_eq!(client.get(format!("{url}/admin/namespaces")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    c.fleet.suspend_namespace(&ns, true).await.unwrap();
+    assert_eq!(client.get(format!("{url}/admin/namespaces/test")).bearer_auth(&consumer).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    server.abort();
+}
+
+#[tokio::test]
 async fn proof_app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
     let (_dir, c, ns) = setup().await;
     let elf = "a".repeat(64);
     let other_elf = "b".repeat(64);
     c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
     c.fleet.add_app(&ns, "eth", &other_elf, 0).await.unwrap();
+    c.fleet.add_app(&ns, "goat", &elf, 0).await.unwrap();
     let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
     c.fleet.add_app(&other_ns, "eth", &elf, 0).await.unwrap();
-    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
+    let owner = user_token(&c, &ns, 1, "goat", "scope=default", None, true).await;
     let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), false).await;
     let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), true).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -944,9 +1015,9 @@ async fn proof_app_http_metadata_is_owner_managed_and_quotas_are_admin_managed()
         for (token, selector) in [
             (&consumer, own.clone()),
             (&owner, format!("namespace={other_ns}&tenant=eth&elf_id={elf}")),
-            (&owner, format!("namespace={ns}&tenant=other&elf_id={elf}")),
             (&owner, format!("{own}&tag=scope=research")),
             (&restricted, format!("namespace={ns}&tenant=eth&elf_id={other_elf}")),
+            (&restricted, format!("namespace={ns}&tenant=goat&elf_id={elf}")),
         ] {
             let response = client.request(method.clone(), format!("{url}/admin/{path}?{selector}&priority=31"))
                 .bearer_auth(token).send().await.unwrap();

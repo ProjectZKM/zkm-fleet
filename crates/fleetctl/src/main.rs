@@ -62,7 +62,7 @@ enum Cmd {
     Node(NodeArgs),
     /// Administrator-managed user access tokens: list, inspect, issue, refresh or revoke.
     Token(TokenArgs),
-    /// Manage namespace ownership, shared GPU/CPU quotas and user access (administrator only).
+    /// Inspect your namespace; administrators manage shared quotas and access.
     Namespace(NamespaceArgs),
     /// Set up a cluster's secrets, offline: the cluster and admin tokens, the stage API's
     /// certificates (install.sh jobs these; no scheduler is needed).
@@ -191,7 +191,7 @@ struct NamespaceArgs {
 
 #[derive(Subcommand)]
 enum NamespaceCmd {
-    /// Create a namespace and write its owner token bundle for scope=default.
+    /// Administrator-only: create a namespace and its owner token bundle for scope=default.
     Create {
         /// Unique namespace name: lowercase letters, digits and hyphens.
         name: String,
@@ -201,16 +201,17 @@ enum NamespaceCmd {
         #[command(flatten)] quota: QuotaArgs,
         #[command(flatten)] bundle: TokenBundle,
     },
-    /// Replace shared GPU/CPU caps; --tag KEY=VALUE changes that tag's caps.
+    /// Administrator-only: replace shared GPU/CPU caps; --tag KEY=VALUE changes that tag's caps.
     /// Omitted caps are unlimited; no cap flags clears both. This does not allocate hardware.
     Quota { name: String, #[command(flatten)] quota: QuotaArgs },
-    /// Inspect quota and reserved resources; --tag KEY=VALUE includes that tag's usage.
+    /// Inspect your namespace's quota and reserved resources; administrators can inspect any namespace.
+    /// Scoped tokens see their own tag's usage and caps; --tag must match that tag.
     Get { name: String },
-    /// List namespaces, their shared quotas and current reservations (the default).
+    /// List namespaces and configured quotas (the default); scoped tokens see only their own.
     List,
-    /// Block namespace tokens and new submissions; accepted jobs keep running.
+    /// Administrator-only: block namespace tokens and new submissions; accepted jobs keep running.
     Suspend { name: String },
-    /// Restore namespace access; individually revoked tokens remain revoked.
+    /// Administrator-only: restore namespace access; individually revoked tokens remain revoked.
     Resume { name: String },
 }
 

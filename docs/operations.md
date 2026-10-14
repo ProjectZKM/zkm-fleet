@@ -8,24 +8,38 @@ Run these on the control host. Remote operators set `FLEET_URL` to the HTTPS
 gateway and `FLEET_ADMIN_TOKEN_FILE` to their private administrator token file.
 Namespace users use `FLEET_TOKEN_FILE`. Owner tokens (`manage_apps: true`) manage
 app and batch metadata; ordinary app tokens submit and inspect permitted jobs.
-Node and namespace administration require the administrator token. Clear
+Scoped tokens can list and inspect their own namespace, including its shared
+quota and their tag's quota and usage. Node administration and namespace writes
+require the administrator token. Clear
 `FLEET_TOKEN_FILE` when switching to administrator commands: it takes precedence
 over `FLEET_ADMIN_TOKEN_FILE`. Add `--json` for structured output.
 
 ## Namespaces and access
 
 A namespace owns apps and batches and shares one GPU/CPU quota across their
-allocations. These administrator commands manage ownership and access:
+allocations. Scoped users can read their own namespace; administrators manage
+ownership, access and quotas:
 
-| Command | Purpose |
-|---|---|
-| `fleetctl namespace` or `namespace list` | List namespaces, quotas and reservations. |
-| `namespace create NAME --tenant TENANT --endpoint URL --out NAME.env` | Create the namespace and its owner bundle for `scope=default`. |
-| `namespace get NAME` | Inspect quotas, reserved resources and known tags. |
-| `namespace quota NAME --gpus N --cpus N` | Replace the namespace's shared limits. |
-| `namespace quota NAME --tag team=research --gpus N --cpus N` | Replace that tag's limits within the namespace. |
-| `namespace suspend NAME` | Block tokens and new submissions; accepted work continues. |
-| `namespace resume NAME` | Restore access; individually revoked tokens remain revoked. |
+| Command | Purpose | Access |
+|---|---|---|
+| `fleetctl namespace` or `namespace list` | List namespace identities; JSON also includes configured quotas. | Scoped users: own namespace; administrators: all namespaces. |
+| `namespace create NAME --tenant TENANT --endpoint URL --out NAME.env` | Create the namespace and its owner bundle for `scope=default`. | Administrator |
+| `namespace get NAME` | Inspect shared quota and usage, plus tag caps and usage. | Scoped users: own namespace/tag; administrators: any namespace/tag. |
+| `namespace quota NAME --gpus N --cpus N` | Replace the namespace's shared limits. | Administrator |
+| `namespace quota NAME --tag team=research --gpus N --cpus N` | Replace that tag's limits within the namespace. | Administrator |
+| `namespace suspend NAME` | Block tokens and new submissions; accepted work continues. | Administrator |
+| `namespace resume NAME` | Restore access; individually revoked tokens remain revoked. | Administrator |
+
+Read your namespace with the same token used for app and batch commands:
+
+```bash
+fleetctl --token-file alice.token namespace
+fleetctl --token-file alice.token namespace get alice
+```
+
+Names and immutable IDs are accepted. Scoped reads include namespace totals and
+the token's tag; another namespace or tag selector is refused. Other tags' quota
+settings and job allocation records are not exposed to scoped users.
 
 For example:
 
@@ -62,30 +76,33 @@ CPU units are logical CPUs. Ray's configured pool can be smaller than the hardwa
 configured allocations, including disabled apps; they do not show live utilization.
 Namespace and optional tag quotas further limit allocation.
 
-For example, set the EthProofs worker's allocation to six GPUs and 96 CPUs using
-an owner token for the `ethproofs` tenant in namespace `zkm`:
+For example, set the EthProofs worker's allocation to five GPUs and 96 CPUs using
+the namespace `zkm` owner's token. The token's proof-signing tenant can differ
+from the app's `ethproofs` tenant:
 
 ```bash
-fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8 \
-  --gpus 6 --cpus 96 --replicas 1 --node ant-5090-2
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8 \
+  --gpus 5 --cpus 96 --replicas 1 --node ant-5090-2
 
 # Read desired/observed allocation and operation status.
-fleetctl --token-file ethproofs-owner.token --namespace zkm app scale ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8
 # Node inspection uses administrator credentials.
 fleetctl node ant-5090-2
 ```
 
 Scaling requires app-owner access (`manage_apps: true`) and an online, ready node.
-The token must cover the app's namespace, tenant, tag and app grant; namespace and
-tag quotas remain administrator-managed. Requests are asynchronous; inspect until
+The token must cover the app's namespace, tag and app grant. An owner's signing
+tenant does not restrict metadata or scaling. Namespace and tag quotas remain
+administrator-managed. Requests are asynchronous; inspect until
 the state is `complete` or `failed`. Omitted resource flags retain their current
 values. Disabled apps stay disabled. Use `--node` to
 select a machine when the app has multiple deployments.
 
 Integrated EthProofs uses exactly one replica. SDK-driven proof apps and serving
 apps may use multiple replicas; resources are per replica. The current
-`ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 6 GPUs
-and 96 CPUs, 2 GPUs and 32 CPUs remain for other allocations.
+`ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 5 GPUs
+and 96 CPUs, 3 GPUs and 32 CPUs remain for other allocations. Inspect current
+allocations with `fleetctl app scale`; these resource settings can change.
 Existing allocations are accounted for when replacing an app's own allocation.
 
 To change the node pool, edit `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in
@@ -116,8 +133,8 @@ fleetctl --namespace pi --tag team=research job
 fleetctl node
 fleetctl --namespace zkm app
 fleetctl --namespace zkm job
-fleetctl --token-file ethproofs-owner.token --namespace zkm app disable ethproofs/334b45b8
-fleetctl --token-file ethproofs-owner.token --namespace zkm app enable ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app disable ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app enable ethproofs/334b45b8
 ```
 
 Disabling releases the app's execution resources after cleanup. Durable app data

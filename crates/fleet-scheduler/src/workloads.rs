@@ -1691,7 +1691,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         let app = if parts[0] == "proof-apps" {
             let tenant = q.get("tenant").ok_or_else(|| fail(400, "tenant required"))?;
             let elf = q.get("elf_id").ok_or_else(|| fail(400, "elf_id required"))?;
-            if c.is_some_and(|c| c.tenant != *tenant) {
+            if c.is_some_and(|c| !c.manage_apps && c.tenant != *tenant) {
                 return Err(fail(403, "another tenant cannot be selected"));
             }
             if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown proof app")); }
@@ -2084,9 +2084,6 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         let elf = q
             .get("elf_id")
             .ok_or_else(|| fail(400, "elf_id required"))?;
-        if c.is_some_and(|c| c.tenant != *tenant) {
-            return Err(fail(403, "another tenant cannot be selected"));
-        }
         let key = format!("{tenant}/{elf}");
         WorkloadController::require_grant(c, &key)?;
         let services = {
