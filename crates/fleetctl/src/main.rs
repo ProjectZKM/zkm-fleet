@@ -56,7 +56,7 @@ enum Cmd {
     App(AppArgs),
     /// Finite batch workloads and their jobs.
     Batch(BatchArgs),
-    /// Execution records: list or inspect proof and batch jobs; fetch proof outputs.
+    /// Execution records: list or inspect app and batch jobs; fetch proof outputs.
     Job(JobArgs),
     /// Machine nodes: list their capacity, or drain / undrain a machine.
     Node(NodeArgs),
@@ -131,16 +131,16 @@ enum AppCmd {
 /// Which jobs a list shows: every one still queued or running, and the newest finished.
 #[derive(Args)]
 struct ListArgs {
-    /// How many of the newest of each type (proof and batch jobs); the active ones are always shown.
+    /// How many of the newest of each type (app and batch jobs); the active ones are always shown.
     #[arg(short = 'n', long, default_value_t = 10)]
     limit: usize,
-    /// Only proof jobs, or only batch jobs.
+    /// Only app jobs, or only batch jobs.
     #[arg(long = "type", value_enum)]
     kind: Option<JobType>,
     /// Only what is queued or running.
     #[arg(short, long)]
     active: bool,
-    /// Only this tenant's proof jobs (batch jobs belong to no tenant).
+    /// Only this tenant's app jobs (batch jobs belong to no tenant).
     #[arg(long)]
     tenant: Option<String>,
     /// Only the jobs of this app (as `fleetctl app` names it: tenant/<elf> or a batch profile).
@@ -150,7 +150,8 @@ struct ListArgs {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JobType {
-    Proof,
+    /// Jobs of apps: the proofs a proof app runs.
+    App,
     Batch,
 }
 
@@ -159,7 +160,7 @@ enum JobType {
 struct JobArgs {
     #[command(subcommand)]
     cmd: Option<JobCmd>,
-    /// A proof or batch job's id: its record. Without one, the list.
+    /// An app or batch job's id: its record. Without one, the list.
     id: Option<String>,
     #[command(flatten)]
     list: ListArgs,
@@ -836,7 +837,7 @@ fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
 fn proof_row(j: &Value) -> Value {
     let secs = |k: &str| j[k].as_f64().map(|ms| ms / 1000.0);
     json!({
-        "type": "proof", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "client_id": j["client_id"], "namespace": j["namespace"], "tag": j["tag"], "owner": j["tenant"],
+        "type": "app", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "client_id": j["client_id"], "namespace": j["namespace"], "tag": j["tag"], "owner": j["tenant"],
         "state": j["state"], "priority": j["priority"], "where": j["node"],
         "created_at": secs("created_ms"), "started_at": secs("started_ms"), "finished_at": secs("finished_ms"),
         "took_ms": took_ms(secs("started_ms"), secs("finished_ms")), "record": j,
@@ -889,9 +890,9 @@ fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> 
         q.push(("active", "true".into()));
     }
     let (v, row): (Value, fn(&Value) -> Value) = match (kind, app) {
-        (JobType::Proof, Some(AppRef::Container(_))) | (JobType::Batch, Some(AppRef::Proof { .. })) => return Ok(vec![]),
+        (JobType::App, Some(AppRef::Container(_))) | (JobType::Batch, Some(AppRef::Proof { .. })) => return Ok(vec![]),
         (JobType::Batch, _) if want.tenant.is_some() => return Ok(vec![]), // batch jobs belong to no tenant
-        (JobType::Proof, app) => {
+        (JobType::App, app) => {
             let tenant = match (&app, want.tenant) {
                 (Some(AppRef::Proof { tenant, .. }), Some(t)) if tenant != t => return Ok(vec![]),
                 (Some(AppRef::Proof { tenant, .. }), _) => Some(tenant.as_str()),
@@ -923,7 +924,7 @@ fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> 
 fn list(p: &ListArgs, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let kinds: Vec<JobType> = match p.kind {
         Some(k) => vec![k],
-        None => vec![JobType::Proof, JobType::Batch],
+        None => vec![JobType::App, JobType::Batch],
     };
     let mut rows: Vec<Value> = Vec::new();
     let mut reached = 0;
@@ -945,7 +946,7 @@ fn list(p: &ListArgs, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::R
                     }
                 }
             }
-            Err(e) => tracing::warn!(error=%format!("{e:#}"), api=if *k == JobType::Proof { "scheduler" } else { "batch" }, "API not reachable; listing the rest"),
+            Err(e) => tracing::warn!(error=%format!("{e:#}"), api=if *k == JobType::App { "scheduler" } else { "batch" }, "API not reachable; listing the rest"),
         }
     }
     if reached == 0 {
@@ -1195,14 +1196,14 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
 /// One app's record, and its newest jobs.
 fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let (kind, mut rec) = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => (JobType::Proof, with_type("app", &proof_app_named(&FleetClient::new(conn)?, name, &tenant)?)),
+        AppRef::Proof { tenant, .. } => (JobType::App, with_type("app", &proof_app_named(&FleetClient::new(conn)?, name, &tenant)?)),
         AppRef::Container(_) => {
             let app = serving_app_named(&FleetClient::control(conn)?, name)?;
             (JobType::Batch, with_type("app", &app))
         },
     };
     let full = rec["name"].as_str().unwrap_or(name).to_string();
-    let jobs = if kind == JobType::Proof { fetch_rows(kind, conn, &JobListFilter { limit: 5, active: false, tenant: None, app: Some(&full) })? } else { vec![] };
+    let jobs = if kind == JobType::App { fetch_rows(kind, conn, &JobListFilter { limit: 5, active: false, tenant: None, app: Some(&full) })? } else { vec![] };
     if out.json {
         rec["newest_jobs"] = Value::Array(jobs);
         out.record(&rec);
@@ -1417,11 +1418,11 @@ fn with_type(t: &str, record: &Value) -> Value {
     Value::Object(m)
 }
 
-/// A proof or batch job, by id: the scheduler is asked first, then the batch API.
+/// An app or batch job, by id: the scheduler is asked first, then the batch API.
 fn record(id: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let proof = FleetClient::new(conn).and_then(|a| a.get(&format!("/jobs/{id}")));
     if let Ok(v) = &proof {
-        out.record(&with_type("proof", v));
+        out.record(&with_type("app", v));
         return Ok(());
     }
     match FleetClient::control(conn).and_then(|a| a.get(&format!("/batches/{id}"))) {
@@ -1430,7 +1431,7 @@ fn record(id: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Res
             Ok(())
         }
         Err(batch_error) => bail!(
-            "no proof or batch job {id} (scheduler: {:#}; batch API: {batch_error:#})",
+            "no app or batch job {id} (scheduler: {:#}; batch API: {batch_error:#})",
             proof.err().unwrap_or_else(|| anyhow::anyhow!("-"))
         ),
     }

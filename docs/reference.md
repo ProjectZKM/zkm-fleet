@@ -621,7 +621,7 @@ Batch tools are `fleet_batch_profile_create`, `fleet_batch_profiles_list`,
 `fleet_batch_profile_get`, `fleet_batches_list`, `fleet_batch_get`,
 `fleet_batch_submit`, `fleet_batch_logs` and `fleet_batch_cancel`. `fleet_app_logs` reads a visible app's log from its node. Batch submission
 uses a `profile` name and a command. `fleet_jobs_list` remains a combined execution
-view with `kind: "batch"` or `kind: "proof"`. Profile creation requires a
+view with `kind: "batch"` or `kind: "app"`. Profile creation requires a
 workload-management grant. Its `priority` and `allow` fields are owner-managed.
 The profile list/get tools use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batches_list` and `fleet_batch_get` use `fleetctl job --type batch` and `fleetctl job ID`.
 `fleet_batch_submit` accepts a `mounts` array such as `["/data/models:ro"]`;

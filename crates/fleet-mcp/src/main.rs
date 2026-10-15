@@ -107,14 +107,15 @@ impl FleetctlClient {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum JobType {
-    Proof,
+    /// Jobs of apps (proofs).
+    App,
     Batch,
 }
 
 impl JobType {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Proof => "proof",
+            Self::App => "app",
             Self::Batch => "batch",
         }
     }
@@ -478,5 +479,18 @@ impl ServerHandler for FleetMcp {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(rmcp::model::Implementation::new("zkm-fleet", env!("CARGO_PKG_VERSION")))
             .with_instructions("Initialization and tool discovery are public. To execute a tool, send an Authorization: Bearer user-token header. Tool access is limited by that token's namespace, tag, and app grants.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn job_type_is_app_or_batch() {
+        for (input, want) in [("\"app\"", "app"), ("\"batch\"", "batch")] {
+            assert_eq!(serde_json::from_str::<super::JobType>(input).unwrap().as_str(), want);
+        }
+        for old in ["\"proof\"", "\"run\""] {
+            assert!(serde_json::from_str::<super::JobType>(old).is_err(), "{old}");
+        }
     }
 }
