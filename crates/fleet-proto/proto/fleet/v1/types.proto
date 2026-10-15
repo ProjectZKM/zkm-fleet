@@ -40,6 +40,13 @@ message ProofFetch {
   ArtifactRef reference = 7;
 }
 
+// Asks a node for the last `lines` lines of one app service's log.
+message LogRequest {
+  string ticket = 1;
+  string service = 2;
+  uint32 lines = 3;
+}
+
 enum NodeOperation {
   NODE_OPERATION_UNSPECIFIED = 0;
   NODE_OPERATION_LAUNCH_JOB = 1;

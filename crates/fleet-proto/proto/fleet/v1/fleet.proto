@@ -169,4 +169,5 @@ message WorkerHeartbeatResponse {
   // Terminal executions whose metadata and artifact receipts are durable.
   repeated string acknowledged_jobs = 4;
   repeated ProofFetch proof_fetches = 5;
+  repeated LogRequest log_requests = 6;
 }

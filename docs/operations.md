@@ -171,6 +171,26 @@ from application-owned storage. Fleet supplies status and logs.
 
 ## Logs and recovery
 
+Read an app's log from anywhere with control-plane access. The scheduler asks the
+node that runs the app through its next heartbeat, so nothing is stored centrally and
+the answer takes a moment:
+
+```bash
+fleetctl app logs ethproofs/ELF_ID -n 200     # the last 200 lines (default 100, at most 2000)
+fleetctl app logs APP --node NODE             # when the app runs on several machines
+```
+
+It needs the same access as `fleetctl app scale APP` without changing anything: the app
+must be granted to the token and within its tag. An offline node, or one that is busy for
+longer than 15 seconds, answers with an error. Each reply carries at most
+256 KiB, from the first replica's `<service>-0.node.log` file in the node's log directory.
+MCP clients use `fleet_app_logs`. A node must run this release for the command to work.
+
+When `fleetctl app` shows an app as `starting`, DETAIL says why: `waiting for capacity`
+with what it needs and what its node has free (the start is held until it fits; `app
+disable` or a smaller `app scale` replaces the held start), `starting on NODE` once the node
+has the request, or `waiting for NODE to report it ready`.
+
 Inspect ordinary logs on the node:
 
 ```bash

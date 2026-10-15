@@ -189,6 +189,15 @@ struct BatchLogs {
 }
 fn default_log_lines() -> usize { 50 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AppLogs {
+    name: String,
+    #[serde(default = "default_log_lines")]
+    lines: usize,
+    /// The machine, when the app has services on more than one.
+    node: Option<String>,
+}
+
 #[derive(Clone)]
 struct FleetMcp {
     fleet: FleetctlClient,
@@ -219,6 +228,26 @@ impl FleetMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
         self.call(parts, vec!["app".into(), input.name]).await
+    }
+
+    #[tool(
+        name = "fleet_app_logs",
+        description = "Read the last lines of a visible long-running app's log from the node that runs it.",
+        annotations(read_only_hint = true, destructive_hint = false)
+    )]
+    async fn app_logs(
+        &self,
+        Parameters(input): Parameters<AppLogs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<Json<Value>, ErrorData> {
+        if !(1..=2000).contains(&input.lines) {
+            return Err(tool_error("lines must be between 1 and 2000"));
+        }
+        let mut args = vec!["app".into(), "logs".into(), input.name, "--lines".into(), input.lines.to_string()];
+        if let Some(node) = input.node {
+            args.extend(["--node".into(), node]);
+        }
+        self.call(parts, args).await
     }
 
     #[tool(

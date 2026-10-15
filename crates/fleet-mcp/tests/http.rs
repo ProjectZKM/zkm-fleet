@@ -110,7 +110,7 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .unwrap()
         .iter()
         .any(|tool| tool["name"] == "fleet_batch_submit"));
-    for name in ["fleet_apps_list", "fleet_batch_profiles_list", "fleet_batch_profile_get",
+    for name in ["fleet_apps_list", "fleet_app_logs", "fleet_batch_profiles_list", "fleet_batch_profile_get",
         "fleet_batches_list", "fleet_batch_get", "fleet_batch_logs", "fleet_batch_cancel"] {
         assert!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == name), "missing {name}");
     }
@@ -191,6 +191,8 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
             "--json batch submit --app training --mount /approved:ro -- python train.py"),
         (9, "fleet_batch_logs", json!({"id":"training-job","lines":25}),
             "--json batch logs training-job --lines 25"),
+        (13, "fleet_app_logs", json!({"name":"ethproofs/941629f6","lines":30,"node":"gpu-1"}),
+            "--json app logs ethproofs/941629f6 --lines 30 --node gpu-1"),
     ] {
         let response = client.post(format!("{origin}/mcp"))
             .bearer_auth("scoped-token")

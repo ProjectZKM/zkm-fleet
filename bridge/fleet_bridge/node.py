@@ -315,7 +315,8 @@ class NodeExecutor:
         ready = len(nodes) == 1
         total, free = resources()
         config = jobs.load_config(self.profiles)
-        services = reconcile.load_services(yaml.safe_load(self.services.read_text())).raw.get("services", [])
+        apps = reconcile.load_services(yaml.safe_load(self.services.read_text()))
+        services = apps.raw.get("services", [])
         running = reconcile.running()
         for service in services:
             names = [f"{service['name']}-{i}" for i in range(service.get("replicas", 1))]
@@ -324,6 +325,8 @@ class NodeExecutor:
             service.setdefault("cpus", 1)
             service["gpus"] = 0 if service["kind"] == "ziren-cpu" else service.get("gpus", 1)
             service["ready"] = True
+            # Where `fleetctl app logs` reads from: one node log per replica.
+            service["logs"] = [os.path.join(apps.cluster.log_dir, f"{name}.node.log") for name in names]
             for name in names:
                 try:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None

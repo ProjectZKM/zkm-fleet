@@ -1,8 +1,9 @@
 //! Outbound machine heartbeats. A slim Python child performs local Ray operations.
+mod logs;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fleet_proto::fleet::v1::{
-    worker_service_client::WorkerServiceClient, ProofFetch, WorkerHeartbeatRequest,
+    worker_service_client::WorkerServiceClient, LogRequest, ProofFetch, WorkerHeartbeatRequest,
 };
 use serde_json::{json, Value};
 use std::{
@@ -165,6 +166,7 @@ async fn main() -> Result<()> {
         let mut client = None;
         let mut fetches = tokio::task::JoinSet::new();
         let mut fetching = std::collections::HashSet::new();
+        let mut log_reads = tokio::task::JoinSet::new();
         loop {
             while let Some(result) = fetches.try_join_next() {
                 if let Ok(ticket) = result {
@@ -231,6 +233,26 @@ async fn main() -> Result<()> {
                             ticket
                         });
                     }
+                    while log_reads.try_join_next().is_some() {}
+                    for request in response.log_requests {
+                        if log_reads.len() >= 4 {
+                            continue;
+                        }
+                        let path = {
+                            let s = snapshot.lock().await;
+                            s.as_ref()
+                                .and_then(|s| log_path(&s.report, &request.service))
+                        };
+                        log_reads.spawn(serve_log(
+                            http.clone(),
+                            a.scheduler.clone(),
+                            secret.clone(),
+                            a.name.clone(),
+                            session.clone(),
+                            path,
+                            request,
+                        ));
+                    }
                     for execution in response.acknowledged_jobs {
                         if let Some((id, lease)) = execution.split_once('/') {
                             send(&input, json!({"reported":id,"lease":lease})).await?;
@@ -264,6 +286,73 @@ async fn main() -> Result<()> {
     reader.abort();
     let _ = child.kill().await;
     Ok(())
+}
+
+/// The log file this machine reported for a service. Only a path the bridge itself
+/// reported, and only a node log, is ever read.
+fn log_path(report: &Value, service: &str) -> Option<PathBuf> {
+    let path = report["services"]
+        .as_array()?
+        .iter()
+        .find(|s| s["name"].as_str() == Some(service))?["logs"]
+        .get(0)?
+        .as_str()?;
+    let path = PathBuf::from(path);
+    (path.is_absolute()
+        && path.to_string_lossy().ends_with(".node.log")
+        && !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir))
+    .then_some(path)
+}
+
+async fn serve_log(
+    http: reqwest::Client,
+    scheduler: String,
+    secret: String,
+    worker: String,
+    session: String,
+    path: Option<PathBuf>,
+    request: LogRequest,
+) {
+    if request.ticket.len() != 64 || !request.ticket.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return;
+    }
+    let read = match path {
+        Some(path) => {
+            let lines = request.lines;
+            tokio::task::spawn_blocking(move || logs::tail(&path, lines))
+                .await
+                .map_err(|_| "unavailable")
+                .and_then(|r| {
+                    r.map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            "missing"
+                        } else {
+                            "unavailable"
+                        }
+                    })
+                })
+        }
+        None => Err("unconfigured"),
+    };
+    let mut reply = http
+        .post(format!(
+            "{}/internal/app-logs/{}",
+            scheduler.trim_end_matches('/'),
+            request.ticket
+        ))
+        .bearer_auth(secret)
+        .header("x-fleet-worker", worker)
+        .header("x-fleet-session", session)
+        .timeout(Duration::from_secs(10));
+    reply = match read {
+        Ok(bytes) => reply.body(bytes),
+        Err(code) => reply.header("x-fleet-log-error", code),
+    };
+    if let Err(error) = reply.send().await.and_then(|r| r.error_for_status()) {
+        tracing::debug!(%error, "log reply failed; the client may retry");
+    }
 }
 
 async fn fetch_proof(

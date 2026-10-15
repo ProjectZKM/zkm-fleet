@@ -6,6 +6,7 @@ pub mod http;
 pub mod placement;
 pub mod preemption;
 pub mod proof_api;
+pub mod log_relay;
 pub mod proof_fetch;
 pub mod quota;
 pub mod workloads;

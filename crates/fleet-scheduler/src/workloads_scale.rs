@@ -97,6 +97,31 @@ impl WorkloadController {
             "observed":observed.map(|s|json!({"gpus":s["gpus"],"cpus":s["cpus"],"replicas":s["replicas"],"ready":s["ready"],"disabled":s["disabled"]}))})
     }
 
+    /// Reads the last `lines` lines of the app service's log from the node that runs it,
+    /// through that node's heartbeat.
+    pub(super) async fn app_logs(
+        &self,
+        c: Option<&Token>,
+        namespace: &str,
+        app: &str,
+        q: &BTreeMap<String, String>,
+    ) -> anyhow::Result<Response> {
+        let node = q.get("node").map(String::as_str);
+        self.require_service_scope(c, namespace, app, node)?;
+        let (_, deployment) = self.scale_service(namespace, app, node)?;
+        let lines = match q.get("lines") {
+            Some(v) => v.parse::<u32>().map_err(|_| fail(400, "lines must be a number"))?,
+            None => 100,
+        };
+        let bytes = self
+            .fleet
+            .log_relay
+            .request(&deployment.worker, text(&deployment.service, "name"), lines)
+            .await
+            .map_err(|e| fail(fleet_proto::sdk::http_status_code(e.code()), e.message().to_owned()))?;
+        Ok(bytes.into_response())
+    }
+
     pub(super) fn scale_status(
         &self,
         namespace: &str,
@@ -137,6 +162,7 @@ impl WorkloadController {
             if intent.scale.as_ref().is_some_and(ScaleStatus::pending)
                 || i.commands.values().any(|c| {
                     !c.done
+                        && c.admitted // one still waiting for capacity is replaced by this request
                         && c.worker == intent.worker
                         && c.operation == NodeOperation::SetService as i32
                         && text(&c.parameters["service"], "name") == text(&intent.service, "name")

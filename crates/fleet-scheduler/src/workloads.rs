@@ -198,13 +198,23 @@ impl WorkloadController {
                     s.pending() && parameters["scale_id"].as_str() != Some(s.id())) {
                 return Err(fail(409, "app scaling is already pending"));
             }
-            if inner.commands.values().any(|c| {
+            let same_service = |c: &CommandRecord| {
                 !c.done
                     && c.worker == worker
                     && c.operation == operation as i32
-                    && text(&c.parameters["service"], "name")
-                        == text(&parameters["service"], "name")
-            }) {
+                    && text(&c.parameters["service"], "name") == text(&parameters["service"], "name")
+            };
+            // An operation still waiting for capacity was never sent to the node, so a newer one
+            // replaces it. Without this an app that cannot be placed could not be disabled or scaled.
+            let waiting: Vec<_> = inner.commands.values().filter(|c| same_service(c) && !c.admitted).map(|c| c.id.clone()).collect();
+            for id in waiting {
+                if let Some(c) = inner.commands.get_mut(&id) {
+                    c.done = true;
+                    c.error = Some("replaced by a newer service operation before it was sent to the node".into());
+                    self.save("commands", &id, &*c)?;
+                }
+            }
+            if inner.commands.values().any(same_service) {
                 return Err(fail(409, "a service operation is already pending"));
             }
             let intent = AppDeployment {
@@ -1577,6 +1587,7 @@ impl WorkerService for NodeControlService {
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
+            log_requests: self.0.fleet.log_relay.heartbeat(&r.worker_id, &r.session),
             heartbeat_secs: 2,
             commands,
             acknowledged_results: ack,
@@ -1684,9 +1695,11 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus",
         ));
     }
-    if parts == ["proof-apps", "scale"]
-        || (parts.len() == 3 && parts[0] == "apps" && parts[2] == "scale")
-    {
+    let action = match parts.as_slice() {
+        ["proof-apps", action] | ["apps", _, action] if matches!(*action, "scale" | "logs") => Some(*action),
+        _ => None,
+    };
+    if let Some(action) = action {
         let (namespace, _) = s.scope(c, &q, None)?;
         let app = if parts[0] == "proof-apps" {
             let tenant = q.get("tenant").ok_or_else(|| fail(400, "tenant required"))?;
@@ -1704,6 +1717,12 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             app.name
         };
         WorkloadController::require_grant(c, &app)?;
+        if action == "logs" {
+            if method != Method::GET {
+                return Err(fail(405, "GET required"));
+            }
+            return s.app_logs(c, &namespace, &app, &q).await;
+        }
         if method == Method::GET {
             s.require_service_scope(c, &namespace, &app, q.get("node").map(String::as_str))?;
             return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str),

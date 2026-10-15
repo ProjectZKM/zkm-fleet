@@ -77,6 +77,7 @@ impl WorkloadController {
         let mut nodes = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
         let mut states = std::collections::BTreeSet::new();
+        let mut reasons = Vec::new();
         for intent in &services {
             let s = intent
                 .scale
@@ -115,6 +116,7 @@ impl WorkloadController {
                 }) {
                 "running"
             } else {
+                reasons.push(Self::starting_reason(&i.commands, intent, worker));
                 "starting"
             };
             states.insert(state);
@@ -126,9 +128,35 @@ impl WorkloadController {
         json!({
             "resources":(!services.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
             "tags":tags, "state":state,
+            "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
             "tag_quota":tag.and_then(|tag|n.as_ref()?.tag_quotas.get(tag)),
         })
+    }
+
+    /// Why an enabled service is not running yet, for `fleetctl app`'s DETAIL column.
+    fn starting_reason(commands: &BTreeMap<String, CommandRecord>, intent: &AppDeployment, worker: Option<&NodeSession>) -> String {
+        let name = text(&intent.service, "name");
+        let pending = commands.values().find(|c| {
+            !c.done
+                && c.worker == intent.worker
+                && c.operation == NodeOperation::SetService as i32
+                && text(&c.parameters["service"], "name") == name
+        });
+        match pending {
+            Some(c) if !c.admitted => {
+                let s = &c.parameters["service"];
+                let n = s["replicas"].as_f64().unwrap_or(1.0);
+                let (g, cpu) = (s["gpus"].as_f64().unwrap_or(0.0) * n, s["cpus"].as_f64().unwrap_or(1.0) * n);
+                match worker {
+                    Some(w) => format!("waiting for capacity: needs {g} GPU and {cpu} CPU, {} has {} GPU and {} CPU free",
+                        intent.worker, w.report.free_gpus, w.report.free_cpus),
+                    None => format!("waiting for capacity: needs {g} GPU and {cpu} CPU"),
+                }
+            }
+            Some(_) => format!("starting on {}", intent.worker),
+            None => format!("waiting for {} to report it ready", intent.worker),
+        }
     }
 
     pub(crate) fn proof_app_value(&self, mut app: Value, tag: Option<&str>) -> Value {

@@ -59,7 +59,7 @@ pub fn router(state: HttpState) -> Router {
             state.clone(),
             authorize_http,
         ));
-    let fetch = crate::proof_fetch::router(state.clone());
+    let fetch = crate::proof_fetch::router(state.clone()).merge(crate::log_relay::router(state.clone()));
     Router::new()
         .route("/access", get(access))
         .route("/healthz", get(|| async { "ok" }))

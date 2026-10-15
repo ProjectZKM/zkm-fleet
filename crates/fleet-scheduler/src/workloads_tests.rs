@@ -1356,3 +1356,84 @@ async fn integrated_worker_owner_must_be_cleaned_before_moving() {
     assert!(c.command("other", NodeOperation::SetService,
         json!({"service":service,"disabled":false})).is_ok());
 }
+
+#[tokio::test]
+async fn a_service_operation_replaces_an_enable_still_waiting_for_capacity() {
+    let (_dir, c, ns) = setup().await;
+    let report = scale_inventory(&ns, false, true);
+    let service = report.services[0].clone();
+    c.report("gpu", "session", report).await.unwrap();
+    let enable = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap();
+    assert!(!c.inner.lock().commands[&enable].admitted, "an enable waits until the node can fit it");
+    let disable = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":true})).unwrap();
+    let commands = c.inner.lock().commands.clone();
+    assert!(commands[&enable].done && commands[&enable].error.as_deref().unwrap().contains("replaced"));
+    assert!(!commands[&disable].done && c.inner.lock().services["gpu-service"].disabled);
+    // Once the node has been sent an operation, it is not replaced.
+    c.inner.lock().commands.get_mut(&disable).unwrap().admitted = true;
+    let error = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap_err();
+    assert!(error.to_string().contains("already pending"), "{error}");
+}
+
+#[tokio::test]
+async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
+    for proof in [false, true] {
+        let (_dir, c, ns) = setup().await;
+        let elf = "a".repeat(64);
+        c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
+        c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
+        c.fleet.log_relay.heartbeat("gpu", "session");
+        let app = if proof { format!("eth/{elf}") } else { "service".into() };
+        let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
+        let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
+        let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
+        let logs = if proof { format!("/proof-apps/logs?tenant=eth&elf_id={elf}") } else { "/apps/service/logs".into() };
+        let query = |extra: &str| format!("{logs}{}{extra}", if proof { "&" } else { "?" });
+        for token in [&restricted, &foreign_tag] {
+            let status = scale_call(c.clone(), token, "GET", &logs, Value::Null).await.status();
+            assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{status}");
+        }
+        assert_eq!(scale_call(c.clone(), &consumer, "POST", &logs, Value::Null).await.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(scale_call(c.clone(), &consumer, "GET", &query("lines=many"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
+
+        let (control, token, path) = (c.clone(), consumer.clone(), query("lines=5"));
+        let request = tokio::spawn(async move { scale_call(control, &token, "GET", &path, Value::Null).await });
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(r) = c.fleet.log_relay.heartbeat("gpu", "session").into_iter().next() { break r; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!((asked.service.as_str(), asked.lines), ("service", 5));
+        c.fleet.log_relay.claim(&asked.ticket, "gpu", "session").unwrap().send(Ok(b"hello\n".to_vec())).unwrap();
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(axum::body::to_bytes(response.into_body(), 64).await.unwrap().as_ref(), b"hello\n");
+    }
+}
+
+#[tokio::test]
+async fn app_logs_of_an_offline_node_are_unavailable() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
+    let status = scale_call(c, "admin", "GET", &format!("/apps/service/logs?namespace={ns}"), Value::Null).await.status();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn a_starting_app_says_why_it_is_not_running() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = scale_inventory(&ns, false, true);
+    report.free_gpus = 1.0;
+    report.free_cpus = 3.0;
+    let service = report.services[0].clone();
+    c.report("gpu", "session", report).await.unwrap();
+    c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap();
+    let view = c.app_resources(&ns, "service", None);
+    assert_eq!(view["state"], "starting");
+    assert_eq!(view["detail"], "waiting for capacity: needs 2 GPU and 4 CPU, gpu has 1 GPU and 3 CPU free");
+    c.inner.lock().commands.values_mut().for_each(|c| c.admitted = true);
+    assert_eq!(c.app_resources(&ns, "service", None)["detail"], "starting on gpu");
+    c.inner.lock().commands.values_mut().for_each(|c| c.done = true);
+    assert_eq!(c.app_resources(&ns, "service", None)["detail"], "waiting for gpu to report it ready");
+}

@@ -106,7 +106,8 @@ fn app_list_server(listener: TcpListener) -> std::thread::JoinHandle<()> {
                     {"name":"training","type":"run","namespace":"alice","persistent":false},
                     {"name":"comfyui","type":"app","namespace":"alice",
                      "persistent":true,"last_submitted_at":3,"image":"comfyui:latest",
-                     "tags":["scope=default"], "state":"running",
+                     "tags":["scope=default"], "state":"starting",
+                     "detail":"waiting for capacity: needs 1 GPU and 2 CPU, gpu-machine has 0 GPU and 8 CPU free",
                      "resources":{"gpus":1,"cpus":2,"replicas":1,"nodes":["gpu-machine"]}}
                 ])
             }.to_string();
@@ -140,6 +141,24 @@ fn app_list_unifies_apps_and_excludes_batch_profiles() {
         assert!(app.get("kind").is_none());
         assert_eq!(app["tags"], serde_json::json!(["scope=default"]));
     }
+}
+
+#[test]
+fn app_list_shows_why_a_starting_app_is_not_running() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let token = std::env::temp_dir().join(format!("fleet-app-detail-test-{}.token", std::process::id()));
+    std::fs::write(&token, "test-admin").unwrap();
+    let server = app_list_server(listener);
+    let output = cli().args(["--namespace", "alice", "--tag", "scope=default", "--url", &url, "--admin-token-file"])
+        .arg(&token).arg("app").output().unwrap();
+    server.join().unwrap();
+    std::fs::remove_file(token).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let table = String::from_utf8_lossy(&output.stdout);
+    let row = table.lines().find(|l| l.contains("comfyui")).unwrap();
+    assert!(row.contains("starting") && row.contains("waiting for capacity: needs 1 GPU and 2 CPU"), "{row}");
+    assert!(row.contains("image comfyui:latest"), "the reason comes first, other details stay: {row}");
 }
 
 #[test]
@@ -473,5 +492,55 @@ fn app_scale_and_status_use_only_control_plane_routes_and_preserve_omitted_setti
         let output=cmd.output().unwrap();server.join().unwrap();std::fs::remove_file(token).unwrap();
         assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["replicas"],2);
+    }}
+}
+
+#[test]
+fn app_logs_read_the_control_plane_route_and_print_the_raw_log_or_the_error() {
+    for proof in [false, true] { for status in [200u16, 503] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap(); listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let token = std::env::temp_dir().join(format!("fleet-logs-{}-{proof}-{status}.token", std::process::id()));
+        std::fs::write(&token, "test-admin").unwrap();
+        let elf = "a".repeat(64); let ns = "1".repeat(32);
+        let name = if proof { format!("eth/{elf}") } else { "comfyui".into() };
+        let app = serde_json::json!({"name":name,"tenant":"eth","elf_id":elf,"namespace":ns,"persistent":true});
+        let server = std::thread::spawn(move || {
+            for index in 0..2 {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    if let Ok((s, _)) = listener.accept() { break s; }
+                    assert!(std::time::Instant::now() < deadline, "logs CLI did not contact control plane");
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut headers = Vec::new(); let mut byte = [0];
+                while !headers.ends_with(b"\r\n\r\n") { stream.read_exact(&mut byte).unwrap(); headers.push(byte[0]); }
+                let headers = String::from_utf8(headers).unwrap();
+                assert!(headers.to_lowercase().contains("authorization: bearer test-admin"));
+                if index == 0 {
+                    let body = serde_json::json!([app]).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
+                let line = headers.lines().next().unwrap();
+                assert!(line.starts_with("GET "), "{line}");
+                assert!(line.contains(if proof { "/proof-apps/logs?" } else { "/apps/comfyui/logs?" }), "{line}");
+                assert!(line.contains(&format!("namespace={ns}")) && line.contains("lines=7") && line.contains("node=gpu-box"), "{line}");
+                if proof { assert!(line.contains(&format!("elf_id={elf}")), "{line}"); }
+                let body = if status == 200 { "alpha\nbeta\n" } else { "node is offline" };
+                write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let output = cli().args(["--namespace", "alice", "--url", &url, "--admin-token-file"]).arg(&token)
+            .args(["app", "logs", &name, "-n", "7", "--node", "gpu-box"]).output().unwrap();
+        server.join().unwrap(); std::fs::remove_file(token).unwrap();
+        if status == 200 {
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha\nbeta\n");
+        } else {
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("503") && String::from_utf8_lossy(&output.stderr).contains("node is offline"));
+        }
     }}
 }

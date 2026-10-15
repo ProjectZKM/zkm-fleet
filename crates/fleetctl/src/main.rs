@@ -108,6 +108,14 @@ enum AppCmd {
         /// Select a machine agent when the app has services on multiple nodes.
         #[arg(long)] node: Option<String>,
     },
+    /// Show the last lines of an app's log, read from the node that runs it.
+    Logs {
+        name: String,
+        /// How many of the last lines to show (at most 2000).
+        #[arg(short = 'n', long, default_value_t = 100)] lines: u32,
+        /// Select a machine agent when the app has services on multiple nodes.
+        #[arg(long)] node: Option<String>,
+    },
     /// Delete an app, refused while any of its jobs is queued or running. A proof app
     /// (tenant/<elf>) goes with its jobs' records, inputs and proofs, its anchor, and its
     /// ELF when no other tenant uses it; serving deployments must be disabled first.
@@ -1067,6 +1075,43 @@ fn set_app_priority(name: &str, priority: i32, conn: &ConnectionOptions, out: &O
     Ok(())
 }
 
+/// The control client, URL path and query for `leaf` ("scale", "logs") of a proof or serving app.
+type AppEndpoint = (FleetClient, String, Vec<(&'static str, String)>);
+fn app_endpoint(name: &str, leaf: &str, conn: &ConnectionOptions) -> anyhow::Result<AppEndpoint> {
+    let mut a = FleetClient::control(conn)?;
+    Ok(match AppRef::parse(name) {
+        AppRef::Proof { tenant, .. } => {
+            let proof = proof_app_named(&FleetClient::new(conn)?, name, &tenant)?;
+            a.namespace = proof["namespace"].as_str().map(str::to_owned);
+            let query = vec![("tenant", tenant), ("elf_id", proof["elf_id"].as_str().unwrap_or("").to_string())];
+            (a, format!("/proof-apps/{leaf}"), query)
+        }
+        AppRef::Container(_) => {
+            let app = serving_app_named(&a, name)?;
+            a.namespace = app["namespace"].as_str().map(str::to_owned);
+            (a, format!("/apps/{name}/{leaf}"), vec![])
+        }
+    })
+}
+
+fn app_logs(name: &str, lines: u32, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let (a, path, mut query) = app_endpoint(name, "logs", conn)?;
+    query.push(("lines", lines.to_string()));
+    if let Some(node) = node { query.push(("node", node.to_string())); }
+    let response = a.req(reqwest::Method::GET, &path).query(&query).send()?;
+    let status = response.status();
+    let body = response.bytes()?;
+    if !status.is_success() {
+        bail!("{status}: {}", String::from_utf8_lossy(&body));
+    }
+    if out.json {
+        out.line(&json!({"data": String::from_utf8_lossy(&body)}));
+    } else {
+        std::io::stdout().write_all(&body)?;
+    }
+    Ok(())
+}
+
 fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<u32>, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut body = json!({});
     if let Some(v) = gpus {
@@ -1078,20 +1123,7 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     let write = !body.as_object().unwrap().is_empty();
     if let Some(node) = node { body["node"] = json!(node); }
     let method = if write { reqwest::Method::PUT } else { reqwest::Method::GET };
-    let mut a = FleetClient::control(conn)?;
-    let (path, mut query) = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => {
-            let proof = proof_app_named(&FleetClient::new(conn)?, name, &tenant)?;
-            a.namespace = proof["namespace"].as_str().map(str::to_owned);
-            ("/proof-apps/scale".to_string(), vec![("tenant", tenant),
-                ("elf_id", proof["elf_id"].as_str().unwrap_or("").to_string())])
-        }
-        AppRef::Container(_) => {
-            let app = serving_app_named(&a, name)?;
-            a.namespace = app["namespace"].as_str().map(str::to_owned);
-            (format!("/apps/{name}/scale"), vec![])
-        }
-    };
+    let (a, path, mut query) = app_endpoint(name, "scale", conn)?;
     if !write { if let Some(node)=node { query.push(("node",node.to_string())); } }
     let mut request=a.req(method,&path).query(&query);
     if write { request=request.json(&body); }
@@ -1243,6 +1275,7 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Enable { name }) => return set_app_disabled(name, false, &p.conn, out),
         Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
+        Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
         None => {}
     }
@@ -1276,7 +1309,9 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         let mean = a["mean_prove_ms"].as_f64().map(|m| format!("mean prove {:.1} s", m / 1000.0));
         let anchored = a["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
         let image = a["image"].as_str().map(|i| format!("image {i}"));
-        let detail: Vec<String> = [anchored, mean, image].into_iter().flatten().collect();
+        // Why a starting app is not running yet comes first.
+        let why = a["detail"].as_str().filter(|d| !d.is_empty()).map(str::to_owned);
+        let detail: Vec<String> = [why, anchored, mean, image].into_iter().flatten().collect();
         json!({
             "type": "app", "name": a["name"], "namespace": a["namespace"],
             "tag": a.get("tags").filter(|v| v.as_array().is_some_and(|tags| !tags.is_empty())).unwrap_or(&a["tag"]),
