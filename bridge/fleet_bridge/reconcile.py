@@ -6,11 +6,13 @@ Namespace validation, quotas, draining and preemption stay in the control plane.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Mapping
 
 import ray
-from ray.util.placement_group import placement_group, remove_placement_group
+from ray._raylet import PlacementGroupID
+from ray.util.placement_group import PlacementGroup, placement_group, remove_placement_group
 from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -96,19 +98,28 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
     """Start an admitted replica using this machine's Ray-granted resources."""
     b = bundle(spec)
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
-    ray.get(pg.ready(), timeout=ready_timeout_s)
-    actor: ActorHandle[Any] = ACTORS[spec.kind].options(
-        name=spec.name,
-        namespace=NAMESPACE,
-        lifetime="detached",
-        max_restarts=-1,
-        max_task_retries=0,
-        num_cpus=b.cpu,
-        num_gpus=b.gpu,
-        memory=b.memory,
-        scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
-    ).remote(spec)
-    health_of(actor, ready_timeout_s)
+    try:
+        ray.get(pg.ready(), timeout=ready_timeout_s)
+        actor: ActorHandle[Any] = ACTORS[spec.kind].options(
+            name=spec.name,
+            namespace=NAMESPACE,
+            lifetime="detached",
+            max_restarts=-1,
+            max_task_retries=0,
+            num_cpus=b.cpu,
+            num_gpus=b.gpu,
+            memory=b.memory,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
+        ).remote(spec)
+        health_of(actor, ready_timeout_s)
+    except BaseException:
+        # A failed start must not keep its detached group: it holds the replica's
+        # GPUs and CPUs and blocks every retry.
+        try:
+            stop(spec.name)
+        except Exception:
+            logging.getLogger(__name__).exception("cleanup after failed start of %s", spec.name)
+        raise
     return actor
 
 
@@ -126,10 +137,11 @@ def stop(name: str) -> None:
     # Find all generations because an actor can have been restarted several
     # times. Only remove live groups; Ray retains removed group names forever.
     prefix = f"pg-{name}-"
-    for info in ray.util.placement_group_table().values():
+    for pg_id, info in ray.util.placement_group_table().items():
         group_name = info.get("name", "")
         if group_name.startswith(prefix) and info.get("state") != "REMOVED":
             try:
-                remove_placement_group(ray.util.get_placement_group(group_name))
+                # By id: a name lookup only sees groups of the caller's Ray namespace.
+                remove_placement_group(PlacementGroup(PlacementGroupID.from_hex(pg_id)))
             except Exception:
-                pass
+                logging.getLogger(__name__).exception("could not remove placement group %s", group_name)

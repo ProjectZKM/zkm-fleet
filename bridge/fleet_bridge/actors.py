@@ -174,6 +174,8 @@ class _NodeProcess:
         self.log: io.BufferedWriter = open(log_path, "ab")
         self.stop_timeout_s = stop_timeout_s
         command = [binary] if isinstance(binary, str) else binary
+        if workdir:
+            os.makedirs(workdir, exist_ok=True)
         self.proc = subprocess.Popen(command, env=env, cwd=workdir,
                                      stdout=self.log, stderr=subprocess.STDOUT)
 

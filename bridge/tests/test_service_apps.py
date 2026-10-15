@@ -90,9 +90,10 @@ def test_stop_kills_actor_without_restart_and_removes_reservation(monkeypatch):
     monkeypatch.setattr(
         reconcile.ray.util,
         "placement_group_table",
-        lambda: {"pg": {"name": "pg-comfyui-0-old", "state": "CREATED"}},
+        lambda: {"abc123": {"name": "pg-comfyui-0-old", "state": "CREATED"}},
     )
-    monkeypatch.setattr(reconcile.ray.util, "get_placement_group", lambda *a: pg)
+    monkeypatch.setattr(reconcile, "PlacementGroupID", Mock(from_hex=lambda h: h))
+    monkeypatch.setattr(reconcile, "PlacementGroup", lambda pg_id: pg if pg_id == "abc123" else None)
     monkeypatch.setattr(reconcile, "remove_placement_group", remove)
     reconcile.stop("comfyui-0")
     kill.assert_called_once_with(actor, no_restart=True)
@@ -172,3 +173,23 @@ def test_worker_process_uses_argument_vector_and_waits_after_forced_stop(tmp_pat
     process.kill.assert_called_once()
     assert process.wait.call_count == 2
     assert worker.log.closed
+
+def test_failed_start_removes_its_placement_group(monkeypatch):
+    cfg = reconcile.load_services({"services": [{"name": "web", "kind": "app",
+        "image": "web:latest", "port_base": 8080, "gpus": 0, "cpus": 2}]})
+    spec = reconcile.replica_specs(cfg)["web-0"]
+    monkeypatch.setattr(reconcile, "placement_group", lambda *a, **k: Mock())
+    monkeypatch.setattr(reconcile.ray, "get", Mock(side_effect=TimeoutError("not ready")))
+    stop = Mock()
+    monkeypatch.setattr(reconcile, "stop", stop)
+    with pytest.raises(TimeoutError):
+        reconcile.start(spec)
+    stop.assert_called_once_with(spec.name)
+
+def test_worker_workdir_is_created(tmp_path, monkeypatch):
+    from fleet_bridge import actors
+    monkeypatch.setattr(actors, "_kill_orphans", lambda _: None)
+    workdir = tmp_path / "missing" / "worker"
+    proc = actors._NodeProcess(["true"], {"FLEET_NODE_NAME": "n"}, str(tmp_path / "log"), str(workdir))
+    proc.proc.wait()
+    assert workdir.is_dir()
