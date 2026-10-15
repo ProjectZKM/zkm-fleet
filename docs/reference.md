@@ -140,7 +140,7 @@ replica settings and job counts remain in app details. An app with services usin
 multiple tags shows their tags together. Batch profiles show `enabled` or
 `disabled`; their execution states appear in the job table.
 
-`fleetctl batch` lists finite executions. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, list workloads with `fleetctl batch list` and inspect one with `fleetctl batch show NAME`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `jobs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+`fleetctl batch` lists the batch profiles, as `fleetctl app` lists apps, with each profile's active jobs and last job; `fleetctl batch NAME` shows one profile and its newest jobs, and `fleetctl job --type batch` lists the finite executions themselves. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `jobs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
 
 Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch “profile” is its reusable workload configuration, not an additional resource. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
@@ -623,7 +623,7 @@ Batch tools are `fleet_batch_profile_create`, `fleet_batch_profiles_list`,
 uses a `profile` name and a command. `fleet_jobs_list` remains a combined execution
 view with `kind: "batch"` or `kind: "proof"`. Profile creation requires a
 workload-management grant. Its `priority` and `allow` fields are owner-managed.
-The list/get tools use `fleetctl batch list` and `fleetctl batch show NAME`.
+The profile list/get tools use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batches_list` and `fleet_batch_get` use `fleetctl job --type batch` and `fleetctl job ID`.
 `fleet_batch_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
 each path must be inside the profile's allowed roots. Existing metadata changes
 and app scaling use the CLI or HTTP API; MCP currently exposes profile creation

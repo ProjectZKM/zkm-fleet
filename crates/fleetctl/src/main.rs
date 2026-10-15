@@ -453,15 +453,9 @@ struct AddProofApp {
 struct BatchArgs {
     #[command(subcommand)]
     cmd: Option<BatchCmd>,
-    /// Batch job ID. Without one, list active and recent batch jobs.
-    id: Option<String>,
-    #[arg(short = 'n', long, default_value_t = 10)]
-    limit: usize,
-    #[arg(short, long)]
-    active: bool,
-    /// Filter batch jobs by workload name.
-    #[arg(long = "app")]
-    profile: Option<String>,
+    /// A batch profile: its settings and newest jobs. Without one, every profile;
+    /// the jobs themselves are `fleetctl job --type batch`.
+    name: Option<String>,
     #[command(flatten)]
     conn: ConnectionOptions,
 }
@@ -470,11 +464,11 @@ struct BatchArgs {
 enum BatchCmd {
     /// Register a reusable batch execution profile in an existing namespace.
     Add { #[command(flatten)] add: AddBatch },
-    /// List registered batch workloads and their shared execution configuration.
-    #[command(name = "list")]
+    /// The profiles, as plain `fleetctl batch` lists them.
+    #[command(name = "list", hide = true)]
     Profiles,
-    /// Inspect a batch workload and its newest jobs.
-    #[command(name = "show")]
+    /// A profile and its newest jobs, as `fleetctl batch NAME` shows them.
+    #[command(name = "show", hide = true)]
     Profile { name: String },
     /// Stop accepting new jobs for this profile; accepted jobs continue.
     Disable { name: String },
@@ -1335,30 +1329,8 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match &p.cmd {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
-        Some(BatchCmd::Profiles) => {
-            let profiles = FleetClient::control(&p.conn)?.get("/batch-profiles")?;
-            let rows: Vec<Value> = profiles.as_array().into_iter().flatten().map(|profile| {
-                let mut row = profile.clone();
-                if row["state"].is_null() {
-                    row["state"] = json!(if profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
-                }
-                row
-            }).collect();
-            out.table(&rows, &[
-                col("NAME", "name"), col("NAMESPACE", "namespace"),
-                col("TAG", "tag"), col("STATE", "state"),
-                col("PRIORITY", "priority"), col("MAX GPUS", "max_gpus"),
-                col("IMAGE", "image"),
-            ], Some(&profiles));
-            return Ok(());
-        }
-        Some(BatchCmd::Profile { name }) => {
-            let mut profile = batch_profile_named(&FleetClient::control(&p.conn)?, name)?;
-            profile["newest_jobs"] = json!(fetch_rows(JobType::Batch, &p.conn,
-                &JobListFilter { limit: 5, active: false, tenant: None, app: Some(name) })?);
-            out.record(&profile);
-            return Ok(());
-        }
+        Some(BatchCmd::Profiles) => return batch_profiles(&p.conn, out),
+        Some(BatchCmd::Profile { name }) => return batch_profile(name, &p.conn, out),
         Some(cmd) => {
             let a = FleetClient::control(&p.conn)?;
             let name = match cmd {
@@ -1385,14 +1357,55 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
         }
         None => {}
     }
-    if let Some(id) = &p.id {
-        let value = FleetClient::control(&p.conn)?.get(&format!("/batches/{id}"))?;
-        out.record(&with_type("batch", &value));
-        return Ok(());
+    match &p.name {
+        Some(name) => batch_profile(name, &p.conn, out),
+        None => batch_profiles(&p.conn, out),
     }
-    list(&ListArgs { limit: p.limit, active: p.active, kind: Some(JobType::Batch),
-        tenant: None, app: p.profile.clone() }, &p.conn, out)
 }
+
+/// The profiles, like `fleetctl app`: settings plus how many jobs are active and when the last began.
+fn batch_profiles(conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let profiles = FleetClient::control(conn)?.get("/batch-profiles")?;
+    // Every active job, however old, and enough recent ones to date each profile's last job.
+    let jobs = fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 1000, active: true, tenant: None, app: None })
+        .and_then(|mut jobs| {
+            jobs.extend(fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 200, active: false, tenant: None, app: None })?);
+            Ok(jobs)
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error=%format!("{e:#}"), "batch jobs not reachable; listing profiles only");
+            vec![]
+        });
+    let rows: Vec<Value> = profiles.as_array().into_iter().flatten().map(|profile| {
+        let mut row = profile.clone();
+        if row["state"].is_null() {
+            row["state"] = json!(if profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
+        }
+        let mut ids = std::collections::HashSet::new();
+        let own: Vec<&Value> = jobs.iter().filter(|j| j["app"] == profile["name"] && ids.insert(j["id"].to_string())).collect();
+        row["active_jobs"] = json!(own.iter().filter(|j| is_active(j)).count());
+        row["last_at"] = json!(own.iter().filter_map(|j| j["created_at"].as_f64()).reduce(f64::max));
+        row
+    }).collect();
+    out.table(&rows, &[
+        col("NAME", "name"), col("NAMESPACE", "namespace"),
+        col("TAG", "tag"), col("STATE", "state"),
+        col("PRIORITY", "priority"), col("MAX GPUS", "max_gpus"),
+        col("ACTIVE", "active_jobs"), col("LAST JOB", "last_at"),
+        col("IMAGE", "image"),
+    ], None);
+    Ok(())
+}
+
+fn batch_profile(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let mut profile = batch_profile_named(&FleetClient::control(conn)?, name)?;
+    profile["newest_jobs"] = json!(fetch_rows(JobType::Batch, conn,
+        &JobListFilter { limit: 5, active: false, tenant: None, app: Some(name) })?);
+    out.record(&profile);
+    Ok(())
+}
+
+
 
 /// `record` with its resource `type` field (a proof's own `kind` is its proof kind).
 fn with_type(t: &str, record: &Value) -> Value {

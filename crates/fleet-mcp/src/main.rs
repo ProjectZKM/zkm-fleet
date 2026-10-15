@@ -282,20 +282,20 @@ impl FleetMcp {
     #[tool(name = "fleet_batch_profiles_list", description = "List reusable finite batch execution profiles in the authenticated namespace.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batch_profiles_list(&self, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), "list".into()]).await
+        self.call(parts, vec!["batch".into()]).await
     }
 
     #[tool(name = "fleet_batch_profile_get", description = "Inspect a batch execution profile and its newest jobs.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batch_profile_get(&self, Parameters(input): Parameters<AppName>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), "show".into(), input.name]).await
+        self.call(parts, vec!["batch".into(), input.name]).await
     }
 
     #[tool(name = "fleet_batches_list", description = "List finite batch jobs visible to the authenticated token.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batches_list(&self, Parameters(input): Parameters<BatchesFilter>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         if !(1..=100).contains(&input.limit) { return Err(tool_error("limit must be between 1 and 100")); }
-        let mut args = vec!["batch".into(), "--limit".into(), input.limit.to_string()];
+        let mut args = vec!["job".into(), "--type".into(), "batch".into(), "--limit".into(), input.limit.to_string()];
         if let Some(profile) = input.profile { args.extend(["--app".into(), profile]); }
         if input.active { args.push("--active".into()); }
         self.call(parts, args).await
@@ -304,7 +304,7 @@ impl FleetMcp {
     #[tool(name = "fleet_batch_get", description = "Inspect a finite batch job visible to the authenticated token.",
         annotations(read_only_hint = true, destructive_hint = false))]
     async fn batch_get(&self, Parameters(input): Parameters<JobId>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), input.id]).await
+        self.call(parts, vec!["job".into(), input.id]).await
     }
 
     #[tool(name = "fleet_batch_logs", description = "Read recent container logs for a visible batch job.",

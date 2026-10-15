@@ -125,7 +125,7 @@ configured services before releasing their reservations.
 
 ```bash
 fleetctl --namespace zkm --tag scope=default app
-fleetctl --namespace pi --tag team=research batch list
+fleetctl --namespace pi --tag team=research batch
 fleetctl --namespace pi --tag team=research job
 ```
 
@@ -148,8 +148,9 @@ For a batch, first register reusable configuration, then submit and inspect jobs
 ```bash
 fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
   --image nvidia/cuda:12.8.0-base-ubuntu22.04 --allow /data/models --priority 10
-fleetctl --token-file pi-owner.token batch list
-fleetctl --token-file pi-owner.token batch show gpu-test
+fleetctl --token-file pi-owner.token batch            # the profiles, with active jobs and the last job
+fleetctl --token-file pi-owner.token batch gpu-test   # one profile and its newest jobs
+fleetctl --token-file pi-owner.token job --type batch -a   # the queued and running batch jobs
 fleetctl --token-file pi-owner.token batch priority gpu-test 20
 fleetctl --token-file pi-owner.token batch submit --app gpu-test --gpus 1 --cpus 2 \
   --mount /data/models:ro -- nvidia-smi

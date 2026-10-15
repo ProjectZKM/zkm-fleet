@@ -544,3 +544,60 @@ fn app_logs_read_the_control_plane_route_and_print_the_raw_log_or_the_error() {
         }
     }}
 }
+
+/// A stub control plane that answers each GET by path and records what was asked.
+fn batch_server(listener: TcpListener, requests: usize) -> std::thread::JoinHandle<Vec<String>> {
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..requests {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                if let Ok((s, _)) = listener.accept() { break s; }
+                assert!(std::time::Instant::now() < deadline, "CLI stopped after {seen:?}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut headers = Vec::new(); let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") { stream.read_exact(&mut byte).unwrap(); headers.push(byte[0]); }
+            let line = String::from_utf8(headers).unwrap().lines().next().unwrap().to_string();
+            let path = line.split_whitespace().nth(1).unwrap().to_string();
+            let (status, body) = if path.starts_with("/batch-profiles?") {
+                (200, serde_json::json!([
+                    {"name":"training","namespace":"alice","priority":3,"max_gpus":2,"image":"python:3"},
+                    {"name":"idle","namespace":"alice","disabled":true,"image":"python:3"}]).to_string())
+            } else if path.starts_with("/batches?") {
+                (200, serde_json::json!([
+                    {"id":"a","profile":"training","state":"running","submitted_at":1_800_000_100.0},
+                    {"id":"b","profile":"training","state":"succeeded","submitted_at":1_800_000_000.0}]).to_string())
+            } else {
+                panic!("unexpected request {line}");
+            };
+            write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            seen.push(path);
+        }
+        seen
+    })
+}
+
+#[test]
+fn plain_batch_lists_every_profile_like_app() {
+    let token = std::env::temp_dir().join(format!("fleet-batch-profiles-{}.token", std::process::id()));
+    std::fs::write(&token, "test-admin").unwrap();
+    // The profiles, then every active job and the recent ones to count and date them.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = batch_server(listener, 3);
+    let output = cli().args(["--json", "batch", "--namespace", "alice", "--url", &url, "--admin-token-file"])
+        .arg(&token).output().unwrap();
+    let seen = server.join().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(seen[0].starts_with("/batch-profiles?") && seen[1..].iter().all(|p| p.starts_with("/batches?")), "{seen:?}");
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["name"], "training");
+    assert_eq!(rows[0]["active_jobs"], 1, "the running job, counted once although both lists return it");
+    assert_eq!(rows[0]["last_at"], 1_800_000_100.0);
+    assert_eq!((rows[1]["state"].as_str(), rows[1]["active_jobs"].as_u64()), (Some("disabled"), Some(0)));
+    assert!(rows[1]["last_at"].is_null());
+    std::fs::remove_file(token).unwrap();
+}

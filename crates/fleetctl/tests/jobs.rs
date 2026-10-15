@@ -104,7 +104,6 @@ fn list_query_is_scoped(command: &str, kind: &str, endpoint: &str, limit_param: 
 fn job_lists_send_namespace_and_api_specific_limit_query() {
     list_query_is_scoped("job", "proof", "/admin/jobs", "limit", "n");
     list_query_is_scoped("job", "batch", "/batches", "limit", "n");
-    list_query_is_scoped("batch", "batch", "/batches", "limit", "n");
 }
 
 #[test]
