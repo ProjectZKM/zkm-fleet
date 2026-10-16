@@ -56,4 +56,9 @@ enum NodeOperation {
   NODE_OPERATION_PURGE_JOB = 5;
   reserved 6;
   reserved "NODE_OPERATION_STAGE_MODEL";
+  // An app was deleted: the node stops what is left of the services running it and drops
+  // them from services.yaml.
+  NODE_OPERATION_REMOVE_APP = 7;
+  // The batch profile was deleted: drop it from jobs.yaml.
+  NODE_OPERATION_REMOVE_PROFILE = 8;
 }

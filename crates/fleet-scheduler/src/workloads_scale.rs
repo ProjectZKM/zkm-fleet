@@ -159,7 +159,13 @@ impl WorkloadController {
         }
         {
             let i = self.inner.lock();
-            if intent.scale.as_ref().is_some_and(ScaleStatus::pending)
+            // A scale whose start still waits for capacity has nothing on the node to protect
+            // (its old server is stopped and the start was never sent): a new size replaces it.
+            let waiting_start = intent.scale.as_ref().is_some_and(|s| {
+                s.phase() == Phase::Starting
+                    && s.start.as_ref().is_some_and(|id| i.commands.get(id).is_some_and(|c| !c.done && !c.admitted))
+            });
+            if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_start
                 || i.commands.values().any(|c| {
                     !c.done
                         && c.admitted // one still waiting for capacity is replaced by this request

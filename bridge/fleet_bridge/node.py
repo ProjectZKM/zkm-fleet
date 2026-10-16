@@ -68,6 +68,10 @@ def set_disabled(path: Path, name: str, disabled: bool, resources: dict[str, Any
         else:
             position = entry.start_mark.index
             text = text[:position] + f"{key}: {scalar}\n" + " " * entry.start_mark.column + text[position:]
+    _replace(path, text)
+
+
+def _replace(path: Path, text: str) -> None:
     temporary = path.with_suffix(".node-tmp")
     with temporary.open("w") as file:
         file.write(text)
@@ -80,6 +84,54 @@ def set_disabled(path: Path, name: str, disabled: bool, resources: dict[str, Any
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _is_content(line: str) -> bool:
+    return bool(line.strip()) and not line.lstrip().startswith("#")
+
+
+def remove_entry(path: Path, section: str, name: str) -> bool:
+    """Removes one `services` entry or `profiles` key from a configuration file and keeps
+    every other line as written, with the comment lines directly above the entry. The
+    previous file stays as <file>.removed-<UTC time>. False when there is no such entry."""
+    text = path.read_text()
+    root = yaml.compose(text)
+    node = next((v for k, v in root.value if k.value == section), None) if root else None
+    if isinstance(node, yaml.SequenceNode) and not node.flow_style:
+        found = next(((e, e) for e in node.value
+                      if any(k.value == "name" and v.value == name for k, v in e.value)), None)
+    elif isinstance(node, yaml.MappingNode) and not node.flow_style:
+        found = next(((k, v) for k, v in node.value if k.value == name), None)
+    else:
+        found = None
+    if found is None:
+        return False
+    first, last = found
+    start = text.rfind("\n", 0, first.start_mark.index) + 1
+    while start > 0:
+        above = text.rfind("\n", 0, start - 1) + 1
+        line = text[above:start - 1]
+        if not line.lstrip().startswith("#"):
+            break
+        start = above
+    # An entry's node runs on to the next entry; it ends with its last line of content.
+    end = offset = start
+    for line in text[start:last.end_mark.index].splitlines(keepends=True):
+        offset += len(line)
+        if _is_content(line):
+            end = offset
+    if last.end_mark.column and not text[end - 1:end] == "\n":
+        end = text.find("\n", end) + 1 or len(text)
+    remaining = text[:start] + text[end:]
+    if (yaml.safe_load(remaining) or {}).get(section) is None:
+        # Removing the last entry would leave the section null; keep it an empty collection.
+        key = next(k for k, _ in yaml.compose(remaining).value if k.value == section)
+        line_end = remaining.find("\n", key.end_mark.index)
+        line_end = len(remaining) if line_end < 0 else line_end
+        remaining = remaining[:key.end_mark.index] + (": []" if isinstance(node, yaml.SequenceNode) else ": {}") + remaining[line_end:]
+    shutil.copy2(path, path.with_name(f"{path.name}.removed-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"))
+    _replace(path, remaining)
+    return True
 
 
 class NodeExecutor:
@@ -125,7 +177,7 @@ class NodeExecutor:
 
     def execute(self, command: dict[str, Any]) -> None:
         params = command["parameters"]
-        key = params.get("id") or params.get("service", {}).get("name") or command["id"]
+        key = params.get("id") or params.get("service", {}).get("name") or params.get("app") or params.get("name") or command["id"]
         result: Any = {"cleaned": False}
         error = None
         try:
@@ -149,6 +201,11 @@ class NodeExecutor:
                             raise ValueError("job cleanup is not confirmed")
                         shutil.rmtree(job.path)
                     result = {"cleaned": True}
+                elif operation == 7:
+                    with self.services_lock:
+                        result = self.remove_app(params)
+                elif operation == 8:
+                    result = {"removed": remove_entry(Path(self.profiles), "profiles", params["name"])}
                 else:
                     raise ValueError("unsupported node operation")
         except BaseException as e:
@@ -309,6 +366,27 @@ class NodeExecutor:
                 reconcile.stop(spec.name)
             reconcile.start(spec)
         return {"disabled": False, "ready": True}
+
+    def remove_app(self, p: dict[str, Any]) -> dict[str, Any]:
+        """An app was deleted: every service here that runs it (a proof app's server by its
+        `tenant/elf_id`, a serving app by its name) has what is left of its replicas cleaned up
+        the way disabling does, then is dropped from services.yaml. App data stays: storage
+        roots, workdirs, env files and images belong to the operator."""
+        cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
+        namespaces = {p["namespace"], p.get("namespace_name") or p["namespace"]}
+        removed = []
+        for service in cfg.services:
+            if service.namespace not in namespaces or p["app"] not in (service.proof_app, service.name if service.kind.value == "app" else None):
+                continue
+            for index in range(service.replicas):
+                replica = f"{service.name}-{index}"
+                reconcile.stop(replica)
+                ray.get(actors.clean_after.remote(replica), timeout=120)
+                if not container_gone(actors.gpu_container(replica)) or not container_gone(actors.app_container(replica)):
+                    raise ValueError(f"{service.name}: service container cleanup is uncertain")
+            if remove_entry(self.services, "services", service.name):
+                removed.append(service.name)
+        return {"removed": removed}
 
     def report(self) -> dict[str, Any]:
         nodes = alive_nodes()

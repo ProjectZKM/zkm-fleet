@@ -163,6 +163,57 @@ impl WorkloadController {
         }
     }
 
+    /// Drops a service record, its allocation already released. Nothing else removes one, and a
+    /// stale record can restart its service or claim its app's worker slot.
+    fn forget_service(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.lock().services.remove(key);
+        match std::fs::remove_file(self.dir.join("services").join(format!("{key}.json"))) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        tracing::info!(service = key, "service record removed: its node no longer configures it");
+        Ok(())
+    }
+
+    /// The node reports every service its configuration has, so one it stopped reporting was
+    /// removed from it. Its record goes once nothing about it is still open.
+    fn forget_unreported_services(&self, worker: &str, reported: &[String]) -> anyhow::Result<()> {
+        let candidates: Vec<(String, String)> = {
+            let i = self.inner.lock();
+            i.services.iter()
+                .filter(|(_, intent)| {
+                    let name = text(&intent.service, "name");
+                    intent.worker == worker && intent.disabled
+                        && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
+                        && !reported.iter().any(|r| r == name)
+                        && !i.commands.values().any(|c| !c.done && c.worker == worker
+                            && c.operation == NodeOperation::SetService as i32
+                            && text(&c.parameters["service"], "name") == name)
+                })
+                .map(|(key, intent)| (key.clone(), text(&intent.service, "namespace").to_owned()))
+                .collect()
+        };
+        for (key, namespace) in candidates {
+            if !self.fleet.allocations(&namespace).iter().any(|a| a.id == format!("service:{key}")) {
+                self.forget_service(&key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tells every node that `app` (a proof app's `tenant/elf_id` or a serving app's name) was
+    /// deleted from `namespace`; each removes the services it configures for it. A node's
+    /// configuration may name the namespace by id or by name, so both go along. The command
+    /// waits in the scheduler while a node is offline.
+    pub(crate) fn remove_app(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
+        let name = self.fleet.namespace(namespace).map(|n| n.name).unwrap_or_default();
+        let workers: Vec<String> = self.inner.lock().workers.keys().cloned().collect();
+        for worker in workers {
+            self.command(&worker, NodeOperation::RemoveApp, json!({"namespace":namespace,"namespace_name":name,"app":app}))?;
+        }
+        Ok(())
+    }
+
     fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, service: &Value,
     ) -> anyhow::Result<()> {
         if !integrated_worker(service) { return Ok(()); }
@@ -883,6 +934,7 @@ impl WorkloadController {
                     parameters)?;
             }
         }
+        self.forget_unreported_services(worker_id, &report.services.iter().map(|s| text(s, "name").to_owned()).collect::<Vec<_>>())?;
         self.refresh_worker_owned_apps();
         for incoming in &report.jobs {
             if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
@@ -893,7 +945,7 @@ impl WorkloadController {
                 r
             } else {
                 let profile = text(&incoming.spec, "profile_name").to_string();
-                let Some(app) = self.inner.lock().apps.get(&profile).cloned() else {
+                let Some(app) = self.inner.lock().apps.get(&profile).filter(|a| !a.removed).cloned() else {
                     continue;
                 };
                 let mut request = json!({"command":incoming.spec["command"],"gpus":incoming.spec["gpus"],"cpus":incoming.spec["cpus"],"nodes":1});
@@ -1926,7 +1978,14 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
             app.removed = true;
             s.save("apps", name, &app)?;
-            s.inner.lock().apps.insert(name.into(), app);
+            s.inner.lock().apps.insert(name.into(), app.clone());
+            if app.persistent {
+                s.remove_app(&app.namespace, name)?;
+            } else {
+                for worker in &app.workers {
+                    s.command(worker, NodeOperation::RemoveProfile, json!({"name":name}))?;
+                }
+            }
             return Ok(Json(json!({"name":name,"removed":true})).into_response());
         }
         if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {

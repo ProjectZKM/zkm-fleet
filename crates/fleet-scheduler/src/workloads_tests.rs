@@ -1451,3 +1451,122 @@ async fn enabling_an_integrated_worker_without_a_registered_proof_app_keeps_hear
     assert!(c.inner.lock().commands[&id].done,"the enable result must be recorded, not rejected with the whole heartbeat");
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_scale_waiting_to_start_says_why() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,true);
+    report.free_gpus=1.0;report.free_cpus=3.0;
+    let service=report.services[0].clone();
+    c.report("gpu","session",report).await.unwrap();
+    let id=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    {
+        let mut i=c.inner.lock();
+        let intent=i.services.get_mut("gpu-service").unwrap();
+        let mut scale=scaling::new_scale(intent.service.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;scale.start=Some(id);
+        intent.scale=Some(scale);
+    }
+    let view=c.app_resources(&ns,"service",None);
+    assert_eq!(view["state"],"starting");
+    assert_eq!(view["detail"],"waiting for capacity: needs 2 GPU and 4 CPU, gpu has 1 GPU and 3 CPU free");
+}
+
+#[tokio::test]
+async fn a_scale_waiting_for_capacity_to_start_can_be_resized() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,true);
+    report.free_gpus=1.0;report.free_cpus=3.0;
+    let service=report.services[0].clone();
+    c.report("gpu","session",report).await.unwrap();
+    let start=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    {
+        let mut i=c.inner.lock();
+        let intent=i.services.get_mut("gpu-service").unwrap();
+        let mut scale=scaling::new_scale(intent.service.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;scale.start=Some(start.clone());
+        intent.scale=Some(scale);
+    }
+    let path=format!("/apps/service/scale?namespace={ns}");
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"gpus":0,"cpus":1})).await.status(),StatusCode::ACCEPTED);
+    c.advance_scales().await.unwrap();
+    let old=c.inner.lock().commands[&start].clone();
+    assert!(old.done && old.error.as_deref().is_some_and(|e|e.contains("replaced")),"{old:?}");
+    c.inner.lock().commands.get_mut(&start).unwrap().admitted=true;
+    c.inner.lock().commands.get_mut(&start).unwrap().done=false;
+    c.inner.lock().services.get_mut("gpu-service").unwrap().scale.as_mut().unwrap().start=Some(start);
+    c.inner.lock().services.get_mut("gpu-service").unwrap().scale.as_mut().unwrap().phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":2})).await.status(),StatusCode::CONFLICT,"a start already sent to the node must finish first");
+}
+
+/// One integrated worker (a dedicated proof server running the app's own worker).
+fn integrated_inventory(ns: &str) -> NodeReport {
+    let mut report=scale_inventory(ns,true,false);
+    report.services[0]["worker_command"]=json!(["/opt/eth-proofs"]);
+    report.services[0]["replicas"]=json!(1);
+    report.services[0]["machine"]=json!("machine");
+    report
+}
+
+#[tokio::test]
+async fn a_disabled_service_its_node_stopped_reporting_is_forgotten() {
+    let (_dir,c,ns)=setup().await;
+    let record=c.dir.join("services").join("gpu-service.json");
+    c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    assert!(c.inner.lock().services.contains_key("gpu-service") && record.exists(),"an enabled service may only be missing for now");
+    c.inner.lock().services.get_mut("gpu-service").unwrap().disabled=true;
+    c.fleet.release_job(&ns,"service:gpu-service").await.unwrap();
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    assert!(!c.inner.lock().services.contains_key("gpu-service"));
+    assert!(!record.exists());
+}
+
+fn remove_commands(c: &WorkloadController, operation: NodeOperation) -> Vec<(String, Value)> {
+    let mut commands: Vec<(String, Value)> = c.inner.lock().commands.values()
+        .filter(|cmd| cmd.operation == operation as i32 && !cmd.done && cmd.admitted)
+        .map(|cmd| (cmd.worker.clone(), (*cmd.parameters).clone()))
+        .collect();
+    commands.sort_by(|a, b| a.0.cmp(&b.0));
+    commands
+}
+
+#[tokio::test]
+async fn deleting_a_proof_app_tells_every_node_which_app_was_deleted() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    c.report("cpu","session",inventory(&ns)).await.unwrap();
+    let app=format!("eth/{}","a".repeat(64));
+    c.remove_app(&ns,&app).unwrap();
+    c.remove_app(&ns,&app).unwrap();
+    let expected=json!({"namespace":ns,"namespace_name":"test","app":app});
+    assert_eq!(remove_commands(&c,NodeOperation::RemoveApp),vec![("cpu".to_string(),expected.clone()),("gpu".to_string(),expected)]);
+}
+
+#[tokio::test]
+async fn deleting_a_serving_app_tells_its_nodes() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
+    c.inner.lock().apps.get_mut("service").unwrap().profile["disabled"]=json!(true);
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/service?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    assert_eq!(remove_commands(&c,NodeOperation::RemoveApp),vec![("gpu".to_string(),json!({"namespace":ns,"namespace_name":"test","app":"service"}))]);
+}
+
+#[tokio::test]
+async fn deleting_a_batch_profile_sends_remove_profile_and_keeps_its_jobs() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    let job=submit(&c).await;
+    c.dispatch().await.unwrap();
+    let job=c.job(&job.id,None,&BTreeMap::new()).unwrap();
+    let mut report=inventory(&ns);
+    report.jobs.push(incoming(&job,"succeeded",true));
+    c.report("gpu","session",report).await.unwrap();
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/batch-profiles/training?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    assert_eq!(remove_commands(&c,NodeOperation::RemoveProfile),vec![("gpu".to_string(),json!({"name":"training"}))]);
+    assert!(c.job(&job.id,None,&BTreeMap::new()).is_ok(),"job history and outputs follow the job's own lifecycle");
+    let mut late=incoming(&job,"succeeded",true);late.id="other-job".into();
+    let mut report=inventory(&ns);report.jobs.push(late);
+    c.report("gpu","session",report).await.unwrap();
+    assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted profile imports no jobs");
+}

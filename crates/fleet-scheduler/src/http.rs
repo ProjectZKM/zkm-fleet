@@ -418,7 +418,11 @@ async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<T
             let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
                 Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
             };
-            app_outcome(s.fleet.delete_app(&n, &t, &e).await)
+            let deleted = s.fleet.delete_app(&n, &t, &e).await;
+            if let (Ok(_), Err(error)) = (&deleted, s.workloads.remove_app(&n, &format!("{t}/{e}"))) {
+                return internal(error);
+            }
+            app_outcome(deleted)
         }
         Err(r) => r,
     }

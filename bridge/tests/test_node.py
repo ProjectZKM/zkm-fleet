@@ -264,3 +264,82 @@ def test_scale_down_replay_does_not_forget_replicas_after_uncertain_cleanup(exec
     assert executor.service({"service":service,"disabled":True,"scale_id":"resize"})["cleaned"]
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
     assert yaml.safe_load(executor.services.read_text())["services"][0]["replicas"]==1
+
+
+SERVICES = """# machine config
+cluster: {log_dir: /tmp}
+services:
+# the GOAT worker
+- name: goat
+  kind: ziren-gpu
+  env:
+    X: "1"
+
+# ethproofs: retired
+- name: eth
+  kind: ziren-gpu   # owner label
+- {name: flow, kind: app}
+# trailing note
+"""
+
+
+def test_remove_entry_keeps_every_other_line(tmp_path):
+    p=tmp_path/"services.yaml";p.write_text(SERVICES)
+    assert node.remove_entry(p,"services","eth")
+    text=p.read_text()
+    assert [s["name"] for s in yaml.safe_load(text)["services"]]==["goat","flow"]
+    assert "ethproofs: retired" not in text and "owner label" not in text
+    assert "# machine config" in text and "# the GOAT worker" in text and "# trailing note" in text
+    assert len(list(tmp_path.glob("services.yaml.removed-*")))==1
+    assert node.remove_entry(p,"services","flow")
+    assert node.remove_entry(p,"services","goat")
+    assert yaml.safe_load(p.read_text())["services"]==[]
+    assert "# trailing note" in p.read_text()
+    assert not node.remove_entry(p,"services","goat")
+
+
+def test_remove_entry_drops_one_profile(tmp_path):
+    p=tmp_path/"jobs.yaml"
+    p.write_text("profiles:\n  trainer:\n    image: a\n  # retired\n  old:\n    image: b\n    allow: [/srv]\n  last: {image: c}\n")
+    assert node.remove_entry(p,"profiles","old")
+    assert sorted(yaml.safe_load(p.read_text())["profiles"])==["last","trainer"] and "retired" not in p.read_text()
+    assert node.remove_entry(p,"profiles","last") and node.remove_entry(p,"profiles","trainer")
+    assert yaml.safe_load(p.read_text())["profiles"]=={}
+
+
+def test_remove_entry_leaves_flow_sections_and_unknown_names_alone(tmp_path):
+    p=tmp_path/"services.yaml";text="services: [{name: a, kind: app}]\n";p.write_text(text)
+    assert not node.remove_entry(p,"services","a") and p.read_text()==text
+    assert not node.remove_entry(p,"profiles","a")
+
+
+def test_remove_commands_clean_up_and_drop_the_entry(executor,monkeypatch):
+    stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
+    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
+    monkeypatch.setattr(node,"container_gone",lambda _:True)
+    services=yaml.safe_load(executor.services.read_text())
+    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","proof_app":"eth/"+"b"*64},
+                           {"name":"web","kind":"app","namespace":"zkm"}]
+    executor.services.write_text(yaml.safe_dump(services))
+    remove=lambda ident,app,ns="a"*32,name="":executor.execute({"id":ident,"operation":7,"parameters":{"namespace":ns,"namespace_name":name,"app":app}})
+    remove("remove-1","eth/"+"b"*64)
+    done=node.read_json(executor.journal/"remove-1.json")
+    assert (done["result"],done["error"])==({"removed":["proof"]},None)
+    assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
+    remove("remove-2","eth/"+"b"*64)
+    assert node.read_json(executor.journal/"remove-2.json")["result"]=={"removed":[]}
+    remove("remove-3","web","1"*32,"zkm")
+    assert node.read_json(executor.journal/"remove-3.json")["result"]=={"removed":["web"]}
+    assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["other-ns"]
+    (executor.services.parent/"profiles.yaml").write_text("profiles:\n  old: {image: a}\n  kept: {image: b}\n")
+    executor.execute({"id":"remove-4","operation":8,"parameters":{"name":"old"}})
+    assert node.read_json(executor.journal/"remove-4.json")["result"]=={"removed":True}
+    assert list(yaml.safe_load((executor.services.parent/"profiles.yaml").read_text())["profiles"])==["kept"]
+
+
+def test_a_service_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
+    monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
+    monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
+    executor.execute({"id":"remove-1","operation":7,"parameters":{"namespace":"a"*32,"app":"eth/"+"b"*64}})
+    assert "uncertain" in node.read_json(executor.journal/"remove-1.json")["error"]
+    assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["proof"]

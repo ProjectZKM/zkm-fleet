@@ -788,6 +788,11 @@ impl Scheduler {
                 refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id)),
                 )
             })?;
+        // Its dedicated worker would keep the node's GPUs with no app left to serve.
+        if self.app_worker_owned(namespace, tenant, elf_id) {
+            return Err(refuse(409, format!("app {} still has a dedicated worker; disable it first: fleetctl app disable {}",
+                app_name(tenant, elf_id), app_name(tenant, elf_id))));
+        }
         let live = self
             .inner
             .lock()

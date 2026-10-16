@@ -108,6 +108,9 @@ impl WorkloadController {
             } else if worker.is_none() {
                 "offline"
             } else if let Some(scale) = intent.scale.as_ref().filter(|s| s.pending()) {
+                if scale.phase() == fleet_proto::model::v1::ScalePhase::Starting {
+                    reasons.push(Self::starting_reason(&i.commands, intent, worker));
+                }
                 scale.phase().name()
             } else if intent.disabled {
                 if observed.is_some_and(|s| s["cleaned"].as_bool() == Some(true)) { "disabled" } else { "draining" }
