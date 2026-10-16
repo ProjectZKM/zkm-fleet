@@ -147,7 +147,7 @@ struct AppName {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct CreateBatchProfile {
+struct CreateBatch {
     name: String,
     image: String,
     #[serde(default)]
@@ -159,8 +159,8 @@ struct CreateBatchProfile {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct SubmitBatch {
-    profile: String,
+struct SubmitBatchJob {
+    batch: String,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -173,9 +173,9 @@ struct SubmitBatch {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct BatchesFilter {
+struct BatchJobsFilter {
     #[serde(default)]
-    profile: Option<String>,
+    batch: Option<String>,
     #[serde(default)]
     active: bool,
     #[serde(default = "default_limit")]
@@ -183,12 +183,23 @@ struct BatchesFilter {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-struct BatchLogs {
+struct BatchJobLogs {
     id: String,
+    /// The job's batch (found from the id when omitted).
+    #[serde(default)]
+    batch: Option<String>,
     #[serde(default = "default_log_lines")]
     lines: usize,
 }
 fn default_log_lines() -> usize { 50 }
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct BatchJobId {
+    id: String,
+    /// The job's batch (found from the id when omitted).
+    #[serde(default)]
+    batch: Option<String>,
+}
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct AppLogs {
@@ -252,13 +263,13 @@ impl FleetMcp {
     }
 
     #[tool(
-        name = "fleet_batch_profile_create",
-        description = "Create an owner-managed batch profile in the authenticated namespace, including priority and allowed mount roots. The token must have workload-management access; the scheduler validates the profile and enforces namespace quotas.",
+        name = "fleet_batch_create",
+        description = "Create an owner-managed batch in the authenticated namespace, including priority and allowed mount roots. The token must have workload-management access; the scheduler validates the batch and enforces namespace quotas.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
-    async fn batch_profile_create(
+    async fn batch_create(
         &self,
-        Parameters(input): Parameters<CreateBatchProfile>,
+        Parameters(input): Parameters<CreateBatch>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
         let mut args = vec![
@@ -280,39 +291,41 @@ impl FleetMcp {
         self.call(parts, args).await
     }
 
-    #[tool(name = "fleet_batch_profiles_list", description = "List reusable finite batch execution profiles in the authenticated namespace.",
+    #[tool(name = "fleet_batches_list", description = "List reusable finite batches in the authenticated namespace.",
         annotations(read_only_hint = true, destructive_hint = false))]
-    async fn batch_profiles_list(&self, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
+    async fn batches_list(&self, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         self.call(parts, vec!["batch".into()]).await
     }
 
-    #[tool(name = "fleet_batch_profile_get", description = "Inspect a batch execution profile and its newest jobs.",
+    #[tool(name = "fleet_batch_get", description = "Inspect a batch and its newest jobs.",
         annotations(read_only_hint = true, destructive_hint = false))]
-    async fn batch_profile_get(&self, Parameters(input): Parameters<AppName>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
+    async fn batch_get(&self, Parameters(input): Parameters<AppName>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         self.call(parts, vec!["batch".into(), input.name]).await
     }
 
-    #[tool(name = "fleet_batches_list", description = "List finite batch jobs visible to the authenticated token.",
+    #[tool(name = "fleet_batch_jobs_list", description = "List finite batch jobs visible to the authenticated token, optionally of one batch.",
         annotations(read_only_hint = true, destructive_hint = false))]
-    async fn batches_list(&self, Parameters(input): Parameters<BatchesFilter>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
+    async fn batch_jobs_list(&self, Parameters(input): Parameters<BatchJobsFilter>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         if !(1..=100).contains(&input.limit) { return Err(tool_error("limit must be between 1 and 100")); }
         let mut args = vec!["job".into(), "--type".into(), "batch".into(), "--limit".into(), input.limit.to_string()];
-        if let Some(profile) = input.profile { args.extend(["--app".into(), profile]); }
+        if let Some(batch) = input.batch { args.extend(["--app".into(), batch]); }
         if input.active { args.push("--active".into()); }
         self.call(parts, args).await
     }
 
-    #[tool(name = "fleet_batch_get", description = "Inspect a finite batch job visible to the authenticated token.",
+    #[tool(name = "fleet_batch_job_get", description = "Inspect a finite batch job visible to the authenticated token.",
         annotations(read_only_hint = true, destructive_hint = false))]
-    async fn batch_get(&self, Parameters(input): Parameters<JobId>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
+    async fn batch_job_get(&self, Parameters(input): Parameters<JobId>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         self.call(parts, vec!["job".into(), input.id]).await
     }
 
-    #[tool(name = "fleet_batch_logs", description = "Read recent container logs for a visible batch job.",
+    #[tool(name = "fleet_batch_job_logs", description = "Read recent container logs for a visible batch job.",
         annotations(read_only_hint = true, destructive_hint = false))]
-    async fn batch_logs(&self, Parameters(input): Parameters<BatchLogs>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
+    async fn batch_job_logs(&self, Parameters(input): Parameters<BatchJobLogs>, Extension(parts): Extension<Parts>) -> Result<Json<Value>, ErrorData> {
         if !(1..=10000).contains(&input.lines) { return Err(tool_error("lines must be between 1 and 10000")); }
-        self.call(parts, vec!["batch".into(), "logs".into(), input.id, "--lines".into(), input.lines.to_string()]).await
+        let mut args = vec!["batch".into(), "logs".into(), input.id, "--lines".into(), input.lines.to_string()];
+        if let Some(batch) = input.batch { args.extend(["--batch".into(), batch]); }
+        self.call(parts, args).await
     }
 
     #[tool(
@@ -359,13 +372,13 @@ impl FleetMcp {
     }
 
     #[tool(
-        name = "fleet_batch_submit",
-        description = "Submit a finite batch job using a profile available to the authenticated token. Commands read inputs and write outputs directly in owner-managed storage. FleetctlClient provides job status and logs. The command is passed directly without a shell.",
+        name = "fleet_batch_job_submit",
+        description = "Submit a finite job under a batch available to the authenticated token. Commands read inputs and write outputs directly in owner-managed storage. FleetctlClient provides job status and logs. The command is passed directly without a shell.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
-    async fn batch_submit(
+    async fn batch_job_submit(
         &self,
-        Parameters(input): Parameters<SubmitBatch>,
+        Parameters(input): Parameters<SubmitBatchJob>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
         if input.command.is_empty() {
@@ -374,7 +387,7 @@ impl FleetMcp {
         if input.command.iter().any(|part| part.contains('\0')) {
             return Err(tool_error("command arguments cannot contain NUL bytes"));
         }
-        let mut args = vec!["batch".into(), "submit".into(), "--app".into(), input.profile];
+        let mut args = vec!["batch".into(), "submit".into(), input.batch];
         if let Some(name) = input.name {
             args.extend(["--name".into(), name]);
         }
@@ -396,17 +409,20 @@ impl FleetMcp {
     }
 
     #[tool(
-        name = "fleet_batch_cancel",
+        name = "fleet_batch_job_cancel",
         description = "Cancel a visible batch job and release its resources after cleanup. This stops the job.",
         annotations(read_only_hint = false, destructive_hint = true)
     )]
-    async fn batch_cancel(
+    async fn batch_job_cancel(
         &self,
-        Parameters(input): Parameters<JobId>,
+        Parameters(input): Parameters<BatchJobId>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
-        self.call(parts, vec!["batch".into(), "cancel".into(), input.id])
-            .await
+        let mut args = vec!["batch".into(), "cancel".into(), input.id];
+        if let Some(batch) = input.batch {
+            args.extend(["--batch".into(), batch]);
+        }
+        self.call(parts, args).await
     }
 }
 

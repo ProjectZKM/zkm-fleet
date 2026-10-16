@@ -30,7 +30,7 @@ struct NodeAgentArgs {
     #[arg(long)]
     services: PathBuf,
     #[arg(long)]
-    profiles: PathBuf,
+    batches: PathBuf,
     #[arg(long)]
     jobs_dir: PathBuf,
     #[arg(long)]
@@ -122,8 +122,8 @@ async fn main() -> Result<()> {
         .arg("fleet_bridge.node")
         .arg("--services")
         .arg(&a.services)
-        .arg("--profiles")
-        .arg(&a.profiles)
+        .arg("--batches")
+        .arg(&a.batches)
         .arg("--jobs-dir")
         .arg(&a.jobs_dir)
         .arg("--address")

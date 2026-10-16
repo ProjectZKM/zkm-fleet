@@ -3,7 +3,7 @@ import os
 from types import SimpleNamespace
 
 from fleet_bridge import jobs
-from fleet_bridge.model import JobTemplate, JobSpec, JobState, JobStatus
+from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
 
 
 def test_prepare_launch_discards_blocked_placement(monkeypatch):
@@ -31,7 +31,7 @@ def test_launch_reuses_placement_and_atomically_deduplicates_actor_creation(monk
     monkeypatch.setattr(jobs,'job_placement',lambda spec:pg)
     monkeypatch.setattr(jobs,'JobActor',Actor())
     monkeypatch.setattr(jobs,'PlacementGroupSchedulingStrategy',lambda **kw:kw)
-    spec=JobSpec(id='job',profile_name='p',profile=JobTemplate(image='python:3'),command=['true'],gpus=0,cpus=1,out='/tmp/job/out')
+    spec=JobSpec(id='job',batch='p',policy=Batch(image='python:3'),command=['true'],gpus=0,cpus=1,out='/tmp/job/out')
     jobs.launch(spec,'/tmp/job')
     jobs.launch(spec,'/tmp/job')
     assert all(c['get_if_exists'] and c['name']=='job-job' for c in created)
@@ -64,7 +64,7 @@ def test_cancelled_actor_cannot_start_container_after_cleanup(tmp_path,monkeypat
     job=jobs.JobDirectory(str(tmp_path),'job',must_exist=False)
     os.makedirs(job.out)
     JobStatus(id='job',state=JobState.CANCELLED,submitted_at=1,gpus_requested=0,cpus=1).write(job.status_path)
-    spec=JobSpec(id='job',profile_name='p',profile=JobTemplate(image='python:3'),command=['true'],gpus=0,cpus=1,out=job.out)
+    spec=JobSpec(id='job',batch='p',policy=Batch(image='python:3'),command=['true'],gpus=0,cpus=1,out=job.out)
     monkeypatch.setattr(jobs.ray,'get_gpu_ids',lambda:[])
     called=[]
     monkeypatch.setattr(jobs,'_sh',called.append)
@@ -76,7 +76,7 @@ def test_cancelled_actor_cannot_start_container_after_cleanup(tmp_path,monkeypat
 def test_preemption_does_not_release_placement_when_container_is_unreachable(tmp_path, monkeypatch):
     job = jobs.JobDirectory(str(tmp_path), "job", must_exist=False)
     os.makedirs(job.out)
-    spec = JobSpec(id="job", namespace="n", profile_name="p", profile=JobTemplate(image="i"), command=["x"], gpus=1, cpus=1, out=job.out)
+    spec = JobSpec(id="job", namespace="n", batch="p", policy=Batch(image="i"), command=["x"], gpus=1, cpus=1, out=job.out)
     spec.write(job.spec_path)
     JobStatus(id="job", state=JobState.RUNNING, submitted_at=1, started_at=1,
               gpus_requested=1, cpus=1, node_ip="unreachable").write(job.status_path)
@@ -99,7 +99,7 @@ def test_single_machine_actor_retries_oom_and_releases_local_placement(tmp_path,
 
     job = jobs.JobDirectory(str(tmp_path), "job", must_exist=False)
     os.makedirs(job.out)
-    spec = JobSpec(id="job", namespace="n", profile_name="p", profile=JobTemplate(image="i"),
+    spec = JobSpec(id="job", namespace="n", batch="p", policy=Batch(image="i"),
                    command=["x"], gpus=1, cpus=1, out=job.out, restart_on_oom=1)
     spec.write(job.spec_path)
     JobStatus(id="job", state=JobState.QUEUED, submitted_at=1, gpus_requested=1, cpus=1).write(job.status_path)
@@ -124,7 +124,7 @@ def test_single_machine_actor_retries_oom_and_releases_local_placement(tmp_path,
 
 
 def test_multiple_machine_execution_is_rejected_before_ray_allocation(monkeypatch):
-    spec = JobSpec(id="job", profile_name="p", profile=JobTemplate(image="i"), command=["x"],
+    spec = JobSpec(id="job", batch="p", policy=Batch(image="i"), command=["x"],
                    gpus=1, cpus=1, out="/tmp/job/out", nodes=2)
     allocated = []
     monkeypatch.setattr(jobs, "placement_group", allocated.append)
@@ -137,7 +137,7 @@ def test_multiple_machine_execution_is_rejected_before_ray_allocation(monkeypatc
 def test_local_rank_reports_machine_identity_and_ray_granted_cards(monkeypatch):
     monkeypatch.setattr(jobs.ray, "get_gpu_ids", lambda: [1.0])
     monkeypatch.setattr(jobs, "node_ip", lambda: "127.0.0.1")
-    spec = JobSpec(id="job", profile_name="p", profile=JobTemplate(image="i"), command=["true"],
+    spec = JobSpec(id="job", batch="p", policy=Batch(image="i"), command=["true"],
                    gpus=1, cpus=1, out="/tmp/job/out")
     info = jobs._Rank(spec).info()
     assert info.machine and info.node_ip == "127.0.0.1"

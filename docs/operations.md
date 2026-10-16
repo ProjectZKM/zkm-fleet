@@ -115,11 +115,11 @@ increase node capacity. Follow the [node maintenance procedure](maintenance.md).
 Apps and jobs show `TAG` and `STATE`. App state reports service readiness;
 job state reports an execution's progress. App details retain replica settings
 and job counts. Tags use `key=value`, for example `scope=default` or `team=research`.
-The same namespace/tag selectors work for apps, batch profiles and jobs.
+The same namespace/tag selectors work for apps, batches and jobs.
 
 Owner tokens can register and remove workloads, set priority, enable/disable them
 and scale apps within their grants. Batch owners set image, environment, resource
-policy and allowed mount roots when registering a profile. Profile disabling
+policy and allowed mount roots when registering a batch. Batch disabling
 blocks new submissions; accepted batch jobs continue. App disabling drains the
 configured services before releasing their reservations.
 
@@ -148,11 +148,11 @@ For a batch, first register reusable configuration, then submit and inspect jobs
 ```bash
 fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
   --image nvidia/cuda:12.8.0-base-ubuntu22.04 --allow /data/models --priority 10
-fleetctl --token-file pi-owner.token batch            # the profiles, with active jobs and the last job
-fleetctl --token-file pi-owner.token batch gpu-test   # one profile and its newest jobs
+fleetctl --token-file pi-owner.token batch            # the batches, with active jobs and the last job
+fleetctl --token-file pi-owner.token batch gpu-test   # one batch and its newest jobs
 fleetctl --token-file pi-owner.token job --type batch -a   # the queued and running batch jobs
 fleetctl --token-file pi-owner.token batch priority gpu-test 20
-fleetctl --token-file pi-owner.token batch submit --app gpu-test --gpus 1 --cpus 2 \
+fleetctl --token-file pi-owner.token batch submit gpu-test --gpus 1 --cpus 2 \
   --mount /data/models:ro -- nvidia-smi
 fleetctl --token-file pi-owner.token batch logs JOB_ID -f
 fleetctl --token-file pi-owner.token batch cancel JOB_ID
@@ -163,9 +163,9 @@ for namespace creation, token issuance and quotas. Use `fleetctl --help` and
 subcommand `--help` for the complete command list. SDK clients use their app's
 endpoint; Fleet CLI and MCP use the control-plane URL.
 
-Reusable batch templates are stored in node `etc/jobs.yaml`; app deployments
+Batches are configured in node `etc/batches.yaml`; app deployments
 are configured in `etc/services.yaml`. Both share namespace, tag, priority,
-image and resource policy. Each batch gets a workspace under
+image and resource policy. Each batch job gets a workspace under
 `FLEET_JOBS_DIR/JOB_ID/`, normally `~/app/fleet/work/jobs/JOB_ID/`.
 The command's output directory is exposed as `FLEET_OUT`; retrieve artifacts
 from application-owned storage. Fleet supplies status and logs.

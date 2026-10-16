@@ -175,7 +175,7 @@ sudo systemctl start zkm-fleet-node.service
 The offline wheel command assumes Ray and PyYAML are already installed at the
 versions required by the package. For cron installations, pause and restore the
 watchdog as described above. Preserve `etc/watchdog.env`, including node capacity
-and `FLEET_NODE_SUPERVISED`, along with `services.yaml`, `jobs.yaml` and credentials.
+and `FLEET_NODE_SUPERVISED`, along with `services.yaml`, `batches.yaml` and credentials.
 Keep independent app endpoints running when their programs are unchanged.
 Verify the fresh heartbeat, total/free resources, app states and saved progress
 before following [verify and resume](#verify-and-resume).

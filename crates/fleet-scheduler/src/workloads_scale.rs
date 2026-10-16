@@ -339,7 +339,7 @@ impl WorkloadController {
                         .get(text(&intent.service, "name"))
                         .cloned();
                     if let Some(mut app) = app {
-                        app.profile["disabled"] = json!(true);
+                        app.spec["disabled"] = json!(true);
                         self.save("apps", &app.name, &app)?;
                         self.inner.lock().apps.insert(app.name.clone(), app);
                     }
@@ -440,9 +440,9 @@ impl WorkloadController {
                 .cloned();
             if let Some(mut app) = app.filter(|a| a.persistent) {
                 for k in ["gpus", "cpus", "replicas"] {
-                    app.profile[k] = scale.target[k].clone();
+                    app.spec[k] = scale.target[k].clone();
                 }
-                app.profile["disabled"] = json!(scale.disabled);
+                app.spec["disabled"] = json!(scale.disabled);
                 self.save("apps", &app.name, &app)?;
                 self.inner.lock().apps.insert(app.name.clone(), app);
             }

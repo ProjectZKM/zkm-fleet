@@ -1564,7 +1564,7 @@ async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
     let mut agent = WorkerServiceClient::with_interceptor(channel, fleet_scheduler::token::BearerTokenInterceptor::new(TOKEN).unwrap(),
     );
     let report = serde_json::json!({"version":2,"machine":"test","ready":true,
-        "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"profiles":{},
+        "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"batches":{},
         "services":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
             "proof_app":format!("eth/{elf}"),"worker_command":["/opt/eth-proofs"],
             "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});

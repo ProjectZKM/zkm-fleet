@@ -4,17 +4,17 @@ import pytest
 import yaml
 
 from fleet_bridge import actors, node, reconcile, jobs
-from fleet_bridge.model import JobTemplate, JobSpec, JobState, JobStatus
+from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
 
 
 @pytest.fixture
 def executor(tmp_path, monkeypatch):
-    (tmp_path / "profiles.yaml").write_text("profiles: {}\n")
+    (tmp_path / "batches.yaml").write_text("batches: {}\n")
     (tmp_path / "services.yaml").write_text(yaml.safe_dump({"services": [{
         "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
         "proof_app": "eth/"+"b"*64, "disabled": True, "replicas": 2,
     }]}))
-    e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"profiles.yaml"),str(tmp_path/"jobs"))
+    e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
     e.pool=Mock()
     monkeypatch.setattr(node.ray,"nodes",lambda:[{"Alive":True}])
@@ -119,7 +119,7 @@ def test_pending_launch_refuses_removed_input_capture_without_starting_a_job(exe
 def test_storage_inputs_are_passed_to_the_app_without_capturing_code(executor, monkeypatch):
     p = command()["parameters"]
     p.update({"owner": "owner", "namespace": "a" * 32, "tag": "scope=default",
-              "profile_name": "training", "profile": {"image": "training:latest", "namespace": "a" * 32},
+              "batch": "training", "policy": {"image": "training:latest", "namespace": "a" * 32},
               "submitted_at": 1,
               "request": {"command": ["train", "--input", "s3://owner/dataset"], "gpus": 0,
                           "cpus": 1, "env": ["INPUT_URI=s3://owner/dataset"]}})
@@ -137,7 +137,7 @@ def test_finished_job_reports_log_completion_without_archiving_outputs(executor,
     directory = executor.jobs_dir / "job-output"
     (directory / "out").mkdir(parents=True)
     (directory / "out/result.txt").write_text("app-owned output")
-    JobSpec(id="job-output", profile_name="training", profile=JobTemplate(image="training:latest"),
+    JobSpec(id="job-output", batch="training", policy=Batch(image="training:latest"),
             command=["true"], gpus=0, cpus=1, out=str(directory / "out")).write(str(directory / "spec.json"))
     JobStatus(id="job-output", state=JobState.SUCCEEDED, submitted_at=1, gpus_requested=0, cpus=1).write(str(directory / "status.json"))
     node.write_json(directory / ".fleet-lease.json", {"lease": "lease-1"})
@@ -298,19 +298,19 @@ def test_remove_entry_keeps_every_other_line(tmp_path):
     assert not node.remove_entry(p,"services","goat")
 
 
-def test_remove_entry_drops_one_profile(tmp_path):
-    p=tmp_path/"jobs.yaml"
-    p.write_text("profiles:\n  trainer:\n    image: a\n  # retired\n  old:\n    image: b\n    allow: [/srv]\n  last: {image: c}\n")
-    assert node.remove_entry(p,"profiles","old")
-    assert sorted(yaml.safe_load(p.read_text())["profiles"])==["last","trainer"] and "retired" not in p.read_text()
-    assert node.remove_entry(p,"profiles","last") and node.remove_entry(p,"profiles","trainer")
-    assert yaml.safe_load(p.read_text())["profiles"]=={}
+def test_remove_entry_drops_one_batch(tmp_path):
+    p=tmp_path/"batches.yaml"
+    p.write_text("batches:\n  trainer:\n    image: a\n  # retired\n  old:\n    image: b\n    allow: [/srv]\n  last: {image: c}\n")
+    assert node.remove_entry(p,"batches","old")
+    assert sorted(yaml.safe_load(p.read_text())["batches"])==["last","trainer"] and "retired" not in p.read_text()
+    assert node.remove_entry(p,"batches","last") and node.remove_entry(p,"batches","trainer")
+    assert yaml.safe_load(p.read_text())["batches"]=={}
 
 
 def test_remove_entry_leaves_flow_sections_and_unknown_names_alone(tmp_path):
     p=tmp_path/"services.yaml";text="services: [{name: a, kind: app}]\n";p.write_text(text)
     assert not node.remove_entry(p,"services","a") and p.read_text()==text
-    assert not node.remove_entry(p,"profiles","a")
+    assert not node.remove_entry(p,"batches","a")
 
 
 def test_remove_commands_clean_up_and_drop_the_entry(executor,monkeypatch):
@@ -331,10 +331,10 @@ def test_remove_commands_clean_up_and_drop_the_entry(executor,monkeypatch):
     remove("remove-3","web","1"*32,"zkm")
     assert node.read_json(executor.journal/"remove-3.json")["result"]=={"removed":["web"]}
     assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["other-ns"]
-    (executor.services.parent/"profiles.yaml").write_text("profiles:\n  old: {image: a}\n  kept: {image: b}\n")
+    (executor.services.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
     executor.execute({"id":"remove-4","operation":8,"parameters":{"name":"old"}})
     assert node.read_json(executor.journal/"remove-4.json")["result"]=={"removed":True}
-    assert list(yaml.safe_load((executor.services.parent/"profiles.yaml").read_text())["profiles"])==["kept"]
+    assert list(yaml.safe_load((executor.services.parent/"batches.yaml").read_text())["batches"])==["kept"]
 
 
 def test_a_service_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):

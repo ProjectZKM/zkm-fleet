@@ -109,7 +109,7 @@ message WorkloadTemplate {
   required string name = 1;
   required string namespace = 2;
   optional string tag = 3;
-  required Json profile = 4;
+  required Json spec = 4;
   required bool persistent = 5;
   required bool removed = 6;
   repeated string workers = 7;
@@ -121,7 +121,7 @@ message Job {
   required string owner = 3;
   required string namespace = 4;
   optional string tag = 5;
-  required string profile = 6;
+  required string batch = 6;
   required Json policy = 7;
   required Json request = 8;
   optional string worker = 9;
@@ -151,7 +151,7 @@ message NodeReport {
   required double total_cpus = 5;
   required double free_gpus = 6;
   required double free_cpus = 7;
-  map<string, Json> profiles = 8;
+  map<string, Json> batches = 8;
   repeated Json services = 9;
   repeated JobReport jobs = 10;
   repeated CommandResult results = 11;

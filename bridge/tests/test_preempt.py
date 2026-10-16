@@ -5,12 +5,12 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from fleet_bridge.model import JobAttempt, FailureCause, JobTemplate, JobSpec, JobState, JobStatus
+from fleet_bridge.model import JobAttempt, FailureCause, Batch, JobSpec, JobState, JobStatus
 from fleet_bridge.jobs import JobDirectory, budgets
 
 
 def spec(**kw: Any) -> JobSpec:
-    base: dict[str, Any] = dict(id="r", profile_name="p", profile=JobTemplate(image="i"), command=["x"], gpus=1, cpus=1,
+    base: dict[str, Any] = dict(id="r", batch="p", policy=Batch(image="i"), command=["x"], gpus=1, cpus=1,
                                 out="/tmp/out")
     base.update(kw)
     return JobSpec(**base)

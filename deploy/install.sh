@@ -130,7 +130,7 @@ EOF
   if [ -n "$CA" ] && ! grep -q '^scheduler_ca_file:' "$ETC/services.yaml"; then
     printf '\nscheduler_ca_file: %s\n' "$CA" >> "$ETC/services.yaml"
   fi
-  [ -f "$ETC/jobs.yaml" ] || echo 'profiles: {} # initial operator-managed batch profiles' > "$ETC/jobs.yaml"
+  [ -f "$ETC/batches.yaml" ] || echo 'batches: {} # initial operator-managed batches' > "$ETC/batches.yaml"
   mkdir -p "$JOBS_DIR"
   if [ -n "$PROOF_ROOTS" ]; then
     [ -f "$PROOF_ROOTS" ] || die "--proof-storage-roots must name a file with one approved root per line"

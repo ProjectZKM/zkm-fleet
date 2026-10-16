@@ -26,7 +26,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .rayapi import alive_nodes, node_ip
 from .model import (JobAttempt, ResourceRequest, GpuMemoryState, FailureCause, GpuProcess,
-                    TaskPlacement, JobTemplates, JobSpec, JobState, JobStatus)
+                    TaskPlacement, Batches, JobSpec, JobState, JobStatus)
 
 NAMESPACE = "zkm-fleet"
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
@@ -179,7 +179,7 @@ def pg_name(job_id: str) -> str:
 
 def docker_command(spec: JobSpec, gpus: list[str], attempt: int = 1, rank: int = 0) -> list[str]:
     """The `docker run` for a job (or one rank of it) on the given host cards."""
-    p = spec.profile
+    p = spec.policy
     cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", "none" if spec.namespace or spec.owner else "host",
            f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=job", "--label", f"zkm-fleet.job={spec.id}"]
     if gpus:
@@ -469,9 +469,9 @@ def launch(spec: JobSpec, job_dir: str) -> None:
 
 # ── submit ───────────────────────────────────────────────────────────────────
 
-def load_config(path: str) -> JobTemplates:
+def load_config(path: str) -> Batches:
     with open(path) as f:
-        return JobTemplates.load(yaml.safe_load(f) or {})
+        return Batches.load(yaml.safe_load(f) or {})
 
 
 def _inside(path: str, roots: list[str]) -> bool:
@@ -564,7 +564,7 @@ def cancel(jobs_dir: str, job_id: str) -> JobStatus:
     if st.state is not JobState.CANCELLED:
         raise Conflict(f"{job_id} already {st.state.value}: nothing to cancel")
     if st.node_ip or st.container or st.ranks:  # location is written before container creation
-        _stop_ranks(st, job_id, job.spec().profile.stop_timeout_s)
+        _stop_ranks(st, job_id, job.spec().policy.stop_timeout_s)
     _end_actors(job_id, st.nodes)
     gone = [r.machine for r in st.places()
             if _on_job_node(r, ["docker", "rm", "-f", container_name(job_id, r.rank)]) is None]
@@ -617,7 +617,7 @@ def preempt(jobs_dir: str, job_id: str, reason: str) -> JobStatus:
     if st.state is not JobState.PREEMPTED:
         raise Conflict(f"{job_id} is {st.state.value}: nothing to preempt")
     if before.state is JobState.RUNNING:
-        _stop_ranks(st, job_id, spec.profile.stop_timeout_s)
+        _stop_ranks(st, job_id, spec.policy.stop_timeout_s)
     _end_actors(job_id, st.nodes)
     if not confirm_cleanup(job):
         return job.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")

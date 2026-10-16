@@ -74,9 +74,9 @@ When systemd supervises the agent, set `FLEET_NODE_SUPERVISED=1` in
 `etc/watchdog.env`; the watchdog may still keep Ray running. Use only one agent
 supervisor.
 It preserves existing app and batch configuration. A new node starts empty:
-configure `etc/services.yaml` and `etc/jobs.yaml` using the
+configure `etc/services.yaml` and `etc/batches.yaml` using the
 [app example](../deploy/services.example.yaml) and
-[batch example](../deploy/jobs.example.yaml).
+[batch example](../deploy/batches.example.yaml).
 
 On the control host, verify registration:
 

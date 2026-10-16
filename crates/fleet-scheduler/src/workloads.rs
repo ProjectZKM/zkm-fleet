@@ -332,7 +332,7 @@ impl WorkloadController {
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
-                "batch_profiles":w.report.profiles.keys().collect::<Vec<_>>(),
+                "batches":w.report.batches.keys().collect::<Vec<_>>(),
                 "heartbeat_age_ms":((now()-w.seen)*1000.0) as u64})
         }).collect()
     }
@@ -371,7 +371,7 @@ impl WorkloadController {
     ) -> bool {
         let selected = principal.and_then(|c| c.tag.as_deref())
             .or_else(|| q.get("tag").map(String::as_str));
-        let fixed = app.tag.as_deref().or_else(|| app.profile["tag"].as_str());
+        let fixed = app.tag.as_deref().or_else(|| app.spec["tag"].as_str());
         self.visible(&app.namespace, selected, principal, q)
             && fixed.is_none_or(|tag| {
                 if principal.is_some() { selected == Some(tag) }
@@ -479,6 +479,10 @@ impl WorkloadController {
             )
         })?
     }
+    /// Whether a batch still has job records (not purged).
+    fn has_jobs(&self, batch: &str) -> bool {
+        self.inner.lock().jobs.values().any(|r| r.batch == batch && !r.purged)
+    }
     fn app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
         let resources = app.persistent.then(|| self.app_resources(&app.namespace, &app.name, tag));
         let i = self.inner.lock();
@@ -486,15 +490,15 @@ impl WorkloadController {
             .jobs
             .values()
             .filter(|r| {
-                !r.purged && r.profile == app.name && r.namespace == app.namespace
+                !r.purged && r.batch == app.name && r.namespace == app.namespace
                 && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag)
             })
             .collect();
-        let mut v = app.profile.0.clone();
+        let mut v = app.spec.0.clone();
         if let Some(resources) = resources {
             v.as_object_mut().unwrap().extend(resources.as_object().unwrap().clone());
         }
-        v["tag"] = json!(app.tag.as_deref().or_else(|| app.profile["tag"].as_str()));
+        v["tag"] = json!(app.tag.as_deref().or_else(|| app.spec["tag"].as_str()));
         v["last_submitted_at"] = json!(jobs
             .iter()
             .filter_map(|r| r.status["submitted_at"].as_f64())
@@ -502,11 +506,11 @@ impl WorkloadController {
         if app.persistent {
             v.as_object_mut().unwrap().remove("kind");
             v["max_gpus"] = json!(
-                app.profile["gpus"].as_f64().unwrap_or(0.0)
-                    * app.profile["replicas"].as_f64().unwrap_or(1.0)
+                app.spec["gpus"].as_f64().unwrap_or(0.0)
+                    * app.spec["replicas"].as_f64().unwrap_or(1.0)
             );
         } else {
-            v["state"] = json!(if app.profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
+            v["state"] = json!(if app.removed { "deleted" } else if app.spec["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
         }
 
         for (k, value) in [
@@ -539,6 +543,7 @@ impl WorkloadController {
     }
     async fn submit(
         &self,
+        batch: &str,
         mut request: Value,
         c: Option<&Token>,
         q: &BTreeMap<String, String>,
@@ -548,7 +553,6 @@ impl WorkloadController {
             .as_object_mut()
             .ok_or_else(|| fail(400, "expected object"))?;
         let allowed = [
-            "profile",
             "name",
             "command",
             "gpus",
@@ -595,12 +599,12 @@ impl WorkloadController {
         if request["machine"].as_array().is_some_and(|a| a.len() > 1) {
             return Err(fail(422, "one machine may be selected for a local job"));
         }
-        for key in ["profile", "name", "after", "log", "workdir"] {
+        for key in ["name", "after", "log", "workdir"] {
             if !request[key].is_null() && !request[key].is_string() {
                 return Err(fail(400, format!("{key}: expected string")));
             }
         }
-        let name = text(&request, "profile").to_string();
+        let name = batch.to_string();
         Self::require_grant(c, &name)?;
         let app = self
             .inner
@@ -609,8 +613,8 @@ impl WorkloadController {
             .get(&name)
             .filter(|a| !a.removed)
             .cloned()
-            .ok_or_else(|| fail(404, "unknown batch profile"))?;
-        if app.persistent || app.profile["disabled"].as_bool() == Some(true) {
+            .ok_or_else(|| fail(404, "unknown batch"))?;
+        if app.persistent || app.spec["disabled"].as_bool() == Some(true) {
             return Err(fail(409, "app does not accept batch jobs"));
         }
         let mut selectors = q.clone();
@@ -637,11 +641,11 @@ impl WorkloadController {
             || gpus < 0.0
             || cpus < 1
             || (gpus > 1.0 && gpus.fract() != 0.0)
-            || gpus > app.profile["max_gpus"].as_f64().unwrap_or(8.0)
+            || gpus > app.spec["max_gpus"].as_f64().unwrap_or(8.0)
         {
             return Err(fail(
                 400,
-                "invalid GPU/CPU request or profile GPU cap exceeded",
+                "invalid GPU/CPU request or batch GPU cap exceeded",
             ));
         }
         let n = self.fleet.namespace(&namespace).unwrap();
@@ -658,12 +662,12 @@ impl WorkloadController {
         }
         let gpu_mem = request["gpu_mem"]
             .as_u64()
-            .unwrap_or_else(|| app.profile["default_gpu_mem_gb"].as_u64().unwrap_or(0));
+            .unwrap_or_else(|| app.spec["default_gpu_mem_gb"].as_u64().unwrap_or(0));
         if gpus > 0.0 && gpus < 1.0 && gpu_mem == 0 {
             return Err(fail(400, "fractional GPUs require a VRAM limit"));
         }
         let mounts = request["mount"].as_array().cloned().unwrap_or_default();
-        let roots = app.profile["allow"].as_array().cloned().unwrap_or_default();
+        let roots = app.spec["allow"].as_array().cloned().unwrap_or_default();
         if mounts.iter().any(|m| {
             m.as_str()
                 .is_none_or(|m| !path_allowed(m.split(':').next().unwrap_or(""), &roots))
@@ -702,8 +706,8 @@ impl WorkloadController {
             owner: c.map_or("admin", |c| c.id.as_str()).into(),
             namespace,
             tag,
-            profile: name,
-            policy: app.profile,
+            batch: name,
+            policy: app.spec,
             request: request.into(),
             worker: None,
             status: json!({"id":id,"state":state,"submitted_at":now(),"gpus_requested":gpus,"cpus":cpus,"gpu_mem_gb":gpu_mem,"gpus":[],"nodes":1,"priority":0}).into(),
@@ -757,8 +761,8 @@ impl WorkloadController {
                 service["namespace"] = json!(n.id);
             }
         }
-        for profile in report.profiles.values().chain(report.services.iter()) {
-            if let Some(tag) = profile["tag"].as_str() {
+        for spec in report.batches.values().chain(report.services.iter()) {
+            if let Some(tag) = spec["tag"].as_str() {
                 crate::fleet::Scheduler::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
             }
         }
@@ -800,32 +804,32 @@ impl WorkloadController {
                 },
             );
         }
-        for (name, mut profile) in report.profiles.clone().into_iter().chain(
+        for (name, mut spec) in report.batches.clone().into_iter().chain(
             report
                 .services
                 .iter()
                 .filter(|s| text(s, "kind") == "app")
                 .map(|s| (text(s, "name").into(), s.clone())),
         ) {
-            if !is_safe_id(&name) || !profile.is_object() {
+            if !is_safe_id(&name) || !spec.is_object() {
                 continue;
             }
-            let reference = profile["namespace"]
+            let reference = spec["namespace"]
                 .as_str()
                 .unwrap_or(crate::store::SYSTEM_NAMESPACE);
             let Some(namespace) = self.fleet.namespace(reference) else {
                 continue;
             };
-            profile["namespace"] = json!(namespace.id);
-            if profile["priority"].is_null() {
-                profile["priority"] = json!(0);
+            spec["namespace"] = json!(namespace.id);
+            if spec["priority"].is_null() {
+                spec["priority"] = json!(0);
             }
-            let persistent = text(&profile, "kind") == "app";
+            let persistent = text(&spec, "kind") == "app";
             let mut app = self.inner.lock().apps.get(&name).cloned().unwrap_or(WorkloadTemplate {
                 name: name.clone(),
                 namespace: namespace.id.clone(),
                 tag: None,
-                profile,
+                spec,
                 persistent,
                 removed: false,
                 workers: Vec::new(),
@@ -944,8 +948,8 @@ impl WorkloadController {
             let mut r = if let Some(r) = existing {
                 r
             } else {
-                let profile = text(&incoming.spec, "profile_name").to_string();
-                let Some(app) = self.inner.lock().apps.get(&profile).filter(|a| !a.removed).cloned() else {
+                let batch = text(&incoming.spec, "batch").to_string();
+                let Some(app) = self.inner.lock().apps.get(&batch).filter(|a| !a.removed).cloned() else {
                     continue;
                 };
                 let mut request = json!({"command":incoming.spec["command"],"gpus":incoming.spec["gpus"],"cpus":incoming.spec["cpus"],"nodes":1});
@@ -958,8 +962,8 @@ impl WorkloadController {
                     owner: incoming.spec["owner"].as_str().unwrap_or("admin").into(),
                     namespace: app.namespace,
                     tag: incoming.spec["tag"].as_str().map(str::to_owned),
-                    profile,
-                    policy: incoming.spec["profile"].clone().into(),
+                    batch,
+                    policy: incoming.spec["policy"].clone().into(),
                     request: request.into(),
                     worker: Some(worker_id.into()),
                     status: incoming.status.clone(),
@@ -1507,7 +1511,7 @@ impl WorkloadController {
             }
             let allowed = {
                 let i = self.inner.lock();
-                let app = i.apps.get(&r.profile);
+                let app = i.apps.get(&r.batch);
                 i.workers
                     .iter()
                     .filter(|(id, w)| {
@@ -1581,7 +1585,7 @@ impl WorkloadController {
                 continue;
             }
             self.inner.lock().jobs.insert(r.id.clone(), r.clone());
-            self.command(&worker,NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.command(&worker,NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"batch":r.batch,"policy":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
         }
         // A durable assigned job whose process died before command persistence still
         // receives the same lease. Uncertain execution is never moved to another node.
@@ -1595,7 +1599,7 @@ impl WorkloadController {
                 .collect::<Vec<_>>()
         };
         for r in assigned {
-            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"profile_name":r.profile,"profile":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"batch":r.batch,"policy":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
         }
         Ok(())
     }
@@ -1705,7 +1709,7 @@ fn path_allowed(path: &str, roots: &[Value]) -> bool {
 
 pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batch-profiles", "batches", "proof-apps", "internal/jobs",
+    for root in ["apps", "batches", "proof-apps", "internal/jobs",
     ] {
         router = router
             .route(&format!("/{root}"), any(handle))
@@ -1730,8 +1734,11 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         return Err(fail(400, "use optional tag; groups are not a resource"));
     }
     let mut parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
-    let batch_profile = parts.first() == Some(&"batch-profiles");
-    if batch_profile { parts[0] = "apps"; }
+    // /batches/{name}/jobs[/{id}] are one batch's jobs; the other /batches routes are batch
+    // definitions, which share the app template routes.
+    let batch_jobs = parts.first() == Some(&"batches") && parts.get(2) == Some(&"jobs");
+    let batch = parts.first() == Some(&"batches") && !batch_jobs;
+    if batch { parts[0] = "apps"; }
     let bearer = request
         .headers()
         .get(token::HEADER)
@@ -1753,7 +1760,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     if let Some(c) = c {
         s.scope(Some(c), &q, None)?;
     }
-    if batch_profile && parts.len() == 3 && parts[2] == "scale" {
+    if batch && parts.len() == 3 && parts[2] == "scale" {
         return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus",
         ));
     }
@@ -1802,13 +1809,13 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     if method == Method::GET && parts == ["apps"] {
         if q.contains_key("tag") { s.scope(c, &q, None)?; }
         let apps = {
-            s.inner
-                .lock()
-                .apps
+            let i = s.inner.lock();
+            let with_jobs: HashSet<&str> = i.jobs.values().filter(|r| !r.purged).map(|r| r.batch.as_str()).collect();
+            i.apps
                 .values()
                 .filter(|a| {
-                    !a.removed
-                        && a.persistent != batch_profile
+                    (!a.removed || batch && with_jobs.contains(a.name.as_str()))
+                        && a.persistent != batch
                         && s.app_visible(a, c, &q)
                         && WorkloadController::require_grant(c, &a.name).is_ok()
                 })
@@ -1820,8 +1827,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         );
     }
     if method == Method::POST && parts == ["apps"] {
-        if !batch_profile {
-            return Err(fail(400, "configure serving deployments in services.yaml; finite profiles use POST /batch-profiles"));
+        if !batch {
+            return Err(fail(400, "configure serving deployments in services.yaml; batches use POST /batches"));
         }
         if c.is_some_and(|c| !c.manage_apps) {
             return Err(fail(403, "app management grant required"));
@@ -1920,7 +1927,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             name: name.clone(),
             namespace,
             tag,
-            profile: body.into(),
+            spec: body.into(),
             persistent: false,
             removed: false,
             workers: Vec::new(),
@@ -1932,12 +1939,14 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     }
     if parts.first() == Some(&"apps") && parts.len() >= 2 {
         let name = parts[1];
+        // A deleted batch stays readable while it has job records: they are its history.
+        let readable_deleted = batch && method == Method::GET && parts.len() == 2 && s.has_jobs(name);
         let mut app = s
             .inner
             .lock()
             .apps
             .get(name)
-            .filter(|a| !a.removed && a.persistent != batch_profile)
+            .filter(|a| (!a.removed || readable_deleted) && a.persistent != batch)
             .cloned()
             .ok_or_else(|| fail(404, "unknown app"))?;
         WorkloadController::require_grant(c, name)?;
@@ -1955,7 +1964,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             let _ops = s.ops.lock().await;
             s.ensure_not_scaling(&app.namespace, name)?;
             let persistent_ready_to_remove = !app.persistent
-                || (app.profile["disabled"].as_bool() == Some(true)
+                || (app.spec["disabled"].as_bool() == Some(true)
                     && app.workers.iter().all(|id| {
                         s.inner.lock().workers.get(id).is_some_and(|w| {
                             now() - w.seen < 30.0
@@ -1969,7 +1978,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     .lock()
                     .jobs
                     .values()
-                    .any(|r| r.profile == name && (!terminal(r.state()) || r.quota_held))
+                    .any(|r| r.batch == name && (!terminal(r.state()) || r.quota_held))
             {
                 return Err(fail(
                     409,
@@ -1983,7 +1992,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 s.remove_app(&app.namespace, name)?;
             } else {
                 for worker in &app.workers {
-                    s.command(worker, NodeOperation::RemoveProfile, json!({"name":name}))?;
+                    s.command(worker, NodeOperation::RemoveBatch, json!({"name":name}))?;
                 }
             }
             return Ok(Json(json!({"name":name,"removed":true})).into_response());
@@ -2002,10 +2011,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 .lock()
                 .apps
                 .get(name)
-                .filter(|a| !a.removed && a.persistent != batch_profile)
+                .filter(|a| !a.removed && a.persistent != batch)
                 .cloned()
                 .ok_or_else(|| fail(404, "unknown app"))?;
-            app.profile["priority"] = json!(p);
+            app.spec["priority"] = json!(p);
             s.save("apps", name, &app)?;
             s.inner.lock().apps.insert(name.into(), app.clone());
             return Ok(Json(s.app_value(&app, tag)).into_response());
@@ -2023,11 +2032,11 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     .lock()
                     .apps
                     .get(name)
-                    .filter(|a| !a.removed && a.persistent != batch_profile)
+                    .filter(|a| !a.removed && a.persistent != batch)
                     .cloned()
                     .ok_or_else(|| fail(404, "unknown app"))?;
                 s.ensure_not_scaling(&app.namespace, name)?;
-                app.profile["disabled"] = json!(disabled);
+                app.spec["disabled"] = json!(disabled);
                 s.save("apps", name, &app)?;
                 s.inner.lock().apps.insert(name.into(), app.clone());
                 if app.persistent {
@@ -2042,7 +2051,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                                     .filter(|svc| text(svc, "name") == name)
                                     .map(|svc| {
                                         let mut svc = svc.clone();
-                                        svc["priority"] = app.profile["priority"].clone();
+                                        svc["priority"] = app.spec["priority"].clone();
                                         (w.clone(), svc)
                                     })
                             })
@@ -2068,97 +2077,105 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(s.app_value(&app, tag)).into_response());
         }
     }
-    if method == Method::GET && parts == ["batches"] {
-        let limit = q
-            .get("limit")
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or(50)
-            .min(10000);
-        let active = q.get("active").is_some_and(|a| a == "1" || a == "true");
-        let mut jobs = {
-            s.inner
-                .lock()
-                .jobs
-                .values()
-                .filter(|r| {
-                    !r.purged
-                        && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
-                        && q.get("profile").is_none_or(|p| p == &r.profile)
-                        && (!active || !terminal(r.state()))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        jobs.sort_by(|a, b| {
-            b.status["submitted_at"]
-                .as_f64()
-                .unwrap_or(0.0)
-                .total_cmp(&a.status["submitted_at"].as_f64().unwrap_or(0.0))
-        });
-        return Ok(Json(
-            jobs.into_iter()
-                .take(limit)
-                .map(|r| r.value())
-                .collect::<Vec<_>>(),
-        )
-        .into_response());
-    }
-    if method == Method::DELETE && parts == ["batches"] {
-        let days = q
-            .get("older_than")
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .ok_or_else(|| fail(400, "older_than must be non-negative days"))?;
-        let _ops = s.ops.lock().await;
-        let jobs = {
-            s.inner
-                .lock()
-                .jobs
-                .values()
-                .filter(|r| {
-                    !r.purged
-                        && terminal(r.state())
-                        && !r.quota_held
-                        && r.status["finished_at"]
-                            .as_f64()
-                            .is_some_and(|v| v < now() - days * 86400.0)
-                        && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        return Ok(Json(
-            jobs.into_iter()
-                .map(|r| s.purge(r))
-                .collect::<anyhow::Result<Vec<_>>>()?,
-        )
-        .into_response());
-    }
-    if method == Method::POST && parts == ["batches"] {
-        let body = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-        return Ok((StatusCode::CREATED, Json(s.submit(body, c, &q).await?)).into_response());
-    }
-    if parts.first() == Some(&"batches") && parts.len() >= 2 {
-        let r = s.job(parts[1], c, &q)?;
-        if method == Method::GET && parts.len() == 2 {
-            return Ok(Json(r.value()).into_response());
+    if batch_jobs {
+        let batch = parts[1];
+        if method == Method::GET && parts.len() == 3 {
+            let limit = q
+                .get("limit")
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(50)
+                .min(10000);
+            let active = q.get("active").is_some_and(|a| a == "1" || a == "true");
+            let mut jobs = {
+                s.inner
+                    .lock()
+                    .jobs
+                    .values()
+                    .filter(|r| {
+                        !r.purged
+                            && r.batch == batch
+                            && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
+                            && (!active || !terminal(r.state()))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            jobs.sort_by(|a, b| {
+                b.status["submitted_at"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .total_cmp(&a.status["submitted_at"].as_f64().unwrap_or(0.0))
+            });
+            return Ok(Json(
+                jobs.into_iter()
+                    .take(limit)
+                    .map(|r| r.value())
+                    .collect::<Vec<_>>(),
+            )
+            .into_response());
         }
-        if method == Method::POST && parts.len() == 3 && matches!(parts[2], "cancel" | "preempt") {
-            let preempt = parts[2] == "preempt";
-            if preempt && c.is_some() {
-                return Err(fail(403, "administrator required"));
+        if method == Method::DELETE && parts.len() == 3 {
+            let days = q
+                .get("older_than")
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| fail(400, "older_than must be non-negative days"))?;
+            let _ops = s.ops.lock().await;
+            let jobs = {
+                s.inner
+                    .lock()
+                    .jobs
+                    .values()
+                    .filter(|r| {
+                        !r.purged
+                            && r.batch == batch
+                            && terminal(r.state())
+                            && !r.quota_held
+                            && r.status["finished_at"]
+                                .as_f64()
+                                .is_some_and(|v| v < now() - days * 86400.0)
+                            && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            return Ok(Json(
+                jobs.into_iter()
+                    .map(|r| s.purge(r))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            )
+            .into_response());
+        }
+        if method == Method::POST && parts.len() == 3 {
+            let body = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            return Ok((StatusCode::CREATED, Json(s.submit(batch, body, c, &q).await?)).into_response());
+        }
+        if parts.len() >= 4 {
+            let id = parts[3];
+            let job = |s: &WorkloadController| {
+                Some(s.job(id, c, &q)?).filter(|r| r.batch == batch).ok_or_else(|| fail(404, "unknown batch job"))
+            };
+            let r = job(&s)?;
+            if method == Method::GET && parts.len() == 4 {
+                return Ok(Json(r.value()).into_response());
             }
-            let _ops = s.ops.lock().await;
-            let r = s.job(parts[1], c, &q)?;
-            return Ok(Json(s.stop_job(r, preempt).await?.value()).into_response());
-        }
-        if method == Method::DELETE && parts.len() == 2 {
-            let _ops = s.ops.lock().await;
-            let r = s.job(parts[1], c, &q)?;
-            return Ok(Json(vec![s.purge(r)?]).into_response());
-        }
-        if method == Method::GET && parts.len() == 3 && parts[2] == "logs" {
-            return log_response(&s, &r, &q).await;
+            if method == Method::POST && parts.len() == 5 && matches!(parts[4], "cancel" | "preempt") {
+                let preempt = parts[4] == "preempt";
+                if preempt && c.is_some() {
+                    return Err(fail(403, "administrator required"));
+                }
+                let _ops = s.ops.lock().await;
+                let r = job(&s)?;
+                return Ok(Json(s.stop_job(r, preempt).await?.value()).into_response());
+            }
+            if method == Method::DELETE && parts.len() == 4 {
+                let _ops = s.ops.lock().await;
+                let r = job(&s)?;
+                return Ok(Json(vec![s.purge(r)?]).into_response());
+            }
+            if method == Method::GET && parts.len() == 5 && parts[4] == "logs" {
+                return log_response(&s, &r, &q).await;
+            }
         }
     }
     if parts.first() == Some(&"proof-apps") && parts.len() == 2 {

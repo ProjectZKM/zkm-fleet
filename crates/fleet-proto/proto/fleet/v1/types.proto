@@ -59,6 +59,6 @@ enum NodeOperation {
   // An app was deleted: the node stops what is left of the services running it and drops
   // them from services.yaml.
   NODE_OPERATION_REMOVE_APP = 7;
-  // The batch profile was deleted: drop it from jobs.yaml.
-  NODE_OPERATION_REMOVE_PROFILE = 8;
+  // The batch was deleted: drop it from batches.yaml.
+  NODE_OPERATION_REMOVE_BATCH = 8;
 }

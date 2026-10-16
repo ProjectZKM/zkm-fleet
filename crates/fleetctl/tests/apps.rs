@@ -18,7 +18,7 @@ fn cli() -> Command {
 }
 
 #[test]
-fn batch_profile_creation_requires_namespace_before_contacting_api() {
+fn batch_creation_requires_namespace_before_contacting_api() {
     let output = cli()
         .args([
             "batch", "add", "training", "--image", "python:3", "--allow", "/tmp",
@@ -30,7 +30,7 @@ fn batch_profile_creation_requires_namespace_before_contacting_api() {
 }
 
 #[test]
-fn batch_profile_creation_with_user_token_leaves_namespace_to_verified_api_scope() {
+fn batch_creation_with_user_token_leaves_namespace_to_verified_api_scope() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -59,7 +59,7 @@ fn batch_profile_creation_with_user_token_leaves_namespace_to_verified_api_scope
         }).unwrap();
         let mut request_body = vec![0; length];
         stream.read_exact(&mut request_body).unwrap();
-        assert!(headers.starts_with("POST /batch-profiles HTTP/1.1"));
+        assert!(headers.starts_with("POST /batches HTTP/1.1"));
         assert!(headers.to_ascii_lowercase().contains("authorization: bearer owner-token"));
         let body = r#"{"name":"training","namespace":"alice","type":"batch","persistent":false}"#;
         write!(stream, "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
@@ -69,9 +69,9 @@ fn batch_profile_creation_with_user_token_leaves_namespace_to_verified_api_scope
         .output().unwrap();
     server.join().unwrap(); std::fs::remove_file(token).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let profile: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(profile["namespace"], "alice");
-    assert_eq!(profile["type"], "batch");
+    let batch: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(batch["namespace"], "alice");
+    assert_eq!(batch["type"], "batch");
 }
 
 fn app_list_server(listener: TcpListener) -> std::thread::JoinHandle<()> {
@@ -117,7 +117,7 @@ fn app_list_server(listener: TcpListener) -> std::thread::JoinHandle<()> {
 }
 
 #[test]
-fn app_list_unifies_apps_and_excludes_batch_profiles() {
+fn app_list_unifies_apps_and_excludes_batches() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = std::env::temp_dir().join(format!("fleet-batch-app-test-{}.token", std::process::id()));
@@ -162,7 +162,7 @@ fn app_list_shows_why_a_starting_app_is_not_running() {
 }
 
 #[test]
-fn batch_profile_creation_sends_namespace_selector() {
+fn batch_creation_sends_namespace_selector() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = std::env::temp_dir().join(format!("fleet-app-test-{}.token", std::process::id()));
@@ -195,7 +195,7 @@ fn batch_profile_creation_sends_namespace_selector() {
         }
         let headers = String::from_utf8_lossy(&request);
         assert!(
-            headers.starts_with("POST /batch-profiles?namespace=alice HTTP/1.1\r\n"),
+            headers.starts_with("POST /batches?namespace=alice HTTP/1.1\r\n"),
             "{headers}"
         );
         assert!(headers
@@ -562,14 +562,16 @@ fn batch_server(listener: TcpListener, requests: usize) -> std::thread::JoinHand
             while !headers.ends_with(b"\r\n\r\n") { stream.read_exact(&mut byte).unwrap(); headers.push(byte[0]); }
             let line = String::from_utf8(headers).unwrap().lines().next().unwrap().to_string();
             let path = line.split_whitespace().nth(1).unwrap().to_string();
-            let (status, body) = if path.starts_with("/batch-profiles?") {
+            let (status, body) = if path.starts_with("/batches?") {
                 (200, serde_json::json!([
                     {"name":"training","namespace":"alice","priority":3,"max_gpus":2,"image":"python:3"},
                     {"name":"idle","namespace":"alice","disabled":true,"image":"python:3"}]).to_string())
-            } else if path.starts_with("/batches?") {
+            } else if path.starts_with("/batches/training/jobs?") {
                 (200, serde_json::json!([
-                    {"id":"a","profile":"training","state":"running","submitted_at":1_800_000_100.0},
-                    {"id":"b","profile":"training","state":"succeeded","submitted_at":1_800_000_000.0}]).to_string())
+                    {"id":"a","batch":"training","state":"running","submitted_at":1_800_000_100.0},
+                    {"id":"b","batch":"training","state":"succeeded","submitted_at":1_800_000_000.0}]).to_string())
+            } else if path.starts_with("/batches/idle/jobs?") {
+                (200, "[]".to_string())
             } else {
                 panic!("unexpected request {line}");
             };
@@ -581,18 +583,19 @@ fn batch_server(listener: TcpListener, requests: usize) -> std::thread::JoinHand
 }
 
 #[test]
-fn plain_batch_lists_every_profile_like_app() {
-    let token = std::env::temp_dir().join(format!("fleet-batch-profiles-{}.token", std::process::id()));
+fn plain_batch_lists_every_batch_like_app() {
+    let token = std::env::temp_dir().join(format!("fleet-batches-{}.token", std::process::id()));
     std::fs::write(&token, "test-admin").unwrap();
-    // The profiles, then every active job and the recent ones to count and date them.
+    // The batches, then each batch's active jobs and its recent ones to count and date them.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = batch_server(listener, 3);
+    let server = batch_server(listener, 7);
     let output = cli().args(["--json", "batch", "--namespace", "alice", "--url", &url, "--admin-token-file"])
         .arg(&token).output().unwrap();
     let seen = server.join().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(seen[0].starts_with("/batch-profiles?") && seen[1..].iter().all(|p| p.starts_with("/batches?")), "{seen:?}");
+    assert!(seen[0].starts_with("/batches?"), "{seen:?}");
+    assert_eq!(seen.iter().filter(|p| p.starts_with("/batches/training/jobs?")).count(), 2, "{seen:?}");
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(rows[0]["name"], "training");
     assert_eq!(rows[0]["active_jobs"], 1, "the running job, counted once although both lists return it");

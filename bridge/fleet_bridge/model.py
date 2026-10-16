@@ -258,8 +258,8 @@ class Mount(Record):
 
 
 @dataclass(kw_only=True)
-class JobTemplate(Record):
-    """A jobs.yaml profile: what a request may ask for, and the container it gets."""
+class Batch(Record):
+    """A batches.yaml batch: what a request may ask for, and the container it gets."""
 
     image: str
     # Operator-managed YAML defaults to the reserved system namespace.
@@ -286,10 +286,10 @@ class JobTemplate(Record):
 
 
 @dataclass(kw_only=True)
-class JobTemplates(Record):
-    """jobs.yaml."""
+class Batches(Record):
+    """batches.yaml."""
 
-    profiles: dict[str, JobTemplate] = field(default_factory=dict)
+    batches: dict[str, Batch] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -297,11 +297,11 @@ class JobSpec(Record):
     """Everything a job was asked to be; written once at submit, read by its actor."""
 
     id: str
-    profile_name: str
+    batch: str
     owner: str | None = None
     namespace: str | None = None
     tag: str | None = None
-    profile: JobTemplate
+    policy: Batch
     command: list[str]
     gpus: float
     cpus: int

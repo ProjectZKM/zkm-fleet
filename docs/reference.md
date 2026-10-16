@@ -25,7 +25,7 @@ and [controller](https://kubernetes.io/docs/concepts/architecture/controller/) c
 Fleet keeps `fleetctl app` and `fleetctl batch`; it needs no Kubernetes runtime.
 Node execution configuration is currently `services.yaml`; its entries describe
 apps, whereas a Kubernetes [Service](https://kubernetes.io/docs/concepts/services-networking/service/)
-is a network endpoint. Batch templates use `jobs.yaml`, and local job records use
+is a network endpoint. Batches use `batches.yaml`, and local job records use
 `FLEET_JOBS_DIR`. This release replaces the previous execution names and paths
 without compatibility aliases.
 
@@ -125,7 +125,7 @@ the current storage formats and GOAT execution path are preserved.
 |---|---|
 | **Namespace** | Administrator-created ownership and billing boundary. |
 | **App** | Long-running workload in one namespace. |
-| **Batch** | Finite workload in one namespace, using a reusable execution profile. |
+| **Batch** | Reusable finite workload configuration in one namespace; each run is a batch job. |
 | **Job** | Execution record for a proof request or batch command, with namespace and tag ownership. |
 | **Token** | Belongs to one namespace, with explicit app grants and an optional tag. |
 
@@ -137,14 +137,14 @@ App and job tables both show `TAG` and `STATE`. An app's state describes its ser
 `configured`, `starting`, `running`, `draining`, `disabled`, `offline` or `failed`.
 The app table shows total configured GPUs and CPUs without a replica column;
 replica settings and job counts remain in app details. An app with services using
-multiple tags shows their tags together. Batch profiles show `enabled` or
+multiple tags shows their tags together. Batches show `enabled` or
 `disabled`; their execution states appear in the job table.
 
-`fleetctl batch` lists the batch profiles, as `fleetctl app` lists apps, with each profile's active jobs and last job; `fleetctl batch NAME` shows one profile and its newest jobs, and `fleetctl job --type batch` lists the finite executions themselves. Register a reusable image and resource policy with `fleetctl --namespace NAME batch add PROFILE --image IMAGE`, and submit commands with `fleetctl batch submit --app PROFILE --gpus N --cpus N -- COMMAND`. Batch profiles can also be initially advertised from node `jobs.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+`fleetctl batch` lists the batches, as `fleetctl app` lists apps, with each batch's active jobs and last job; `fleetctl batch NAME` shows one batch and its newest jobs, and `fleetctl job --type batch` lists the finite executions themselves. Register a reusable image and resource policy with `fleetctl --namespace NAMESPACE batch add NAME --image IMAGE`, and submit commands with `fleetctl batch submit NAME --gpus N --cpus N -- COMMAND`. Job actions take the job ID: `fleetctl batch logs`, `cancel`, `preempt` and `purge` find its batch, and `--batch NAME` skips that lookup. Batches can also be initially advertised from node `batches.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
 
-Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch “profile” is its reusable workload configuration, not an additional resource. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
+Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch is that reusable configuration; each submission creates a batch job. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
-Every app and batch profile belongs to an administrator-created namespace. Proof requests require a registered proof app, and batch submissions require an existing batch profile. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
+Every app and batch belongs to an administrator-created namespace. Proof requests require a registered proof app, and batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
 
 App listings contain registered workloads. Rejected proof requests remain job
 records and do not create an app entry.
@@ -263,14 +263,14 @@ namespace IDs and tags and retain the submitting token for audit.
 Revoking one token blocks that key. Suspending a namespace blocks every
 token in it. Resuming a namespace does not restore individually revoked
 keys. Neither action cancels accepted work; an administrator stops jobs explicitly.
-Existing tenant/profile resource limits also apply. Each namespace has a shared
+Existing tenant and batch resource limits also apply. Each namespace has a shared
 GPU/CPU quota, described below.
 
 ### Workload ownership
 
 Every app belongs to an existing namespace. An administrator creates the namespace
 and issues its owner token for the built-in `scope=default` tag. The owner can then
-register proof apps and batch profiles, manage their metadata and submit jobs
+register proof apps and batches, manage their metadata and submit jobs
 inside that namespace and tag:
 
 ```bash
@@ -293,13 +293,13 @@ granted scaling status; they cannot change workload metadata.
 | Namespace creation, token issuance, namespace/tag quotas and node administration | Administrator token |
 | Namespace listing and quota/usage inspection | Any scoped token for its own namespace and tag; administrators can inspect all |
 | Proof app registration, removal, priority and enable/disable | Owner token for the namespace, with any explicit app grants |
-| Batch profile creation, mount roots, priority, enable/disable and removal | Owner token for the namespace, tag and profile |
+| Batch creation, mount roots, priority, enable/disable and removal | Owner token for the namespace, tag and batch |
 | App GPU/CPU and replica changes | Owner token for the app; namespace/tag quotas and node capacity still apply |
 | Job submission and inspection; batch logs and cancellation | App-granted or owner token within its scope |
 
 Batch image, environment, resource policy and mount roots are supplied when
-registering a profile. Existing profiles have priority and enable/disable
-endpoints; changing other fields requires removing the profile after its jobs
+registering a batch. Existing batches have priority and enable/disable
+endpoints; changing other fields requires removing the batch after its jobs
 finish and registering it again. Serving deployments start from node
 `services.yaml`; owners manage their lifecycle, priority and allocation through
 the control plane.
@@ -310,33 +310,36 @@ Owner metadata routes use the same authenticated API as the CLI:
 |---|---|
 | Proof registration | `POST` / `DELETE /admin/apps` and `PUT /admin/apps/priority`, with namespace, tenant and full `elf_id` selectors |
 | Proof enable/disable | `PUT` / `DELETE /admin/apps/disabled`; dedicated services use `PUT` / `DELETE /proof-apps/disabled` |
-| Batch profiles | `POST /batch-profiles`, `DELETE /batch-profiles/NAME`, `PUT /batch-profiles/NAME/priority`, `PUT` / `DELETE /batch-profiles/NAME/disabled` |
+| Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT` / `DELETE /batches/NAME/disabled` |
+| Batch jobs | `GET` / `POST /batches/NAME/jobs`, `DELETE /batches/NAME/jobs?older_than=DAYS`, `GET` / `DELETE /batches/NAME/jobs/ID`, `POST /batches/NAME/jobs/ID/cancel`, `POST /batches/NAME/jobs/ID/preempt`, `GET /batches/NAME/jobs/ID/logs` |
 | Persistent apps | `PUT /apps/NAME/priority`, `PUT` / `DELETE /apps/NAME/disabled`, `DELETE /apps/NAME` |
 | Allocation and status | `PUT` / `GET /apps/NAME/scale`, or `/proof-apps/scale` with tenant and full `elf_id` selectors |
 
 The `/admin` prefix on proof metadata routes does not require an administrator
 token for these owner actions. Namespace and tag quota endpoints remain
-administrator-only. Disabling a batch profile blocks new submissions and lets
+administrator-only. Disabling a batch blocks new submissions and lets
 accepted jobs continue; disabling an app drains its services before releasing
-their reservations.
+their reservations. A deleted batch stays listed with state `deleted`, and readable,
+while it still has job records; its jobs keep their own lifecycle until purged.
 
 Omitting the namespace during app creation is refused; an unknown namespace is not
-automatically created. Batch profile creation can infer the namespace from a verified
+automatically created. Batch creation can infer the namespace from a verified
 user token; administrator requests must supply it. Proof registrations use `(namespace, tenant, ELF ID)`, so
 namespaces can register the same program independently. Disabling or deleting one
-registration leaves the others and their jobs intact. Batch profile names remain unique within the control plane; each workload has one namespace.
+registration leaves the others and their jobs intact. Batch names remain unique within the control plane; each workload has one namespace.
 App and batch grants are explicit; a grant from another namespace cannot authorize submission. Admin batch submissions
 also inherit the app's namespace and participate in its quota.
 
 The proof API uses `POST /admin/apps?namespace=alice&tag=scope=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
-The control-plane batch API accepts `POST /batch-profiles?namespace=alice` with the profile JSON, or a
+The control-plane batch API accepts `POST /batches?namespace=alice` with the batch JSON, or a
 `namespace` field in the JSON. Names and immutable namespace IDs are accepted;
-registrations persist the ID. A configured batch profile or persistent `kind: app`
+registrations persist the ID. A configured batch or persistent `kind: app`
 entry can also specify `namespace: alice`; its namespace is verified before launch.
 The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
-Owners configure host mount roots for their batch profiles. Submit batch jobs through
-`fleetctl batch submit` or `POST /batches`; their reported type is `batch`.
+Owners configure host mount roots for their batches. Submit batch jobs through
+`fleetctl batch submit NAME` or `POST /batches/NAME/jobs`; job records name their
+`batch`, and their reported type is `batch`.
 
 ### GPU and CPU quotas
 
@@ -360,7 +363,7 @@ fleetctl namespace quota alice     # clear both caps: unlimited (a write operati
 Each `quota` command replaces both caps. An omitted cap is unlimited; zero
 prohibits allocation of that resource. For example `--gpus 0 --cpus 8` permits
 CPU-only batch jobs. Fractional GPU units are supported and retain the existing
-per-profile VRAM requirements for shared cards. New namespaces
+per-batch VRAM requirements for shared cards. New namespaces
 start with unlimited caps unless the administrator sets them.
 
 Use the publicly reachable TLS endpoint in bundles shared with users; `127.0.0.1`
@@ -427,7 +430,7 @@ placement constraints or tenant anchoring. A blocked job can be skipped so work
 that fits can proceed.
 
 Automatic preemption selects only lower-priority batch jobs in the requesting namespace
-whose profile permits preemption and whose minimum runtime has elapsed. It prefers
+whose batch permits preemption and whose minimum runtime has elapsed. It prefers
 the lowest priority victims and plans enough physical capacity and namespace/tag
 quota before stopping any batch job. The Rust scheduler makes this plan from Ray-reported
 capacity and batch candidates; the Python adapter executes the selected stop, and
@@ -546,7 +549,7 @@ Batch job IDs and directories retain their existing flat layout, with namespace
 and tag ownership recorded in each batch spec. Namespace names are never host paths.
 App owners prepare batch inputs in shared or object storage and manage access to
 that storage. The app reads inputs directly using its own storage client or a
-mount permitted by the owner's batch profile. Fleet passes command arguments
+mount permitted by the owner's batch. Fleet passes command arguments
 and environment variables to the app. The app writes outputs and checkpoints directly to its owner's
 storage, including any files staged in its local `{out}` workspace. Fleet does not
 transfer batch inputs or outputs. Dependencies, logs and mutations check both namespace
@@ -556,7 +559,7 @@ A verified replacement token can read accepted batch jobs from earlier keys.
 For a batch command that uses `INPUT_URI` and `OUTPUT_URI` from its environment:
 
 ```bash
-fleetctl --token-file alice.token batch submit --app training --gpus 1 \
+fleetctl --token-file alice.token batch submit training --gpus 1 \
   --env INPUT_URI=s3://alice-inputs/dataset \
   --env OUTPUT_URI=s3://alice-results/job-output -- python /app/train.py
 ```
@@ -589,7 +592,7 @@ recreate namespaces and tokens, and preserve app-owned proofs and checkpoints.
 Operator-managed proof apps use the reserved `system` namespace. User tokens
 cannot be issued in `system`.
 
-Configured batch profiles and persistent app entries default to `system`.
+Configured batches and persistent app entries default to `system`.
 Administrators assign a user app's namespace explicitly; API registrations require
 an existing namespace. Namespace quotas govern proof and batch jobs as well as
 configured service replica reservations. Disabling a service releases its reservation
@@ -617,20 +620,20 @@ Streamable HTTP and allow the Bearer header to be configured. Clients that only
 support local `stdio` servers cannot connect directly to this endpoint.
 
 The server lists long-running apps with `fleet_apps_list` and `fleet_app_get`.
-Batch tools are `fleet_batch_profile_create`, `fleet_batch_profiles_list`,
-`fleet_batch_profile_get`, `fleet_batches_list`, `fleet_batch_get`,
-`fleet_batch_submit`, `fleet_batch_logs` and `fleet_batch_cancel`. `fleet_app_logs` reads a visible app's log from its node. Batch submission
-uses a `profile` name and a command. `fleet_jobs_list` remains a combined execution
-view with `kind: "batch"` or `kind: "app"`. Profile creation requires a
+Batch tools are `fleet_batch_create`, `fleet_batches_list`,
+`fleet_batch_get`, `fleet_batch_jobs_list`, `fleet_batch_job_get`,
+`fleet_batch_job_submit`, `fleet_batch_job_logs` and `fleet_batch_job_cancel`. `fleet_app_logs` reads a visible app's log from its node. Batch job submission
+uses a `batch` name and a command; the jobs list, logs and cancel tools take an optional `batch`. `fleet_jobs_list` remains a combined execution
+view with `kind: "batch"` or `kind: "app"`. Batch creation requires a
 workload-management grant. Its `priority` and `allow` fields are owner-managed.
-The profile list/get tools use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batches_list` and `fleet_batch_get` use `fleetctl job --type batch` and `fleetctl job ID`.
-`fleet_batch_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
-each path must be inside the profile's allowed roots. Existing metadata changes
-and app scaling use the CLI or HTTP API; MCP currently exposes profile creation
+`fleet_batches_list` and `fleet_batch_get` use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batch_jobs_list` and `fleet_batch_job_get` use `fleetctl job --type batch` and `fleetctl job ID`.
+`fleet_batch_job_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
+each path must be inside the batch's allowed roots. Existing metadata changes
+and app scaling use the CLI or HTTP API; MCP currently exposes batch creation
 and job operations. Proof jobs remain submitted through the Ziren network SDK;
 MCP can list and inspect their records.
 
-Namespace owner tokens (`manage_apps: true`) manage proof app and batch profile
+Namespace owner tokens (`manage_apps: true`) manage proof app and batch
 metadata across proof tenants within their namespace, tag and app grants:
 registration, priority, enable/disable, removal and batch mount roots. Owners can
 scale their proof and persistent apps within namespace and tag quotas, and submit
@@ -644,12 +647,12 @@ Namespaces are the resource accounting and billing unit; namespace and optional 
 cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
 
 
-LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`, without a `kind` field. Batch profiles and executions appear only under `fleetctl batch`, with `type: batch`.
+LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`, without a `kind` field. Batches and their jobs appear only under `fleetctl batch`, with `type: batch`.
 `fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
 app has its own dedicated Ziren GPU server: disable blocks new submissions,
 drains its active proofs, then stops that server and releases its GPUs. Queued
 proofs wait until the app is enabled again. Enabling an app starts its
-service before accepting work. Disabling a batch profile only blocks new
+service before accepting work. Disabling a batch only blocks new
 batch jobs; accepted batch jobs finish.
 
 Each `ziren-gpu` entry in `services.yaml` must bind its server to one proof app
@@ -658,7 +661,7 @@ Ziren server for multiple proof apps. `fleetctl app add TENANT/ELF` requires a
 matching dedicated service to exist first. `services.yaml` supplies initial resource
 settings; app owners then manage allocations through the control plane with
 `fleetctl app scale`. Batch jobs request resources with
-`fleetctl batch submit --app PROFILE --gpus N --cpus N`. Active proofs cannot resize
+`fleetctl batch submit NAME --gpus N --cpus N`. Active proofs cannot resize
 their GPU allocation. Resizing a proof already in progress is tracked in
 [issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3).
 
@@ -670,7 +673,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 | SDK proof ELFs and inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores references, hashes and parameters. |
 | SDK proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. The local app endpoint reads them directly; remote Fleet fetches use an authorized heartbeat ticket and HTTPS relay. Disabling the GPU actor preserves fetching. |
 | Integrated EthProofs data | Its app-owned storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`; the app manages their format and recovery. |
-| serving apps, batch profiles, jobs and command intents | `data_dir/workloads/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
+| serving apps, batches, jobs and command intents | `data_dir/workloads/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
 | batch inputs, outputs and checkpoints | owner-managed shared or object storage, read and written directly by the batch command |
 | batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in `FLEET_JOBS_DIR/<job-id>/` (normally `work/jobs/`) |
 
@@ -687,7 +690,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 Proof clients use bundled SDK signing material and bearer authorization at their
 app endpoint. Loopback clients use local HTTP; external clients require an authenticated HTTPS app gateway. The token API exposes only opaque IDs and access
 scopes. Namespace-owner tokens can register apps and manage their metadata;
-app-limited tokens can use only granted programs and profiles. Revocation applies to both proofs and
+app-limited tokens can use only granted programs and batches. Revocation applies to both proofs and
 batch jobs.
 
 The scheduler’s backend listeners stay private behind the HTTPS gateway. Node control gRPC uses TLS with the scheduler

@@ -28,6 +28,16 @@ fn list_query_is_scoped(command: &str, kind: &str, endpoint: &str, limit_param: 
     let batch = kind == "batch";
     let server = std::thread::spawn(move || {
         for expected_limit in ["1000", "10"] {
+            if batch {
+                // Batch jobs are listed per batch: the batches first.
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 2048];
+                let count = stream.read(&mut request).unwrap();
+                let line = String::from_utf8_lossy(&request[..count]).lines().next().unwrap().to_string();
+                assert!(line.starts_with("GET /batches?namespace=alice"), "{line}");
+                let body = r#"[{"name":"training"}]"#;
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
             let (mut stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -58,7 +68,7 @@ fn list_query_is_scoped(command: &str, kind: &str, endpoint: &str, limit_param: 
                 "unsupported query was sent: {request_line}"
             );
             let body = if batch {
-                r#"[{"id":"training-job","type":"run","profile":"training","namespace":"alice","state":"succeeded","node":"gpu-machine","gpus":["0","1"]}]"#
+                r#"[{"id":"training-job","type":"run","batch":"training","namespace":"alice","state":"succeeded","node":"gpu-machine","gpus":["0","1"]}]"#
             } else {
                 "[]"
             };
@@ -103,7 +113,7 @@ fn list_query_is_scoped(command: &str, kind: &str, endpoint: &str, limit_param: 
 #[test]
 fn job_lists_send_namespace_and_api_specific_limit_query() {
     list_query_is_scoped("job", "app", "/admin/jobs", "limit", "n");
-    list_query_is_scoped("job", "batch", "/batches", "limit", "n");
+    list_query_is_scoped("job", "batch", "/batches/training/jobs", "limit", "n");
 }
 
 #[test]
@@ -126,7 +136,7 @@ fn batch_submission_passes_storage_references_without_uploading_files() {
             bytes.extend_from_slice(&buffer[..count]);
             if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&bytes[..end]);
-                assert!(headers.starts_with("POST /batches HTTP/1.1"));
+                assert!(headers.starts_with("POST /batches/training/jobs HTTP/1.1"));
                 let length = headers
                     .lines()
                     .find_map(|line| {
@@ -151,6 +161,7 @@ fn batch_submission_passes_storage_references_without_uploading_files() {
             serde_json::json!(["train", "--input", "s3://owner-bucket/dataset"])
         );
         assert!(body.get("code").is_none());
+        assert!(body.get("batch").is_none(), "the batch is in the path");
         let response = r#"{"id":"storage-job","state":"queued"}"#;
         write!(stream, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
     });
@@ -160,7 +171,6 @@ fn batch_submission_passes_storage_references_without_uploading_files() {
         .args([
             "batch",
             "submit",
-            "--app",
             "training",
             "--env",
             "INPUT_URI=s3://owner-bucket/dataset",

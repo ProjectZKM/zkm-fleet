@@ -22,7 +22,7 @@ import ray
 import yaml
 
 from . import actors, reconcile, jobs
-from .model import JobTemplate, JobSpec, JobState, JobStatus, Mount
+from .model import Batch, JobSpec, JobState, JobStatus, Mount
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -91,7 +91,7 @@ def _is_content(line: str) -> bool:
 
 
 def remove_entry(path: Path, section: str, name: str) -> bool:
-    """Removes one `services` entry or `profiles` key from a configuration file and keeps
+    """Removes one `services` entry or `batches` key from a configuration file and keeps
     every other line as written, with the comment lines directly above the entry. The
     previous file stays as <file>.removed-<UTC time>. False when there is no such entry."""
     text = path.read_text()
@@ -135,8 +135,8 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
 
 
 class NodeExecutor:
-    def __init__(self, services: str, profiles: str, jobs_dir: str) -> None:
-        self.services, self.profiles, self.jobs_dir = Path(services), profiles, Path(jobs_dir)
+    def __init__(self, services: str, batches: str, jobs_dir: str) -> None:
+        self.services, self.batches, self.jobs_dir = Path(services), batches, Path(jobs_dir)
         self.journal = self.jobs_dir / ".node" / "commands"
         self.journal.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
@@ -205,7 +205,7 @@ class NodeExecutor:
                     with self.services_lock:
                         result = self.remove_app(params)
                 elif operation == 8:
-                    result = {"removed": remove_entry(Path(self.profiles), "profiles", params["name"])}
+                    result = {"removed": remove_entry(Path(self.batches), "batches", params["name"])}
                 else:
                     raise ValueError("unsupported node operation")
         except BaseException as e:
@@ -249,8 +249,8 @@ class NodeExecutor:
         request = p["request"]
         if "code" in request:
             raise ValueError("job inputs must be prepared by the app owner in storage")
-        profile = JobTemplate.load(p["profile"])
-        if profile.namespace != p["namespace"] or request.get("nodes", 1) != 1:
+        policy = Batch.load(p["policy"])
+        if policy.namespace != p["namespace"] or request.get("nodes", 1) != 1:
             raise ValueError("invalid local execution scope")
         directory.mkdir(parents=True, exist_ok=True)
         job = jobs.JobDirectory(str(self.jobs_dir), ident, must_exist=False)
@@ -259,12 +259,12 @@ class NodeExecutor:
         protected = [str(self.jobs_dir), str(self.services.parent)]
         for mount in mounts:
             real = os.path.realpath(mount.path)
-            if not jobs._inside(real, profile.allow) or any(os.path.commonpath([real, root]) in (real, root) for root in protected):
+            if not jobs._inside(real, policy.allow) or any(os.path.commonpath([real, root]) in (real, root) for root in protected):
                 raise ValueError("mount outside allowed roots or overlaps fleet state")
             if not os.path.exists(real):
                 raise ValueError("mount is missing on this machine")
         spec = JobSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"),
-            profile_name=p["profile_name"], profile=profile, command=request["command"], gpus=request["gpus"], cpus=request["cpus"],
+            batch=p["batch"], policy=policy, command=request["command"], gpus=request["gpus"], cpus=request["cpus"],
             out=job.out, mounts=mounts, env=dict(e.split("=", 1) for e in request.get("env", []) if "=" in e),
             log=request.get("log"), workdir=request.get("workdir"),
             gpu_mem_gb=request.get("gpu_mem", 0), vram_wait_s=request.get("vram_wait", 1800),
@@ -276,7 +276,7 @@ class NodeExecutor:
             raise ValueError("log outside writable job mounts")
         spec.write(job.spec_path)
         if not os.path.isfile(job.status_path):
-            JobStatus(id=ident, state=JobState.QUEUED, namespace=p["namespace"], tag=p.get("tag"), priority=profile.priority,
+            JobStatus(id=ident, state=JobState.QUEUED, namespace=p["namespace"], tag=p.get("tag"), priority=policy.priority,
                 submitted_at=p["submitted_at"], gpus_requested=spec.gpus, cpus=spec.cpus, launch_pending=True).write(job.status_path)
         write_json(lease_file, {"lease": lease})
         if not jobs.prepare_launch(spec):
@@ -309,7 +309,7 @@ class NodeExecutor:
                 jobs.cancel(str(self.jobs_dir), p["id"])
         if not self.cleanup(job) and state.terminal:
             jobs._end_actors(job.id, job.status().nodes)
-            subprocess.run(["docker", "stop", "--time", str(job.spec().profile.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().profile.stop_timeout_s + 30)
+            subprocess.run(["docker", "stop", "--time", str(job.spec().policy.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().policy.stop_timeout_s + 30)
         return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 
     def service(self, p: dict[str, Any]) -> dict[str, Any]:
@@ -392,7 +392,7 @@ class NodeExecutor:
         nodes = alive_nodes()
         ready = len(nodes) == 1
         total, free = resources()
-        config = jobs.load_config(self.profiles)
+        config = jobs.load_config(self.batches)
         apps = reconcile.load_services(yaml.safe_load(self.services.read_text()))
         services = apps.raw.get("services", [])
         running = reconcile.running()
@@ -444,7 +444,7 @@ class NodeExecutor:
         return {"version": 2, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
-            "profiles": {k: v.dump() for k, v in config.profiles.items()},
+            "batches": {k: v.dump() for k, v in config.batches.items()},
             "services": services, "jobs": job_reports, "results": results}
 
     def publish(self) -> None:
@@ -460,7 +460,7 @@ class NodeExecutor:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    for name in ["services", "profiles", "jobs-dir"]:
+    for name in ["services", "batches", "jobs-dir"]:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--address", default="127.0.0.1:6379")
     args = parser.parse_args()
@@ -468,7 +468,7 @@ def main() -> None:
     if not args.address.startswith(("127.0.0.1:", "localhost:")):
         raise SystemExit("Ray must be local")
     ray.init(address=args.address, namespace=reconcile.NAMESPACE, log_to_driver=False)
-    executor = NodeExecutor(args.services, args.profiles, args.jobs_dir)
+    executor = NodeExecutor(args.services, args.batches, args.jobs_dir)
     for path in executor.journal.glob("*.json"):
         entry = read_json(path)
         if not entry.get("done"):

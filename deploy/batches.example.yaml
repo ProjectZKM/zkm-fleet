@@ -1,13 +1,13 @@
-# Batch job profiles advertised by fleet-node (installed as ${FLEET_ETC}/jobs.yaml).
+# Batches advertised by fleet-node (installed as ${FLEET_ETC}/batches.yaml).
 # The paths a job touches come with each request (`--mount PATH[:ro]`, repeated);
-# a profile only bounds them: the roots a request may mount below, plus the
+# a batch only bounds them: the roots a request may mount below, plus the
 # image, the user and a GPU cap. A requested mount must already exist.
 #
 # Every batch job gets its own FLEET_JOBS_DIR/<id>/out, mounted read-write as $FLEET_OUT
 # (`{out}` in the command). App owners retrieve outputs from their own storage;
 # Fleet provides job status and logs with `fleetctl batch` and `fleetctl batch logs`.
 
-profiles:
+batches:
   trainer:
     namespace: system                  # existing admin-created namespace; use a user namespace for user jobs
     priority: 10                       # inherited by jobs; higher values run first

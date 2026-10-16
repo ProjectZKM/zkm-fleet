@@ -109,14 +109,14 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|tool| tool["name"] == "fleet_batch_submit"));
-    for name in ["fleet_apps_list", "fleet_app_logs", "fleet_batch_profiles_list", "fleet_batch_profile_get",
-        "fleet_batches_list", "fleet_batch_get", "fleet_batch_logs", "fleet_batch_cancel"] {
+        .any(|tool| tool["name"] == "fleet_batch_job_submit"));
+    for name in ["fleet_apps_list", "fleet_app_logs", "fleet_batch_create", "fleet_batches_list", "fleet_batch_get",
+        "fleet_batch_jobs_list", "fleet_batch_job_get", "fleet_batch_job_logs", "fleet_batch_job_cancel"] {
         assert!(tools.as_array().unwrap().iter().any(|tool| tool["name"] == name), "missing {name}");
     }
     let submit_schema = &tools.as_array().unwrap().iter()
-        .find(|tool| tool["name"] == "fleet_batch_submit").unwrap()["inputSchema"];
-    assert!(submit_schema["properties"].get("profile").is_some());
+        .find(|tool| tool["name"] == "fleet_batch_job_submit").unwrap()["inputSchema"];
+    assert!(submit_schema["properties"].get("batch").is_some());
     assert!(submit_schema["properties"].get("app").is_none());
     assert!(!tools.as_array().unwrap().iter().any(|tool|
         tool["name"].as_str().unwrap().starts_with("fleet_run_")));
@@ -130,7 +130,7 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .header("accept", "application/json, text/event-stream")
         .header("mcp-session-id", &session)
         .header("mcp-protocol-version", "2025-11-25")
-        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_batch_profile_create","arguments":{"name":"demo","image":"image:tag"}}}))
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fleet_batch_create","arguments":{"name":"demo","image":"image:tag"}}}))
         .send()
         .await
         .unwrap();
@@ -148,7 +148,7 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .header("accept", "application/json, text/event-stream")
         .header("mcp-session-id", &session)
         .header("mcp-protocol-version", "2025-11-25")
-        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_batch_profile_create","arguments":{"name":"demo","image":"image:tag","allow":["/srv"],"max_gpus":2,"priority":7}}}))
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fleet_batch_create","arguments":{"name":"demo","image":"image:tag","allow":["/srv"],"max_gpus":2,"priority":7}}}))
         .send()
         .await
         .unwrap();
@@ -181,16 +181,18 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
         .contains("--json job --limit 20 --type batch"));
 
     for (id, name, arguments, expected) in [
-        (10, "fleet_batch_profiles_list", json!({}), "--json batch"),
-        (11, "fleet_batch_profile_get", json!({"name":"training"}), "--json batch training"),
-        (7, "fleet_batches_list", json!({"profile":"training","active":true,"limit":3}),
+        (10, "fleet_batches_list", json!({}), "--json batch"),
+        (11, "fleet_batch_get", json!({"name":"training"}), "--json batch training"),
+        (7, "fleet_batch_jobs_list", json!({"batch":"training","active":true,"limit":3}),
             "--json job --type batch --limit 3 --app training --active"),
-        (8, "fleet_batch_submit", json!({"profile":"training","gpus":1,"cpus":4,"command":["python","train.py"]}),
-            "--json batch submit --app training --gpus 1 --cpus 4 -- python train.py"),
-        (12, "fleet_batch_submit", json!({"profile":"training","mounts":["/approved:ro"],"command":["python","train.py"]}),
-            "--json batch submit --app training --mount /approved:ro -- python train.py"),
-        (9, "fleet_batch_logs", json!({"id":"training-job","lines":25}),
+        (8, "fleet_batch_job_submit", json!({"batch":"training","gpus":1,"cpus":4,"command":["python","train.py"]}),
+            "--json batch submit training --gpus 1 --cpus 4 -- python train.py"),
+        (12, "fleet_batch_job_submit", json!({"batch":"training","mounts":["/approved:ro"],"command":["python","train.py"]}),
+            "--json batch submit training --mount /approved:ro -- python train.py"),
+        (9, "fleet_batch_job_logs", json!({"id":"training-job","lines":25}),
             "--json batch logs training-job --lines 25"),
+        (14, "fleet_batch_job_cancel", json!({"id":"training-job","batch":"training"}),
+            "--json batch cancel training-job --batch training"),
         (13, "fleet_app_logs", json!({"name":"ethproofs/941629f6","lines":30,"node":"gpu-1"}),
             "--json app logs ethproofs/941629f6 --lines 30 --node gpu-1"),
     ] {

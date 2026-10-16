@@ -234,7 +234,7 @@ impl Job {
         for (k, x) in [
             ("type", json!("batch")),
             ("id", json!(self.id)),
-            ("profile", json!(self.profile)),
+            ("batch", json!(self.batch)),
             ("namespace", json!(self.namespace)),
             ("tag", json!(self.tag)),
             ("owner", json!(self.owner)),
@@ -299,13 +299,13 @@ mod tests {
     fn node_reports_share_the_json_and_protobuf_contract() {
         let source = json!({"version":2,"machine":"gpu","ready":true,
             "total_gpus":8,"total_cpus":64,"free_gpus":6,"free_cpus":32,
-            "profiles":{"training":{"image":"app","counter":u64::MAX}},
+            "batches":{"training":{"image":"app","counter":u64::MAX}},
             "jobs":[{"id":"job","lease":"attempt","status":{"state":"running"},
                 "spec":{"namespace":"alice"},"cleaned":false,"logs_ready":false}]});
         let report: NodeReport = serde_json::from_value(source).unwrap();
         let decoded = NodeReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, report);
-        assert_eq!(decoded.profiles["training"]["counter"], json!(u64::MAX));
+        assert_eq!(decoded.batches["training"]["counter"], json!(u64::MAX));
         assert!(serde_json::from_value::<NodeReport>(json!({"version":2,"unknown":true})).is_err());
     }
 

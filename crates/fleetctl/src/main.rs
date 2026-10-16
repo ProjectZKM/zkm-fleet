@@ -143,7 +143,7 @@ struct ListArgs {
     /// Only this tenant's app jobs (batch jobs belong to no tenant).
     #[arg(long)]
     tenant: Option<String>,
-    /// Only the jobs of this app (as `fleetctl app` names it: tenant/<elf> or a batch profile).
+    /// Only the jobs of this app or batch (as `fleetctl app` / `fleetctl batch` name it: tenant/<elf> or a batch).
     #[arg(long)]
     app: Option<String>,
 }
@@ -255,11 +255,11 @@ enum NodeCmd {
 
 #[derive(Subcommand)]
 enum TokenCmd {
-    /// Issue an admin-managed token scoped to approved apps and batch profiles and write the client bundle.
+    /// Issue an admin-managed token scoped to approved apps and batches and write the client bundle.
     Issue {
         #[arg(long)]
         tenant: String,
-        /// Approved app (repeat): serving/batch profile name or tenant/full-ELF-id. Required for user access.
+        /// Approved app (repeat): a serving app or batch name, or tenant/full-ELF-id. Required for user access.
         #[arg(long = "app", required = true)]
         apps: Vec<String>,
         #[arg(long, default_value = "")]
@@ -300,9 +300,9 @@ struct TokenBundle {
 /// take the server's defaults.
 #[derive(Args, Serialize)]
 struct BatchSubmission {
-    /// Batch workload name (image, user, GPU cap and approved mount roots).
-    #[arg(long = "app")]
-    profile: String,
+    /// The batch to run under (its image, user, GPU cap and approved mount roots).
+    #[serde(skip)]
+    batch: String,
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
@@ -361,17 +361,17 @@ struct BatchSubmission {
     command: Vec<String>,
 }
 
-/// A batch profile to add. The command line and the request body are this one
-/// struct (its field names are the profile's); unset flags take the server's defaults.
+/// A batch to add. The command line and the request body are this one struct (its
+/// field names are the batch's); unset flags take the server's defaults.
 #[derive(Args, Serialize)]
 struct AddBatch {
     /// Priority inherited by new jobs (default 0; higher values run first).
     #[arg(long, allow_hyphen_values = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
-    /// Profile name (letters, digits, _ . -); used with batch submit --app.
+    /// Batch name (letters, digits, _ . -); jobs run under it with fleetctl batch submit NAME.
     name: String,
-    /// Container image used by this batch profile.
+    /// Container image the batch's jobs run in.
     #[arg(long)]
     image: String,
     /// UID[:GID] the container jobs as (default: the image's).
@@ -390,7 +390,7 @@ struct AddBatch {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     shm_gb: Option<u32>,
-    /// Absolute mount root allowed by the profile owner.
+    /// Absolute mount root the batch's jobs may mount below; repeat.
     #[arg(long)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
@@ -403,7 +403,7 @@ struct AddBatch {
 /// What can be done to a batch job (a proof job is the scheduler's and its client's).
 #[derive(Subcommand)]
 enum BatchJobCmd {
-    /// Queue a batch job: fleetctl batch submit --app film-gpu --gpus 1 --mount /data:ro -- python3 train.py
+    /// Queue a batch job: fleetctl batch submit film-gpu --gpus 1 --mount /data:ro -- python3 train.py
     Submit {
         #[command(flatten)]
         submit: BatchSubmission,
@@ -411,19 +411,25 @@ enum BatchJobCmd {
     /// Batch container logs: the last lines, then with -f everything new until it ends.
     Logs {
         id: String,
+        /// The job's batch (found from the id when omitted).
+        #[arg(long)]
+        batch: Option<String>,
         #[arg(short, long)]
         follow: bool,
         #[arg(short = 'n', long, default_value_t = 50)]
         lines: usize,
     },
-    /// Stop a batch job (SIGTERM, SIGKILL its profile's stop_timeout_s later; its cards freed).
-    Cancel { id: String },
+    /// Stop a batch job (SIGTERM, SIGKILL its batch's stop_timeout_s later; its cards freed).
+    Cancel { id: String, #[arg(long)] batch: Option<String> },
     /// Stop a batch job as a service needing its cards would: it queues again (same id and
     /// out/, FLEET_ATTEMPT counting on) and spends no --retry.
-    Preempt { id: String },
+    Preempt { id: String, #[arg(long)] batch: Option<String> },
     /// Delete a finished batch job's record (out/ included), or every finished batch job older than --older-than days.
     Purge {
         id: Option<String>,
+        /// Only this batch's jobs (with --older-than), or the job's batch (found from the id when omitted).
+        #[arg(long)]
+        batch: Option<String>,
         #[arg(long)]
         older_than: Option<f64>,
     },
@@ -454,8 +460,8 @@ struct AddProofApp {
 struct BatchArgs {
     #[command(subcommand)]
     cmd: Option<BatchCmd>,
-    /// A batch profile: its settings and newest jobs. Without one, every profile;
-    /// the jobs themselves are `fleetctl job --type batch`.
+    /// A batch: its settings and newest jobs. Without one, every batch (a deleted one while
+    /// it still has jobs); the jobs themselves are `fleetctl job --type batch`.
     name: Option<String>,
     #[command(flatten)]
     conn: ConnectionOptions,
@@ -463,21 +469,21 @@ struct BatchArgs {
 
 #[derive(Subcommand)]
 enum BatchCmd {
-    /// Register a reusable batch execution profile in an existing namespace.
+    /// Register a reusable batch in an existing namespace.
     Add { #[command(flatten)] add: AddBatch },
-    /// The profiles, as plain `fleetctl batch` lists them.
-    #[command(name = "list", hide = true)]
-    Profiles,
-    /// A profile and its newest jobs, as `fleetctl batch NAME` shows them.
-    #[command(name = "show", hide = true)]
-    Profile { name: String },
-    /// Stop accepting new jobs for this profile; accepted jobs continue.
+    /// The batches, as plain `fleetctl batch` lists them.
+    #[command(hide = true)]
+    List,
+    /// A batch and its newest jobs, as `fleetctl batch NAME` shows them.
+    #[command(hide = true)]
+    Show { name: String },
+    /// Stop accepting new jobs for this batch; accepted jobs continue.
     Disable { name: String },
-    /// Accept new jobs for this profile again.
+    /// Accept new jobs for this batch again.
     Enable { name: String },
     /// App owners: set the priority inherited by new jobs.
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
-    /// Delete a profile after all accepted jobs finish; keep job history.
+    /// Delete a batch after all accepted jobs finish; its job history stays until purged.
     Delete { name: String, #[arg(long)] yes: bool },
     #[command(flatten)]
     Job(BatchJobCmd),
@@ -847,7 +853,7 @@ fn proof_row(j: &Value) -> Value {
 /// A batch job as a `ps` row.
 fn batch_row(r: &Value) -> Value {
     json!({
-        "type": "batch", "app": r["profile"], "id": r["id"], "namespace": r["namespace"], "tag": r["tag"], "owner": Value::Null, "state": r["state"], "priority": r["priority"],
+        "type": "batch", "app": r["batch"], "id": r["id"], "namespace": r["namespace"], "tag": r["tag"], "owner": Value::Null, "state": r["state"], "priority": r["priority"],
         "where": r["node"],
         "created_at": r["submitted_at"], "started_at": r["started_at"], "finished_at": r["finished_at"],
         "took_ms": took_ms(r["started_at"].as_f64(), r["finished_at"].as_f64()), "record": with_type("batch", r),
@@ -907,10 +913,18 @@ fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> 
             (FleetClient::new(conn)?.get_q("/jobs", &q)?, proof_row)
         }
         (JobType::Batch, app) => {
-            if let Some(AppRef::Container(name)) = &app {
-                q.push(("profile", name.clone()));
+            let a = FleetClient::control(conn)?;
+            let batches = match &app {
+                Some(AppRef::Container(name)) => vec![name.clone()],
+                _ => batch_names(&a)?,
+            };
+            let mut jobs = Vec::new();
+            for batch in batches {
+                jobs.extend(a.get_q(&format!("/batches/{batch}/jobs"), &q)?.as_array().cloned().unwrap_or_default());
             }
-            (FleetClient::control(conn)?.get_q("/batches", &q)?, batch_row)
+            jobs.sort_by(|x, y| y["submitted_at"].as_f64().unwrap_or(0.0).total_cmp(&x["submitted_at"].as_f64().unwrap_or(0.0)));
+            jobs.truncate(want.limit);
+            (Value::Array(jobs), batch_row)
         }
     };
     let rows = v.as_array().into_iter().flatten().map(row);
@@ -1003,7 +1017,7 @@ fn serving_app_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
         .flatten()
         .find(|x| x["name"].as_str() == Some(name) && x["persistent"].as_bool() == Some(true) && x["removed"].as_bool() != Some(true))
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no serving app {name}; use fleetctl batch profile for a finite workload"))
+        .ok_or_else(|| anyhow::anyhow!("no serving app {name}; finite workloads are fleetctl batch"))
 }
 
 /// Disables or enables an app.
@@ -1134,7 +1148,7 @@ fn add_app(add: &AddProofApp, conn: &ConnectionOptions, out: &OutputWriter) -> a
         bail!("app creation requires --namespace NAME; an administrator must create the namespace first");
     }
     let AppRef::Proof { tenant, elf } = AppRef::parse(&add.name) else {
-        bail!("proof registration requires TENANT/<elf id>; configure serving deployments in services.yaml and finite profiles with fleetctl batch add");
+        bail!("proof registration requires TENANT/<elf id>; configure serving deployments in services.yaml and batches with fleetctl batch add");
     };
     if tenant.is_empty() || add.name == "(rejected)" {
         bail!("a proof app is TENANT/<elf id> (or TENANT/ with --elf FILE)");
@@ -1169,9 +1183,9 @@ fn add_app(add: &AddProofApp, conn: &ConnectionOptions, out: &OutputWriter) -> a
 
 fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
-        bail!("batch profile creation requires --namespace NAME; an administrator must create the namespace first");
+        bail!("batch creation requires --namespace NAME; an administrator must create the namespace first");
     }
-    if add.name.contains('/') { bail!("a batch profile name cannot contain /"); }
+    if add.name.contains('/') { bail!("a batch name cannot contain /"); }
     let mut body = serde_json::to_value(add)?;
     let mut env = serde_json::Map::new();
     for kv in &add.env {
@@ -1182,10 +1196,10 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
         body["env"] = Value::Object(env);
     }
     let a = FleetClient::control(conn)?;
-    let v = a.send(a.req(reqwest::Method::POST, "/batch-profiles").json(&body))?;
+    let v = a.send(a.req(reqwest::Method::POST, "/batches").json(&body))?;
     let gpus = v["max_gpus"].as_u64().unwrap_or(0);
     out.done(
-        &format!("added batch profile {}: image {}, up to {gpus} GPU{}, mounts under {}", add.name,
+        &format!("added batch {}: image {}, up to {gpus} GPU{}, mounts under {}", add.name,
                  v["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" },
                  v["allow"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
         v,
@@ -1318,20 +1332,40 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn batch_profile_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
-    let profile = a.get(&format!("/batch-profiles/{name}"))?;
-    if profile["persistent"].as_bool() == Some(true) {
+fn batch_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
+    let batch = a.get(&format!("/batches/{name}"))?;
+    if batch["persistent"].as_bool() == Some(true) {
         bail!("{name} is a long-running app; use fleetctl app");
     }
-    Ok(with_type("batch", &profile))
+    Ok(with_type("batch", &batch))
+}
+
+/// Every batch the caller can see, deleted ones that still have jobs included.
+fn batch_names(a: &FleetClient) -> anyhow::Result<Vec<String>> {
+    Ok(a.get("/batches")?.as_array().into_iter().flatten()
+        .filter_map(|b| b["name"].as_str().map(str::to_owned)).collect())
+}
+
+/// A batch job's path: under `batch` when given, else under the batch that has the id.
+fn batch_job_path(a: &FleetClient, batch: Option<&str>, id: &str) -> anyhow::Result<String> {
+    if let Some(batch) = batch {
+        return Ok(format!("/batches/{batch}/jobs/{id}"));
+    }
+    for batch in batch_names(a)? {
+        let path = format!("/batches/{batch}/jobs/{id}");
+        if a.get(&path).is_ok() {
+            return Ok(path);
+        }
+    }
+    bail!("no batch job {id}")
 }
 
 fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match &p.cmd {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
-        Some(BatchCmd::Profiles) => return batch_profiles(&p.conn, out),
-        Some(BatchCmd::Profile { name }) => return batch_profile(name, &p.conn, out),
+        Some(BatchCmd::List) => return batches(&p.conn, out),
+        Some(BatchCmd::Show { name }) => return show_batch(name, &p.conn, out),
         Some(cmd) => {
             let a = FleetClient::control(&p.conn)?;
             let name = match cmd {
@@ -1339,51 +1373,51 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
                 | BatchCmd::Priority { name, .. } | BatchCmd::Delete { name, .. } => name,
                 _ => unreachable!(),
             };
-            batch_profile_named(&a, name)?;
-            let path = format!("/batch-profiles/{name}");
+            batch_named(&a, name)?;
+            let path = format!("/batches/{name}");
             let request = match cmd {
                 BatchCmd::Disable { .. } => a.req(reqwest::Method::PUT, &format!("{path}/disabled")),
                 BatchCmd::Enable { .. } => a.req(reqwest::Method::DELETE, &format!("{path}/disabled")),
                 BatchCmd::Priority { priority, .. } => a.req(reqwest::Method::PUT, &format!("{path}/priority"))
                     .json(&json!({"priority": priority})),
                 BatchCmd::Delete { yes, .. } => {
-                    if !yes { bail!("would remove batch profile {name}; accepted jobs must finish first. Pass --yes to delete"); }
+                    if !yes { bail!("would remove batch {name}; accepted jobs must finish first. Pass --yes to delete"); }
                     a.req(reqwest::Method::DELETE, &path)
                 }
                 _ => unreachable!(),
             };
             let value = a.send(request)?;
-            out.done(&format!("updated batch profile {name}"), value);
+            out.done(&format!("updated batch {name}"), value);
             return Ok(());
         }
         None => {}
     }
     match &p.name {
-        Some(name) => batch_profile(name, &p.conn, out),
-        None => batch_profiles(&p.conn, out),
+        Some(name) => show_batch(name, &p.conn, out),
+        None => batches(&p.conn, out),
     }
 }
 
-/// The profiles, like `fleetctl app`: settings plus how many jobs are active and when the last began.
-fn batch_profiles(conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
-    let profiles = FleetClient::control(conn)?.get("/batch-profiles")?;
-    // Every active job, however old, and enough recent ones to date each profile's last job.
+/// The batches, like `fleetctl app`: settings plus how many jobs are active and when the last began.
+fn batches(conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let batches = FleetClient::control(conn)?.get("/batches")?;
+    // Every active job, however old, and enough recent ones to date each batch's last job.
     let jobs = fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 1000, active: true, tenant: None, app: None })
         .and_then(|mut jobs| {
             jobs.extend(fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 200, active: false, tenant: None, app: None })?);
             Ok(jobs)
         })
         .unwrap_or_else(|e| {
-            tracing::warn!(error=%format!("{e:#}"), "batch jobs not reachable; listing profiles only");
+            tracing::warn!(error=%format!("{e:#}"), "batch jobs not reachable; listing batches only");
             vec![]
         });
-    let rows: Vec<Value> = profiles.as_array().into_iter().flatten().map(|profile| {
-        let mut row = profile.clone();
+    let rows: Vec<Value> = batches.as_array().into_iter().flatten().map(|batch| {
+        let mut row = batch.clone();
         if row["state"].is_null() {
-            row["state"] = json!(if profile["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
+            row["state"] = json!(if batch["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
         }
         let mut ids = std::collections::HashSet::new();
-        let own: Vec<&Value> = jobs.iter().filter(|j| j["app"] == profile["name"] && ids.insert(j["id"].to_string())).collect();
+        let own: Vec<&Value> = jobs.iter().filter(|j| j["app"] == batch["name"] && ids.insert(j["id"].to_string())).collect();
         row["active_jobs"] = json!(own.iter().filter(|j| is_active(j)).count());
         row["last_at"] = json!(own.iter().filter_map(|j| j["created_at"].as_f64()).reduce(f64::max));
         row
@@ -1398,11 +1432,11 @@ fn batch_profiles(conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Resul
     Ok(())
 }
 
-fn batch_profile(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
-    let mut profile = batch_profile_named(&FleetClient::control(conn)?, name)?;
-    profile["newest_jobs"] = json!(fetch_rows(JobType::Batch, conn,
+fn show_batch(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    let mut batch = batch_named(&FleetClient::control(conn)?, name)?;
+    batch["newest_jobs"] = json!(fetch_rows(JobType::Batch, conn,
         &JobListFilter { limit: 5, active: false, tenant: None, app: Some(name) })?);
-    out.record(&profile);
+    out.record(&batch);
     Ok(())
 }
 
@@ -1425,7 +1459,7 @@ fn record(id: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Res
         out.record(&with_type("app", v));
         return Ok(());
     }
-    match FleetClient::control(conn).and_then(|a| a.get(&format!("/batches/{id}"))) {
+    match FleetClient::control(conn).and_then(|a| a.get(&batch_job_path(&a, None, id)?)) {
         Ok(v) => {
             out.record(&with_type("batch", &v));
             Ok(())
@@ -1469,22 +1503,36 @@ fn batch_action(cmd: &BatchJobCmd, conn: &ConnectionOptions, out: &OutputWriter)
     match cmd {
         BatchJobCmd::Submit { submit } => {
             let body = serde_json::to_value(submit)?;
-            let v = a.send(a.req(M::POST, "/batches").json(&body))?;
+            let v = a.send(a.req(M::POST, &format!("/batches/{}/jobs", submit.batch)).json(&body))?;
             out.record(&with_type("batch", &v));
         }
-        BatchJobCmd::Cancel { id } => out.record(&a.send(a.req(M::POST, &format!("/batches/{id}/cancel")))?),
-        BatchJobCmd::Preempt { id } => out.record(&a.send(a.req(M::POST, &format!("/batches/{id}/preempt")))?),
-        BatchJobCmd::Purge { id, older_than } => {
-            let path = match (id, older_than) {
-                (Some(id), _) => format!("/batches/{id}"),
-                (None, Some(days)) => format!("/batches?older_than={days}"),
+        BatchJobCmd::Cancel { id, batch } => {
+            let path = batch_job_path(&a, batch.as_deref(), id)?;
+            out.record(&a.send(a.req(M::POST, &format!("{path}/cancel")))?)
+        }
+        BatchJobCmd::Preempt { id, batch } => {
+            let path = batch_job_path(&a, batch.as_deref(), id)?;
+            out.record(&a.send(a.req(M::POST, &format!("{path}/preempt")))?)
+        }
+        BatchJobCmd::Purge { id, batch, older_than } => {
+            let purged = match (id, older_than) {
+                (Some(id), _) => a.send(a.req(M::DELETE, &batch_job_path(&a, batch.as_deref(), id)?))?,
+                (None, Some(days)) => {
+                    let batches = match batch { Some(batch) => vec![batch.clone()], None => batch_names(&a)? };
+                    let mut purged = Vec::new();
+                    for batch in batches {
+                        let v = a.send(a.req(M::DELETE, &format!("/batches/{batch}/jobs?older_than={days}")))?;
+                        purged.extend(v.as_array().cloned().unwrap_or_default());
+                    }
+                    Value::Array(purged)
+                }
                 (None, None) => bail!("purge ID, or purge --older-than DAYS"),
             };
-            let v = a.send(a.req(M::DELETE, &path))?;
-            out.table(v.as_array().map(Vec::as_slice).unwrap_or_default(), PURGE_COLS, Some(&v));
+            out.table(purged.as_array().map(Vec::as_slice).unwrap_or_default(), PURGE_COLS, Some(&purged));
         }
-        BatchJobCmd::Logs { id, follow, lines } => {
-            let mut chunk = a.get(&format!("/batches/{id}/logs?lines={lines}"))?;
+        BatchJobCmd::Logs { id, batch, follow, lines } => {
+            let path = batch_job_path(&a, batch.as_deref(), id)?;
+            let mut chunk = a.get(&format!("{path}/logs?lines={lines}"))?;
             let mut stdout = std::io::stdout();
             loop {
                 if out.json {
@@ -1500,7 +1548,7 @@ fn batch_action(cmd: &BatchJobCmd, conn: &ConnectionOptions, out: &OutputWriter)
                     std::thread::sleep(Duration::from_secs(1));
                 }
                 let offset = chunk["offset"].as_u64().unwrap_or(0);
-                chunk = a.get(&format!("/batches/{id}/logs?offset={offset}"))?;
+                chunk = a.get(&format!("{path}/logs?offset={offset}"))?;
             }
         }
     }

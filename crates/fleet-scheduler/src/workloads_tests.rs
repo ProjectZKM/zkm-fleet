@@ -29,14 +29,14 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     (dir, control, namespace)
 }
 fn inventory(namespace: &str) -> NodeReport {
-    serde_json::from_value(json!({"version":2,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"profiles":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+    serde_json::from_value(json!({"version":2,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
 }
 fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
     JobReport {
         id: job.id.clone(),
         lease: job.lease.clone(),
         status: json!({"state":state,"submitted_at":1,"started_at":1}).into(),
-        spec: json!({"profile_name":job.profile}).into(),
+        spec: json!({"batch":job.batch}).into(),
         cleaned,
         logs_ready: cleaned,
     }
@@ -46,7 +46,7 @@ fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
 async fn apps_and_batches_have_separate_lifecycles_after_restart() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, false, true);
-    report.profiles.get_mut("training").unwrap()["type"] = json!("job");
+    report.batches.get_mut("training").unwrap()["type"] = json!("job");
     c.report("gpu", "session", report).await.unwrap();
     let mut job = submit(&c).await;
     job.status["type"] = json!("job");
@@ -55,11 +55,11 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap());
     for path in [
         "/apps".to_string(),
-        "/batch-profiles".to_string(),
-        "/batch-profiles/training".to_string(),
-        "/apps/service".to_string(),
         "/batches".to_string(),
-        format!("/batches/{}", job.id),
+        "/batches/training".to_string(),
+        "/apps/service".to_string(),
+        "/batches/training/jobs".to_string(),
+        format!("/batches/training/jobs/{}", job.id),
     ] {
         let response = scale_call(restarted.clone(), "admin", "GET", &path, Value::Null).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
@@ -143,31 +143,31 @@ async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     for tag in [Some("scope=default"), Some("team=research"), None] {
         let q = tag.map(|tag| [("tag".into(), tag.into())].into_iter().collect()).unwrap_or_default();
-        c.submit(json!({"profile":"training","command":["true"],"gpus":0,"cpus":1}), None, &q,
+        c.submit("training", json!({"command":["true"],"gpus":0,"cpus":1}), None, &q,
         ).await.unwrap();
     }
     for (path, count) in [
         (format!("/apps?namespace={ns}&tag=scope%3Ddefault"), 1),
         (format!("/apps?namespace={ns}&tag=team%3Dresearch"), 0),
-        (format!("/batch-profiles?namespace={ns}&tag=team%3Dresearch"), 1,
+        (format!("/batches?namespace={ns}&tag=team%3Dresearch"), 1,
         ),
     ] {
         let response = scale_call(c.clone(), "admin", "GET", &path, Value::Null).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let rows: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), count, "{path}: {rows}");
-        if path.starts_with("/batch-profiles") { assert_eq!(rows[0]["jobs"], 1); }
+        if path.starts_with("/batches") { assert_eq!(rows[0]["jobs"], 1); }
     }
     let secret = "ab".repeat(32);
     c.fleet.add_user_token("eth", &"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
         Some(vec!["training".into(), "service".into()]),
         Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.clone()), None, false,
         ).await.unwrap();
-    let response = scale_call(c.clone(), &secret, "GET", "/batch-profiles/training", Value::Null,
+    let response = scale_call(c.clone(), &secret, "GET", "/batches/training", Value::Null,
     ).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let profile: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
-    assert_eq!(profile["jobs"], 1);
+    let batch: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(batch["jobs"], 1);
     assert_eq!(scale_call(c.clone(), &secret, "GET", "/apps/service", Value::Null).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(scale_call(c, "admin", "GET", &format!("/apps?namespace={ns}&tag=bare"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
 }
@@ -222,19 +222,19 @@ async fn lifecycle_routes_reject_cross_type_access_and_serving_batch_submissions
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     for (method, path, body, status) in [
         ("GET", "/apps/training", Value::Null, StatusCode::NOT_FOUND),
-        ("GET", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND,
+        ("GET", "/batches/service", Value::Null, StatusCode::NOT_FOUND,
         ),
         ("PUT", "/apps/training/disabled", Value::Null, StatusCode::NOT_FOUND,
         ),
-        ("PUT", "/batch-profiles/service/priority", json!({"priority":100}), StatusCode::NOT_FOUND,
+        ("PUT", "/batches/service/priority", json!({"priority":100}), StatusCode::NOT_FOUND,
         ),
-        ("DELETE", "/batch-profiles/service", Value::Null, StatusCode::NOT_FOUND,
+        ("DELETE", "/batches/service", Value::Null, StatusCode::NOT_FOUND,
         ),
-        ("PUT", "/batch-profiles/service/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST,
+        ("PUT", "/batches/service/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST,
         ),
         ("POST", "/apps", json!({"name":"finite","image":"test","namespace":ns}), StatusCode::BAD_REQUEST,
         ),
-        ("POST", "/batches", json!({"profile":"service","command":["true"]}), StatusCode::CONFLICT,
+        ("POST", "/batches/service/jobs", json!({"command":["true"]}), StatusCode::CONFLICT,
         ),
     ] {
         let response = scale_call(c.clone(), "admin", method, path, body).await;
@@ -242,37 +242,37 @@ async fn lifecycle_routes_reject_cross_type_access_and_serving_batch_submissions
     }
     assert!(c.inner.lock().jobs.is_empty());
     assert!(c.inner.lock().commands.is_empty());
-    assert_eq!(c.inner.lock().apps["service"].profile["priority"], 0);
+    assert_eq!(c.inner.lock().apps["service"].spec["priority"], 0);
 }
 
 #[tokio::test]
-async fn batch_profile_policy_and_job_lifecycle_use_batch_routes() {
+async fn batch_policy_and_job_lifecycle_use_batch_routes() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let response = scale_call(c.clone(), "admin", "PUT", "/batch-profiles/training/priority",
+    let response = scale_call(c.clone(), "admin", "PUT", "/batches/training/priority",
         json!({"priority":31}),
     ).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let response = scale_call(c.clone(), "admin", "POST", "/batches",
-        json!({"profile":"training","command":["true"],"gpus":1}),
+    let response = scale_call(c.clone(), "admin", "POST", "/batches/training/jobs",
+        json!({"command":["true"],"gpus":1}),
     ).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(job["type"], "batch");
     assert_eq!(job["namespace"], ns);
     assert_eq!(job["priority"], 31);
-    assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/batch-profiles/training", Value::Null)
+    assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/batches/training", Value::Null)
         .await.status(), StatusCode::CONFLICT);
-    assert_eq!(scale_call(c.clone(), "admin", "PUT", "/batch-profiles/training/disabled", Value::Null)
+    assert_eq!(scale_call(c.clone(), "admin", "PUT", "/batches/training/disabled", Value::Null)
         .await.status(), StatusCode::OK);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/batches",
-        json!({"profile":"training","command":["true"]})).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/batches/training/jobs",
+        json!({"command":["true"]})).await.status(), StatusCode::CONFLICT);
     assert_eq!(c.job(text(&job,"id"), None, &BTreeMap::new()).unwrap().state(), "waiting_quota");
-    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/batches/{}/cancel", text(&job,"id")), Value::Null)
+    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/batches/training/jobs/{}/cancel", text(&job,"id")), Value::Null)
         .await.status(), StatusCode::OK);
-    assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/batch-profiles/training", Value::Null)
+    assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/batches/training", Value::Null)
         .await.status(), StatusCode::OK);
-    assert_eq!(scale_call(c.clone(), "admin", "GET", &format!("/batches/{}", text(&job,"id")), Value::Null)
+    assert_eq!(scale_call(c.clone(), "admin", "GET", &format!("/batches/training/jobs/{}", text(&job,"id")), Value::Null)
         .await.status(), StatusCode::OK);
 }
 
@@ -309,7 +309,7 @@ async fn completed_job_logs_finish_without_output_artifacts() {
 async fn submit(control: &WorkloadController) -> Job {
     let job = control
         .submit(
-            json!({"profile":"training","command":["true"],"gpus":1,"cpus":1}),
+            "training", json!({"command":["true"],"gpus":1,"cpus":1}),
             None,
             &BTreeMap::new(),
         )
@@ -477,9 +477,9 @@ async fn invalid_requests_and_cross_machine_jobs_are_refused_before_creation() {
         ("env", json!("bad"), 400),
         ("code", json!("upload:removed"), 400),
     ] {
-        let mut request = json!({"profile":"training","command":["true"],"gpus":1,"cpus":1});
+        let mut request = json!({"command":["true"],"gpus":1,"cpus":1});
         request[field] = value;
-        let err = c.submit(request, None, &BTreeMap::new()).await.unwrap_err();
+        let err = c.submit("training", request, None, &BTreeMap::new()).await.unwrap_err();
         assert_eq!(
             err.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,
             code
@@ -506,7 +506,7 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
     };
     let job = c
         .submit(
-            json!({"profile":"training","command":["true"],"gpus":0,"cpus":1}),
+            "training", json!({"command":["true"],"gpus":0,"cpus":1}),
             Some(&token),
             &BTreeMap::new(),
         )
@@ -578,7 +578,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         .await
     }
     assert_eq!(
-        call(c.clone(), "GET", "/batch-profiles", None, Value::Null)
+        call(c.clone(), "GET", "/batches", None, Value::Null)
             .await
             .status(),
         StatusCode::UNAUTHORIZED
@@ -599,7 +599,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "POST",
-            "/batch-profiles",
+            "/batches",
             Some(&secret),
             json!({"name":"user-app","image":"python:3"})
         )
@@ -611,7 +611,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "POST",
-            "/batch-profiles",
+            "/batches",
             Some(&secret),
             json!({"name":"mounted","image":"python:3","namespace":ns,"allow":["/data/models"],"priority":17})
         )
@@ -623,7 +623,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "PUT",
-            "/batch-profiles/user-app/priority",
+            "/batches/user-app/priority",
             Some(&secret),
             json!({"priority":100})
         )
@@ -635,7 +635,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "GET",
-            "/batch-profiles?tag=scope=research",
+            "/batches?tag=scope=research",
             Some(&secret),
             Value::Null
         )
@@ -646,9 +646,9 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
     let response = call(
         c.clone(),
         "POST",
-        "/batches",
+        "/batches/user-app/jobs",
         Some(&secret),
-        json!({"profile":"user-app","gpus":0,"cpus":1,"command":["train","--input","s3://owner-bucket/dataset"],"env":["INPUT_URI=s3://owner-bucket/dataset"]}),
+        json!({"gpus":0,"cpus":1,"command":["train","--input","s3://owner-bucket/dataset"],"env":["INPUT_URI=s3://owner-bucket/dataset"]}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -679,7 +679,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         call(
             c.clone(),
             "GET",
-            &format!("/batches/{id}/out.tar.gz"),
+            &format!("/batches/user-app/jobs/{id}/out.tar.gz"),
             Some(&secret),
             Value::Null
         )
@@ -819,43 +819,43 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
     let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
     let foreign_ns = user_token(&c, &other_ns, 5, "eth", "scope=default", None, true).await;
-    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batch-profiles",
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches",
         json!({"name":"training","image":"python:3","allow":["/data/models"],"priority":17})).await.status(), StatusCode::CREATED);
     for token in [&consumer, &restricted, &foreign_tag, &foreign_ns] {
         for (method, path, body) in [
-            ("PUT", "/batch-profiles/training/priority", json!({"priority":99})),
-            ("PUT", "/batch-profiles/training/disabled", Value::Null),
-            ("DELETE", "/batch-profiles/training/disabled", Value::Null),
-            ("DELETE", "/batch-profiles/training", Value::Null),
+            ("PUT", "/batches/training/priority", json!({"priority":99})),
+            ("PUT", "/batches/training/disabled", Value::Null),
+            ("DELETE", "/batches/training/disabled", Value::Null),
+            ("DELETE", "/batches/training", Value::Null),
         ] {
             let status = scale_call(c.clone(), token, method, path, body).await.status();
             assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{method} {path}: {status}");
         }
     }
-    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batch-profiles",
+    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batches",
         json!({"name":"consumer","image":"test"})).await.status(), StatusCode::FORBIDDEN);
     for body in [json!({"name":"invalid","image":"test","allow":["/"]}),
         json!({"name":"invalid","image":"test","allow":["/data/../etc"]}),
         json!({"name":"invalid","image":"test","priority":2147483648_i64}),
     ] {
-        assert_eq!(scale_call(c.clone(), &owner, "POST", "/batch-profiles", body).await.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches", body).await.status(), StatusCode::BAD_REQUEST);
     }
-    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batch-profiles/training/disabled", Value::Null).await.status(), StatusCode::OK);
-    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches",
-        json!({"profile":"training","command":["true"]})).await.status(), StatusCode::CONFLICT);
-    assert_eq!(scale_call(c.clone(), &owner, "DELETE", "/batch-profiles/training/disabled", Value::Null).await.status(), StatusCode::OK);
-    let response = scale_call(c.clone(), &consumer, "POST", "/batches",
-        json!({"profile":"training","gpus":0,"cpus":1,"mount":["/data/models:ro"],"command":["true"]})).await;
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batches/training/disabled", Value::Null).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches/training/jobs",
+        json!({"command":["true"]})).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), &owner, "DELETE", "/batches/training/disabled", Value::Null).await.status(), StatusCode::OK);
+    let response = scale_call(c.clone(), &consumer, "POST", "/batches/training/jobs",
+        json!({"gpus":0,"cpus":1,"mount":["/data/models:ro"],"command":["true"]})).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(job["priority"], 17);
-    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batch-profiles/training/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batches/training/priority", json!({"priority":31})).await.status(), StatusCode::OK);
     assert_eq!(c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().policy["priority"], 17);
-    assert_eq!(c.inner.lock().apps["training"].profile["allow"], json!(["/data/models"]));
-    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batches",
-        json!({"profile":"training","gpus":0,"cpus":1,"mount":["/etc:ro"],"command":["true"]})).await.status(), StatusCode::FORBIDDEN);
-    assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/{}/cancel", text(&job, "id")), Value::Null).await.status(), StatusCode::OK);
-    assert_eq!(scale_call(c, &owner, "DELETE", "/batch-profiles/training", Value::Null).await.status(), StatusCode::OK);
+    assert_eq!(c.inner.lock().apps["training"].spec["allow"], json!(["/data/models"]));
+    assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batches/training/jobs",
+        json!({"gpus":0,"cpus":1,"mount":["/etc:ro"],"command":["true"]})).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/training/jobs/{}/cancel", text(&job, "id")), Value::Null).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c, &owner, "DELETE", "/batches/training", Value::Null).await.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -897,7 +897,7 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
             json!({"replicas":1})).await.status(), StatusCode::FORBIDDEN);
         if !proof {
             assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/priority", json!({"priority":31})).await.status(), StatusCode::OK);
-            assert_eq!(c.inner.lock().apps["service"].profile["priority"], 31);
+            assert_eq!(c.inner.lock().apps["service"].spec["priority"], 31);
         }
         for (method, disabled_state) in [("PUT", true), ("DELETE", false)] {
             let control = c.clone();
@@ -1058,7 +1058,7 @@ async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, c
 }
 
 #[tokio::test]
-async fn owner_scale_rejects_invalid_capacity_quota_and_one_shot_profiles() {
+async fn owner_scale_rejects_invalid_capacity_quota_and_batches() {
     use sha2::Digest;
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
@@ -1115,7 +1115,7 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     ] {
         assert_eq!(scale_call(c.clone(),"admin",method,&path,json!({})).await.status(),StatusCode::CONFLICT);
     }
-    assert_eq!(c.inner.lock().apps["service"].profile["disabled"],false);
+    assert_eq!(c.inner.lock().apps["service"].spec["disabled"],false);
     assert!(c.request_scale(&ns,"service",request_resources(json!({"replicas":1}))).await.is_err());
     let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
@@ -1143,7 +1143,7 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
     finish_service_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
     assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"complete");
-    assert_eq!(c.inner.lock().apps["service"].profile["replicas"],1);
+    assert_eq!(c.inner.lock().apps["service"].spec["replicas"],1);
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     // A node-local edit after completion cannot overwrite the durable desired allocation.
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
@@ -1306,7 +1306,7 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
         }
     }
-    let path = format!("/batches/{}/logs?rank=1", job.id);
+    let path = format!("/batches/training/jobs/{}/logs?rank=1", job.id);
     let response = scale_call(c, "admin", "GET", &path, Value::Null).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -1547,13 +1547,13 @@ async fn deleting_a_proof_app_tells_every_node_which_app_was_deleted() {
 async fn deleting_a_serving_app_tells_its_nodes() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
-    c.inner.lock().apps.get_mut("service").unwrap().profile["disabled"]=json!(true);
+    c.inner.lock().apps.get_mut("service").unwrap().spec["disabled"]=json!(true);
     assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/service?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
     assert_eq!(remove_commands(&c,NodeOperation::RemoveApp),vec![("gpu".to_string(),json!({"namespace":ns,"namespace_name":"test","app":"service"}))]);
 }
 
 #[tokio::test]
-async fn deleting_a_batch_profile_sends_remove_profile_and_keeps_its_jobs() {
+async fn deleting_a_batch_sends_remove_batch_and_keeps_its_jobs() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     let job=submit(&c).await;
@@ -1562,11 +1562,11 @@ async fn deleting_a_batch_profile_sends_remove_profile_and_keeps_its_jobs() {
     let mut report=inventory(&ns);
     report.jobs.push(incoming(&job,"succeeded",true));
     c.report("gpu","session",report).await.unwrap();
-    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/batch-profiles/training?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::RemoveProfile),vec![("gpu".to_string(),json!({"name":"training"}))]);
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/batches/training?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    assert_eq!(remove_commands(&c,NodeOperation::RemoveBatch),vec![("gpu".to_string(),json!({"name":"training"}))]);
     assert!(c.job(&job.id,None,&BTreeMap::new()).is_ok(),"job history and outputs follow the job's own lifecycle");
     let mut late=incoming(&job,"succeeded",true);late.id="other-job".into();
     let mut report=inventory(&ns);report.jobs.push(late);
     c.report("gpu","session",report).await.unwrap();
-    assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted profile imports no jobs");
+    assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted batch imports no jobs");
 }

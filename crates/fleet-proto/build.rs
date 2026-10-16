@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Job.logs_ready",
         "Job.purged",
         "CommandRecord.admitted",
-        "NodeReport.profiles",
+        "NodeReport.batches",
         "NodeReport.services",
         "NodeReport.jobs",
         "NodeReport.results",
