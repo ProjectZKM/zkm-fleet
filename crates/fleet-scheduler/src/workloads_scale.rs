@@ -323,10 +323,8 @@ impl WorkloadController {
         for (key, intent) in intents {
             let mut scale = intent.scale.clone().unwrap();
             if scale.phase() == Phase::Draining {
-                if let Some((tenant, elf)) = text(&intent.service, "proof_app").split_once('/') {
-                    self.fleet
-                        .set_app_disabled(text(&intent.service, "namespace"), tenant, elf, true)
-                        .await?;
+                if text(&intent.service, "proof_app").contains('/') {
+                    self.sync_proof_app(&intent.service, true).await?;
                 } else {
                     let app = self
                         .inner
@@ -426,11 +424,7 @@ impl WorkloadController {
                 continue;
             }
             if !scale.disabled {
-                if let Some((tenant, elf)) = text(&scale.target, "proof_app").split_once('/') {
-                    self.fleet
-                        .set_app_disabled(text(&scale.target, "namespace"), tenant, elf, false)
-                        .await?;
-                }
+                self.sync_proof_app(&scale.target, false).await?;
             }
             let app = self
                 .inner

@@ -149,6 +149,20 @@ impl WorkloadController {
         );
     }
 
+    /// Mirrors an integrated worker's state onto its proof app. A worker whose proof app is
+    /// not registered has nothing to mirror: that must not fail the heartbeat or scale pass
+    /// carrying it, or every later node result is rejected with it.
+    pub(super) async fn sync_proof_app(&self, service: &Value, disabled: bool) -> anyhow::Result<()> {
+        let Some((tenant, elf)) = text(service, "proof_app").split_once('/') else { return Ok(()) };
+        match self.fleet.set_app_disabled(text(service, "namespace"), tenant, elf, disabled).await {
+            Err(e) if e.downcast_ref::<crate::fleet::RequestRejection>().is_some_and(|r| r.status == 404) => {
+                tracing::warn!(service = text(service, "name"), error = %e, "integrated worker has no registered proof app");
+                Ok(())
+            }
+            r => r.map(drop),
+        }
+    }
+
     fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, service: &Value,
     ) -> anyhow::Result<()> {
         if !integrated_worker(service) { return Ok(()); }
@@ -1050,11 +1064,7 @@ impl WorkloadController {
                         && c.parameters["disabled"].as_bool() == Some(false)
                         && c.parameters["scale_id"].is_null()
                     {
-                        if let Some((tenant, elf)) = text(service, "proof_app").split_once('/') {
-                            self.fleet
-                                .set_app_disabled(text(service, "namespace"), tenant, elf, false)
-                                .await?;
-                        }
+                        self.sync_proof_app(service, false).await?;
                     }
                 }
                 self.save("commands", &c.id, &c)?;

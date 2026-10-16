@@ -1437,3 +1437,17 @@ async fn a_starting_app_says_why_it_is_not_running() {
     c.inner.lock().commands.values_mut().for_each(|c| c.done = true);
     assert_eq!(c.app_resources(&ns, "service", None)["detail"], "waiting for gpu to report it ready");
 }
+
+#[tokio::test]
+async fn enabling_an_integrated_worker_without_a_registered_proof_app_keeps_heartbeats_accepted() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,true,true);
+    assert!(!c.fleet.app_known(&ns,"eth",&"a".repeat(64)));
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let mut service:Value=report.services[0].clone().into();service["disabled"]=json!(false);
+    let id=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    let command=c.inner.lock().commands.get(&id).cloned().unwrap();
+    finish_service_command(&c,&ns,true,&command,false,None).await;
+    assert!(c.inner.lock().commands[&id].done,"the enable result must be recorded, not rejected with the whole heartbeat");
+    c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
+}
