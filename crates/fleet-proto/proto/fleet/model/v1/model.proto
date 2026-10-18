@@ -90,7 +90,7 @@ message ProofJob {
   optional fleet.v1.ProofOutputs outputs = 22;
 }
 
-message ProofApp {
+message App {
   required int32 priority = 1;
   required string namespace = 2;
   required string tenant = 3;
@@ -188,6 +188,10 @@ message ScaleStatus {
   optional string start = 6;
   optional string error = 7;
   optional double ready_since = 8;
+  // An update also changes these settings: the node writes them with the rest of the target
+  // configuration (NODE_OPERATION_APP, command `update`) while the service is stopped.
+  optional Json set = 9;
+  optional string update = 10;
 }
 
 message AppDeployment {
@@ -243,7 +247,7 @@ message ProofJobsQuery {
   required uint64 limit = 6;
 }
 
-message ProofAppRequest {
+message AppRequest {
   optional string namespace = 1;
   optional string tag = 2;
   optional string tenant = 3;
@@ -284,7 +288,7 @@ message NodeStatus {
   required string machine = 5;
   required string zkm_version = 6;
   required string image = 7;
-  optional string proof_app = 8;
+  optional string app = 8;
   required bool ready = 9;
   optional string busy = 10;
   optional string reserved_for = 11;

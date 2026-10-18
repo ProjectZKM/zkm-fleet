@@ -382,7 +382,7 @@ fn app_priority_uses_admin_policy_routes_for_both_app_types() {
 }
 
 #[test]
-fn proof_app_disable_uses_control_plane_for_lifecycle_and_canonical_namespace() {
+fn app_disable_uses_control_plane_for_lifecycle_and_canonical_namespace() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token =
@@ -414,7 +414,7 @@ fn proof_app_disable_uses_control_plane_for_lifecycle_and_canonical_namespace() 
                     "tenant":"eth", "elf_id":app_elf, "disabled":false}])
                 .to_string()
             } else {
-                assert!(request.starts_with(&format!("PUT /proof-apps/disabled?namespace={hash}&tenant=eth&elf_id={app_elf} HTTP/1.1")), "{request}");
+                assert!(request.starts_with(&format!("PUT /apps/eth/{app_elf}/disabled?namespace={hash} HTTP/1.1")), "{request}");
                 assert!(
                     !request.contains("namespace=alice"),
                     "duplicate namespace: {request}"
@@ -472,9 +472,9 @@ fn app_scale_and_status_use_only_control_plane_routes_and_preserve_omitted_setti
                 else {
                     let line=headers.lines().next().unwrap();
                     assert!(line.starts_with(if inspect {"GET "}else{"PUT "}));
-                    assert!(line.contains(if proof {"/proof-apps/scale?"}else{"/apps/comfyui/scale?"}),"{line}");
+                    let path=if proof {format!("/apps/eth/{elf}/scale?")}else{"/apps/comfyui/scale?".into()};
+                    assert!(line.contains(&path),"{line}");
                     assert!(line.contains(&format!("namespace={ns}")),"{line}");
-                    if proof {assert!(line.contains(&format!("elf_id={elf}")));}
                     if inspect {assert!(line.contains("node=gpu-box"));}
                     else {
                         let size:usize=headers.lines().find_map(|l|l.to_lowercase().strip_prefix("content-length: ").map(str::to_owned)).unwrap().parse().unwrap();
@@ -525,9 +525,9 @@ fn app_logs_read_the_control_plane_route_and_print_the_raw_log_or_the_error() {
                 }
                 let line = headers.lines().next().unwrap();
                 assert!(line.starts_with("GET "), "{line}");
-                assert!(line.contains(if proof { "/proof-apps/logs?" } else { "/apps/comfyui/logs?" }), "{line}");
+                let path = if proof { format!("/apps/eth/{elf}/logs?") } else { "/apps/comfyui/logs?".into() };
+                assert!(line.contains(&path), "{line}");
                 assert!(line.contains(&format!("namespace={ns}")) && line.contains("lines=7") && line.contains("node=gpu-box"), "{line}");
-                if proof { assert!(line.contains(&format!("elf_id={elf}")), "{line}"); }
                 let body = if status == 200 { "alpha\nbeta\n" } else { "node is offline" };
                 write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }

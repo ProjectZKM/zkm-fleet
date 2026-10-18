@@ -40,7 +40,7 @@ a small Python adapter performs local Ray/container operations. The control host
 requires no Ray installation. Adding a remote machine requires the control-plane URL
 and cluster token; machines do not join a shared Ray head or use SSH channels.
 
-SDK-driven proof apps preserve the `GenerateProof`/`GetStatus` protocol:
+SDK-driven apps preserve the `GenerateProof`/`GetStatus` protocol:
 
 1. The client submits to its **app-owned endpoint**, which stores the inputs and
    sends Fleet only references, SHA-256 hashes and job parameters.
@@ -144,7 +144,7 @@ multiple tags shows their tags together. Batches show `enabled` or
 
 Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch is that reusable configuration; each submission creates a batch job. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
-Every app and batch belongs to an administrator-created namespace. Proof requests require a registered proof app, and batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
+Every app and batch belongs to an administrator-created namespace. Proof requests require a registered app (TENANT/ELF), and batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching.
 
 App listings contain registered workloads. Rejected proof requests remain job
 records and do not create an app entry.
@@ -154,7 +154,7 @@ in Postgres. Batch records, service intents and commands are durable files in
 the control host's `data_dir`; back up that directory together with Postgres.
 Nodes continue locally, reconnect through heartbeats, and retry
 completion metadata until acknowledged. App endpoints and the machine storage handler remain independent of
-prover replicas. Disabling a proof app releases its GPU server while retained
+prover replicas. Disabling a registered app releases its GPU server while retained
 proofs remain fetchable through the machine agent.
 App owners control retention of their input and output files.
 
@@ -189,7 +189,7 @@ on each request, so token rotation and revocation still apply. Supplied authoriz
 is checked directly, without falling back to the configured token. This binary binds
 loopback only; external access requires an authenticated HTTPS app gateway.
 Repeat `--elf-id` and `--elf-file` for multiple allowlisted programs in the same
-namespace and tenant. Each program remains a separate Fleet proof app.
+namespace and tenant. Each program remains a separate Fleet app.
 GOAT uses its app-owned SDK endpoint on loopback ports `51012`/`51013`.
 Integrated EthProofs calls its local GPU server directly and requires no SDK endpoint.
 For other SDK-driven apps, use a separate storage root, scoped token and pair of
@@ -270,7 +270,7 @@ GPU/CPU quota, described below.
 
 Every app belongs to an existing namespace. An administrator creates the namespace
 and issues its owner token for the built-in `scope=default` tag. The owner can then
-register proof apps and batches, manage their metadata and submit jobs
+register apps and batches, manage their metadata and submit jobs
 inside that namespace and tag:
 
 ```bash
@@ -282,7 +282,7 @@ fleetctl --token-file alice.token --namespace alice --tag scope=default app add 
 ```
 
 Owner tokens carry `manage_apps: true`. Metadata changes still enforce the
-token's namespace, tag and any explicit app grants. Owners can manage proof
+token's namespace, tag and any explicit app grants. Owners can manage
 apps from any registered tenant in that namespace. The token's `tenant` binds
 SDK proof-signing identity; it does not restrict owner metadata or scaling.
 Tokens with app grants alone can submit and inspect permitted jobs and read
@@ -292,30 +292,48 @@ granted scaling status; they cannot change workload metadata.
 |---|---|
 | Namespace creation, token issuance, namespace/tag quotas and node administration | Administrator token |
 | Namespace listing and quota/usage inspection | Any scoped token for its own namespace and tag; administrators can inspect all |
-| Proof app registration, removal, priority and enable/disable | Owner token for the namespace, with any explicit app grants |
+| App registration, removal, priority and enable/disable | Owner token for the namespace, with any explicit app grants |
 | Batch creation, mount roots, priority, enable/disable and removal | Owner token for the namespace, tag and batch |
 | App GPU/CPU and replica changes | Owner token for the app; namespace/tag quotas and node capacity still apply |
 | Job submission and inspection; batch logs and cancellation | App-granted or owner token within its scope |
 
 Batch image, environment, resource policy and mount roots are supplied when
-registering a batch. Existing batches have priority and enable/disable
-endpoints; changing other fields requires removing the batch after its jobs
-finish and registering it again. Serving deployments start from node
-`services.yaml`; owners manage their lifecycle, priority and allocation through
-the control plane.
+registering a batch and changed with `fleetctl batch update NAME --image ...`
+(`PUT /batches/NAME/settings`). Accepted jobs keep the settings they were
+submitted with; new jobs use the new ones. Serving deployments start from node
+`services.yaml`; owners manage their lifecycle, priority, allocation and
+settings through the control plane. `fleetctl app update NAME --image ... --env K=V`
+(`PUT /apps/NAME/settings`, or `PUT /apps/TENANT/ELF_ID/settings` for a registered
+app) changes an app's server or prover image,
+environment, command, user, workdir, volumes, shm/memory size, health path or
+timeouts.
+
+The scheduler is the source of truth for an app's configuration and tells each
+node with one app-level node operation, `NODE_OPERATION_APP`: it addresses an app
+(its namespace by id and name, plus a registered app's `tenant/elf_id` or the serving
+app name; the node finds its services that run it) or a batch by name, and either
+removes it (`remove`) or writes its configuration into `services.yaml` or
+`batches.yaml` (`set`): enabled state, resources and settings. Enabling,
+disabling, scaling and updating an app all run the same way: the service drains
+and stops, its node writes the new configuration, and it starts again unless it
+is now disabled. `NODE_OPERATION_SET_SERVICE` only starts or stops a service's
+replicas as configured, for that sequence and when a node's replicas stop
+matching it. Priority is a scheduling parameter within the namespace and stays in
+the scheduler.
 
 Owner metadata routes use the same authenticated API as the CLI:
 
 | Workload | Routes |
 |---|---|
-| Proof registration | `POST` / `DELETE /admin/apps` and `PUT /admin/apps/priority`, with namespace, tenant and full `elf_id` selectors |
-| Proof enable/disable | `PUT` / `DELETE /admin/apps/disabled`; dedicated services use `PUT` / `DELETE /proof-apps/disabled` |
-| Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT` / `DELETE /batches/NAME/disabled` |
+| App registration | `POST` / `DELETE /admin/apps` and `PUT /admin/apps/priority`, with namespace, tenant and full `elf_id` selectors |
+| App enable/disable | `PUT` / `DELETE /admin/apps/disabled`; dedicated services use `PUT` / `DELETE /apps/TENANT/ELF_ID/disabled` |
+| Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
 | Batch jobs | `GET` / `POST /batches/NAME/jobs`, `DELETE /batches/NAME/jobs?older_than=DAYS`, `GET` / `DELETE /batches/NAME/jobs/ID`, `POST /batches/NAME/jobs/ID/cancel`, `POST /batches/NAME/jobs/ID/preempt`, `GET /batches/NAME/jobs/ID/logs` |
-| Persistent apps | `PUT /apps/NAME/priority`, `PUT` / `DELETE /apps/NAME/disabled`, `DELETE /apps/NAME` |
-| Allocation and status | `PUT` / `GET /apps/NAME/scale`, or `/proof-apps/scale` with tenant and full `elf_id` selectors |
+| Persistent apps | `PUT /apps/NAME/priority`, `PUT /apps/NAME/settings`, `PUT` / `DELETE /apps/NAME/disabled`, `DELETE /apps/NAME` |
+| Allocation and status | `PUT` / `GET /apps/NAME/scale`, or `/apps/TENANT/ELF_ID/scale` for a registered app |
+| Prover settings | `PUT /apps/TENANT/ELF_ID/settings` |
 
-The `/admin` prefix on proof metadata routes does not require an administrator
+The `/admin` prefix on app registration routes does not require an administrator
 token for these owner actions. Namespace and tag quota endpoints remain
 administrator-only. Disabling a batch blocks new submissions and lets
 accepted jobs continue; disabling an app drains its services before releasing
@@ -324,13 +342,13 @@ while it still has job records; its jobs keep their own lifecycle until purged.
 
 Omitting the namespace during app creation is refused; an unknown namespace is not
 automatically created. Batch creation can infer the namespace from a verified
-user token; administrator requests must supply it. Proof registrations use `(namespace, tenant, ELF ID)`, so
+user token; administrator requests must supply it. App registrations use `(namespace, tenant, ELF ID)`, so
 namespaces can register the same program independently. Disabling or deleting one
 registration leaves the others and their jobs intact. Batch names remain unique within the control plane; each workload has one namespace.
 App and batch grants are explicit; a grant from another namespace cannot authorize submission. Admin batch submissions
 also inherit the app's namespace and participate in its quota.
 
-The proof API uses `POST /admin/apps?namespace=alice&tag=scope=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
+The app registration API uses `POST /admin/apps?namespace=alice&tag=scope=default&tenant=eth&elf_id=FULL_ELF_SHA256`.
 The control-plane batch API accepts `POST /batches?namespace=alice` with the batch JSON, or a
 `namespace` field in the JSON. Names and immutable namespace IDs are accepted;
 registrations persist the ID. A configured batch or persistent `kind: app`
@@ -589,7 +607,7 @@ Postgres creates schema 14 directly and checks its version at startup. Incompati
 schemas require an explicit metadata reset; Fleet does not run database migrations.
 Tags must use `key=value`. A reset removes job history and access registrations;
 recreate namespaces and tokens, and preserve app-owned proofs and checkpoints.
-Operator-managed proof apps use the reserved `system` namespace. User tokens
+Operator-managed apps use the reserved `system` namespace. User tokens
 cannot be issued in `system`.
 
 Configured batches and persistent app entries default to `system`.
@@ -633,10 +651,10 @@ and app scaling use the CLI or HTTP API; MCP currently exposes batch creation
 and job operations. Proof jobs remain submitted through the Ziren network SDK;
 MCP can list and inspect their records.
 
-Namespace owner tokens (`manage_apps: true`) manage proof app and batch
-metadata across proof tenants within their namespace, tag and app grants:
+Namespace owner tokens (`manage_apps: true`) manage app and batch
+metadata across tenants within their namespace, tag and app grants:
 registration, priority, enable/disable, removal and batch mount roots. Owners can
-scale their proof and persistent apps within namespace and tag quotas, and submit
+scale their apps within namespace and tag quotas, and submit
 batch jobs in their tag. SDK proof submissions retain their signing-tenant binding.
 Tokens with app grants alone can use those apps but cannot change their metadata.
 Administrators manage namespace and tag quotas, namespace access and token issuance.
@@ -648,19 +666,20 @@ cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service r
 
 
 LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`, without a `kind` field. Batches and their jobs appear only under `fleetctl batch`, with `type: batch`.
-`fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
-app has its own dedicated Ziren GPU server: disable blocks new submissions,
+`fleetctl app disable NAME` stops a persistent app and releases its GPUs. A registered
+app (TENANT/ELF) has its own dedicated Ziren GPU server: disable blocks new submissions,
 drains its active proofs, then stops that server and releases its GPUs. Queued
 proofs wait until the app is enabled again. Enabling an app starts its
 service before accepting work. Disabling a batch only blocks new
 batch jobs; accepted batch jobs finish.
 
-Each `ziren-gpu` entry in `services.yaml` must bind its server to one proof app
-using `namespace` and `proof_app: TENANT/FULL_ELF_SHA256`. Do not configure a
-Ziren server for multiple proof apps. `fleetctl app add TENANT/ELF` requires a
-matching dedicated service to exist first. `services.yaml` supplies initial resource
-settings; app owners then manage allocations through the control plane with
-`fleetctl app scale`. Batch jobs request resources with
+Every service in `services.yaml` has an `app`. Each `ziren-gpu` entry must bind
+its server to the one app it is dedicated to using `namespace` and
+`app: TENANT/FULL_ELF_SHA256`; any other service is its own app, and its `app`
+defaults to the service name. Do not configure a Ziren server for multiple apps.
+`fleetctl app add TENANT/ELF` requires a matching dedicated service to exist first.
+`services.yaml` supplies initial resource settings; app owners then manage
+allocations through the control plane with `fleetctl app scale`. Batch jobs request resources with
 `fleetctl batch submit NAME --gpus N --cpus N`. Active proofs cannot resize
 their GPU allocation. Resizing a proof already in progress is tracked in
 [issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3).
@@ -669,7 +688,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 
 | what | where |
 |---|---|
-| proof apps, proof jobs, tokens | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
+| registered apps, proof jobs, tokens | Postgres (compose): `fleet_apps` (program registrations per namespace and tenant, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and optional tag quota settings), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
 | SDK proof ELFs and inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores references, hashes and parameters. |
 | SDK proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. The local app endpoint reads them directly; remote Fleet fetches use an authorized heartbeat ticket and HTTPS relay. Disabling the GPU actor preserves fetching. |
 | Integrated EthProofs data | Its app-owned storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`; the app manages their format and recovery. |

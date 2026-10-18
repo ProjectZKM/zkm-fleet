@@ -12,7 +12,7 @@ def executor(tmp_path, monkeypatch):
     (tmp_path / "batches.yaml").write_text("batches: {}\n")
     (tmp_path / "services.yaml").write_text(yaml.safe_dump({"services": [{
         "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
-        "proof_app": "eth/"+"b"*64, "disabled": True, "replicas": 2,
+        "app": "eth/"+"b"*64, "disabled": True, "replicas": 2,
     }]}))
     e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
@@ -57,21 +57,23 @@ def test_cancel_before_local_record_confirms_absence_without_launch(executor,mon
         executor.stop(command()["parameters"],False)
 
 
-def test_disable_removes_every_replica_even_when_already_disabled(executor,monkeypatch):
+def test_stop_removes_every_replica_and_writes_nothing(executor,monkeypatch):
     cfg=yaml.safe_load(executor.services.read_text())
+    before=executor.services.read_bytes()
     stop=Mock();clean=Mock();monkeypatch.setattr(reconcile,"stop",stop)
+    monkeypatch.setattr(reconcile,"running",lambda:{"proof-2":"left over","other-0":"another service"})
     monkeypatch.setattr(actors,"clean_after",clean);monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
     result=executor.service({"service":cfg["services"][0],"disabled":True})
     assert result["cleaned"]
-    assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    assert clean.remote.call_count==2
-    assert yaml.safe_load(executor.services.read_text())["services"][0]["disabled"]
+    assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1","proof-2"]
+    assert clean.remote.call_count==3
+    assert executor.services.read_bytes()==before
 
 
-def test_disable_failure_retains_desired_state_and_does_not_confirm_cleanup(executor,monkeypatch):
+def test_stop_failure_does_not_confirm_cleanup(executor,monkeypatch):
     service=yaml.safe_load(executor.services.read_text())["services"][0]
-    monkeypatch.setattr(reconcile,"stop",lambda _:None)
+    monkeypatch.setattr(reconcile,"stop",lambda _:None);monkeypatch.setattr(reconcile,"running",lambda:{})
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:False)
     with pytest.raises(ValueError,match="uncertain"):
@@ -79,10 +81,13 @@ def test_disable_failure_retains_desired_state_and_does_not_confirm_cleanup(exec
     assert yaml.safe_load(executor.services.read_text())["services"][0]["disabled"]
 
 
-def test_enable_uses_local_executor_and_no_admin_token(executor,monkeypatch):
+def test_start_uses_local_executor_and_no_admin_token(executor,monkeypatch):
     service=yaml.safe_load(executor.services.read_text())["services"][0]
     monkeypatch.setattr(reconcile,"running",lambda:{})
     start=Mock();monkeypatch.setattr(reconcile,"start",start)
+    with pytest.raises(ValueError,match="disabled in services.yaml"):
+        executor.service({"service":service,"disabled":False})
+    node.set_fields(executor.services,"services","proof",{"disabled":False})
     assert executor.service({"service":service,"disabled":False})["ready"]
     assert start.call_count==2
     assert all(not c.kwargs for c in start.call_args_list)
@@ -191,49 +196,21 @@ def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(execut
     assert all(call.kwargs == {'timeout_s': 5} for call in health.call_args_list)
 
 
-def test_scale_applies_control_resources_but_preserves_machine_config(executor, monkeypatch):
-    from fleet_bridge import actors
+def test_start_takes_resources_from_services_yaml_and_stops_extra_replicas(executor,monkeypatch):
     service=yaml.safe_load(executor.services.read_text())["services"][0]
-    service.update(gpus=2,cpus=8,replicas=1)
-    monkeypatch.setattr(reconcile,"stop",lambda _:None)
-    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:True)
-    monkeypatch.setattr(reconcile,"running",lambda:{})
-    start=Mock();monkeypatch.setattr(reconcile,"start",start)
-    result=executor.service({"service":service,"disabled":False,"scale_id":"resize"})
-    assert result["ready"]
-    assert start.call_count==1
-    replica=start.call_args.args[0]
-    assert (replica.service.gpus,replica.service.cpus)==(2,8)
-    cfg=yaml.safe_load(executor.services.read_text())
-    assert cfg["services"][0]["proof_app"]==service["proof_app"]
-    assert cfg["services"][0]["replicas"]==1
-    # The removed replica is cleaned even though it no longer appears in desired config.
-    # This test uses the same cleanup mocks as an enable after the scheduler's stop phase.
-
-
-def test_scale_down_cleans_removed_replicas(executor,monkeypatch):
-    service=yaml.safe_load(executor.services.read_text())["services"][0]
-    service["replicas"]=1
+    node.set_fields(executor.services,"services","proof",{"disabled":False,"gpus":2,"cpus":8,"replicas":1})
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
+    monkeypatch.setattr(reconcile,"running",lambda:{"proof-1":"outside the new count"})
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
-    result=executor.service({"service":service,"disabled":True,"scale_id":"resize"})
-    assert result["cleaned"]
-    assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    assert yaml.safe_load(executor.services.read_text())["services"][0]["replicas"]==1
+    start=Mock();monkeypatch.setattr(reconcile,"start",start)
+    assert executor.service({"service":service,"disabled":False,"scale_id":"resize"})["ready"]
+    assert [c.args[0] for c in stop.call_args_list]==["proof-1"]
+    replica=start.call_args.args[0]
+    assert (start.call_count,replica.name,replica.service.gpus,replica.service.cpus)==(1,"proof-0",2,8)
 
 
-@pytest.mark.parametrize("field,value",[("gpus",-1),("gpus",0.5),("cpus",0),("replicas",0),("replicas",1.5),("replicas",True),("replicas",65)])
-def test_scale_invalid_resources_leave_config_unchanged(executor,field,value):
-    before=executor.services.read_bytes()
-    service=yaml.safe_load(before)["services"][0];service[field]=value
-    with pytest.raises(ValueError,match="invalid service resources"):
-        executor.service({"service":service,"disabled":True})
-    assert executor.services.read_bytes()==before
-
-
-@pytest.mark.parametrize("field,value",[("namespace","another"),("proof_app","eth/"+"c"*64),("tag","other"),("kind","app")])
+@pytest.mark.parametrize("field,value",[("namespace","another"),("app","eth/"+"c"*64),("tag","other"),("kind","app")])
 def test_scale_cannot_change_machine_service_scope(executor,field,value):
     before=executor.services.read_bytes()
     service=yaml.safe_load(before)["services"][0];service[field]=value
@@ -246,24 +223,12 @@ def test_resource_update_preserves_comments_and_handles_flow_yaml(tmp_path):
     for text in ["# machine config\nservices:\n- name: app # owner label\n  kind: app\n  image: image:latest\n",
                  "# machine config\nservices: [{name: app, kind: app, image: 'image:latest'}]\n"]:
         p=tmp_path/"services.yaml";p.write_text(text)
-        node.set_disabled(p,"app",True,{"gpus":2,"cpus":8,"replicas":3})
+        node.set_fields(p,"services","app",{"disabled":True,"gpus":2,"cpus":8,"replicas":3})
         data=yaml.safe_load(p.read_text())["services"][0]
         assert (data["gpus"],data["cpus"],data["replicas"],data["disabled"])==(2,8,3,True)
         assert data["image"]=="image:latest" and "# machine config" in p.read_text()
 
 
-def test_scale_down_replay_does_not_forget_replicas_after_uncertain_cleanup(executor,monkeypatch):
-    service=yaml.safe_load(executor.services.read_text())["services"][0];service["replicas"]=1
-    stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
-    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:False)
-    with pytest.raises(ValueError,match="uncertain"):
-        executor.service({"service":service,"disabled":True,"scale_id":"resize"})
-    assert yaml.safe_load(executor.services.read_text())["services"][0]["replicas"]==2
-    stop.reset_mock();monkeypatch.setattr(node,"container_gone",lambda _:True)
-    assert executor.service({"service":service,"disabled":True,"scale_id":"resize"})["cleaned"]
-    assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    assert yaml.safe_load(executor.services.read_text())["services"][0]["replicas"]==1
 
 
 SERVICES = """# machine config
@@ -313,33 +278,91 @@ def test_remove_entry_leaves_flow_sections_and_unknown_names_alone(tmp_path):
     assert not node.remove_entry(p,"batches","a")
 
 
-def test_remove_commands_clean_up_and_drop_the_entry(executor,monkeypatch):
+def app_message(executor, ident, change, app=None, batch=None, ns="a"*32, ns_name=""):
+    target = {"batch": {"name": batch}} if batch else {"app": {"namespace": ns, "namespace_name": ns_name, "name": app}}
+    executor.execute({"id": ident, "operation": 7, "parameters": {**target, **change}})
+    done = node.read_json(executor.journal/f"{ident}.json")
+    return done["result"], done["error"]
+
+
+def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
     services=yaml.safe_load(executor.services.read_text())
-    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","proof_app":"eth/"+"b"*64},
+    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth/"+"b"*64},
                            {"name":"web","kind":"app","namespace":"zkm"}]
     executor.services.write_text(yaml.safe_dump(services))
-    remove=lambda ident,app,ns="a"*32,name="":executor.execute({"id":ident,"operation":7,"parameters":{"namespace":ns,"namespace_name":name,"app":app}})
-    remove("remove-1","eth/"+"b"*64)
-    done=node.read_json(executor.journal/"remove-1.json")
-    assert (done["result"],done["error"])==({"removed":["proof"]},None)
+    assert app_message(executor,"remove-1",{"remove":True},app="eth/"+"b"*64)==({"removed":["proof"]},None)
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    remove("remove-2","eth/"+"b"*64)
-    assert node.read_json(executor.journal/"remove-2.json")["result"]=={"removed":[]}
-    remove("remove-3","web","1"*32,"zkm")
-    assert node.read_json(executor.journal/"remove-3.json")["result"]=={"removed":["web"]}
+    assert app_message(executor,"remove-2",{"remove":True},app="eth/"+"b"*64)==({"removed":[]},None)
+    assert app_message(executor,"remove-3",{"remove":True},app="web",ns="1"*32,ns_name="zkm")==({"removed":["web"]},None)
     assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["other-ns"]
     (executor.services.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
-    executor.execute({"id":"remove-4","operation":8,"parameters":{"name":"old"}})
-    assert node.read_json(executor.journal/"remove-4.json")["result"]=={"removed":True}
+    assert app_message(executor,"remove-4",{"remove":True},batch="old")==({"removed":["old"]},None)
     assert list(yaml.safe_load((executor.services.parent/"batches.yaml").read_text())["batches"])==["kept"]
 
 
 def test_a_service_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
-    executor.execute({"id":"remove-1","operation":7,"parameters":{"namespace":"a"*32,"app":"eth/"+"b"*64}})
-    assert "uncertain" in node.read_json(executor.journal/"remove-1.json")["error"]
+    result,error=app_message(executor,"remove-1",{"remove":True},app="eth/"+"b"*64)
+    assert "uncertain" in error
     assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["proof"]
+
+
+SETTINGS = """# machine config
+services:
+# the web app
+- name: web # owner label
+  kind: app
+  namespace: zkm
+  image: web:1
+  env:
+    A: "1"
+    B: "2"
+  replicas: 1
+- {name: other, kind: app, namespace: zkm, image: other:1}
+"""
+
+
+def test_app_settings_are_written_without_touching_other_lines(executor):
+    executor.services.write_text(SETTINGS)
+    change={"set":{"image":"web:2","env":{"A":"3"},"shm_gb":8}}
+    assert app_message(executor,"set-1",change,app="web",ns="1"*32,ns_name="zkm")==({"updated":["web"]},None)
+    text=executor.services.read_text()
+    web,other=yaml.safe_load(text)["services"]
+    assert (web["image"],web["env"],web["shm_gb"],web["replicas"])==("web:2",{"A":"3"},8,1)
+    assert other=={"name":"other","kind":"app","namespace":"zkm","image":"other:1"}
+    assert "# machine config" in text and "# the web app" in text and "owner label" in text
+    assert app_message(executor,"set-2",{"set":{"image":"x:1"}},app="missing",ns="zkm")==({"updated":[]},None)
+
+
+def test_invalid_app_settings_leave_the_configuration_alone(executor):
+    executor.services.write_text(SETTINGS)
+    result,error=app_message(executor,"set-1",{"set":{"replicas":"many"}},app="web",ns="zkm")
+    assert error and executor.services.read_text()==SETTINGS
+
+
+def test_batch_settings_are_written_and_validated(executor):
+    path=executor.services.parent/"batches.yaml"
+    path.write_text("batches:\n  # trainer\n  train:\n    image: t:1\n    allow: [/srv]\n  other: {image: o:1}\n")
+    assert app_message(executor,"set-1",{"set":{"image":"t:2","allow":["/srv","/data"]}},batch="train")==({"updated":["train"]},None)
+    batches=yaml.safe_load(path.read_text())["batches"]
+    assert batches["train"]=={"image":"t:2","allow":["/srv","/data"]} and batches["other"]=={"image":"o:1"}
+    assert "# trainer" in path.read_text()
+    before=path.read_text()
+    result,error=app_message(executor,"set-2",{"set":{"priority":"high"}},batch="train")
+    assert error and path.read_text()==before
+    assert app_message(executor,"set-3",{"set":{"image":"x"}},batch="missing")==({"updated":[]},None)
+
+
+def test_a_stopped_service_gets_its_configuration_by_name(executor):
+    executor.services.write_text(SETTINGS)
+    executor.execute({"id":"set-1","operation":7,"parameters":{"service":{"name":"web"},"set":{"disabled":True,"replicas":2,"image":"web:3"}}})
+    done=node.read_json(executor.journal/"set-1.json")
+    assert (done["result"],done["error"])==({"updated":["web"]},None)
+    web=yaml.safe_load(executor.services.read_text())["services"][0]
+    assert (web["disabled"],web["replicas"],web["image"])==(True,2,"web:3")
+    executor.execute({"id":"set-2","operation":7,"parameters":{"service":{"name":"missing"},"set":{"disabled":True}}})
+    assert node.read_json(executor.journal/"set-2.json")["result"]=={"updated":[]}

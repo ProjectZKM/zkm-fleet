@@ -87,9 +87,9 @@ enum AppCmd {
     /// Serving deployments are initially configured in the node's services.yaml.
     Add {
         #[command(flatten)]
-        add: AddProofApp,
+        add: AddApp,
     },
-    /// Disable an app: proof apps drain and stop their dedicated GPU servers; persistent apps stop and release GPUs.
+    /// Disable an app: its services drain and stop, releasing their GPUs.
     Disable { name: String },
     /// Set the priority inherited by new jobs (higher values run first).
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
@@ -108,6 +108,19 @@ enum AppCmd {
         /// Select a machine agent when the app has services on multiple nodes.
         #[arg(long)] node: Option<String>,
     },
+    /// App owners: change a proof or persistent app's settings. Its service drains, stops,
+    /// takes the new settings on its node and starts again, like a scale.
+    Update {
+        name: String,
+        /// Container image.
+        #[arg(long)] image: Option<String>,
+        /// K=V; repeat. Replaces the app's whole environment.
+        #[arg(long)] env: Vec<String>,
+        /// /dev/shm size in GiB.
+        #[arg(long)] shm_gb: Option<u32>,
+        /// Select a machine agent when the app has services on multiple nodes.
+        #[arg(long)] node: Option<String>,
+    },
     /// Show the last lines of an app's log, read from the node that runs it.
     Logs {
         name: String,
@@ -116,12 +129,12 @@ enum AppCmd {
         /// Select a machine agent when the app has services on multiple nodes.
         #[arg(long)] node: Option<String>,
     },
-    /// Delete an app, refused while any of its jobs is queued or running. A proof app
+    /// Delete an app, refused while any of its jobs is queued or running. A registered app
     /// (tenant/<elf>) goes with its jobs' records, inputs and proofs, its anchor, and its
     /// ELF when no other tenant uses it; serving deployments must be disabled first.
     /// Without --yes it only says what it would delete.
     Delete {
-        /// The app, as `fleetctl app` names it (a proof app's full elf id works too).
+        /// The app, as `fleetctl app` names it (a registered app's full elf id works too).
         name: String,
         #[arg(long)]
         yes: bool,
@@ -150,7 +163,7 @@ struct ListArgs {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JobType {
-    /// Jobs of apps: the proofs a proof app runs.
+    /// Jobs of apps: the proofs an app runs.
     App,
     Batch,
 }
@@ -446,7 +459,7 @@ enum JobCmd {
 }
 
 #[derive(Args)]
-struct AddProofApp {
+struct AddApp {
     /// TENANT/<full ELF SHA-256>, or TENANT/ with --elf FILE.
     name: String,
     #[arg(long)]
@@ -483,6 +496,23 @@ enum BatchCmd {
     Enable { name: String },
     /// App owners: set the priority inherited by new jobs.
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
+    /// Change a batch's settings; accepted jobs keep the ones they were submitted with.
+    Update {
+        name: String,
+        #[arg(long)] image: Option<String>,
+        /// UID[:GID] the container runs as.
+        #[arg(long)] user: Option<String>,
+        /// Cards a batch job may ask for.
+        #[arg(long)] max_gpus: Option<u32>,
+        /// GiB a batch job needs free on its card unless it says --gpu-mem.
+        #[arg(long = "gpu-mem")] gpu_mem: Option<u32>,
+        /// /dev/shm size in GiB.
+        #[arg(long)] shm_gb: Option<u32>,
+        /// Absolute mount root jobs may mount below; repeat. Replaces the batch's roots.
+        #[arg(long)] allow: Vec<String>,
+        /// K=V every batch job gets; repeat. Replaces the batch's environment.
+        #[arg(long)] env: Vec<String>,
+    },
     /// Delete a batch after all accepted jobs finish; its job history stays until purged.
     Delete { name: String, #[arg(long)] yes: bool },
     #[command(flatten)]
@@ -830,8 +860,8 @@ fn took_ms(started_s: Option<f64>, finished_s: Option<f64>) -> Value {
     }
 }
 
-/// A proof app's name: its tenant and the start of its program's id (as the scheduler names it).
-fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
+/// A registered app's name: its tenant and the start of its program's id (as the scheduler names it).
+fn app_label(tenant: &Value, elf_id: &Value) -> Value {
     let (tenant, elf) = (tenant.as_str().unwrap_or(""), elf_id.as_str().unwrap_or(""));
     if tenant.is_empty() && elf.is_empty() {
         return json!("(rejected)");
@@ -843,7 +873,7 @@ fn proof_app(tenant: &Value, elf_id: &Value) -> Value {
 fn proof_row(j: &Value) -> Value {
     let secs = |k: &str| j[k].as_f64().map(|ms| ms / 1000.0);
     json!({
-        "type": "app", "app": proof_app(&j["tenant"], &j["elf_id"]), "id": j["id"], "client_id": j["client_id"], "namespace": j["namespace"], "tag": j["tag"], "owner": j["tenant"],
+        "type": "app", "app": app_label(&j["tenant"], &j["elf_id"]), "id": j["id"], "client_id": j["client_id"], "namespace": j["namespace"], "tag": j["tag"], "owner": j["tenant"],
         "state": j["state"], "priority": j["priority"], "where": j["node"],
         "created_at": secs("created_ms"), "started_at": secs("started_ms"), "finished_at": secs("finished_ms"),
         "took_ms": took_ms(secs("started_ms"), secs("finished_ms")), "record": j,
@@ -860,20 +890,20 @@ fn batch_row(r: &Value) -> Value {
     })
 }
 
-/// An app by the name `fleetctl app` shows: a proof app is `tenant/<elf id prefix>`
+/// An app by the name `fleetctl app` shows: a registered app is `tenant/<elf id prefix>`
 /// (`?` for no tenant) or `(rejected)`; any other name is a container workload.
 enum AppRef {
-    Proof { tenant: String, elf: String },
+    Registered { tenant: String, elf: String },
     Container(String),
 }
 
 impl AppRef {
     fn parse(name: &str) -> Self {
         if name == "(rejected)" {
-            return AppRef::Proof { tenant: String::new(), elf: String::new() };
+            return AppRef::Registered { tenant: String::new(), elf: String::new() };
         }
         match name.split_once('/') {
-            Some((t, e)) => AppRef::Proof { tenant: if t == "?" { String::new() } else { t.into() }, elf: e.into() },
+            Some((t, e)) => AppRef::Registered { tenant: if t == "?" { String::new() } else { t.into() }, elf: e.into() },
             None => AppRef::Container(name.into()),
         }
     }
@@ -896,18 +926,18 @@ fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> 
         q.push(("active", "true".into()));
     }
     let (v, row): (Value, fn(&Value) -> Value) = match (kind, app) {
-        (JobType::App, Some(AppRef::Container(_))) | (JobType::Batch, Some(AppRef::Proof { .. })) => return Ok(vec![]),
+        (JobType::App, Some(AppRef::Container(_))) | (JobType::Batch, Some(AppRef::Registered { .. })) => return Ok(vec![]),
         (JobType::Batch, _) if want.tenant.is_some() => return Ok(vec![]), // batch jobs belong to no tenant
         (JobType::App, app) => {
             let tenant = match (&app, want.tenant) {
-                (Some(AppRef::Proof { tenant, .. }), Some(t)) if tenant != t => return Ok(vec![]),
-                (Some(AppRef::Proof { tenant, .. }), _) => Some(tenant.as_str()),
+                (Some(AppRef::Registered { tenant, .. }), Some(t)) if tenant != t => return Ok(vec![]),
+                (Some(AppRef::Registered { tenant, .. }), _) => Some(tenant.as_str()),
                 (_, t) => t,
             };
             if let Some(t) = tenant {
                 q.push(("tenant", t.into()));
             }
-            if let Some(AppRef::Proof { elf, .. }) = &app {
+            if let Some(AppRef::Registered { elf, .. }) = &app {
                 q.push(("elf", elf.clone()));
             }
             (FleetClient::new(conn)?.get_q("/jobs", &q)?, proof_row)
@@ -928,7 +958,7 @@ fn fetch_rows(kind: JobType, conn: &ConnectionOptions, want: &JobListFilter) -> 
         }
     };
     let rows = v.as_array().into_iter().flatten().map(row);
-    // an app name is exact (a proof app's elf part is a prefix on the server)
+    // an app name is exact (a registered app's elf part is a prefix on the server)
     Ok(rows
         .filter(|r| want.app.is_none_or(|a| r["app"].as_str() == Some(a)) && (!want.active || is_active(r)))
         .collect())
@@ -986,8 +1016,8 @@ const APP_COLS: &[out::TableColumn] = &[
     col("DETAIL", "detail"),
 ];
 
-/// The one proof app a name means: as the list names it, or `tenant/<full elf id>`.
-fn proof_app_named(a: &FleetClient, name: &str, tenant: &str) -> anyhow::Result<Value> {
+/// The one registered app a name means: as the list names it, or `tenant/<full elf id>`.
+fn registered_app_named(a: &FleetClient, name: &str, tenant: &str) -> anyhow::Result<Value> {
     let apps = a.get("/apps")?;
     let found: Vec<&Value> = apps
         .as_array()
@@ -1024,21 +1054,17 @@ fn serving_app_named(a: &FleetClient, name: &str) -> anyhow::Result<Value> {
 fn set_app_disabled(name: &str, disabled: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let method = if disabled { reqwest::Method::PUT } else { reqwest::Method::DELETE };
     let v = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => {
+        AppRef::Registered { tenant, .. } => {
             let a = FleetClient::new(conn)?;
-            let app = proof_app_named(&a, name, &tenant)?;
+            let app = registered_app_named(&a, name, &tenant)?;
             let mut manager = FleetClient::control(conn)?;
             // The app's canonical namespace is sent explicitly below. Do not append
             // the caller's selector a second time to this lifecycle request.
             manager.namespace = None;
             manager.tag = None;
-            let key = [
-                ("namespace", app["namespace"].as_str().context("proof app has no namespace")?),
-                ("tenant", app["tenant"].as_str().unwrap_or("")),
-                ("elf_id", app["elf_id"].as_str().unwrap_or("")),
-            ];
-            manager.send(manager.req(method, "/proof-apps/disabled")
-                .query(&key).timeout(Duration::from_secs(1800)))?
+            let namespace = [("namespace", app["namespace"].as_str().context("app has no namespace")?)];
+            let path = format!("/apps/{}/{}/disabled", app["tenant"].as_str().unwrap_or(""), app["elf_id"].as_str().unwrap_or(""));
+            manager.send(manager.req(method, &path).query(&namespace).timeout(Duration::from_secs(1800)))?
         }
         AppRef::Container(_) => {
             let a = FleetClient::control(conn)?;
@@ -1064,9 +1090,9 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &ConnectionOptions, out: &
 /// Changes app policy; accepted jobs retain their inherited priority.
 fn set_app_priority(name: &str, priority: i32, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let v = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => {
+        AppRef::Registered { tenant, .. } => {
             let mut a = FleetClient::new(conn)?;
-            let app = proof_app_named(&a, name, &tenant)?;
+            let app = registered_app_named(&a, name, &tenant)?;
             a.namespace = app["namespace"].as_str().map(str::to_owned);
             a.send(a.req(reqwest::Method::PUT, "/apps/priority").query(&[
                 ("tenant", app["tenant"].as_str().unwrap_or("")),
@@ -1084,16 +1110,15 @@ fn set_app_priority(name: &str, priority: i32, conn: &ConnectionOptions, out: &O
     Ok(())
 }
 
-/// The control client, URL path and query for `leaf` ("scale", "logs") of a proof or serving app.
+/// The control client, URL path and query for `leaf` ("scale", "logs", "settings") of an app.
 type AppEndpoint = (FleetClient, String, Vec<(&'static str, String)>);
 fn app_endpoint(name: &str, leaf: &str, conn: &ConnectionOptions) -> anyhow::Result<AppEndpoint> {
     let mut a = FleetClient::control(conn)?;
     Ok(match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => {
-            let proof = proof_app_named(&FleetClient::new(conn)?, name, &tenant)?;
-            a.namespace = proof["namespace"].as_str().map(str::to_owned);
-            let query = vec![("tenant", tenant), ("elf_id", proof["elf_id"].as_str().unwrap_or("").to_string())];
-            (a, format!("/proof-apps/{leaf}"), query)
+        AppRef::Registered { tenant, .. } => {
+            let app = registered_app_named(&FleetClient::new(conn)?, name, &tenant)?;
+            a.namespace = app["namespace"].as_str().map(str::to_owned);
+            (a, format!("/apps/{tenant}/{}/{leaf}", app["elf_id"].as_str().unwrap_or("")), vec![])
         }
         AppRef::Container(_) => {
             let app = serving_app_named(&a, name)?;
@@ -1142,16 +1167,37 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     Ok(())
 }
 
+/// Changes an app's settings; the scheduler drains and restarts its service with them.
+fn update_app(name: &str, set: Value, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
+    let (a, path, mut query) = app_endpoint(name, "settings", conn)?;
+    if let Some(node) = node { query.push(("node", node.to_string())); }
+    let v = a.send(a.req(reqwest::Method::PUT, &path).query(&query).json(&set))?;
+    out.done(&format!("{name}: {} — its service drains and restarts with the new settings on {}",
+        v["state"].as_str().unwrap_or("requested"), v["node"].as_str().unwrap_or("?")), v);
+    Ok(())
+}
+
+/// `K=V` arguments as an environment map.
+fn env_map(pairs: &[String]) -> anyhow::Result<Value> {
+    let mut env = serde_json::Map::new();
+    for kv in pairs {
+        let Some((k, v)) = kv.split_once('=') else { bail!("--env {kv}: K=V") };
+        env.insert(k.into(), json!(v));
+    }
+    Ok(Value::Object(env))
+}
+
 /// Register a proof program with its long-running dedicated prover.
-fn add_app(add: &AddProofApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) {
         bail!("app creation requires --namespace NAME; an administrator must create the namespace first");
     }
-    let AppRef::Proof { tenant, elf } = AppRef::parse(&add.name) else {
+    let AppRef::Registered { tenant, elf } = AppRef::parse(&add.name) else {
         bail!("proof registration requires TENANT/<elf id>; configure serving deployments in services.yaml and batches with fleetctl batch add");
     };
     if tenant.is_empty() || add.name == "(rejected)" {
-        bail!("a proof app is TENANT/<elf id> (or TENANT/ with --elf FILE)");
+        bail!("a registered app is TENANT/<elf id> (or TENANT/ with --elf FILE)");
     }
     let elf_id = match (&add.elf, elf.as_str()) {
         (Some(file), "") => {
@@ -1163,17 +1209,15 @@ fn add_app(add: &AddProofApp, conn: &ConnectionOptions, out: &OutputWriter) -> a
         (Some(_), _) => bail!("give the elf id in the name or --elf FILE, not both"),
         (None, _) => bail!("give TENANT/<elf id>, or TENANT/ with --elf FILE"),
     };
-    let namespace = conn.namespace.as_deref().context("proof app creation requires --namespace")?;
+    let namespace = conn.namespace.as_deref().context("app registration requires --namespace")?;
     let mut manager = FleetClient::control(conn)?;
     manager.namespace = None;
     manager.tag = None;
-    let _server = manager.get_q("/proof-apps/available", &[
-        ("namespace", namespace.to_string()), ("tenant", tenant.clone()), ("elf_id", elf_id.clone()),
-    ])?;
+    let _server = manager.get_q(&format!("/apps/{tenant}/{elf_id}/available"), &[("namespace", namespace.to_string())])?;
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").query(&[("tenant", tenant.as_str()), ("elf_id", elf_id.as_str()), ("priority", &add.priority.unwrap_or(0).to_string())]))?;
     out.done(
-        &format!("added proof app {}: tenant {tenant}, program {elf_id} (its jobs are accepted from now on{})",
+        &format!("added app {}: tenant {tenant}, program {elf_id} (its jobs are accepted from now on{})",
                  v["app"].as_str().unwrap_or(&add.name),
                  if v["elf_stored"].as_bool() == Some(true) { "" } else { "; the ELF itself arrives with the first one" }),
         v,
@@ -1210,7 +1254,7 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
 /// One app's record, and its newest jobs.
 fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let (kind, mut rec) = match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => (JobType::App, with_type("app", &proof_app_named(&FleetClient::new(conn)?, name, &tenant)?)),
+        AppRef::Registered { tenant, .. } => (JobType::App, with_type("app", &registered_app_named(&FleetClient::new(conn)?, name, &tenant)?)),
         AppRef::Container(_) => {
             let app = serving_app_named(&FleetClient::control(conn)?, name)?;
             (JobType::Batch, with_type("app", &app))
@@ -1235,9 +1279,9 @@ fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> any
 fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     use reqwest::Method as M;
     match AppRef::parse(name) {
-        AppRef::Proof { tenant, .. } => {
+        AppRef::Registered { tenant, .. } => {
             let mut a = FleetClient::new(conn)?;
-            let app = proof_app_named(&a, name, &tenant)?;
+            let app = registered_app_named(&a, name, &tenant)?;
             a.namespace = app["namespace"].as_str().map(str::to_string);
             let elf = app["elf_id"].as_str().unwrap_or("");
             if !yes {
@@ -1247,14 +1291,14 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
                     format!(", its anchor, and its ELF {elf} unless another tenant uses it")
                 };
                 bail!(
-                    "would delete proof app {name}: {} job record(s) with their inputs and proofs{rest} \
+                    "would delete app {name}: {} job record(s) with their inputs and proofs{rest} \
                      ({} queued or running: refused while any is). Pass --yes to delete",
                     app["jobs"], app["active"]
                 );
             }
             let v = a.send(a.req(M::DELETE, "/apps").query(&[("tenant", app["tenant"].as_str().unwrap_or("")), ("elf_id", elf)]))?;
             out.done(
-                &format!("deleted proof app {name}: {} job(s), ELF {}", v["jobs_deleted"],
+                &format!("deleted app {name}: {} job(s), ELF {}", v["jobs_deleted"],
                          if v["elf_removed"].as_bool() == Some(true) { "removed" } else { "kept (in use or absent)" }),
                 v,
             );
@@ -1286,6 +1330,13 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
+        Some(AppCmd::Update { name, image, env, shm_gb, node }) => {
+            let mut set = json!({});
+            if let Some(v) = image { set["image"] = json!(v); }
+            if !env.is_empty() { set["env"] = env_map(env)?; }
+            if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }
+            return update_app(name, set, node.as_deref(), &p.conn, out);
+        }
         None => {}
     }
     if let Some(name) = &p.name {
@@ -1365,6 +1416,22 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
         Some(BatchCmd::List) => return batches(&p.conn, out),
+        Some(BatchCmd::Update { name, image, user, max_gpus, gpu_mem, shm_gb, allow, env }) => {
+            let mut set = json!({});
+            if let Some(v) = image { set["image"] = json!(v); }
+            if let Some(v) = user { set["user"] = json!(v); }
+            if let Some(v) = max_gpus { set["max_gpus"] = json!(v); }
+            if let Some(v) = gpu_mem { set["default_gpu_mem_gb"] = json!(v); }
+            if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }
+            if !allow.is_empty() { set["allow"] = json!(allow); }
+            if !env.is_empty() { set["env"] = env_map(env)?; }
+            if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
+            let a = FleetClient::control(&p.conn)?;
+            batch_named(&a, name)?;
+            let v = a.send(a.req(reqwest::Method::PUT, &format!("/batches/{name}/settings")).json(&set))?;
+            out.done(&format!("updated batch {name}; new jobs use the new settings"), v);
+            return Ok(());
+        }
         Some(BatchCmd::Show { name }) => return show_batch(name, &p.conn, out),
         Some(cmd) => {
             let a = FleetClient::control(&p.conn)?;

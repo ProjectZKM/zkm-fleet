@@ -11,7 +11,7 @@ use axum::{
     Extension, Json, Router,
 };
 use fleet_proto::model::v1::{
-    ProofAppRequest, ProofJobsQuery, NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest, PublicValuesQuery,
+    AppRequest, ProofJobsQuery, NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest, PublicValuesQuery,
     AllocationRequest,
 };
 
@@ -365,7 +365,7 @@ async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>
                 }
                 v.sort_by_key(|a| std::cmp::Reverse(a["last_created_ms"].as_u64().unwrap_or(0)));
             }
-            v = v.into_iter().map(|app| s.workloads.proof_app_value(app, tag.as_deref())).collect();
+            v = v.into_iter().map(|app| s.workloads.app_record_value(app, tag.as_deref())).collect();
             Json(v).into_response()
         }
         Err(e) => internal(e),
@@ -374,7 +374,7 @@ async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>
 
 /// An app by its exact key (both given; empty for the rejected requests' app).
 
-fn app_parts(key: &ProofAppRequest, fleet: &Scheduler) -> Result<(String, String, String), Response> {
+fn app_parts(key: &AppRequest, fleet: &Scheduler) -> Result<(String, String, String), Response> {
         match (&key.namespace, &key.tenant, &key.elf_id) {
             (Some(reference), Some(t), Some(e)) => match fleet.namespace(reference) {
                 Some(n) => Ok((n.id, t.clone(), e.clone())),
@@ -386,7 +386,7 @@ fn app_parts(key: &ProofAppRequest, fleet: &Scheduler) -> Result<(String, String
     }
 }
 
-fn authorize_app_management(c: Option<&Token>, key: &ProofAppRequest, namespace: &str, tenant: &str, elf: &str,
+fn authorize_app_management(c: Option<&Token>, key: &AppRequest, namespace: &str, tenant: &str, elf: &str,
 ) -> Result<(), Response> {
     if let Some(c) = c {
         if !c.manage_apps || c.namespace.as_deref() != Some(namespace)
@@ -410,7 +410,7 @@ fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
     }
 }
 
-async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {
@@ -428,7 +428,7 @@ async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<T
     }
 }
 
-async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
 ) -> Response {
     let priority = k.priority.unwrap_or(0);
     if let Some(c) = c {
@@ -445,7 +445,7 @@ async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Toke
     }
 }
 
-async fn set_app_priority(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn set_app_priority(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
 ) -> Response {
     let Some(priority) = k.priority else { return (StatusCode::BAD_REQUEST, "priority is required").into_response(); };
     match app_parts(&k, &s.fleet) {
@@ -458,7 +458,7 @@ async fn set_app_priority(State(s): State<HttpState>, Extension(c): Extension<Op
     }
 }
 
-async fn disable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn disable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {
@@ -472,7 +472,7 @@ async fn disable_app(State(s): State<HttpState>, Extension(c): Extension<Option<
     }
 }
 
-async fn enable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<ProofAppRequest>,
+async fn enable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
 ) -> Response {
     match app_parts(&k, &s.fleet) {
         Ok((n, t, e)) => {

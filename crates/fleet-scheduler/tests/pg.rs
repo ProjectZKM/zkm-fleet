@@ -233,7 +233,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     fresh.add_app(SYSTEM_NAMESPACE, "goat", &shared_elf, 1, 0).await.unwrap();
     fresh.add_app(&namespace.id, "goat", &shared_elf, 1, 7).await.unwrap();
     fresh.set_app_disabled(&namespace.id, "goat", &shared_elf, true, 2).await.unwrap();
-    let app_priority = |apps: Vec<fleet_scheduler::store::ProofApp>| {
+    let app_priority = |apps: Vec<fleet_scheduler::store::App>| {
         apps.into_iter()
         .find(|a| a.namespace == namespace.id && a.elf_id == shared_elf).unwrap().priority
     };

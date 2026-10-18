@@ -98,7 +98,7 @@ the state is `complete` or `failed`. Omitted resource flags retain their current
 values. Disabled apps stay disabled. Use `--node` to
 select a machine when the app has multiple deployments.
 
-Integrated EthProofs uses exactly one replica. SDK-driven proof apps and serving
+Integrated EthProofs uses exactly one replica. SDK-driven apps and serving
 apps may use multiple replicas; resources are per replica. The current
 `ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 5 GPUs
 and 96 CPUs, 3 GPUs and 32 CPUs remain for other allocations. Inspect current

@@ -5,7 +5,7 @@ services:
   - name: ethproofs-v2-gpu
     kind: ziren-gpu
     namespace: REPLACE_WITH_NAMESPACE_ID
-    proof_app: ethproofs/REPLACE_WITH_GUEST_ELF_SHA256
+    app: ethproofs/REPLACE_WITH_GUEST_ELF_SHA256
     proof_storage_root: /srv/zkm-fleet/apps/ethproofs
     machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP
     replicas: 1

@@ -118,7 +118,7 @@ impl WorkloadController {
         }
         fleet.set_worker_owned_apps(inner.services.values().filter(|s| integrated_worker(&s.service) && !s.disabled)
             .filter_map(|s| {
-                    text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)| {
+                    text(&s.service, "app").split_once('/').map(|(tenant, elf)| {
                             (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
                             )
                         })
@@ -141,7 +141,7 @@ impl WorkloadController {
         self.fleet.set_worker_owned_apps(inner.services.values()
             .filter(|s| integrated_worker(&s.service) && !s.disabled)
             .filter_map(|s| {
-                    text(&s.service, "proof_app").split_once('/').map(|(tenant, elf)| {
+                    text(&s.service, "app").split_once('/').map(|(tenant, elf)| {
                             (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
                             )
                         })
@@ -152,8 +152,8 @@ impl WorkloadController {
     /// Mirrors an integrated worker's state onto its proof app. A worker whose proof app is
     /// not registered has nothing to mirror: that must not fail the heartbeat or scale pass
     /// carrying it, or every later node result is rejected with it.
-    pub(super) async fn sync_proof_app(&self, service: &Value, disabled: bool) -> anyhow::Result<()> {
-        let Some((tenant, elf)) = text(service, "proof_app").split_once('/') else { return Ok(()) };
+    pub(super) async fn sync_app_record(&self, service: &Value, disabled: bool) -> anyhow::Result<()> {
+        let Some((tenant, elf)) = text(service, "app").split_once('/') else { return Ok(()) };
         match self.fleet.set_app_disabled(text(service, "namespace"), tenant, elf, disabled).await {
             Err(e) if e.downcast_ref::<crate::fleet::RequestRejection>().is_some_and(|r| r.status == 404) => {
                 tracing::warn!(service = text(service, "name"), error = %e, "integrated worker has no registered proof app");
@@ -201,16 +201,28 @@ impl WorkloadController {
         Ok(())
     }
 
-    /// Tells every node that `app` (a proof app's `tenant/elf_id` or a serving app's name) was
-    /// deleted from `namespace`; each removes the services it configures for it. A node's
-    /// configuration may name the namespace by id or by name, so both go along. The command
-    /// waits in the scheduler while a node is offline.
-    pub(crate) fn remove_app(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
+    /// An app-level node message's address for `app` (a proof app's `tenant/elf_id` or a
+    /// serving app's name) in `namespace`. A node's configuration may name the namespace by id
+    /// or by name, so both go along; the node finds the services that run the app.
+    pub(super) fn app_message(&self, namespace: &str, app: &str) -> Value {
         let name = self.fleet.namespace(namespace).map(|n| n.name).unwrap_or_default();
-        let workers: Vec<String> = self.inner.lock().workers.keys().cloned().collect();
-        for worker in workers {
-            self.command(&worker, NodeOperation::RemoveApp, json!({"namespace":namespace,"namespace_name":name,"app":app}))?;
+        json!({"app":{"namespace":namespace,"namespace_name":name,"name":app}})
+    }
+
+    /// Sends an app-level change (`{"remove":true}` or `{"set":{..}}`) for `message`'s app or
+    /// batch to `workers`. A command waits in the scheduler while its node is offline.
+    pub(super) fn tell_nodes<'a>(&self, workers: impl IntoIterator<Item = &'a String>, mut message: Value, change: Value) -> anyhow::Result<Vec<String>> {
+        for (key, value) in change.as_object().into_iter().flatten() {
+            message[key] = value.clone();
         }
+        workers.into_iter().map(|worker| self.command(worker, NodeOperation::App, message.clone())).collect()
+    }
+
+    /// Tells every node that `app` was deleted from `namespace`; each removes the services it
+    /// configures for it.
+    pub(crate) fn remove_app(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
+        let workers: Vec<String> = self.inner.lock().workers.keys().cloned().collect();
+        self.tell_nodes(&workers, self.app_message(namespace, app), json!({"remove":true}))?;
         Ok(())
     }
 
@@ -223,7 +235,7 @@ impl WorkloadController {
         let owner = inner.services.iter().find(|(other_key, intent)| {
             *other_key != &key && integrated_worker(&intent.service)
                 && text(&intent.service, "namespace") == namespace
-                && text(&intent.service, "proof_app") == text(service, "proof_app")
+                && text(&intent.service, "app") == text(service, "app")
                 && (!intent.disabled || allocations.iter().any(|a| a.id == format!("service:{other_key}")))
         });
         if owner.is_some() {
@@ -325,7 +337,7 @@ impl WorkloadController {
                     )
                 .collect::<Vec<_>>();
             let apps = w.report.services.iter().map(|s| {
-                if text(s, "proof_app").is_empty() { text(s, "name") } else { text(s, "proof_app") }
+                text(s, "app")
             }).collect::<Vec<_>>();
             json!({"id":id,"name":id,"backend":"ray-local",
                 "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
@@ -452,33 +464,12 @@ impl WorkloadController {
         }
         Ok(r)
     }
-    async fn wait(&self, ids: &[String]) -> anyhow::Result<Vec<Value>> {
-        tokio::time::timeout(Duration::from_secs(1800), async {
-            loop {
-                let notified = self.notify.notified();
-                let results: Option<Vec<CommandRecord>> = {
-                    let i = self.inner.lock();
-                    ids.iter()
-                        .map(|id| i.commands.get(id).filter(|c| c.done).cloned())
-                        .collect()
-                };
-                if let Some(results) = results {
-                    return results
-                        .into_iter()
-                        .map(|c| c.error.map_or(Ok(c.result.into()), |e| Err(fail(503, e))))
-                        .collect();
-                }
-                notified.await;
-            }
-        })
-        .await
-        .map_err(|_| {
-            fail(
-                503,
-                "node has not confirmed the operation; desired state is retained",
-            )
-        })?
+    /// The services among `keys` whose node is connected.
+    fn online(&self, keys: &[String]) -> Vec<String> {
+        let i = self.inner.lock();
+        keys.iter().filter(|k| i.services.get(*k).and_then(|d| i.workers.get(&d.worker)).is_some_and(|w| now() - w.seen < 30.0)).cloned().collect()
     }
+
     /// Whether a batch still has job records (not purged).
     fn has_jobs(&self, batch: &str) -> bool {
         self.inner.lock().jobs.values().any(|r| r.batch == batch && !r.purged)
@@ -773,7 +764,7 @@ impl WorkloadController {
                     return Err(fail(409, "integrated workers require exactly one replica"));
                 }
                 if service["disabled"].as_bool() != Some(true)
-                    && !worker_streams.insert((text(service, "namespace"), text(service, "proof_app"))) {
+                    && !worker_streams.insert((text(service, "namespace"), text(service, "app"))) {
                     return Err(fail(409, "duplicate integrated worker stream in node report",
                     ));
                 }
@@ -911,8 +902,8 @@ impl WorkloadController {
                 self.inner.lock().commands.values().any(|c| {
                     !c.done
                         && c.worker == worker_id
-                        && c.operation == NodeOperation::SetService as i32
-                        && text(&c.parameters["service"], "name") == name
+                        && (c.operation == NodeOperation::SetService as i32 && text(&c.parameters["service"], "name") == name
+                            || c.operation == NodeOperation::App as i32 && text(&c.parameters["service"], "name") == name)
                 })
             };
             if !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
@@ -922,20 +913,32 @@ impl WorkloadController {
                 // A node restart or local edit cannot replace the control plane's
                 // desired allocation. Repair drift with the same drain/cleanup fences.
                 let mut repaired = intent.clone();
-                repaired.scale = Some(scaling::new_scale(intent.service.clone(), intent.disabled));
+                repaired.scale = Some(scaling::new_scale(self.with_priority(intent.service.clone()), intent.disabled));
                 self.save("services", &key, &repaired)?;
                 self.inner.lock().services.insert(key.clone(), repaired);
                 continue;
             }
             if mismatch && !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending) {
-                let mut parameters = json!({"service":intent.service,"disabled":intent.disabled});
                 if intent.scale.as_ref().is_some_and(ScaleStatus::failed) {
-                    parameters["scale_cleanup"] = json!(true);
+                    // After a failed change the service stays down, its failure still shown.
+                    if observed["disabled"].as_bool() != Some(true) {
+                        self.tell_nodes([&worker_id.to_owned()], json!({"service":{"name":name}}), json!({"set":{"disabled":true}}))?;
+                    }
+                    if observed["cleaned"].as_bool() != Some(true) {
+                        self.command(worker_id, NodeOperation::SetService,
+                            json!({"service":intent.service,"disabled":true,"scale_cleanup":true}))?;
+                    }
+                } else if observed["disabled"].as_bool().unwrap_or(false) != intent.disabled {
+                    // The node's configuration drifted from the desired one: write it back like a scale.
+                    let mut repaired = intent.clone();
+                    repaired.scale = Some(scaling::new_scale(self.with_priority(intent.service.clone()), intent.disabled));
+                    self.save("services", &key, &repaired)?;
+                    self.inner.lock().services.insert(key.clone(), repaired);
+                } else {
+                    // Configured as desired but not running as desired: start or stop it.
+                    self.command(worker_id, NodeOperation::SetService,
+                        json!({"service":self.with_priority(intent.service.clone()),"disabled":intent.disabled}))?;
                 }
-                self.command(
-                    worker_id,
-                    NodeOperation::SetService,
-                    parameters)?;
             }
         }
         self.forget_unreported_services(worker_id, &report.services.iter().map(|s| text(s, "name").to_owned()).collect::<Vec<_>>())?;
@@ -1120,7 +1123,7 @@ impl WorkloadController {
                         && c.parameters["disabled"].as_bool() == Some(false)
                         && c.parameters["scale_id"].is_null()
                     {
-                        self.sync_proof_app(service, false).await?;
+                        self.sync_app_record(service, false).await?;
                     }
                 }
                 self.save("commands", &c.id, &c)?;
@@ -1373,7 +1376,7 @@ impl WorkloadController {
                 }
             }
             if disabled && text(s, "kind") == "ziren-gpu" {
-                if let Some((tenant, elf)) = text(s, "proof_app").split_once('/') {
+                if let Some((tenant, elf)) = text(s, "app").split_once('/') {
                     let jobs = self
                         .fleet
                         .recent_jobs(
@@ -1707,9 +1710,41 @@ fn path_allowed(path: &str, roots: &[Value]) -> bool {
         })
 }
 
+/// The checks every batch's settings pass, on create and on update.
+fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
+    if spec["priority"].as_i64().is_none_or(|p| i32::try_from(p).is_err())
+        || spec["max_gpus"].as_u64().is_none()
+        || !spec["allow"].is_array()
+        || !spec["env"].is_object()
+    {
+        return Err(fail(400, "invalid batch"));
+    }
+    if ["disabled", "preemptible"].into_iter().any(|k| !spec[k].is_boolean())
+        || ["default_gpu_mem_gb", "shm_gb", "min_runtime_s", "stop_timeout_s"]
+            .into_iter()
+            .any(|k| spec[k].as_u64().is_none())
+        || spec["env"].as_object().is_none_or(|v| v.values().any(|v| !v.is_string()))
+        || spec["allow"].as_array().is_none_or(|v| {
+            v.iter().any(|v| {
+                v.as_str().is_none_or(|p| !p.starts_with('/') || p == "/" || p.split('/').any(|s| s == ".."))
+            })
+        })
+        || !spec["user"].is_null() && !spec["user"].is_string()
+        || text(spec, "image").is_empty()
+    {
+        return Err(fail(400, "invalid batch settings"));
+    }
+    Ok(())
+}
+
+/// Settings an update may change on a batch (its name, namespace, priority and enabled state
+/// have their own operations).
+const BATCH_SETTINGS: [&str; 10] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
+    "preemptible", "min_runtime_s", "stop_timeout_s"];
+
 pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batches", "proof-apps", "internal/jobs",
+    for root in ["apps", "batches", "internal/jobs",
     ] {
         router = router
             .route(&format!("/{root}"), any(handle))
@@ -1739,6 +1774,17 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     let batch_jobs = parts.first() == Some(&"batches") && parts.get(2) == Some(&"jobs");
     let batch = parts.first() == Some(&"batches") && !batch_jobs;
     if batch { parts[0] = "apps"; }
+    // /apps/TENANT/ELF_ID[/ACTION] name a registered app by its tenant and full ELF id (any
+    // other app name has no '/').
+    let registered = (parts.first() == Some(&"apps") && parts.len() >= 3
+        && parts[2].len() == 64 && parts[2].bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| (parts[1].to_owned(), parts[2].to_owned()));
+    if registered.is_some() {
+        parts.drain(1..3);
+        if !matches!(parts.get(1), Some(&("scale" | "logs" | "settings" | "disabled" | "available"))) || parts.len() != 2 {
+            return Err(fail(404, "unknown workload API operation"));
+        }
+    }
     let bearer = request
         .headers()
         .get(token::HEADER)
@@ -1765,18 +1811,17 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         ));
     }
     let action = match parts.as_slice() {
-        ["proof-apps", action] | ["apps", _, action] if matches!(*action, "scale" | "logs") => Some(*action),
+        ["apps", action] if registered.is_some() && matches!(*action, "scale" | "logs" | "settings") => Some(*action),
+        ["apps", _, action] if registered.is_none() && matches!(*action, "scale" | "logs" | "settings") && !batch => Some(*action),
         _ => None,
     };
     if let Some(action) = action {
         let (namespace, _) = s.scope(c, &q, None)?;
-        let app = if parts[0] == "proof-apps" {
-            let tenant = q.get("tenant").ok_or_else(|| fail(400, "tenant required"))?;
-            let elf = q.get("elf_id").ok_or_else(|| fail(400, "elf_id required"))?;
+        let app = if let Some((tenant, elf)) = &registered {
             if c.is_some_and(|c| !c.manage_apps && c.tenant != *tenant) {
                 return Err(fail(403, "another tenant cannot be selected"));
             }
-            if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown proof app")); }
+            if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown app")); }
             format!("{tenant}/{elf}")
         } else {
             let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace && s.app_visible(a, c, &q))
@@ -1791,6 +1836,16 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 return Err(fail(405, "GET required"));
             }
             return s.app_logs(c, &namespace, &app, &q).await;
+        }
+        if action == "settings" {
+            if method != Method::PUT {
+                return Err(fail(405, "PUT required"));
+            }
+            WorkloadController::require_management(c, &app)?;
+            let node = q.get("node").map(String::as_str);
+            s.require_service_scope(c, &namespace, &app, node)?;
+            let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            return Ok((StatusCode::ACCEPTED, Json(s.request_update(&namespace, &app, node, set).await?)).into_response());
         }
         if method == Method::GET {
             s.require_service_scope(c, &namespace, &app, q.get("node").map(String::as_str))?;
@@ -1882,41 +1937,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 body[key] = default;
             }
         }
-        if body["priority"]
-            .as_i64()
-            .is_none_or(|p| i32::try_from(p).is_err())
-            || body["max_gpus"].as_u64().is_none()
-            || !body["allow"].is_array()
-            || !body["env"].is_object()
-        {
-            return Err(fail(400, "invalid app policy"));
-        }
-        if ["disabled", "preemptible"]
-            .into_iter()
-            .any(|k| !body[k].is_boolean())
-            || [
-                "default_gpu_mem_gb",
-                "shm_gb",
-                "min_runtime_s",
-                "stop_timeout_s",
-            ]
-            .into_iter()
-            .any(|k| body[k].as_u64().is_none())
-            || body["env"]
-                .as_object()
-                .is_none_or(|v| v.values().any(|v| !v.is_string()))
-            || body["allow"].as_array().is_none_or(|v| {
-                v.iter().any(|v| {
-                    v.as_str().is_none_or(|p| {
-                        !p.starts_with('/') || p == "/" || p.split('/').any(|s| s == "..")
-                    })
-                })
-            })
-            || !body["user"].is_null() && !body["user"].is_string()
-            || text(&body, "image").is_empty()
-        {
-            return Err(fail(400, "invalid app policy fields"));
-        }
+        check_batch_spec(&body)?;
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");
         let _ops = s.ops.lock().await;
@@ -1937,7 +1958,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         return Ok((StatusCode::CREATED, Json(s.app_value(&app, app.tag.as_deref())),
         ).into_response());
     }
-    if parts.first() == Some(&"apps") && parts.len() >= 2 {
+    if parts.first() == Some(&"apps") && parts.len() >= 2 && registered.is_none() {
         let name = parts[1];
         // A deleted batch stays readable while it has job records: they are its history.
         let readable_deleted = batch && method == Method::GET && parts.len() == 2 && s.has_jobs(name);
@@ -1991,11 +2012,30 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             if app.persistent {
                 s.remove_app(&app.namespace, name)?;
             } else {
-                for worker in &app.workers {
-                    s.command(worker, NodeOperation::RemoveBatch, json!({"name":name}))?;
-                }
+                s.tell_nodes(&app.workers, json!({"batch":{"name":name}}), json!({"remove":true}))?;
             }
             return Ok(Json(json!({"name":name,"removed":true})).into_response());
+        }
+        if batch && parts.len() == 3 && parts[2] == "settings" && method == Method::PUT {
+            WorkloadController::require_management(c, name)?;
+            let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            let set = set.as_object().filter(|o| !o.is_empty()).cloned()
+                .ok_or_else(|| fail(400, "set at least one setting"))?;
+            if let Some(key) = set.keys().find(|k| !BATCH_SETTINGS.contains(&k.as_str())) {
+                return Err(fail(400, format!("{key} cannot be updated; settings: {}", BATCH_SETTINGS.join(", "))));
+            }
+            let _ops = s.ops.lock().await;
+            app = s.inner.lock().apps.get(name).filter(|a| !a.removed && !a.persistent).cloned()
+                .ok_or_else(|| fail(404, "unknown batch"))?;
+            for (k, v) in &set {
+                app.spec[k.as_str()] = v.clone();
+            }
+            check_batch_spec(&app.spec)?;
+            s.save("apps", name, &app)?;
+            s.inner.lock().apps.insert(name.into(), app.clone());
+            // Jobs already accepted keep the settings they were submitted with.
+            s.tell_nodes(&app.workers, json!({"batch":{"name":name}}), json!({"set": set}))?;
+            return Ok(Json(s.app_value(&app, tag)).into_response());
         }
         if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {
             WorkloadController::require_management(c, name)?;
@@ -2035,45 +2075,23 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     .filter(|a| !a.removed && a.persistent != batch)
                     .cloned()
                     .ok_or_else(|| fail(404, "unknown app"))?;
-                s.ensure_not_scaling(&app.namespace, name)?;
                 app.spec["disabled"] = json!(disabled);
                 s.save("apps", name, &app)?;
                 s.inner.lock().apps.insert(name.into(), app.clone());
                 if app.persistent {
-                    let services = {
-                        let i = s.inner.lock();
-                        i.workers
-                            .iter()
-                            .flat_map(|(w, r)| {
-                                r.report
-                                    .services
-                                    .iter()
-                                    .filter(|svc| text(svc, "name") == name)
-                                    .map(|svc| {
-                                        let mut svc = svc.clone();
-                                        svc["priority"] = app.spec["priority"].clone();
-                                        (w.clone(), svc)
-                                    })
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    services
-                        .into_iter()
-                        .map(|(w, svc)| {
-                            s.command(
-                                &w,
-                                NodeOperation::SetService,
-                                json!({"service":svc,"disabled":disabled}),
-                            )
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?
+                    // Every deployment changes; an offline node's waits until it reconnects.
+                    let keys: Vec<String> = s.inner.lock().services.iter()
+                        .filter(|(_, d)| text(&d.service, "app") == name && text(&d.service, "namespace") == app.namespace)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    s.begin_toggle(&keys, disabled)?;
+                    s.online(&keys)
                 } else {
                     vec![]
                 }
             };
-            if !ids.is_empty() {
-                s.wait(&ids).await?;
-            }
+            s.wait_scales(&ids).await?;
+            app = s.inner.lock().apps.get(name).cloned().unwrap_or(app);
             return Ok(Json(s.app_value(&app, tag)).into_response());
         }
     }
@@ -2178,17 +2196,11 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
         }
     }
-    if parts.first() == Some(&"proof-apps") && parts.len() == 2 {
+    if let Some((tenant, elf)) = &registered {
         if c.is_some_and(|c| !c.manage_apps) {
             return Err(fail(403, "app management grant required"));
         }
         let (namespace, _) = s.scope(c, &q, None)?;
-        let tenant = q
-            .get("tenant")
-            .ok_or_else(|| fail(400, "tenant required"))?;
-        let elf = q
-            .get("elf_id")
-            .ok_or_else(|| fail(400, "elf_id required"))?;
         let key = format!("{tenant}/{elf}");
         WorkloadController::require_grant(c, &key)?;
         let services = {
@@ -2200,7 +2212,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                         .services
                         .iter()
                         .filter(|svc| {
-                            text(svc, "proof_app") == key && text(svc, "namespace") == namespace
+                            text(svc, "app") == key && text(svc, "namespace") == namespace
                                 && c.is_none_or(|c| svc["tag"].as_str().is_none_or(|tag| c.tag.as_deref() == Some(tag)))
                         })
                         .map(|svc| (w.clone(), svc.clone()))
@@ -2208,7 +2220,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 .collect::<Vec<_>>()
         };
         if services.is_empty() {
-            return Err(fail(404, "no dedicated proof service configured"));
+            return Err(fail(404, "no service of this app is configured"));
         }
         if method == Method::GET && parts[1] == "available" {
             return Ok(Json(json!({"namespace":namespace,"tenant":tenant,"elf_id":elf,"servers":services.iter().map(|(_,s)|text(s,"name")).collect::<Vec<_>>()})).into_response());
@@ -2216,27 +2228,23 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if parts[1] == "disabled" && matches!(method, Method::PUT | Method::DELETE) {
             WorkloadController::require_management(c, &key)?;
             let disabled = method == Method::PUT;
-            let ids = {
+            // Every deployment changes; an offline node's waits until it reconnects.
+            let ids: Vec<String> = s.inner.lock().services.iter()
+                .filter(|(_, d)| text(&d.service, "app") == key && text(&d.service, "namespace") == namespace)
+                .map(|(k, _)| k.clone())
+                .collect();
+            {
                 let _ops = s.ops.lock().await;
-                s.ensure_not_scaling(&namespace, &key)?;
+                // Refused while another change is under way, before anything changes.
+                s.begin_toggle(&ids, disabled)?;
                 s.fleet
                     .set_app_disabled(&namespace, tenant, elf, true)
                     .await?;
-                services
-                    .into_iter()
-                    .map(|(w, mut svc)| {
-                        svc["namespace"] = json!(namespace);
-                        s.command(
-                            &w,
-                            NodeOperation::SetService,
-                            json!({"service":svc,"disabled":disabled}),
-                        )
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?
-            };
-            s.wait(&ids).await?;
+            }
+            s.wait_scales(&s.online(&ids)).await?;
+            let servers: Vec<&str> = services.iter().map(|(_, svc)| text(svc, "name")).collect();
             return Ok(Json(
-                json!({"namespace":namespace,"app":key,"disabled":disabled,"servers":ids}),
+                json!({"namespace":namespace,"app":key,"disabled":disabled,"servers":servers}),
             )
             .into_response());
         }

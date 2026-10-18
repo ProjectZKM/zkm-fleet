@@ -789,7 +789,7 @@ async fn restart_repairs_stop_intent_written_before_its_command() {
 fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> NodeReport {
     let mut report = inventory(ns);
     report.services = vec![json!({"name":"service","kind":if proof {"ziren-gpu"}else{"app"},
-        "namespace":ns,"tag":"scope=default","proof_app":if proof {json!(format!("eth/{}","a".repeat(64)))}else{Value::Null},
+        "namespace":ns,"tag":"scope=default","app":if proof {format!("eth/{}","a".repeat(64))}else{"service".into()},
         "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled}).into()];
     if !disabled { report.free_gpus=0.0;report.free_cpus=4.0; }
     report
@@ -871,8 +871,8 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
         let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
         let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
         let other_signer = user_token(&c, &ns, 5, "goat", "scope=default", Some(vec!["service".into()]), false).await;
-        let scale = if proof { format!("/proof-apps/scale?tenant=eth&elf_id={elf}") } else { "/apps/service/scale".into() };
-        let disabled = if proof { format!("/proof-apps/disabled?tenant=eth&elf_id={elf}") } else { "/apps/service/disabled".into() };
+        let scale = if proof { format!("/apps/eth/{elf}/scale") } else { "/apps/service/scale".into() };
+        let disabled = if proof { format!("/apps/eth/{elf}/disabled") } else { "/apps/service/disabled".into() };
         for token in [&consumer, &restricted, &foreign_tag] {
             for (method, path, body) in [
                 ("PUT", scale.as_str(), json!({"replicas":1})),
@@ -893,7 +893,7 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
             assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND));
         }
         c.fleet.create_namespace("other", Quota::default()).await.unwrap();
-        assert_eq!(scale_call(c.clone(), &owner, "PUT", &format!("{scale}{}namespace=other", if proof { "&" } else { "?" }),
+        assert_eq!(scale_call(c.clone(), &owner, "PUT", &format!("{scale}?namespace=other"),
             json!({"replicas":1})).await.status(), StatusCode::FORBIDDEN);
         if !proof {
             assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/priority", json!({"priority":31})).await.status(), StatusCode::OK);
@@ -904,17 +904,12 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
             let token = owner.clone();
             let path = disabled.clone();
             let request = tokio::spawn(async move { scale_call(control, &token, method, &path, Value::Null).await });
-            let command = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    if let Some(command) = c.inner.lock().commands.values().find(|v| !v.done).cloned() { break command; }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !c.inner.lock().services.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled_state)) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }).await.unwrap();
-            let mut observed = command.parameters["service"].clone();
-            observed["disabled"] = json!(disabled_state);
-            observed["ready"] = json!(!disabled_state);
-            observed["cleaned"] = json!(disabled_state);
-            finish_service_command(&c, &ns, proof, &command, disabled_state, Some(observed)).await;
+            node_completes_changes(&c, &ns, proof).await;
             assert_eq!(request.await.unwrap().status(), StatusCode::OK);
         }
         assert_eq!(scale_call(c.clone(), &owner, "PUT", &scale, json!({"replicas":1})).await.status(), StatusCode::ACCEPTED);
@@ -988,7 +983,7 @@ async fn namespace_reads_are_scoped_for_owners_and_app_tokens_while_writes_requi
 }
 
 #[tokio::test]
-async fn proof_app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
+async fn app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
     let (_dir, c, ns) = setup().await;
     let elf = "a".repeat(64);
     let other_elf = "b".repeat(64);
@@ -1047,6 +1042,34 @@ async fn proof_app_http_metadata_is_owner_managed_and_quotas_are_admin_managed()
     server.abort();
 }
 fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body).unwrap() }
+/// The node writes the configuration a change sends between stopping and starting a service,
+/// answering with `report`.
+async fn node_writes_config(c: &WorkloadController, mut report: NodeReport) {
+    c.dispatch().await.unwrap();
+    let command=c.inner.lock().commands.values().find(|v|!v.done&&v.operation==NodeOperation::App as i32).cloned().expect("configuration step");
+    report.results=vec![CommandResult{id:command.id,result:json!({"updated":["service"]}).into(),error:None}];
+    c.report("gpu","session",report).await.unwrap();
+    c.dispatch().await.unwrap();
+}
+/// Plays the node through the pending changes of a service until none is pending.
+async fn node_completes_changes(c: &WorkloadController, ns: &str, proof: bool) {
+    for _ in 0..100 {
+        c.dispatch().await.unwrap();
+        let command=c.inner.lock().commands.values().find(|v|!v.done&&v.admitted).cloned();
+        match command {
+            Some(command) if command.operation==NodeOperation::App as i32 => node_writes_config(c,scale_inventory(ns,proof,true)).await,
+            Some(command) => {
+                let disabled=command.parameters["disabled"].as_bool().unwrap();
+                let mut observed=command.parameters["service"].clone();
+                observed["disabled"]=json!(disabled);observed["ready"]=json!(!disabled);observed["cleaned"]=json!(disabled);
+                finish_service_command(c,ns,proof,&command,disabled,Some(observed)).await;
+            }
+            None if c.inner.lock().services.values().all(|s|!s.scale.as_ref().is_some_and(ScaleStatus::pending)) => return,
+            None => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+    panic!("the change did not finish");
+}
 async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, command: &CommandRecord, disabled: bool, target: Option<Value>,
 ) {
     let mut report=scale_inventory(ns,proof,disabled);
@@ -1131,13 +1154,13 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
     // Another workload consumes the freed GPUs; scale waits rather than starting over capacity.
     let mut occupied=scale_inventory(&ns,false,true);occupied.free_gpus=0.0;
-    c.report("gpu","session",occupied).await.unwrap();c.dispatch().await.unwrap();
+    node_writes_config(&c,occupied).await;
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
     assert!(!start.admitted);
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
     let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();c.dispatch().await.unwrap();
-    assert_eq!(c.inner.lock().commands.len(),2);
+    assert_eq!(c.inner.lock().commands.len(),3);
     assert!(c.inner.lock().commands[&start.id].admitted);
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
@@ -1169,7 +1192,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"replicas":1})),
     ).await.unwrap();
     for method in ["PUT", "DELETE"] {
-        assert_eq!(scale_call(c.clone(),"admin",method,&format!("/proof-apps/disabled?namespace={ns}&tenant=eth&elf_id={elf}"),json!({})).await.status(),StatusCode::CONFLICT);
+        assert_eq!(scale_call(c.clone(),"admin",method,&format!("/apps/eth/{elf}/disabled?namespace={ns}"),json!({})).await.status(),StatusCode::CONFLICT);
     }
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
@@ -1194,6 +1217,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     job.state=ProofJobState::Succeeded as i32;job.finished_ms=Some(2);c.fleet.store.upsert(&job).await.unwrap();
     c.dispatch().await.unwrap();assert!(c.inner.lock().commands[&stop.id].admitted);
     finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
+    node_writes_config(&c,scale_inventory(&ns,true,true)).await;
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
     let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);
     finish_service_command(&c,&ns,true,&start,false,Some(observed)).await;
@@ -1213,6 +1237,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
+    node_writes_config(&c,scale_inventory(&ns,true,true)).await;
     let apply=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     assert_eq!(apply.parameters["disabled"],true);
     let mut observed=apply.parameters["service"].clone();observed["disabled"]=json!(true);observed["cleaned"]=json!(true);observed["ready"]=json!(false);
@@ -1230,6 +1255,7 @@ async fn scale_failure_retains_new_reservation_until_confirmed_cleanup_and_can_b
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
+    node_writes_config(&c,scale_inventory(&ns,false,true)).await;
     let apply=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     assert!(apply.admitted);assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     let mut failed=scale_inventory(&ns,false,true);
@@ -1242,7 +1268,10 @@ async fn scale_failure_retains_new_reservation_until_confirmed_cleanup_and_can_b
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     let mut report=scale_inventory(&ns,false,true);report.services=vec![partial.into()];
     c.report("gpu","session",report).await.unwrap();c.dispatch().await.unwrap();
-    let cleanup=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
+    // The failed service stays down: the node writes it disabled and stops it.
+    let config=command_where(&c,|v|!v.done&&v.operation==NodeOperation::App as i32).unwrap();
+    assert_eq!(config.parameters["set"],json!({"disabled":true}));
+    let cleanup=command_where(&c,|v|!v.done&&v.operation==NodeOperation::SetService as i32).unwrap();
     assert_eq!(cleanup.parameters["disabled"],true);
     let mut observed=cleanup.parameters["service"].clone();observed["disabled"]=json!(true);observed["ready"]=json!(false);observed["cleaned"]=json!(true);
     finish_service_command(&c,&ns,false,&cleanup,true,Some(observed)).await;
@@ -1260,7 +1289,7 @@ async fn public_nodes_are_machines_and_machine_drain_covers_current_and_future_p
     c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
     let mut report=inventory(&ns);
     report.services=vec![json!({"name":"proof","kind":"ziren-gpu","namespace":ns,
-        "proof_app":format!("eth/{elf}"),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
+        "app":format!("eth/{elf}"),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
     c.report("gpu","session",report).await.unwrap();
     let replica=NodeInfo{name:"proof-0".into(),machine:"machine".into(),backend:"cuda".into(),
         gpus:1,cpus:2,control_version:1,app_namespace:ns,app_tenant:"eth".into(),app_elf_id:elf.clone(),..Default::default()};
@@ -1387,8 +1416,8 @@ async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
         let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
         let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
         let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
-        let logs = if proof { format!("/proof-apps/logs?tenant=eth&elf_id={elf}") } else { "/apps/service/logs".into() };
-        let query = |extra: &str| format!("{logs}{}{extra}", if proof { "&" } else { "?" });
+        let logs = if proof { format!("/apps/eth/{elf}/logs") } else { "/apps/service/logs".into() };
+        let query = |extra: &str| format!("{logs}?{extra}");
         for token in [&restricted, &foreign_tag] {
             let status = scale_call(c.clone(), token, "GET", &logs, Value::Null).await.status();
             assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{status}");
@@ -1439,7 +1468,7 @@ async fn a_starting_app_says_why_it_is_not_running() {
 }
 
 #[tokio::test]
-async fn enabling_an_integrated_worker_without_a_registered_proof_app_keeps_heartbeats_accepted() {
+async fn enabling_an_integrated_worker_without_a_registered_app_keeps_heartbeats_accepted() {
     let (_dir,c,ns)=setup().await;
     let report=scale_inventory(&ns,true,true);
     assert!(!c.fleet.app_known(&ns,"eth",&"a".repeat(64)));
@@ -1532,15 +1561,15 @@ fn remove_commands(c: &WorkloadController, operation: NodeOperation) -> Vec<(Str
 }
 
 #[tokio::test]
-async fn deleting_a_proof_app_tells_every_node_which_app_was_deleted() {
+async fn deleting_a_registered_app_tells_every_node_which_app_was_deleted() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     c.report("cpu","session",inventory(&ns)).await.unwrap();
     let app=format!("eth/{}","a".repeat(64));
     c.remove_app(&ns,&app).unwrap();
     c.remove_app(&ns,&app).unwrap();
-    let expected=json!({"namespace":ns,"namespace_name":"test","app":app});
-    assert_eq!(remove_commands(&c,NodeOperation::RemoveApp),vec![("cpu".to_string(),expected.clone()),("gpu".to_string(),expected)]);
+    let expected=json!({"app":{"namespace":ns,"namespace_name":"test","name":app},"remove":true});
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("cpu".to_string(),expected.clone()),("gpu".to_string(),expected)]);
 }
 
 #[tokio::test]
@@ -1549,7 +1578,7 @@ async fn deleting_a_serving_app_tells_its_nodes() {
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
     c.inner.lock().apps.get_mut("service").unwrap().spec["disabled"]=json!(true);
     assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/service?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::RemoveApp),vec![("gpu".to_string(),json!({"namespace":ns,"namespace_name":"test","app":"service"}))]);
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"app":{"namespace":ns,"namespace_name":"test","name":"service"},"remove":true}))]);
 }
 
 #[tokio::test]
@@ -1563,10 +1592,159 @@ async fn deleting_a_batch_sends_remove_batch_and_keeps_its_jobs() {
     report.jobs.push(incoming(&job,"succeeded",true));
     c.report("gpu","session",report).await.unwrap();
     assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/batches/training?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::RemoveBatch),vec![("gpu".to_string(),json!({"name":"training"}))]);
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"batch":{"name":"training"},"remove":true}))]);
     assert!(c.job(&job.id,None,&BTreeMap::new()).is_ok(),"job history and outputs follow the job's own lifecycle");
     let mut late=incoming(&job,"succeeded",true);late.id="other-job".into();
     let mut report=inventory(&ns);report.jobs.push(late);
     c.report("gpu","session",report).await.unwrap();
     assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted batch imports no jobs");
+}
+
+fn command_where(c: &WorkloadController, pick: impl Fn(&CommandRecord) -> bool) -> Option<CommandRecord> {
+    c.inner.lock().commands.values().find(|cmd| pick(cmd)).cloned()
+}
+async fn node_answers(c: &WorkloadController, ns: &str, command: &CommandRecord, result: Value) {
+    let mut report=scale_inventory(ns,false,true);
+    report.results=vec![CommandResult{id:command.id.clone(),result:result.into(),error:None}];
+    c.report("gpu","session",report).await.unwrap();
+    c.dispatch().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
+    for bad in [json!({}),json!({"gpus":1}),json!({"image":""}),json!({"env":{"A":1}})] {
+        let refused=c.request_update(&ns,"service",None,bad.clone()).await.unwrap_err();
+        assert_eq!(refused.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,400,"{bad}");
+    }
+    let set=json!({"image":"web:2","env":{"A":"1"}});
+    assert_eq!(c.request_update(&ns,"service",None,set.clone()).await.unwrap()["state"],"draining");
+    assert!(c.request_update(&ns,"service",None,json!({"image":"web:3"})).await.is_err(),"one operation at a time");
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
+    finish_service_command(&c,&ns,false,&stop,true,None).await;
+    c.dispatch().await.unwrap();
+    let update=command_where(&c,|cmd|cmd.operation==NodeOperation::App as i32).unwrap();
+    assert_eq!(*update.parameters,json!({"service":{"name":"service"},
+        "set":{"image":"web:2","env":{"A":"1"},"gpus":1,"cpus":2,"replicas":2,"disabled":false}}));
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none(),"the service starts only after the node wrote the settings");
+    node_answers(&c,&ns,&update,json!({"updated":["service"]})).await;
+    let start=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").unwrap();
+    assert_eq!(start.parameters["service"]["image"],"web:2");
+    let mut observed=start.parameters["service"].clone();
+    observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
+    finish_service_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
+    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"complete");
+    assert_eq!(c.inner.lock().apps["service"].spec["image"],"web:2");
+    assert_eq!(c.inner.lock().apps["service"].spec["env"],json!({"A":"1"}));
+}
+
+#[tokio::test]
+async fn an_update_the_node_cannot_write_fails_and_leaves_the_service_stopped() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
+    c.request_update(&ns,"service",None,json!({"image":"web:2"})).await.unwrap();
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
+    finish_service_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
+    let update=command_where(&c,|cmd|cmd.operation==NodeOperation::App as i32).unwrap();
+    node_answers(&c,&ns,&update,json!({"updated":[]})).await;
+    let status=c.scale_status(&ns,"service",None).unwrap();
+    assert_eq!((status["state"].as_str(),status["error"].as_str()),(Some("failed"),Some("node did not write the new configuration")));
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none());
+}
+
+#[tokio::test]
+async fn a_batch_update_is_checked_kept_by_the_scheduler_and_sent_to_its_nodes() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=inventory(&ns);
+    report.batches.insert("trainer".into(),json!({"image":"t:1","namespace":ns,"priority":0,"user":null,"max_gpus":2,
+        "default_gpu_mem_gb":0,"shm_gb":16,"allow":["/srv"],"env":{},"disabled":false,"preemptible":true,
+        "min_runtime_s":0,"stop_timeout_s":30}).into());
+    c.report("gpu","session",report).await.unwrap();
+    let path=format!("/batches/trainer/settings?namespace={ns}");
+    for bad in [json!({}),json!({"name":"other"}),json!({"allow":["relative"]})] {
+        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,bad.clone()).await.status(),StatusCode::BAD_REQUEST,"{bad}");
+    }
+    assert_eq!(c.inner.lock().apps["trainer"].spec["image"],"t:1","a refused update changes nothing");
+    let set=json!({"image":"t:2","allow":["/srv","/data"]});
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,set.clone()).await.status(),StatusCode::OK);
+    assert_eq!(c.inner.lock().apps["trainer"].spec["image"],"t:2");
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"batch":{"name":"trainer"},"set":set}))]);
+    let job=c.submit("trainer",json!({"command":["true"],"gpus":0,"cpus":1}),None,&BTreeMap::new()).await.unwrap();
+    assert_eq!(c.job(text(&job,"id"),None,&BTreeMap::new()).unwrap().policy["image"],"t:2","new jobs take the new settings");
+}
+
+#[tokio::test]
+async fn a_registered_app_update_changes_its_server() {
+    let (_dir,c,ns)=setup().await;
+    let elf="a".repeat(64);
+    c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
+    c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
+    let path=format!("/apps/eth/{elf}/settings?namespace={ns}");
+    assert_eq!(scale_call(c.clone(),"admin","GET",&path,Value::Null).await.status(),StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"image":"prover:2"})).await.status(),StatusCode::ACCEPTED);
+    let scale=c.inner.lock().services["gpu-service"].scale.clone().unwrap();
+    assert_eq!((scale.set.as_ref().map(|s|s.0.clone()),scale.target["image"].as_str()),(Some(json!({"image":"prover:2"})),Some("prover:2")));
+}
+
+async fn answer(c: &WorkloadController, mut report: NodeReport, command: &CommandRecord, result: Value) {
+    report.results=vec![CommandResult{id:command.id.clone(),result:result.into(),error:None}];
+    c.report("gpu","session",report).await.unwrap();
+    c.dispatch().await.unwrap();
+}
+async fn change_pending(c: &WorkloadController, disabled: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !c.inner.lock().services.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled)) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn disabling_an_app_whose_node_is_offline_is_kept_until_it_returns() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
+    c.inner.lock().workers.get_mut("gpu").unwrap().seen=0.0;
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/disabled?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    let scale=c.inner.lock().services["gpu-service"].scale.clone().unwrap();
+    assert!(scale.pending() && scale.disabled,"the node stops the service when it reconnects");
+}
+
+#[tokio::test]
+async fn an_enable_waiting_for_capacity_can_be_cancelled() {
+    let (_dir,c,ns)=setup().await;
+    let mut occupied=scale_inventory(&ns,false,true);occupied.free_gpus=0.0;occupied.free_cpus=0.0;
+    c.report("gpu","session",occupied.clone()).await.unwrap();
+    let path=format!("/apps/service/disabled?namespace={ns}");
+    let enable=tokio::spawn({let (c,path)=(c.clone(),path.clone());async move{scale_call(c,"admin","DELETE",&path,Value::Null).await}});
+    change_pending(&c,false).await;
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|v|!v.done&&v.parameters["scale_phase"]=="stop").unwrap();
+    answer(&c,occupied.clone(),&stop,json!({"cleaned":true,"disabled":true})).await;
+    node_writes_config(&c,occupied).await;
+    let start=command_where(&c,|v|!v.done&&v.parameters["scale_phase"]=="apply").unwrap();
+    assert!(!start.admitted,"no capacity");
+    let disable=tokio::spawn({let (c,path)=(c.clone(),path.clone());async move{scale_call(c,"admin","PUT",&path,Value::Null).await}});
+    change_pending(&c,true).await;
+    node_completes_changes(&c,&ns,false).await;
+    assert_eq!(disable.await.unwrap().status(),StatusCode::OK);
+    enable.abort();
+    assert!(c.inner.lock().commands[&start.id].error.as_deref().is_some_and(|e|e.contains("replaced")),"the start was never sent");
+    assert!(c.inner.lock().services["gpu-service"].disabled);
+}
+
+#[tokio::test]
+async fn an_enable_carries_the_apps_current_priority() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/priority?namespace={ns}"),json!({"priority":31})).await.status(),StatusCode::OK);
+    let path=format!("/apps/service/disabled?namespace={ns}");
+    let enable=tokio::spawn({let c=c.clone();async move{scale_call(c,"admin","DELETE",&path,Value::Null).await}});
+    change_pending(&c,false).await;
+    node_completes_changes(&c,&ns,false).await;
+    assert_eq!(enable.await.unwrap().status(),StatusCode::OK);
+    let start=command_where(&c,|v|v.parameters["scale_phase"]=="apply").unwrap();
+    assert_eq!(start.parameters["service"]["priority"],31,"admission and preemption use the app's priority");
 }

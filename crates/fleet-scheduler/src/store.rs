@@ -10,7 +10,7 @@ use crate::quota::{Allocation, Quota};
 use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
 
-pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, ProofApp, Token};
+pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, App, Token};
 pub use fleet_proto::models::{kind_name, status_name};
 
 fn kind_from_name(n: &str) -> ProofKind {
@@ -38,7 +38,7 @@ pub trait Store: Send + Sync {
     /// The newest jobs, of one tenant or all.
     async fn recent(&self, f: &ProofJobFilter, limit: usize) -> anyhow::Result<Vec<ProofJob>>;
     /// Every (tenant, program) that has had a job, most recently used first.
-    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>>;
+    async fn apps(&self) -> anyhow::Result<Vec<App>>;
     /// Deletes an app and its finished jobs; returns the jobs' ids.
     async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str,
     ) -> anyhow::Result<Vec<String>>;
@@ -127,14 +127,14 @@ impl Store for MemoryStore {
         Ok(v)
     }
 
-    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
+    async fn apps(&self) -> anyhow::Result<Vec<App>> {
         let blank = |namespace: &str, tenant: &str, elf_id: &str, created_ms, disabled, priority| {
-                ProofApp {
+                App {
             namespace: namespace.into(), tenant: tenant.into(), elf_id: elf_id.into(), created_ms, jobs: 0, active: 0, succeeded: 0, failed: 0,
             last_created_ms: None, mean_prove_ms: None, disabled, priority,
         }
             };
-        let mut apps: HashMap<(String, String, String), (ProofApp, f64)> = self
+        let mut apps: HashMap<(String, String, String), (App, f64)> = self
             .apps
             .lock()
             .iter()
@@ -159,7 +159,7 @@ impl Store for MemoryStore {
                 ProofJobState::Failed => a.failed += 1,
             }
         }
-        let mut v: Vec<ProofApp> = apps
+        let mut v: Vec<App> = apps
             .into_values()
             .map(|(mut a, sum)| {
                 if a.succeeded > 0 {
@@ -586,7 +586,7 @@ impl Store for PgStore {
         rows.iter().map(Self::row_to_job).collect()
     }
 
-    async fn apps(&self) -> anyhow::Result<Vec<ProofApp>> {
+    async fn apps(&self) -> anyhow::Result<Vec<App>> {
         const COUNTS: &str = "count(*) AS jobs, count(*) FILTER (WHERE state IN ('queued', 'running')) AS active, \
              count(*) FILTER (WHERE state = 'succeeded') AS succeeded, count(*) FILTER (WHERE state = 'failed') AS failed, \
              max(created_ms) AS last_created_ms, avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms";
@@ -601,7 +601,7 @@ impl Store for PgStore {
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|r| {
-                Ok(ProofApp {
+                Ok(App {
                     priority: r.try_get("priority")?,
                     namespace: r.try_get("namespace")?,
                     tenant: r.try_get("tenant")?,

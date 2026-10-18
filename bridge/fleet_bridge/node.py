@@ -7,7 +7,6 @@ import argparse
 import concurrent.futures
 import json
 import logging
-import math
 import os
 import shutil
 import socket
@@ -22,7 +21,7 @@ import ray
 import yaml
 
 from . import actors, reconcile, jobs
-from .model import Batch, JobSpec, JobState, JobStatus, Mount
+from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -51,23 +50,40 @@ def container_gone(name: str) -> bool:
             or result.returncode != 0 and ("No such object" in result.stderr or "No such container" in result.stderr))
 
 
-def set_disabled(path: Path, name: str, disabled: bool, resources: dict[str, Any] | None = None) -> None:
-    """Persist control-plane settings without rewriting machine-specific configuration."""
+def _entry(root: Any, section: str, name: str) -> Any:
+    """The `services` entry named `name`, or the `batches` value under key `name`."""
+    node = next((v for k, v in root.value if k.value == section), None) if root else None
+    if isinstance(node, yaml.SequenceNode):
+        return next((e for e in node.value if any(k.value == "name" and v.value == name for k, v in e.value)), None)
+    if isinstance(node, yaml.MappingNode):
+        return next((v for k, v in node.value if k.value == name), None)
+    return None
+
+
+def set_fields(path: Path, section: str, name: str, fields: dict[str, Any]) -> None:
+    """Writes `fields` into one `services` entry or `batches` value, keeping every other line
+    as written. A value is written in YAML flow style (JSON), so maps and lists fit on its line."""
     text = path.read_text()
-    for key, setting in {"disabled": disabled, **(resources or {})}.items():
-        root = yaml.compose(text)
-        sequence = next(v for k, v in root.value if k.value == "services")
-        entry = next(e for e in sequence.value if any(k.value == "name" and v.value == name for k, v in e.value))
+    for key, setting in fields.items():
+        entry = _entry(yaml.compose(text), section, name)
+        if not isinstance(entry, yaml.MappingNode):
+            raise ValueError(f"{section}: no entry {name}")
         value = next((v for k, v in entry.value if k.value == key), None)
-        scalar = str(setting).lower()
+        written = json.dumps(setting)
         if value is not None:
-            text = text[:value.start_mark.index] + scalar + text[value.end_mark.index:]
+            # A block value runs on to the next key; it ends with its last line of content.
+            end = offset = value.start_mark.index
+            for line in text[offset:value.end_mark.index].splitlines(keepends=True):
+                offset += len(line)
+                if _is_content(line):
+                    end = offset - (1 if line.endswith("\n") else 0)
+            text = text[:value.start_mark.index] + written + text[end:]
         elif entry.flow_style:
             position = entry.end_mark.index - 1
-            text = text[:position] + f", {key}: {scalar}" + text[position:]
+            text = text[:position] + f", {key}: {written}" + text[position:]
         else:
             position = entry.start_mark.index
-            text = text[:position] + f"{key}: {scalar}\n" + " " * entry.start_mark.column + text[position:]
+            text = text[:position] + f"{key}: {written}\n" + " " * entry.start_mark.column + text[position:]
     _replace(path, text)
 
 
@@ -177,7 +193,7 @@ class NodeExecutor:
 
     def execute(self, command: dict[str, Any]) -> None:
         params = command["parameters"]
-        key = params.get("id") or params.get("service", {}).get("name") or params.get("app") or params.get("name") or command["id"]
+        key = params.get("id") or params.get("service", {}).get("name") or (params.get("app") or params.get("batch") or {}).get("name") or command["id"]
         result: Any = {"cleaned": False}
         error = None
         try:
@@ -203,9 +219,7 @@ class NodeExecutor:
                     result = {"cleaned": True}
                 elif operation == 7:
                     with self.services_lock:
-                        result = self.remove_app(params)
-                elif operation == 8:
-                    result = {"removed": remove_entry(Path(self.batches), "batches", params["name"])}
+                        result = self.app(params)
                 else:
                     raise ValueError("unsupported node operation")
         except BaseException as e:
@@ -313,50 +327,30 @@ class NodeExecutor:
         return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 
     def service(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Starts or stops a service's replicas as services.yaml configures them; the scheduler
+        writes that configuration (enabled state, resources, settings) with NODE_OPERATION_APP
+        first. A stop removes every replica of the service, also one beyond its configured
+        count, and confirms its containers are gone."""
         if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         service = p["service"]
         cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        configured = next(s for s in cfg.services if s.name == service["name"])
-        if configured.namespace != service.get("namespace_ref", service["namespace"]) or configured.proof_app != service.get("proof_app"):
+        configured = next((s for s in cfg.services if s.name == service["name"]), None)
+        if configured is None:
+            raise ValueError(f"{service['name']} is not configured on this node")
+        if configured.namespace != service.get("namespace_ref", service["namespace"]) or configured.app != service.get("app"):
             raise ValueError("service scope differs from configured scope")
         if service.get("kind") != configured.kind.value or service.get("tag") != configured.tag:
             raise ValueError("service kind or tag differs from configured scope")
-        disabled = p["disabled"]
-        resources = {key: service.get(key, getattr(configured, key)) for key in ("gpus", "cpus", "replicas")}
-        if (any(type(resources[k]) not in (int, float) or not math.isfinite(resources[k]) for k in ("gpus", "cpus"))
-                or resources["gpus"] < 0 or resources["cpus"] <= 0
-                or type(resources["replicas"]) is not int or not 1 <= resources["replicas"] <= 64
-                or (configured.kind.value == "ziren-gpu" and (resources["gpus"] < 1 or resources["gpus"] % 1))):
-            raise ValueError("invalid service resources")
-        if configured.worker_command and resources["replicas"] != 1:
-            raise ValueError("integrated app worker supports one machine-pinned replica")
-        old_count = configured.replicas
-        updates = {k: v for k, v in resources.items() if k in service}
-        # Keep the previous replica count durable until every removed replica is
-        # gone. A crash/replay must not forget an actor outside the new count.
-        if not disabled:
-            for index in range(resources["replicas"], old_count):
-                name = f"{configured.name}-{index}"
-                reconcile.stop(name)
-                ray.get(actors.clean_after.remote(name), timeout=120)
-                if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
-                    raise ValueError("removed replica cleanup is uncertain")
-        set_disabled(self.services, configured.name, disabled, None if disabled else updates)
-        cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        for entry in cfg.services:
-            if entry.name == configured.name:
-                entry.disabled = False  # include every replica for cleanup, even when disabled
-        replicas = [s for s in reconcile.replica_specs(cfg).values() if s.service.name == configured.name]
-        if disabled:
-            for index in range(max(old_count, resources["replicas"])):
-                name = f"{configured.name}-{index}"
-                reconcile.stop(name)
-                ray.get(actors.clean_after.remote(name), timeout=120)
-                if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
-                    raise ValueError("service container cleanup is uncertain")
-            set_disabled(self.services, configured.name, True, updates)
+        running = [n for n in reconcile.running()
+                   if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
+        if p["disabled"]:
+            self._remove_replicas(sorted(set(running) | {f"{configured.name}-{i}" for i in range(configured.replicas)}))
             return {"cleaned": True, "disabled": True}
+        if configured.disabled:
+            raise ValueError(f"{configured.name} is disabled in services.yaml")
+        replicas = [s for s in reconcile.replica_specs(cfg).values() if s.service.name == configured.name]
+        self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
         for spec in replicas:
             if spec.name in existing:
@@ -367,23 +361,57 @@ class NodeExecutor:
             reconcile.start(spec)
         return {"disabled": False, "ready": True}
 
-    def remove_app(self, p: dict[str, Any]) -> dict[str, Any]:
-        """An app was deleted: every service here that runs it (a proof app's server by its
-        `tenant/elf_id`, a serving app by its name) has what is left of its replicas cleaned up
-        the way disabling does, then is dropped from services.yaml. App data stays: storage
-        roots, workdirs, env files and images belong to the operator."""
+    @staticmethod
+    def _remove_replicas(names: list[str]) -> None:
+        for name in names:
+            reconcile.stop(name)
+            ray.get(actors.clean_after.remote(name), timeout=120)
+            if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
+                raise ValueError(f"{name}: service container cleanup is uncertain")
+
+    def app(self, p: dict[str, Any]) -> dict[str, Any]:
+        """An app-level change from the scheduler, for an app (`p["app"]`: a proof app's server
+        by its `tenant/elf_id` or a serving app by its name, in a namespace given by id and by
+        name), a batch (`p["batch"]`, by name), or the one service a change of an app stopped
+        (`p["service"]`, by name, set only): `remove` it, or `set` some of its configuration.
+        A removed service has what is left of its replicas cleaned up the way disabling does;
+        app data stays (storage roots, workdirs, env files and images belong to the operator).
+        Settings are written to the configuration only: the scheduler drains and stops a
+        service first and starts it again afterwards."""
+        if "batch" in p:
+            name, path = p["batch"]["name"], Path(self.batches)
+            if p.get("remove"):
+                return {"removed": [name] if remove_entry(path, "batches", name) else []}
+            entry = (yaml.safe_load(path.read_text()) or {}).get("batches", {}).get(name)
+            if entry is None:
+                return {"updated": []}
+            Batch.load({**entry, **p["set"]})
+            set_fields(path, "batches", name, p["set"])
+            return {"updated": [name]}
+        if "service" in p:
+            # The one service a change of an app stopped: its configuration only.
+            name = p["service"]["name"]
+            entries = {e["name"]: e for e in (yaml.safe_load(self.services.read_text()) or {}).get("services", [])}
+            if p.get("remove") or name not in entries:
+                return {"updated": []}
+            AppSpec.load({**entries[name], **p["set"]})
+            set_fields(self.services, "services", name, p["set"])
+            return {"updated": [name]}
+        target = p["app"]
+        namespaces = {target["namespace"], target.get("namespace_name") or target["namespace"]}
+        entries = {e["name"]: e for e in (yaml.safe_load(self.services.read_text()) or {}).get("services", [])}
         cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        namespaces = {p["namespace"], p.get("namespace_name") or p["namespace"]}
+        services = [s for s in cfg.services if s.namespace in namespaces
+                    and s.app == target["name"]]
+        if not p.get("remove"):
+            for service in services:
+                AppSpec.load({**entries[service.name], **p["set"]})
+            for service in services:
+                set_fields(self.services, "services", service.name, p["set"])
+            return {"updated": [s.name for s in services]}
         removed = []
-        for service in cfg.services:
-            if service.namespace not in namespaces or p["app"] not in (service.proof_app, service.name if service.kind.value == "app" else None):
-                continue
-            for index in range(service.replicas):
-                replica = f"{service.name}-{index}"
-                reconcile.stop(replica)
-                ray.get(actors.clean_after.remote(replica), timeout=120)
-                if not container_gone(actors.gpu_container(replica)) or not container_gone(actors.app_container(replica)):
-                    raise ValueError(f"{service.name}: service container cleanup is uncertain")
+        for service in services:
+            self._remove_replicas([f"{service.name}-{index}" for index in range(service.replicas)])
             if remove_entry(self.services, "services", service.name):
                 removed.append(service.name)
         return {"removed": removed}
@@ -399,6 +427,7 @@ class NodeExecutor:
         for service in services:
             names = [f"{service['name']}-{i}" for i in range(service.get("replicas", 1))]
             service.setdefault("namespace", "0" * 32)
+            service.setdefault("app", service["name"])
             service.setdefault("priority", 0)
             service.setdefault("cpus", 1)
             service["gpus"] = 0 if service["kind"] == "ziren-cpu" else service.get("gpus", 1)

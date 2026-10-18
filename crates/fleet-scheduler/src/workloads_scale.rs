@@ -3,6 +3,8 @@ use super::*;
 
 use fleet_proto::model::v1::{ScalePhase as Phase, ScaleRequest, ScaleStatus};
 
+/// A change to one service: drain, stop, have the node write the target configuration
+/// (NODE_OPERATION_APP), start it again unless `disabled`.
 pub(super) fn new_scale(target: impl Into<Value>, disabled: bool) -> ScaleStatus {
     ScaleStatus {
             id: uuid::Uuid::new_v4().to_string(),
@@ -13,7 +15,18 @@ pub(super) fn new_scale(target: impl Into<Value>, disabled: bool) -> ScaleStatus
             start: None,
             error: None,
             ready_since: None,
+            set: None,
+            update: None,
         }
+}
+
+/// A change whose start still waits for capacity has nothing on the node to protect (its old
+/// server is stopped and the start was never sent): a newer change replaces it.
+fn waiting_for_capacity(i: &WorkloadState, intent: &AppDeployment) -> bool {
+    intent.scale.as_ref().is_some_and(|s| {
+        s.phase() == Phase::Starting
+            && s.start.as_ref().is_some_and(|id| i.commands.get(id).is_some_and(|c| !c.done && !c.admitted))
+    })
 }
 
 pub(super) fn same_resources(a: &Value, b: &Value) -> bool {
@@ -41,7 +54,7 @@ impl WorkloadController {
     pub(super) fn ensure_not_scaling(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
         if self.inner.lock().services.values().any(|s| {
             text(&s.service, "namespace") == namespace
-                && (text(&s.service, "proof_app") == app || text(&s.service, "name") == app)
+                && text(&s.service, "app") == app
                 && s.scale.as_ref().is_some_and(ScaleStatus::pending)
         }) {
             return Err(fail(409, "app scaling is already pending"));
@@ -60,8 +73,8 @@ impl WorkloadController {
             let s = &intent.service;
             text(s, "namespace") == namespace
                 && node.is_none_or(|n| n == intent.worker)
-                && ((text(s, "kind") == "ziren-gpu" && text(s, "proof_app") == app)
-                    || (text(s, "kind") == "app" && text(s, "name") == app))
+                && matches!(text(s, "kind"), "ziren-gpu" | "app")
+                && text(s, "app") == app
         });
         let first = services
             .next()
@@ -132,17 +145,10 @@ impl WorkloadController {
         Ok(self.scale_value(&service))
     }
 
-    pub(super) async fn request_scale(
-        &self,
-        namespace: &str,
-        app: &str,
-        req: ScaleRequest,
-    ) -> anyhow::Result<Value> {
-        let _ops = self.ops.lock().await;
-        if req.gpus.is_none() && req.cpus.is_none() && req.replicas.is_none() {
-            return Err(fail(400, "set at least one of gpus, cpus or replicas"));
-        }
-        let (key, mut intent) = self.scale_service(namespace, app, req.node.as_deref())?;
+    /// The service of `app` (on `node`, when it has several) that a scale or settings update
+    /// changes: the app still exists and no other operation on the service is under way.
+    fn service_to_change(&self, namespace: &str, app: &str, node: Option<&str>) -> anyhow::Result<(String, AppDeployment)> {
+        let (key, intent) = self.scale_service(namespace, app, node)?;
         // Recheck existence under the operation lock: deletion may have finished
         // after the HTTP handler resolved the app but before this request acquired it.
         let exists = if let Some((tenant, elf)) = app.split_once('/') {
@@ -159,13 +165,7 @@ impl WorkloadController {
         }
         {
             let i = self.inner.lock();
-            // A scale whose start still waits for capacity has nothing on the node to protect
-            // (its old server is stopped and the start was never sent): a new size replaces it.
-            let waiting_start = intent.scale.as_ref().is_some_and(|s| {
-                s.phase() == Phase::Starting
-                    && s.start.as_ref().is_some_and(|id| i.commands.get(id).is_some_and(|c| !c.done && !c.admitted))
-            });
-            if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_start
+            if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
                 || i.commands.values().any(|c| {
                     !c.done
                         && c.admitted // one still waiting for capacity is replaced by this request
@@ -177,7 +177,128 @@ impl WorkloadController {
                 return Err(fail(409, "a service operation is already pending"));
             }
         }
-        let mut target = intent.service.clone();
+        Ok((key, intent))
+    }
+
+    /// Settings an update may change on a service. The rest is identity, placement or the
+    /// node's own configuration, or has its own operation (scale, enable/disable, priority).
+    pub(super) const SERVICE_SETTINGS: [&'static str; 11] = ["image", "env", "command", "user", "workdir", "volumes",
+        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s"];
+
+    /// Changes `app`'s service settings like a scale does: drain, stop, have the node write the
+    /// settings (NODE_OPERATION_APP), start it again with them.
+    /// Starts enabling or disabling these services of `app` the way a scale changes them:
+    /// drain, stop, the node writes the enabled state, start again unless disabled. The caller
+    /// holds the operation lock.
+    pub(super) fn begin_toggle(&self, keys: &[String], disabled: bool) -> anyhow::Result<()> {
+        for key in keys {
+            let mut intent = self.inner.lock().services.get(key).cloned()
+                .ok_or_else(|| fail(404, "no configured service for this app"))?;
+            let busy = {
+                let i = self.inner.lock();
+                intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
+                    || i.commands.values().any(|c| {
+                        !c.done && c.admitted && c.worker == intent.worker
+                            && c.operation == NodeOperation::SetService as i32
+                            && text(&c.parameters["service"], "name") == text(&intent.service, "name")
+                    })
+            };
+            if busy {
+                return Err(fail(409, "a service operation is already pending"));
+            }
+            intent.scale = Some(new_scale(self.with_priority(intent.service.clone()), disabled));
+            self.save("services", key, &intent)?;
+            self.inner.lock().services.insert(key.clone(), intent);
+        }
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    /// `service` as a change targets it: with its app's current priority, which only the
+    /// scheduler keeps (a serving app's template, or the registered app's record).
+    pub(super) fn with_priority(&self, service: impl Into<Value>) -> Value {
+        let mut service: Value = service.into();
+        let serving = self.inner.lock().apps.get(text(&service, "name"))
+            .filter(|a| a.persistent).map(|a| a.spec["priority"].as_i64().unwrap_or(0));
+        let priority = serving.unwrap_or_else(|| {
+            text(&service, "app").split_once('/')
+                .map_or(0, |(tenant, elf)| self.fleet.app_priority(text(&service, "namespace"), tenant, elf).into())
+        });
+        service["priority"] = json!(priority);
+        service
+    }
+
+    /// Waits until the changes of these services finished; a failed one is the error.
+    pub(super) async fn wait_scales(&self, keys: &[String]) -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(1800), async {
+            loop {
+                let notified = self.notify.notified();
+                let scales: Vec<Option<ScaleStatus>> = {
+                    let i = self.inner.lock();
+                    keys.iter().map(|k| i.services.get(k).and_then(|d| d.scale.clone())).collect()
+                };
+                if let Some(error) = scales.iter().flatten().find(|s| s.failed()).map(|s| s.error.clone().unwrap_or_default()) {
+                    return Err(fail(503, error));
+                }
+                if !scales.iter().flatten().any(ScaleStatus::pending) {
+                    return Ok(());
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| fail(503, "node has not confirmed the operation; desired state is retained"))?
+    }
+
+    pub(super) async fn request_update(&self, namespace: &str, app: &str, node: Option<&str>, set: Value) -> anyhow::Result<Value> {
+        let _ops = self.ops.lock().await;
+        let set = set.as_object().filter(|o| !o.is_empty()).cloned()
+            .ok_or_else(|| fail(400, "set at least one setting"))?;
+        for (key, value) in &set {
+            let valid = match key.as_str() {
+                "image" => value.as_str().is_some_and(|v| !v.is_empty()),
+                "env" => value.as_object().is_some_and(|o| o.values().all(Value::is_string)),
+                "command" | "volumes" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
+                "user" | "workdir" | "health_path" => value.is_string(),
+                "shm_gb" | "stop_timeout_s" => value.as_u64().is_some(),
+                "memory_gb" | "ready_timeout_s" => value.as_f64().is_some_and(|v| v.is_finite() && v > 0.0),
+                _ => return Err(fail(400, format!("{key} cannot be updated; settings: {}", Self::SERVICE_SETTINGS.join(", ")))),
+            };
+            if !valid {
+                return Err(fail(400, format!("{key}: invalid value")));
+            }
+        }
+        let (key, mut intent) = self.service_to_change(namespace, app, node)?;
+        if set.iter().all(|(k, v)| intent.service.get(k) == Some(v)) {
+            return Ok(self.scale_value(&intent));
+        }
+        let mut target = self.with_priority(intent.service.clone());
+        for (k, v) in &set {
+            target[k.as_str()] = v.clone();
+        }
+        let disabled = intent.scale.as_ref().filter(|s| s.phase() == Phase::Failed).map(|s| s.disabled).unwrap_or(intent.disabled);
+        let mut scale = new_scale(target, disabled);
+        scale.set = Some(Value::Object(set).into());
+        intent.scale = Some(scale);
+        // Persist the transition before changing admission or sending any command.
+        self.save("services", &key, &intent)?;
+        self.inner.lock().services.insert(key, intent.clone());
+        self.notify.notify_waiters();
+        Ok(self.scale_value(&intent))
+    }
+
+    pub(super) async fn request_scale(
+        &self,
+        namespace: &str,
+        app: &str,
+        req: ScaleRequest,
+    ) -> anyhow::Result<Value> {
+        let _ops = self.ops.lock().await;
+        if req.gpus.is_none() && req.cpus.is_none() && req.replicas.is_none() {
+            return Err(fail(400, "set at least one of gpus, cpus or replicas"));
+        }
+        let (key, mut intent) = self.service_to_change(namespace, app, req.node.as_deref())?;
+        let mut target = self.with_priority(intent.service.clone());
         if let Some(v) = req.gpus {
             target["gpus"] = json!(v);
         }
@@ -314,6 +435,7 @@ impl WorkloadController {
         intent.scale = Some(scale);
         self.save("services", key, &intent)?;
         self.inner.lock().services.insert(key.into(), intent);
+        self.notify.notify_waiters();
         Ok(())
     }
 
@@ -329,20 +451,16 @@ impl WorkloadController {
         for (key, intent) in intents {
             let mut scale = intent.scale.clone().unwrap();
             if scale.phase() == Phase::Draining {
-                if text(&intent.service, "proof_app").contains('/') {
-                    self.sync_proof_app(&intent.service, true).await?;
-                } else {
-                    let app = self
-                        .inner
-                        .lock()
-                        .apps
-                        .get(text(&intent.service, "name"))
-                        .cloned();
-                    if let Some(mut app) = app {
+                // A serving app has its template; any other service is a proof server.
+                let serving = self.inner.lock().apps.get(text(&intent.service, "name"))
+                    .filter(|a| a.persistent).cloned();
+                match serving {
+                    Some(mut app) => {
                         app.spec["disabled"] = json!(true);
                         self.save("apps", &app.name, &app)?;
                         self.inner.lock().apps.insert(app.name.clone(), app);
                     }
+                    None => self.sync_app_record(&intent.service, true).await?,
                 }
                 if scale.stop.is_none() {
                     scale.stop =
@@ -368,6 +486,34 @@ impl WorkloadController {
                     );
                     self.save_scale(&key, scale)?;
                     continue;
+                }
+                // The node writes the target configuration while the service is stopped.
+                {
+                    if scale.update.is_none() {
+                        let mut set = scale.set.as_ref().map(|s| s.0.clone()).unwrap_or_else(|| json!({}));
+                        for k in ["gpus", "cpus", "replicas"] {
+                            if !scale.target[k].is_null() {
+                                set[k] = scale.target[k].clone();
+                            }
+                        }
+                        set["disabled"] = json!(scale.disabled);
+                        let message = json!({"service":{"name":text(&intent.service, "name")}});
+                        let sent = self.tell_nodes([&intent.worker], message, json!({"set": set}))?;
+                        scale.update = sent.into_iter().next();
+                        self.save_scale(&key, scale.clone())?;
+                    }
+                    let command = self.inner.lock().commands.get(scale.update.as_ref().unwrap()).cloned().unwrap();
+                    if !command.done {
+                        continue;
+                    }
+                    let written = command.result["updated"].as_array()
+                        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(text(&intent.service, "name"))));
+                    if command.error.is_some() || !written {
+                        scale.phase = Phase::Failed as i32;
+                        scale.error = Some(command.error.unwrap_or_else(|| "node did not write the new configuration".into()));
+                        self.save_scale(&key, scale)?;
+                        continue;
+                    }
                 }
                 scale.phase = Phase::Starting as i32;
                 self.save_scale(&key, scale.clone())?;
@@ -430,7 +576,7 @@ impl WorkloadController {
                 continue;
             }
             if !scale.disabled {
-                self.sync_proof_app(&scale.target, false).await?;
+                self.sync_app_record(&scale.target, false).await?;
             }
             let app = self
                 .inner
@@ -441,6 +587,9 @@ impl WorkloadController {
             if let Some(mut app) = app.filter(|a| a.persistent) {
                 for k in ["gpus", "cpus", "replicas"] {
                     app.spec[k] = scale.target[k].clone();
+                }
+                for (k, v) in scale.set.as_ref().and_then(|set| set.as_object()).into_iter().flatten() {
+                    app.spec[k.as_str()] = v.clone();
                 }
                 app.spec["disabled"] = json!(scale.disabled);
                 self.save("apps", &app.name, &app)?;

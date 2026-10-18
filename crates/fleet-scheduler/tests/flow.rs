@@ -568,7 +568,7 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     add_node_for_app(&h, "gpu-a", 2, false, "system", "eth", b"elf-d").await;
     h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
-    let app = proof_app(&h, "eth");
+    let app = registered_app(&h, "eth");
     let elf = app["elf_id"].as_str().unwrap();
     assert_eq!(app["jobs"], 1);
     let gone = admin_curl(&h, &["-X", "DELETE", &format!("{}/admin/apps?namespace=system&tenant=eth&elf_id={elf}", h.http),
@@ -597,7 +597,7 @@ fn admin_curl(_h: &Harness, args: &[&str]) -> String {
 }
 
 /// A tenant's (only) proof app, from the list.
-fn proof_app(h: &Harness, tenant: &str) -> serde_json::Value {
+fn registered_app(h: &Harness, tenant: &str) -> serde_json::Value {
     let apps: serde_json::Value = serde_json::from_str(&admin_curl(h, &[&format!("{}/admin/apps", h.http)])).unwrap();
     apps.as_array().unwrap().iter().find(|a| a["tenant"] == tenant).unwrap().clone()
 }
@@ -633,15 +633,15 @@ async fn a_disabled_app_refuses_new_jobs_until_it_is_enabled() {
     add_node_for_app(&h, "gpu-a", 2, false, "system", "eth", b"elf-e").await;
     h.stage.generate_proof(request("job-e1", b"elf-e")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-e1").await.status, S::Success as i32);
-    let elf = proof_app(&h, "eth")["elf_id"].as_str().unwrap().to_string();
+    let elf = registered_app(&h, "eth")["elf_id"].as_str().unwrap().to_string();
     let key = format!("{}/admin/apps/disabled?namespace=system&tenant=eth&elf_id={elf}", h.http);
     let off: serde_json::Value = serde_json::from_str(&admin_curl(&h, &["-X", "PUT", &key])).unwrap();
     assert_eq!(off["disabled"], true);
-    assert_eq!(proof_app(&h, "eth")["disabled"], true, "the list says so");
+    assert_eq!(registered_app(&h, "eth")["disabled"], true, "the list says so");
     h.stage.generate_proof(request("job-e2", b"elf-e")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-e2").await.status, S::InvalidParameter as i32, "refused while disabled");
     admin_curl(&h, &["-X", "DELETE", &key]);
-    assert_eq!(proof_app(&h, "eth")["disabled"], false);
+    assert_eq!(registered_app(&h, "eth")["disabled"], false);
     h.stage.generate_proof(request("job-e3", b"elf-e")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-e3").await.status, S::Success as i32, "jobs again once enabled");
     let unknown = admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "PUT", &format!("{}/admin/apps/disabled?namespace=system&tenant=nobody&elf_id=ff", h.http),
@@ -1445,7 +1445,7 @@ async fn jobs_inherit_app_priority_and_dispatch_highest_then_fifo() {
     let (_, calls) = add_node_for_app(&h, "priority-node", 1, false, "system", "eth", b"elf").await;
     wait_done(&mut h, "low-priority").await;
     assert_eq!(*calls.lock(), expected);
-    assert_eq!(proof_app(&h, "eth")["priority"], -10);
+    assert_eq!(registered_app(&h, "eth")["priority"], -10);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1566,7 +1566,7 @@ async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
     let report = serde_json::json!({"version":2,"machine":"test","ready":true,
         "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"batches":{},
         "services":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
-            "proof_app":format!("eth/{elf}"),"worker_command":["/opt/eth-proofs"],
+            "app":format!("eth/{elf}"),"worker_command":["/opt/eth-proofs"],
             "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});
     agent.heartbeat(WorkerHeartbeatRequest {worker_id:"integrated-worker".into(),session:"session".into(),
             report: Some(serde_json::from_value(report).unwrap()),proof_fetch_ready:false,

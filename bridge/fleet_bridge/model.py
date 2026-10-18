@@ -467,10 +467,10 @@ class AppSpec(Record):
     priority: int = 0
     kind: AppRuntime = AppRuntime.ZIREN_GPU
     replicas: int = 1
-    disabled: bool = False  # persistent app or proof app: release resources until enabled
-    # A Ziren prover service is dedicated to this one proof app (tenant/full ELF id).
-    # The service's namespace supplies the other part of the app identity.
-    proof_app: str | None = None
+    disabled: bool = False  # release resources until enabled
+    # The app this service runs: a Ziren prover's dedicated app (tenant/full ELF id; the
+    # service's namespace supplies the other part of its identity), else the service itself.
+    app: str = ""
     proof_storage_root: str | None = None
     gpus: float = 1
     cpus: float = 1
@@ -507,13 +507,13 @@ class AppSpec(Record):
                 raise ModelError("worker executable must be absolute and stop timeout positive")
         elif self.worker_env_file or self.worker_workdir:
             raise ModelError("worker environment and workdir require worker_command")
-        if self.proof_app is not None:
-            tenant, sep, elf_id = self.proof_app.partition("/")
-            if (self.kind is not AppRuntime.ZIREN_GPU or not sep or not tenant
-                    or not re.fullmatch(r"[0-9a-fA-F]{64}", elf_id)):
-                raise ModelError("proof_app must be TENANT/FULL_ELF_SHA256 on a ziren-gpu service")
-        elif self.kind is AppRuntime.ZIREN_GPU:
-            raise ModelError("every ziren-gpu service must name its dedicated proof_app")
+        if self.kind is AppRuntime.ZIREN_GPU:
+            tenant, sep, elf_id = self.app.partition("/")
+            if not sep or not tenant or not re.fullmatch(r"[0-9a-fA-F]{64}", elf_id):
+                raise ModelError("a ziren-gpu service's app must be TENANT/FULL_ELF_SHA256")
+        elif self.app not in ("", self.name):
+            raise ModelError(f"{self.name}: a {self.kind.value} service is its own app")
+        self.app = self.app or self.name
 
 
 @dataclass(kw_only=True)

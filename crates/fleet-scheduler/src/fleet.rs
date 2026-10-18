@@ -1023,7 +1023,7 @@ impl Scheduler {
                 machine: n.info.machine.clone(),
                 zkm_version: n.info.zkm_version.clone(),
                 image: n.info.image.clone(),
-                proof_app: (!n.info.app_namespace.is_empty()).then(|| {
+                app: (!n.info.app_namespace.is_empty()).then(|| {
                     format!("{}/{}/{}", n.info.app_namespace, n.info.app_tenant, n.info.app_elf_id)
                 }),
                 ready: n.ready,

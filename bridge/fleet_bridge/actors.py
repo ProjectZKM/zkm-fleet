@@ -71,8 +71,9 @@ def _node_env(spec: AppReplicaSpec, backend: str, service_env: bool = False, **e
     app_namespace = None
     app_tenant = None
     app_elf_id = None
-    if spec.service.proof_app:
-        app_tenant, app_elf_id = spec.service.proof_app.split("/", 1)
+    tenant, dedicated, elf_id = spec.service.app.partition("/")
+    if dedicated:
+        app_tenant, app_elf_id = tenant, elf_id
         app_namespace = spec.service.namespace
     node = NodeEnvironment(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
@@ -217,7 +218,7 @@ def _node_binary(spec: AppReplicaSpec) -> str:
 
 def _app_worker_env(spec: AppReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
     """Scoped environment for an integrated worker; never evaluated by a shell."""
-    assert spec.service.proof_app is not None and spec.service.proof_storage_root is not None
+    assert "/" in spec.service.app and spec.service.proof_storage_root is not None
     env = dict(os.environ)
     if spec.service.worker_env_file:
         with open(spec.service.worker_env_file) as source:
@@ -235,7 +236,7 @@ def _app_worker_env(spec: AppReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
                     raise ValueError(f"quote worker environment values on line {number}")
                 env[key] = values[0] if values else ""
     # Deployment files cannot override the replica's identity or server binding.
-    tenant, elf_id = spec.service.proof_app.split("/", 1)
+    tenant, elf_id = spec.service.app.split("/", 1)
     env.update({"FLEET_NODE_NAME": spec.name, "FLEET_WORKER_ROLE": "app",
                 "FLEET_EXIT_WITH_PARENT": "true", "FLEET_APP_NAMESPACE": spec.service.namespace,
                 "FLEET_APP_TENANT": tenant, "FLEET_APP_ELF_ID": elf_id,

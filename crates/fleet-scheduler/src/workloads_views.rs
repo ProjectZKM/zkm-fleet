@@ -67,8 +67,7 @@ impl WorkloadController {
             .filter(|intent| {
                 let s = &intent.service;
                 text(s, "namespace") == namespace
-                    && (text(s, "proof_app") == app
-                        || (text(s, "kind") == "app" && text(s, "name") == app))
+                    && text(s, "app") == app
             })
             .collect();
         let mut gpus = 0.0;
@@ -162,7 +161,7 @@ impl WorkloadController {
         }
     }
 
-    pub(crate) fn proof_app_value(&self, mut app: Value, tag: Option<&str>) -> Value {
+    pub(crate) fn app_record_value(&self, mut app: Value, tag: Option<&str>) -> Value {
         let namespace = text(&app, "namespace");
         let name = format!("{}/{}", text(&app, "tenant"), text(&app, "elf_id"));
         let resources = self.app_resources(namespace, &name, tag);
