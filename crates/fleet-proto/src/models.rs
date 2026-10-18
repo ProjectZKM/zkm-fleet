@@ -205,7 +205,7 @@ impl serde::Serialize for ProofJob {
         m.serialize_field("id", &self.id)?;
         m.serialize_field("inputs", &self.inputs)?;
         m.serialize_field("outputs", &self.outputs)?;
-        m.serialize_field("tenant", &self.tenant)?;
+        m.serialize_field("app", &self.app)?;
         m.serialize_field("owner", &self.owner)?;
         m.serialize_field("namespace", &self.namespace)?;
         m.serialize_field("tag", &self.tag)?;
@@ -262,11 +262,7 @@ impl ProofJobFilter {
         self.namespace.as_ref().is_none_or(|n| &j.namespace == n)
             && self.tag.as_ref().is_none_or(|g| &j.tag == g)
             && self.owner.as_ref().is_none_or(|o| &j.owner == o)
-            && self.tenant.as_ref().is_none_or(|t| &j.tenant == t)
-            && self
-                .elf
-                .as_ref()
-                .is_none_or(|e| j.elf_id.starts_with(e.as_str()))
+            && self.app.as_ref().is_none_or(|a| &j.app == a)
             && (!self.active || !j.state().is_terminal())
     }
 }

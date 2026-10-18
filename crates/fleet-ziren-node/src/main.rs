@@ -52,11 +52,11 @@ pub struct ProverArgs {
     image: String,
     #[arg(long, env = "FLEET_MACHINE", default_value = "")]
     machine: String,
-    /// Namespace/tenant/ELF identity for this dedicated proof-app server.
+    /// The proof app this dedicated server proves: its namespace, name and program.
     #[arg(long, env = "FLEET_APP_NAMESPACE", default_value = "")]
     app_namespace: String,
-    #[arg(long, env = "FLEET_APP_TENANT", default_value = "")]
-    app_tenant: String,
+    #[arg(long, env = "FLEET_APP", default_value = "")]
+    app: String,
     #[arg(long, env = "FLEET_APP_ELF_ID", default_value = "")]
     app_elf_id: String,
     /// Durable node output for legacy jobs; reference jobs use app-owned storage.
@@ -165,7 +165,7 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
         machine: args.machine.clone(),
         control_version: 1,
         app_namespace: args.app_namespace.clone(),
-        app_tenant: args.app_tenant.clone(),
+        app: args.app.clone(),
         app_elf_id: args.app_elf_id.to_ascii_lowercase(),
     };
     let mut node_id: Option<String> = None;

@@ -10,7 +10,7 @@ use fleet_scheduler::{
 use std::{sync::Arc, time::Duration};
 
 fn config(dir: &std::path::Path) -> SchedulerConfig {
-    serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nadmin_token_file: unused\nheartbeat_secs: 1\ntenants:\n  - name: proof\n", dir.display())).unwrap()
+    serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nheartbeat_secs: 1\n", dir.display())).unwrap()
 }
 
 async fn fresh(cfg: SchedulerConfig, store: Arc<MemoryStore>) -> Arc<Scheduler> {
@@ -28,6 +28,14 @@ async fn fresh(cfg: SchedulerConfig, store: Arc<MemoryStore>) -> Arc<Scheduler> 
     f
 }
 
+/// The proof app the tests' provers serve: program `elf_id` in the namespace.
+fn app(namespace: &str, elf_id: &str) -> fleet_scheduler::store::App {
+    fleet_scheduler::store::App {
+        namespace: namespace.into(), name: "proof".into(), elf_id: elf_id.into(), created_ms: 1,
+        class: "batch".into(), anchor: "none".into(), max_queued: 64, ..Default::default()
+    }
+}
+
 fn info(name: &str, namespace: &str, elf_id: &str) -> NodeInfo {
     NodeInfo {
         name: name.into(),
@@ -37,7 +45,7 @@ fn info(name: &str, namespace: &str, elf_id: &str) -> NodeInfo {
         machine: "gpu-host".into(),
         control_version: 1,
         app_namespace: namespace.into(),
-        app_tenant: "proof".into(),
+        app: "proof".into(),
         app_elf_id: elf_id.into(),
         ..Default::default()
     }
@@ -79,14 +87,10 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         .await
         .unwrap();
     let elf_id = f.blobs.put_elf(b"elf").unwrap();
-    store
-        .add_app(&namespace.id, "proof", &elf_id, 1, 0)
-        .await
-        .unwrap();
+    store.add_app(&app(&namespace.id, &elf_id)).await.unwrap();
     f.load_apps().await.unwrap();
     let apps = f.apps().await.unwrap();
-    assert_eq!(apps[0]["type"], "app");
-    assert!(apps[0].get("kind").is_none());
+    assert_eq!((apps[0].0.name.as_str(), apps[0].0.elf_id.as_str()), ("proof", elf_id.as_str()));
     for name in [blobs::STDIN, blobs::RECEIPTS] {
         f.blobs
             .put(
@@ -103,7 +107,7 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         namespace: namespace.id.clone(),
         owner: "ab".repeat(20),
         tag: String::new(),
-        tenant: "proof".into(),
+        app: "proof".into(),
         elf_id: elf_id.clone(),
         priority: 0,
         kind: ProofKind::Compressed as i32,
@@ -284,7 +288,7 @@ async fn metadata_completion_is_lease_fenced_and_survives_scheduler_restart() {
             },
         ).await.unwrap();
     let elf_id = fleet_proto::artifacts::hash(b"elf");
-    store.add_app(&namespace.id,"proof",&elf_id,1,0).await.unwrap();
+    store.add_app(&app(&namespace.id, &elf_id)).await.unwrap();
     f.load_apps().await.unwrap();
     let input = ArtifactRef {uri:"file:///app/inputs/hash".into(),sha256:"a".repeat(64),size:3,
     };
@@ -292,7 +296,7 @@ async fn metadata_completion_is_lease_fenced_and_survives_scheduler_restart() {
         inputs:Some(ProofInputs {input:Some(input),elf:Some(ArtifactRef {uri:"file:///app/elf/hash".into(),sha256:elf_id.clone(),size:3,
             }),output_root:"file:///app/outputs".into(),
         }),
-        outputs:None,id:"metadata-job".into(),client_id:"metadata-job".into(),namespace:namespace.id.clone(),owner:"ab".repeat(20),tag:String::new(),tenant:"proof".into(),elf_id:elf_id.clone(),priority:0,kind:ProofKind::Compressed as i32,
+        outputs:None,id:"metadata-job".into(),client_id:"metadata-job".into(),namespace:namespace.id.clone(),owner:"ab".repeat(20),tag:String::new(),app:"proof".into(),elf_id:elf_id.clone(),priority:0,kind:ProofKind::Compressed as i32,
         state:ProofJobState::Queued as i32,
         fail_status: None,error:String::new(),node:None,attempts:0,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:None,finished_ms:None,
     }).await.unwrap();
@@ -337,11 +341,11 @@ async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completi
     let f = fresh(config(dir.path()), store.clone()).await;
     let ns = f.create_namespace("app", Quota::default()).await.unwrap();
     let elf = f.blobs.put_elf(b"elf").unwrap();
-    f.add_app(&ns.id, "proof", &elf, 0).await.unwrap();
+    f.add_app(&ns.id, &fleet_proto::model::v1::RegisterAppRequest { name: "proof".into(), elf_id: elf.clone(), ..Default::default() }).await.unwrap();
     let job = ProofJob {
         inputs: None, outputs: None, id: "active".into(), client_id: "active".into(),
         namespace: ns.id.clone(), owner: "ab".repeat(20), tag: String::new(),
-        tenant: "proof".into(), elf_id: elf.clone(), priority: 0, kind: ProofKind::Compressed as i32,
+        app: "proof".into(), elf_id: elf.clone(), priority: 0, kind: ProofKind::Compressed as i32,
         state: ProofJobState::Queued as i32,
         fail_status: None, error: String::new(), node: None, attempts: 0,
         failed_on: vec![], cycles: 0, prove_ms: 0, created_ms: 1, started_ms: None, finished_ms: None,

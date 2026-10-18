@@ -36,16 +36,21 @@ deploy/install.sh control --public-url https://fleet.example:8905 \
 Omit `--no-mcp` to enable MCP at `/mcp`. The installer creates credentials and puts
 `fleetctl` on the control host's PATH. Administrators use their token for namespace
 quotas, access and node administration. Workload owners receive scoped owner
-tokens (`manage_apps: true`) for app and batch metadata, priority, mount roots,
-enable/disable and scaling. App-granted user tokens can use workloads but cannot
-change their metadata. See [workload ownership](reference.md#workload-ownership).
+tokens (`read`, `submit` and `manage`) for app and batch metadata, priority, mount
+roots, enable/disable and scaling. Tokens without `manage` can use their granted
+workloads but cannot change their metadata. See [workload ownership](reference.md#workload-ownership).
 
-Use [fleet.example.yaml](../deploy/fleet.example.yaml) for the scheduler settings
-and proof tenant configuration. Fleet creates schema 14 for a fresh database;
-an incompatible database requires a metadata reset and new namespace/token setup.
+Use [fleet.example.yaml](../deploy/fleet.example.yaml) for the scheduler settings.
+Proof apps and their placement policy are registered through the API, not
+configured there. Fleet creates schema 16 for a fresh database and migrates a
+schema 14 or 15 database at start; any other database requires a metadata reset
+and new namespace/token setup.
 
 The installer runs `fleetctl init token` and `fleetctl init tls` only when their
-files are missing. `init tls` creates a private CA and server certificate for the
+files are missing. Once Compose is up, it issues the first administrator token into
+`etc/admin.token` with `fleet-scheduler -c fleet.yaml issue-admin --label install
+--out FILE`, which writes the token's record into the database. `fleetctl` reads
+that file by default. `init tls` creates a private CA and server certificate for the
 Fleet backend; `--tls-names` supplies the certificate's hostnames and IPs.
 These are installation commands. Normal namespace operations use the existing
 server certificate and copy its public CA into client bundles when needed.

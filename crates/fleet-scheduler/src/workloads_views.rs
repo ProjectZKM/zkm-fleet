@@ -161,20 +161,96 @@ impl WorkloadController {
         }
     }
 
-    pub(crate) fn app_record_value(&self, mut app: Value, tag: Option<&str>) -> Value {
-        let namespace = text(&app, "namespace");
-        let name = format!("{}/{}", text(&app, "tenant"), text(&app, "elf_id"));
-        let resources = self.app_resources(namespace, &name, tag);
-        app.as_object_mut()
-            .unwrap()
-            .extend(resources.as_object().unwrap().clone());
-        if app["resources"].is_null() && app["disabled"].as_bool() == Some(true) {
-            app["state"] = json!("disabled");
+    /// An app as every listing shows one, whichever kind it is: what it is, where it runs, its
+    /// state and jobs. A proof app adds its program and placement policy under `proof`, a
+    /// serving app its container settings under `service`.
+    #[allow(clippy::too_many_arguments)]
+    fn app_view(&self, kind: &str, namespace: &str, name: &str, fixed_tag: Option<&str>, priority: Value, disabled: bool,
+        jobs: Value, tag: Option<&str>, detail: (&str, Value),
+    ) -> Value {
+        let r = self.app_resources(namespace, name, tag);
+        let state = if r["resources"].is_null() {
+            if disabled { "disabled" } else if kind == "proof" { "registered" } else { "configured" }
+        } else {
+            r["state"].as_str().unwrap_or("configured")
+        };
+        let mut v = json!({
+            "type": "app", "kind": kind, "name": name, "namespace": namespace,
+            "tag": fixed_tag, "tags": r["tags"], "state": state, "detail": r["detail"],
+            "priority": priority, "disabled": disabled, "resources": r["resources"],
+            "namespace_quota": r["namespace_quota"], "tag_quota": r["tag_quota"],
+            "jobs": jobs,
+        });
+        v[detail.0] = detail.1;
+        v
+    }
+
+    /// A serving app (a long-running service from a node's services.yaml) in the app shape.
+    pub(crate) fn serving_app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let jobs: Vec<Job> = self.inner.lock().jobs.values()
+            .filter(|r| !r.purged && r.batch == app.name && r.namespace == app.namespace
+                && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag))
+            .cloned().collect();
+        let count = |f: &dyn Fn(&Job) -> bool| jobs.iter().filter(|r| f(r)).count();
+        let jobs_value = json!({
+            "total": jobs.len(),
+            "active": count(&|r| !terminal(r.state())),
+            "succeeded": count(&|r| r.state() == "succeeded"),
+            "failed": count(&|r| matches!(r.state(), "failed" | "lost")),
+            "last_at": jobs.iter().filter_map(|r| r.status["submitted_at"].as_f64()).max_by(f64::total_cmp),
+        });
+        let mut settings = app.spec.0.clone();
+        if let Some(o) = settings.as_object_mut() {
+            for key in ["kind", "namespace", "namespace_ref", "priority", "disabled", "tag"] {
+                o.remove(key);
+            }
+            o.insert("workers".into(), json!(app.workers));
         }
-        let anchor = app["anchored_on"].as_str();
-        let machine = self.machine_name(anchor, None);
-        app["diagnostics"] = json!({"anchor_replica":anchor});
-        app["anchored_on"] = json!(machine);
-        app
+        self.app_view("service", &app.namespace, &app.name, app.tag.as_deref().or_else(|| app.spec["tag"].as_str()),
+            app.spec["priority"].clone(), app.spec["disabled"].as_bool() == Some(true), jobs_value, tag, ("service", settings))
+    }
+
+    /// A registered proof app in the app shape; its job counts are the selected tag's.
+    pub(crate) async fn proof_app_value(&self, app: &crate::store::App, anchored: Option<&str>, tag: Option<&str>) -> anyhow::Result<Value> {
+        let (mut total, mut active, mut succeeded, mut failed, mut last) = (app.jobs, app.active, app.succeeded, app.failed, app.last_created_ms);
+        if let Some(tag) = tag {
+            let jobs = self.fleet.recent_jobs(&crate::store::ProofJobFilter {
+                namespace: Some(app.namespace.clone()), app: Some(app.name.clone()), tag: Some(tag.into()), ..Default::default()
+            }, usize::MAX).await?;
+            use crate::store::ProofJobState as S;
+            total = jobs.len() as u64;
+            active = jobs.iter().filter(|j| !j.state().is_terminal()).count() as u64;
+            succeeded = jobs.iter().filter(|j| j.state() == S::Succeeded).count() as u64;
+            failed = jobs.iter().filter(|j| j.state() == S::Failed).count() as u64;
+            last = jobs.iter().map(|j| j.created_ms).max();
+        }
+        let jobs = json!({
+            "total": total, "active": active, "succeeded": succeeded, "failed": failed,
+            "last_at": last.map(|ms| ms as f64 / 1000.0),
+        });
+        let proof = json!({
+            "elf_id": app.elf_id, "class": app.class, "anchor": app.anchor, "backends": app.backends,
+            "zkm_version": app.zkm_version, "max_queued": app.max_queued, "mean_prove_ms": app.mean_prove_ms,
+            "anchored_on": self.machine_name(anchored, None), "created_at": app.created_ms as f64 / 1000.0,
+            "diagnostics": {"anchor_replica": anchored},
+        });
+        Ok(self.app_view("proof", &app.namespace, &app.name, None, json!(app.priority), app.disabled, jobs, tag, ("proof", proof)))
+    }
+
+    /// The registered proof apps the caller sees: a token's namespace's that it is granted, or
+    /// an administrator's selected namespace's (every namespace's without one).
+    pub(crate) async fn proof_app_values(&self, c: Option<&Token>, q: &BTreeMap<String, String>, tag: Option<&str>) -> anyhow::Result<Vec<Value>> {
+        let namespace = match (c, q.get("namespace")) {
+            (None, None) => None,
+            _ => Some(self.scope(c, q, None)?.0),
+        };
+        let mut out = Vec::new();
+        for (app, anchored) in self.fleet.apps().await? {
+            if namespace.as_ref().is_some_and(|n| n != &app.namespace) || Self::require_grant(c, &app.name).is_err() {
+                continue;
+            }
+            out.push(self.proof_app_value(&app, anchored.as_deref(), tag).await?);
+        }
+        Ok(out)
     }
 }

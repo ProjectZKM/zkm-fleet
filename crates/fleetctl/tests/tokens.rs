@@ -14,7 +14,7 @@ impl Drop for Temp {
 
 fn cli() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetctl"));
-    cmd.env_remove("FLEET_TOKEN_FILE").env_remove("FLEET_ADMIN_TOKEN_FILE").env_remove("FLEET_NAMESPACE").env_remove("FLEET_TAG").env_remove("FLEET_GROUP");
+    cmd.env_remove("FLEET_TOKEN_FILE").env_remove("FLEET_NAMESPACE").env_remove("FLEET_TAG").env_remove("FLEET_GROUP");
     cmd
 }
 
@@ -51,10 +51,10 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
                 if let Some(pos) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&bytes[..pos]).to_ascii_lowercase();
                     assert!(headers.contains("authorization: bearer operator-token\r\n"));
-                    if step == 0 { assert!(headers.starts_with("post /admin/tokens?namespace=alice&tag=scope%3dresearch ")); }
-                    if step == 1 { assert!(headers.starts_with("get /admin/tokens ")); }
-                    if step == 2 { assert!(headers.starts_with("post /admin/tokens ")); }
-                    if step == 3 { assert!(headers.starts_with("post /admin/tokens?namespace=alice ")); }
+                    if step == 0 { assert!(headers.starts_with("post /tokens?namespace=alice&tag=scope%3dresearch ")); }
+                    if step == 1 { assert!(headers.starts_with("get /tokens ")); }
+                    if step == 2 { assert!(headers.starts_with("post /tokens ")); }
+                    if step == 3 { assert!(headers.starts_with("post /tokens?namespace=alice ")); }
                     let size = headers.lines().find_map(|l| l.strip_prefix("content-length: "))
                         .unwrap_or("0").parse::<usize>().unwrap();
                     break (pos + 4, size);
@@ -81,9 +81,9 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     });
     let env_file = dir.0.join("alice.env");
     let mut issue = cli();
-    issue.args(["--json", "token", "issue", "--tenant", "eth", "--label", "alice",
+    issue.args(["--json", "token", "issue", "--label", "alice",
         "--namespace", "alice", "--tag", "scope=research", "--app", "training", "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url,
-        "--admin-token-file"]).arg(&admin).arg("--server-ca").arg(tls.join("ca.pem")).arg("--out").arg(&env_file);
+        "--token-file"]).arg(&admin).arg("--server-ca").arg(tls.join("ca.pem")).arg("--out").arg(&env_file);
     let output = issue.output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let registered = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -107,11 +107,11 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     let replacement_env = dir.0.join("replacement.env");
     let refreshed = cli().args(["--json", "token", "refresh", registered["id"].as_str().unwrap(),
         "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url,
-        "--admin-token-file"]).arg(&admin).arg("--server-ca").arg(tls.join("ca.pem")).arg("--out").arg(&replacement_env).output().unwrap();
+        "--token-file"]).arg(&admin).arg("--server-ca").arg(tls.join("ca.pem")).arg("--out").arg(&replacement_env).output().unwrap();
     assert!(refreshed.status.success(), "{}", String::from_utf8_lossy(&refreshed.stderr));
     let replacement = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(replacement["namespace"], "1".repeat(32));
-    for field in ["apps", "tenant", "label", "tag"] { assert_eq!(replacement[field], registered[field]); }
+    for field in ["apps", "permissions", "label", "tag"] { assert_eq!(replacement[field], registered[field]); }
     assert_ne!(replacement["id"], registered["id"]);
     assert!(!String::from_utf8_lossy(&refreshed.stdout).contains(registered["address"].as_str().unwrap()));
     assert_ne!(replacement["token_hash"], registered["token_hash"]);
@@ -128,8 +128,8 @@ fn issues_private_scoped_bundle_and_refuses_overwrite() {
     assert!(tag.status.success());
     assert_eq!(String::from_utf8(tag.stdout).unwrap(),"scope=research");
     let untagged_env = dir.0.join("untagged.env");
-    let untagged = cli().args(["token","issue","--namespace","alice","--tenant","eth","--app","training",
-        "--endpoint","http://127.0.0.1:51000","--url",&url,"--admin-token-file"])
+    let untagged = cli().args(["token","issue","--namespace","alice","--app","training",
+        "--endpoint","http://127.0.0.1:51000","--url",&url,"--token-file"])
         .arg(&admin).arg("--out").arg(&untagged_env).output().unwrap();
     assert!(untagged.status.success(),"{}",String::from_utf8_lossy(&untagged.stderr));
     assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap()["tag"].is_null());
@@ -163,7 +163,7 @@ fn proof_token_bundle_uses_server_tls_without_a_client_certificate() {
             if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") { break pos + 4; }
         };
         let headers = String::from_utf8_lossy(&request[..header_end]);
-        assert!(headers.starts_with("POST /admin/tokens?namespace=alice "), "{headers}");
+        assert!(headers.starts_with("POST /tokens?namespace=alice "), "{headers}");
         let length: usize = headers.lines().find_map(|line| {
             line.to_ascii_lowercase().strip_prefix("content-length: ").map(str::to_owned)
         }).unwrap().parse().unwrap();
@@ -179,10 +179,10 @@ fn proof_token_bundle_uses_server_tls_without_a_client_certificate() {
     });
     let env_file = dir.0.join("alice.env");
     let output = cli().args([
-        "--json", "token", "issue", "--namespace", "alice", "--tenant", "eth", "--app",
+        "--json", "token", "issue", "--namespace", "alice", "--app",
         &format!("eth/{}", "ab".repeat(32)), "--endpoint", "https://fleet.example:51000",
         "--domain-name", "fleet.example", "--server-ca",
-    ]).arg(&server_ca).args(["--url", &url, "--admin-token-file"]).arg(&admin)
+    ]).arg(&server_ca).args(["--url", &url, "--token-file"]).arg(&admin)
         .arg("--out").arg(&env_file).output().unwrap();
     server.join().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -236,8 +236,8 @@ fn namespace_quota_cli_attaches_unit_caps_and_can_clear_them() {
             }
             let body: serde_json::Value = serde_json::from_slice(&bytes[end..end + size]).unwrap();
             let request = headers.lines().next().unwrap().to_string();
-            if step == 0 { assert!(request.starts_with("post /admin/namespaces ")); }
-            if step == 1 { assert!(request.starts_with("post /admin/tokens ")); }
+            if step == 0 { assert!(request.starts_with("post /namespaces ")); }
+            if step == 1 { assert!(request.starts_with("post /tokens ")); }
             requests.push((request, body));
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
         }
@@ -246,8 +246,8 @@ fn namespace_quota_cli_attaches_unit_caps_and_can_clear_them() {
     let server_ca = dir.0.join("gateway-ca.pem");
     std::fs::write(&server_ca, b"gateway trust bundle").unwrap();
     let owner_env = dir.0.join("alice.env");
-    let create = cli().args(["namespace", "create", "alice", "--tenant", "eth", "--gpus", "0.5", "--cpus", "4",
-        "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url, "--admin-token-file"])
+    let create = cli().args(["namespace", "create", "alice", "--gpus", "0.5", "--cpus", "4",
+        "--endpoint", "https://127.0.0.1:51000", "--domain-name", "stage", "--url", &url, "--token-file"])
         .arg(&admin).arg("--server-ca").arg(&server_ca)
         .arg("--out").arg(&owner_env).output().unwrap();
     assert!(create.status.success(), "{}", String::from_utf8_lossy(&create.stderr));
@@ -257,22 +257,52 @@ fn namespace_quota_cli_attaches_unit_caps_and_can_clear_them() {
                  vec!["namespace","quota","alice","--tag","scope=research","--gpus","1","--cpus","4"],
                  vec!["namespace","quota","alice","--tag","scope=research","--gpus","2"],
                  vec!["namespace","quota","alice","--tag","scope=research"]] {
-        let result = cli().args(args).args(["--url", &url, "--admin-token-file"]).arg(&admin).output().unwrap();
+        let result = cli().args(args).args(["--url", &url, "--token-file"]).arg(&admin).output().unwrap();
         assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     }
     let requests = server.join().unwrap();
     assert_eq!(requests[0].1["quota"], serde_json::json!({"gpus":0.5,"cpus":4.0}));
-    assert_eq!(requests[1].1["manage_apps"], true);
+    assert_eq!(requests[1].1["permissions"], serde_json::json!(["read","submit","manage"]));
     assert_eq!(requests[1].1["tag"], "scope=default");
-    assert!(requests[2].0.starts_with("put /admin/namespaces/alice/quota "));
+    assert!(requests[2].0.starts_with("put /namespaces/alice/quota "));
     assert_eq!(requests[2].1, serde_json::json!({"gpus":2.0,"cpus":8.0}));
     assert_eq!(requests[3].1, serde_json::json!({"gpus":null,"cpus":null}));
-    assert!(requests[4].0.starts_with("put /admin/namespaces/alice/quota?tag=scope%3dresearch "));
+    assert!(requests[4].0.starts_with("put /namespaces/alice/quota?tag=scope%3dresearch "));
     assert_eq!(requests[4].1,serde_json::json!({"gpus":1.0,"cpus":4.0}));
-    assert!(requests[5].0.starts_with("put /admin/namespaces/alice/quota?tag=scope%3dresearch "));
+    assert!(requests[5].0.starts_with("put /namespaces/alice/quota?tag=scope%3dresearch "));
     assert_eq!(requests[5].1,serde_json::json!({"gpus":2.0,"cpus":null}));
     assert_eq!(requests[6].1,serde_json::json!({"gpus":null,"cpus":null}));
-    let invalid = cli().args(["namespace", "quota", "alice", "--gpus", "NaN", "--url", &url, "--admin-token-file"]).arg(admin).output().unwrap();
+    let invalid = cli().args(["namespace", "quota", "alice", "--gpus", "NaN", "--url", &url, "--token-file"]).arg(admin).output().unwrap();
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("finite and non-negative"));
+}
+
+mod common;
+
+#[test]
+fn an_administrator_issues_another_administrators_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Temp(std::env::temp_dir().join(format!("fleet-admin-token-{:x}", rand::random::<u128>())));
+    std::fs::create_dir(&dir.0).unwrap();
+    let admin = dir.0.join("admin.token");
+    std::fs::write(&admin, "operator-token").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = common::stub(listener, 1, |_, body| (201, body.to_string()));
+    let out = dir.0.join("ops.token");
+    let issued = cli().args(["token", "admin", "--label", "ops", "--url", &url, "--token-file"]).arg(&admin)
+        .arg("--out").arg(&out).output().unwrap();
+    let seen = server.join().unwrap();
+    assert!(issued.status.success(), "{}", String::from_utf8_lossy(&issued.stderr));
+    assert!(seen[0].line.starts_with("POST /tokens HTTP/1.1"), "{}", seen[0].line);
+    let body = &seen[0].body;
+    assert_eq!((body["permissions"].clone(), body["label"].clone()), (serde_json::json!(["admin"]), serde_json::json!("ops")));
+    assert!(body.get("namespace").is_none() && body.get("apps").is_none());
+    let secret = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(body["token_hash"], hex::encode(sha2::Sha256::digest(secret.trim().as_bytes())));
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!String::from_utf8_lossy(&issued.stdout).contains(secret.trim()));
+    let again = cli().args(["token", "admin", "--label", "ops", "--url", &url, "--token-file"]).arg(&admin)
+        .arg("--out").arg(&out).output().unwrap();
+    assert!(!again.status.success(), "an existing token file is never overwritten");
 }

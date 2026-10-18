@@ -12,7 +12,7 @@ def executor(tmp_path, monkeypatch):
     (tmp_path / "batches.yaml").write_text("batches: {}\n")
     (tmp_path / "services.yaml").write_text(yaml.safe_dump({"services": [{
         "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
-        "app": "eth/"+"b"*64, "disabled": True, "replicas": 2,
+        "app": "eth", "elf_id": "b"*64, "disabled": True, "replicas": 2,
     }]}))
     e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
@@ -210,7 +210,7 @@ def test_start_takes_resources_from_services_yaml_and_stops_extra_replicas(execu
     assert (start.call_count,replica.name,replica.service.gpus,replica.service.cpus)==(1,"proof-0",2,8)
 
 
-@pytest.mark.parametrize("field,value",[("namespace","another"),("app","eth/"+"c"*64),("tag","other"),("kind","app")])
+@pytest.mark.parametrize("field,value",[("namespace","another"),("app","other-app"),("elf_id","c"*64),("tag","other"),("kind","app")])
 def test_scale_cannot_change_machine_service_scope(executor,field,value):
     before=executor.services.read_bytes()
     service=yaml.safe_load(before)["services"][0];service[field]=value
@@ -290,12 +290,12 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
     services=yaml.safe_load(executor.services.read_text())
-    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth/"+"b"*64},
+    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth","elf_id":"b"*64},
                            {"name":"web","kind":"app","namespace":"zkm"}]
     executor.services.write_text(yaml.safe_dump(services))
-    assert app_message(executor,"remove-1",{"remove":True},app="eth/"+"b"*64)==({"removed":["proof"]},None)
+    assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["proof"]},None)
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    assert app_message(executor,"remove-2",{"remove":True},app="eth/"+"b"*64)==({"removed":[]},None)
+    assert app_message(executor,"remove-2",{"remove":True},app="eth")==({"removed":[]},None)
     assert app_message(executor,"remove-3",{"remove":True},app="web",ns="1"*32,ns_name="zkm")==({"removed":["web"]},None)
     assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["other-ns"]
     (executor.services.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
@@ -306,7 +306,7 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
 def test_a_service_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
-    result,error=app_message(executor,"remove-1",{"remove":True},app="eth/"+"b"*64)
+    result,error=app_message(executor,"remove-1",{"remove":True},app="eth")
     assert "uncertain" in error
     assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["proof"]
 

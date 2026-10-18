@@ -381,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn relay_checks_cluster_auth_fencing_size_hash_and_single_use_without_files() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nadmin_token_file: unused\ntenants:\n - name: proof\n",dir.path().display())).unwrap();
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\n",dir.path().display())).unwrap();
         let fleet = Scheduler::new(
             cfg,
             Arc::new(MemoryStore::default()),
@@ -390,8 +390,7 @@ mod tests {
         );
         let state = HttpState {
             fleet: fleet.clone(),
-            admin_token: Arc::new(SECRET.into()),
-            workloads: Arc::new(WorkloadController::new(fleet.clone(), SECRET.into(), SECRET.into()).unwrap()),
+            workloads: Arc::new(WorkloadController::new(fleet.clone(), SECRET.into()).unwrap()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());

@@ -151,15 +151,12 @@ impl WorkloadController {
         let (key, intent) = self.scale_service(namespace, app, node)?;
         // Recheck existence under the operation lock: deletion may have finished
         // after the HTTP handler resolved the app but before this request acquired it.
-        let exists = if let Some((tenant, elf)) = app.split_once('/') {
-            self.fleet.app_known(namespace, tenant, elf)
-        } else {
-            self.inner
+        let exists = self.fleet.app_known(namespace, app)
+            || self.inner
                 .lock()
                 .apps
                 .get(app)
-                .is_some_and(|a| !a.removed && a.persistent && a.namespace == namespace)
-        };
+                .is_some_and(|a| !a.removed && a.persistent && a.namespace == namespace);
         if !exists {
             return Err(fail(404, "unknown app"));
         }
@@ -220,10 +217,7 @@ impl WorkloadController {
         let mut service: Value = service.into();
         let serving = self.inner.lock().apps.get(text(&service, "name"))
             .filter(|a| a.persistent).map(|a| a.spec["priority"].as_i64().unwrap_or(0));
-        let priority = serving.unwrap_or_else(|| {
-            text(&service, "app").split_once('/')
-                .map_or(0, |(tenant, elf)| self.fleet.app_priority(text(&service, "namespace"), tenant, elf).into())
-        });
+        let priority = serving.unwrap_or_else(|| self.fleet.app_priority(text(&service, "namespace"), text(&service, "app")).into());
         service["priority"] = json!(priority);
         service
     }

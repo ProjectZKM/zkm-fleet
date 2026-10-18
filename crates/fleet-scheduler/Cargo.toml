@@ -29,6 +29,7 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+rand = "0.8"
 reqwest.workspace = true
 
 [dev-dependencies]
@@ -38,3 +39,4 @@ fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
 tokio-stream = { version = "0.1", features = ["net"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

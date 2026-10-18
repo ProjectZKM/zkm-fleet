@@ -70,11 +70,15 @@ using the node's Ray hostname/IP, namespace, actual ELF digest, validated GPU
 image, and durable storage path. The example starts disabled. Put API credentials
 and RPC URLs in the private file described by
 [`worker.env.example`](worker.env.example), readable only by the worker account.
-Fleet supplies the scoped identity, state root, and loopback GPU endpoint.
+Fleet supplies the scoped identity, state root, and loopback GPU endpoint. The
+worker reads its app name from `FLEET_APP`. Its checkpoint identity names the app;
+a version-1 checkpoint naming a tenant is upgraded in place when the rest of its
+identity matches.
 
-A new guest has a new app identity. Stage its service disabled and wait for the
-node heartbeat to advertise it. Register it with
-`fleetctl --token-file zkm-owner.token --namespace zkm app add ethproofs/ --elf /path/to/program.elf`.
+A new guest has a new app identity. Register it under a new NAME with
+`fleetctl --token-file zkm-owner.token --namespace zkm app add NAME --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda`,
+then stage its service disabled with `app: NAME` and the guest's `elf_id`, and
+wait for the node heartbeat to advertise it.
 Use a new service name and state directory. Keep a temporary rollback package
 until proving and reporting are verified, then remove retired deployment records
 according to the app's retention policy. Keep GOAT's service and image unchanged.
@@ -87,7 +91,7 @@ restarts. Run only one worker for the stream and preserve GOAT's service.
 
 ## Production deployment
 
-The worker runs on `ant-5090-2` as one replica. Inspect its current GPU/CPU
+The worker runs on `ant-5090-2` as one replica of app `ethproofs-z4`. Inspect its current GPU/CPU
 allocation with `fleetctl app scale`; resource settings can change independently
 of the worker package.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
@@ -95,7 +99,7 @@ GPU allocation and preparation concurrency are separate settings.
 The external EthProofs client and its old SDK endpoint have been retired.
 GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an app-owner decision; inspect it with `fleetctl --namespace zkm app` using an
-owner token for namespace `zkm`. Its SDK signing tenant need not be `ethproofs`.
+owner token for namespace `zkm`.
 
 The package records worker source commit
 `85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9` on
@@ -108,8 +112,8 @@ above; package checksums and `source-revision` record the worker separately.
 For example, request five GPUs while retaining the current CPU and replica settings:
 
 ```bash
-fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8 --gpus 5
-fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 --gpus 5
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4
 ```
 
 Inspect `~/app/fleet/work/apps/ethproofs/v5-worker/checkpoint.json` for the saved

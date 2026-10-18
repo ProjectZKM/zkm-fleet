@@ -47,15 +47,17 @@ message Token {
   required string id = 1;
   // Internal SDK signer binding and token digest are never serialized to clients.
   required string address = 2;
-  required string tenant = 3;
-  required string label = 4;
-  required uint64 created_ms = 5;
-  optional uint64 revoked_ms = 6;
-  optional StringList apps = 7;
-  optional string token_hash = 8;
-  optional string namespace = 9;
-  optional string tag = 10;
-  required bool manage_apps = 11;
+  required string label = 3;
+  required uint64 created_ms = 4;
+  optional uint64 revoked_ms = 5;
+  // The apps and batches it may use, by name; absent for all of its namespace's.
+  optional StringList apps = 6;
+  optional string token_hash = 7;
+  optional string namespace = 8;
+  optional string tag = 9;
+  // What the token may do: some of read, submit, manage within its namespace, tag and app
+  // grants; or admin, over every namespace (an admin token has no namespace).
+  repeated string permissions = 10;
 }
 
 enum ProofJobState {
@@ -67,7 +69,8 @@ enum ProofJobState {
 
 message ProofJob {
   required string id = 1;
-  required string tenant = 2;
+  // The app it runs for; empty for a request refused before its app was known.
+  required string app = 2;
   required string owner = 3;
   required string namespace = 4;
   required string tag = 5;
@@ -90,19 +93,46 @@ message ProofJob {
   optional fleet.v1.ProofOutputs outputs = 22;
 }
 
+// A registered proof app: a named program (the sha256 of its ELF) in a namespace, and how its
+// jobs are placed. The job counts are filled in by listings.
 message App {
-  required int32 priority = 1;
-  required string namespace = 2;
-  required string tenant = 3;
-  required string elf_id = 4;
-  required uint64 created_ms = 5;
-  required uint64 jobs = 6;
-  required uint64 active = 7;
-  required uint64 succeeded = 8;
-  required uint64 failed = 9;
-  optional uint64 last_created_ms = 10;
-  optional double mean_prove_ms = 11;
-  required bool disabled = 12;
+  required string namespace = 1;
+  required string name = 2;
+  required string elf_id = 3;
+  required int32 priority = 4;
+  required bool disabled = 5;
+  required uint64 created_ms = 6;
+  // "latency": the biggest free prover first; "batch": the smallest that fits.
+  required string class = 7;
+  // "none", "shared" (keep the program on the prover it first ran on while that one is
+  // healthy) or "exclusive" (as shared, and that prover serves this app only).
+  required string anchor = 8;
+  // Node backends that may prove it ("cuda", "cpu", "mock"); empty for any.
+  repeated string backends = 9;
+  // Only provers of this circuit version prove it.
+  optional string zkm_version = 10;
+  // Jobs queued or running at most; more are refused.
+  required uint32 max_queued = 11;
+  required uint64 jobs = 12;
+  required uint64 active = 13;
+  required uint64 succeeded = 14;
+  required uint64 failed = 15;
+  optional uint64 last_created_ms = 16;
+  optional double mean_prove_ms = 17;
+}
+
+// Registers a proof app (POST /apps). Unset policy fields take the defaults: class batch,
+// anchor none, any backend and circuit version, 64 queued jobs, priority 0.
+message RegisterAppRequest {
+  required string name = 1;
+  required string elf_id = 2;
+  optional string class = 3;
+  optional string anchor = 4;
+  repeated string backends = 5;
+  optional string zkm_version = 6;
+  optional uint32 max_queued = 7;
+  optional int32 priority = 8;
+  optional string namespace = 9;
 }
 
 message WorkloadTemplate {
@@ -228,31 +258,20 @@ message NamespaceSelector {
 
 message CreateTokenRequest {
   required string id = 1;
-  required string tenant = 2;
-  required string address = 3;
-  required string label = 4;
-  optional StringList apps = 5;
-  optional string token_hash = 6;
-  optional string namespace = 7;
-  optional string tag = 8;
-  required bool manage_apps = 9;
+  required string address = 2;
+  required string label = 3;
+  optional StringList apps = 4;
+  optional string token_hash = 5;
+  optional string namespace = 6;
+  optional string tag = 7;
+  repeated string permissions = 8;
 }
 
 message ProofJobsQuery {
   optional string namespace = 1;
   optional string tag = 2;
-  optional string tenant = 3;
-  optional string elf = 4;
-  required bool active = 5;
-  required uint64 limit = 6;
-}
-
-message AppRequest {
-  optional string namespace = 1;
-  optional string tag = 2;
-  optional string tenant = 3;
-  optional string elf_id = 4;
-  optional int32 priority = 5;
+  required bool active = 3;
+  required uint64 limit = 4;
 }
 
 message PublicValuesQuery {
@@ -272,12 +291,11 @@ message SubmitProofRequest {
 }
 
 message ProofJobFilter {
-  optional string tenant = 1;
-  optional string elf = 2;
-  required bool active = 3;
-  optional string owner = 4;
-  optional string namespace = 5;
-  optional string tag = 6;
+  optional string app = 1;
+  required bool active = 2;
+  optional string owner = 3;
+  optional string namespace = 4;
+  optional string tag = 5;
 }
 
 message NodeStatus {
@@ -299,9 +317,8 @@ message NodeStatus {
 
 message AppAnchor {
   required string namespace = 1;
-  required string tenant = 2;
-  required string elf_id = 3;
-  required string node = 4;
+  required string app = 2;
+  required string node = 3;
 }
 
 message FleetStatus {

@@ -39,69 +39,25 @@ pub struct SchedulerConfig {
     /// Attempts per job, the first one included; a retry avoids the nodes that failed it.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
-    /// Reject requests whose signature does not map to a tenant.
-    #[serde(default)]
-    pub require_signature: bool,
-    /// Tenant for unsigned or unknown requests when `require_signature` is false.
-    #[serde(default)]
-    pub default_tenant: Option<String>,
-    pub tenants: Vec<TenantConfig>,
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     /// TLS for node-initiated control gRPC, independent of gateway TLS termination.
     #[serde(default)]
     pub control_tls: Option<TlsConfig>,
     /// Shared secret authenticating node-initiated control requests. At least 32 characters.
+    /// Every other caller has a token from the database (`fleet-scheduler issue-admin` makes
+    /// the first administrator's).
     pub cluster_token_file: PathBuf,
-    /// Bearer token for the operator HTTP endpoints (`/status`, ELF upload).
-    pub admin_token_file: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TenantConfig {
-    pub name: String,
-    /// Ethereum addresses whose request signatures map to this tenant.
-    #[serde(default)]
-    pub addresses: Vec<String>,
-    #[serde(default)]
-    pub class: SchedulingClass,
-    #[serde(default)]
-    pub anchor: AnchorPolicy,
-    /// Only nodes proving with this circuit version serve the tenant.
-    #[serde(default)]
-    pub zkm_version: Option<String>,
-    /// Allowed node backends ("cuda", "cpu", "mock"); empty means any.
-    #[serde(default)]
-    pub backends: Vec<String>,
-    /// Prover name prefixes that may run this tenant's jobs, e.g. `[ethproofs-gpu]` for
-    /// the replicas of that service; empty means any. A tenant whose proofs must come
-    /// from a particular prover configuration (keys, verification mode) pins it here.
-    #[serde(default)]
-    pub nodes: Vec<String>,
-    #[serde(default = "default_max_queued")]
-    pub max_queued: usize,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SchedulingClass {
-    /// Dispatched before every batch job.
-    Latency,
-    #[default]
-    Batch,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AnchorPolicy {
-    /// Any eligible node.
-    #[default]
-    None,
-    /// Keep a program on the node it first ran on while that node is healthy.
-    Shared,
-    /// As `shared`, and the anchor node serves this tenant only.
-    Exclusive,
-}
+/// Settings this configuration no longer has, with what replaced them: starting with one is
+/// refused rather than silently ignoring it.
+const REMOVED: [(&str, &str); 4] = [
+    ("tenants", "a proof app's placement policy is set when it is registered (fleetctl app add NAME --elf-id ID --class --anchor --backend)"),
+    ("default_tenant", "every proof job comes from a namespace token"),
+    ("require_signature", "every proof job is signed by its namespace token's key"),
+    ("admin_token_file", "administrator tokens are in the database: fleet-scheduler issue-admin --label NAME --out FILE"),
+];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TlsConfig {
@@ -130,14 +86,15 @@ fn default_node_stale_secs() -> u64 {
 fn default_max_attempts() -> u32 {
     2
 }
-fn default_max_queued() -> usize {
-    64
-}
 
 impl SchedulerConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let mut cfg: SchedulerConfig = serde_yaml::from_str(&text)?;
+        let raw: serde_yaml::Value = serde_yaml::from_str(&text)?;
+        for (key, instead) in REMOVED {
+            anyhow::ensure!(raw.get(key).is_none(), "{}: {key} was removed: {instead}", path.display());
+        }
+        let mut cfg: SchedulerConfig = serde_yaml::from_value(raw)?;
         if let Some(f) = &cfg.database_url_file {
             cfg.database_url = Some(std::fs::read_to_string(f)?.trim().to_string());
         }
@@ -152,34 +109,8 @@ impl SchedulerConfig {
             self.control_tls.is_some() || (control.ip().is_loopback() && self.database_url.is_none()),
             "control gRPC requires TLS whenever it is network-reachable or backed by production Postgres"
         );
-        let mut seen = std::collections::HashSet::new();
-        for t in &self.tenants {
-            anyhow::ensure!(
-                seen.insert(t.name.as_str()),
-                "tenant {} declared twice",
-                t.name
-            );
-        }
-        if let Some(d) = &self.default_tenant {
-            anyhow::ensure!(
-                self.tenant(d).is_some(),
-                "default_tenant {d} is not declared"
-            );
-        }
         anyhow::ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
         Ok(())
-    }
-
-    pub fn tenant(&self, name: &str) -> Option<&TenantConfig> {
-        self.tenants.iter().find(|t| t.name == name)
-    }
-
-    /// Tenant for a recovered signer address (case-insensitive, with or without 0x).
-    pub fn tenant_for_address(&self, address: &str) -> Option<&TenantConfig> {
-        let want = normalize_address(address);
-        self.tenants
-            .iter()
-            .find(|t| t.addresses.iter().any(|a| normalize_address(a) == want))
     }
 }
 
@@ -187,7 +118,7 @@ impl SchedulerConfig {
 mod tests {
     use super::*;
     fn cfg(control: &str, tls: &str) -> SchedulerConfig {
-        serde_yaml::from_str(&format!("public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\nadmin_token_file: /tmp/admin\ncontrol_addr: {control}\n{tls}tenants: []\n")).unwrap()
+        serde_yaml::from_str(&format!("public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: {control}\n{tls}")).unwrap()
     }
     #[test]
     fn control_listener_requires_tls_outside_loopback() {
@@ -198,11 +129,16 @@ mod tests {
         production.database_url = Some("postgres://localhost/fleet".into());
         assert!(production.validate().is_err());
     }
-}
 
-fn normalize_address(a: &str) -> String {
-    a.trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X")
-        .to_ascii_lowercase()
+    #[test]
+    fn a_removed_setting_is_refused_with_what_replaced_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.yaml");
+        let base = "public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: 127.0.0.1:51001\n";
+        std::fs::write(&path, base).unwrap();
+        assert!(SchedulerConfig::load(&path).is_ok());
+        std::fs::write(&path, format!("{base}admin_token_file: /tmp/admin\n")).unwrap();
+        let e = SchedulerConfig::load(&path).unwrap_err().to_string();
+        assert!(e.contains("admin_token_file was removed") && e.contains("fleet-scheduler issue-admin"), "{e}");
+    }
 }

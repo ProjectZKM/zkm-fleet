@@ -83,7 +83,6 @@ struct WorkloadState {
 
 pub struct WorkloadController {
     fleet: Arc<Scheduler>,
-    admin: String,
     cluster: String,
     dir: PathBuf,
     inner: Mutex<WorkloadState>,
@@ -95,8 +94,16 @@ pub(crate) fn integrated_worker(service: &Value) -> bool {
         && service["worker_command"].as_array().is_some_and(|command| !command.is_empty())
 }
 
+/// The proof apps an enabled integrated worker feeds: (namespace, app).
+fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
+    inner.services.values()
+        .filter(|s| integrated_worker(&s.service) && !s.disabled)
+        .map(|s| (text(&s.service, "namespace").to_owned(), text(&s.service, "app").to_owned()))
+        .collect()
+}
+
 impl WorkloadController {
-    pub fn new(fleet: Arc<Scheduler>, admin: String, cluster: String) -> anyhow::Result<Self> {
+    pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
         for name in ["apps", "jobs", "commands", "artifacts", "services"] {
             fs::create_dir_all(dir.join(name))?;
@@ -116,17 +123,9 @@ impl WorkloadController {
                 .services
                 .insert(format!("{}-{}", v.worker, text(&v.service, "name")), v);
         }
-        fleet.set_worker_owned_apps(inner.services.values().filter(|s| integrated_worker(&s.service) && !s.disabled)
-            .filter_map(|s| {
-                    text(&s.service, "app").split_once('/').map(|(tenant, elf)| {
-                            (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
-                            )
-                        })
-                }).collect(),
-        );
+        fleet.set_worker_owned_apps(worker_owned(&inner));
         Ok(Self {
             fleet,
-            admin,
             cluster,
             dir,
             inner: Mutex::new(inner),
@@ -134,33 +133,28 @@ impl WorkloadController {
             notify: tokio::sync::Notify::new(),
         })
     }
+    pub(crate) fn fleet(&self) -> &Arc<Scheduler> {
+        &self.fleet
+    }
     fn refresh_worker_owned_apps(&self) {
         self.update_worker_owned_apps(&self.inner.lock());
     }
     fn update_worker_owned_apps(&self, inner: &WorkloadState) {
-        self.fleet.set_worker_owned_apps(inner.services.values()
-            .filter(|s| integrated_worker(&s.service) && !s.disabled)
-            .filter_map(|s| {
-                    text(&s.service, "app").split_once('/').map(|(tenant, elf)| {
-                            (text(&s.service, "namespace").into(), tenant.into(), elf.into(),
-                            )
-                        })
-                }).collect(),
-        );
+        self.fleet.set_worker_owned_apps(worker_owned(inner));
     }
 
-    /// Mirrors an integrated worker's state onto its proof app. A worker whose proof app is
-    /// not registered has nothing to mirror: that must not fail the heartbeat or scale pass
-    /// carrying it, or every later node result is rejected with it.
+    /// Mirrors a prover's state onto its proof app. A prover whose app is not registered has
+    /// nothing to mirror: that must not fail the heartbeat or scale pass carrying it, or every
+    /// later node result is rejected with it.
     pub(super) async fn sync_app_record(&self, service: &Value, disabled: bool) -> anyhow::Result<()> {
-        let Some((tenant, elf)) = text(service, "app").split_once('/') else { return Ok(()) };
-        match self.fleet.set_app_disabled(text(service, "namespace"), tenant, elf, disabled).await {
-            Err(e) if e.downcast_ref::<crate::fleet::RequestRejection>().is_some_and(|r| r.status == 404) => {
-                tracing::warn!(service = text(service, "name"), error = %e, "integrated worker has no registered proof app");
-                Ok(())
+        let (namespace, app) = (text(service, "namespace"), text(service, "app"));
+        if !self.fleet.app_known(namespace, app) {
+            if text(service, "kind").starts_with("ziren-") {
+                tracing::warn!(service = text(service, "name"), app, "prover's proof app is not registered");
             }
-            r => r.map(drop),
+            return Ok(());
         }
+        self.fleet.set_app_disabled(namespace, app, disabled).await.map(drop)
     }
 
     /// Drops a service record, its allocation already released. Nothing else removes one, and a
@@ -201,8 +195,7 @@ impl WorkloadController {
         Ok(())
     }
 
-    /// An app-level node message's address for `app` (a proof app's `tenant/elf_id` or a
-    /// serving app's name) in `namespace`. A node's configuration may name the namespace by id
+    /// An app-level node message's address for `app` in `namespace`. A node's configuration may name the namespace by id
     /// or by name, so both go along; the node finds the services that run the app.
     pub(super) fn app_message(&self, namespace: &str, app: &str) -> Value {
         let name = self.fleet.namespace(namespace).map(|n| n.name).unwrap_or_default();
@@ -428,12 +421,6 @@ impl WorkloadController {
             return Err(fail(403, "app is not granted"));
         }
         Ok(())
-    }
-    fn require_management(c: Option<&Token>, name: &str) -> anyhow::Result<()> {
-        if c.is_some_and(|c| !c.manage_apps) {
-            return Err(fail(403, "app management grant required"));
-        }
-        Self::require_grant(c, name)
     }
     fn require_service_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -847,8 +834,9 @@ impl WorkloadController {
             let key = format!("{worker_id}-{name}");
             let existing = { self.inner.lock().services.get(&key).cloned() };
             let intent = if let Some(mut intent) = existing {
-                // NodeSession launch settings are node-admin configuration, not resource-scale overrides.
-                for field in ["worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root",
+                // The app a service runs, its program and its launch settings are the node's own
+                // configuration, not resource-scale overrides.
+                for field in ["app", "elf_id", "worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root",
                 ] {
                     if observed.get(field).is_some() || intent.service.get(field).is_some() {
                         intent.service[field] = observed[field].clone();
@@ -1376,26 +1364,23 @@ impl WorkloadController {
                 }
             }
             if disabled && text(s, "kind") == "ziren-gpu" {
-                if let Some((tenant, elf)) = text(s, "app").split_once('/') {
-                    let jobs = self
-                        .fleet
-                        .recent_jobs(
-                            &crate::store::ProofJobFilter {
-                                namespace: Some(text(s, "namespace").into()),
-                                tenant: Some(tenant.into()),
-                                elf: Some(elf.into()),
-                                active: true,
-                                ..Default::default()
-                            },
-                            usize::MAX,
-                        )
-                        .await?;
-                    if jobs
-                        .iter()
-                        .any(|j| j.node.is_some() && j.started_ms.is_some())
-                    {
-                        continue;
-                    }
+                let jobs = self
+                    .fleet
+                    .recent_jobs(
+                        &crate::store::ProofJobFilter {
+                            namespace: Some(text(s, "namespace").into()),
+                            app: Some(text(s, "app").into()),
+                            active: true,
+                            ..Default::default()
+                        },
+                        usize::MAX,
+                    )
+                    .await?;
+                if jobs
+                    .iter()
+                    .any(|j| j.node.is_some() && j.started_ms.is_some())
+                {
+                    continue;
                 }
             }
             if !disabled {
@@ -1742,128 +1727,99 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
 const BATCH_SETTINGS: [&str; 10] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
     "preemptible", "min_runtime_s", "stop_timeout_s"];
 
+/// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batches", "internal/jobs",
-    ] {
+    for root in ["apps", "batches"] {
         router = router
             .route(&format!("/{root}"), any(handle))
             .route(&format!("/{root}/*path"), any(handle));
     }
     router.with_state(control)
 }
+
+/// The nodes' batch log uploads, authenticated by the cluster token.
+pub fn internal_router(control: Arc<WorkloadController>) -> Router {
+    Router::new()
+        .route("/internal/jobs/*path", any(internal_handle))
+        .with_state(control)
+}
+
 async fn handle(State(s): State<Arc<WorkloadController>>, request: Request) -> Response {
     match handle_result(s, request).await {
         Ok(r) => r,
         Err(e) => response_error(e),
     }
 }
+
+async fn internal_handle(State(s): State<Arc<WorkloadController>>, request: Request) -> Response {
+    let uri = request.uri().clone();
+    let parts: Vec<&str> = uri.path().trim_matches('/').split('/').collect();
+    let result = match query(&uri) {
+        Ok(q) => internal_logs(s, request, &parts, &q).await,
+        Err(e) => Err(e),
+    };
+    result.unwrap_or_else(response_error)
+}
+
+fn query(uri: &axum::http::Uri) -> anyhow::Result<BTreeMap<String, String>> {
+    Ok(reqwest::Url::parse(&format!("http://localhost{uri}"))?
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect())
+}
+
 async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::Result<Response> {
     let uri = request.uri().clone();
     let method = request.method().clone();
-    let q: BTreeMap<String, String> = reqwest::Url::parse(&format!("http://localhost{uri}"))?
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
+    let q = query(&uri)?;
     if q.contains_key("group") {
         return Err(fail(400, "use optional tag; groups are not a resource"));
     }
     let mut parts: Vec<_> = uri.path().trim_matches('/').split('/').collect();
-    // /batches/{name}/jobs[/{id}] are one batch's jobs; the other /batches routes are batch
-    // definitions, which share the app template routes.
-    let batch_jobs = parts.first() == Some(&"batches") && parts.get(2) == Some(&"jobs");
-    let batch = parts.first() == Some(&"batches") && !batch_jobs;
-    if batch { parts[0] = "apps"; }
-    // /apps/TENANT/ELF_ID[/ACTION] name a registered app by its tenant and full ELF id (any
-    // other app name has no '/').
-    let registered = (parts.first() == Some(&"apps") && parts.len() >= 3
-        && parts[2].len() == 64 && parts[2].bytes().all(|b| b.is_ascii_hexdigit()))
-        .then(|| (parts[1].to_owned(), parts[2].to_owned()));
-    if registered.is_some() {
-        parts.drain(1..3);
-        if !matches!(parts.get(1), Some(&("scale" | "logs" | "settings" | "disabled" | "available"))) || parts.len() != 2 {
-            return Err(fail(404, "unknown workload API operation"));
-        }
-    }
-    let bearer = request
-        .headers()
-        .get(token::HEADER)
-        .and_then(|v| v.to_str().ok());
-    if parts.first() == Some(&"internal") {
-        return internal_logs(s, request, &parts, &q).await;
-    }
-    let principal = if token::bearer_matches(bearer, &s.admin) {
-        None
-    } else {
-        Some(
-            s.fleet
-                .token_for_token(bearer)
-                .ok_or_else(|| fail(401, "missing or wrong token"))?,
-        )
-    };
+    // The token `crate::http::router` admitted: None for an administrator's.
+    let principal = request.extensions().get::<Option<Token>>().cloned()
+        .ok_or_else(|| fail(401, "missing or wrong token"))?;
     let c = principal.as_ref();
     // Scope selectors never widen a token's namespace or tag.
     if let Some(c) = c {
         s.scope(Some(c), &q, None)?;
     }
+    if parts.first() == Some(&"apps") {
+        if parts.len() >= 2 {
+            if let Some(app) = s.proof_app(c, &q, parts[1])? {
+                return s.proof_app_request(c, &q, app, &method, &parts[2..], request).await;
+            }
+        }
+        if parts.get(2) == Some(&"jobs") {
+            return Err(fail(404, format!("no proof app {} (only proof apps have jobs; a batch's are under /batches)", parts[1])));
+        }
+    }
+    // /batches/{name}/jobs[/{id}] are one batch's jobs; the other /batches routes are batch
+    // definitions, which share the serving app template routes.
+    let batch_jobs = parts.first() == Some(&"batches") && parts.get(2) == Some(&"jobs");
+    let batch = parts.first() == Some(&"batches") && !batch_jobs;
+    if batch { parts[0] = "apps"; }
     if batch && parts.len() == 3 && parts[2] == "scale" {
         return Err(fail(400, "batch resources are selected per job with batch submit --gpus and --cpus",
         ));
     }
     let action = match parts.as_slice() {
-        ["apps", action] if registered.is_some() && matches!(*action, "scale" | "logs" | "settings") => Some(*action),
-        ["apps", _, action] if registered.is_none() && matches!(*action, "scale" | "logs" | "settings") && !batch => Some(*action),
+        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings") && !batch => Some(*action),
         _ => None,
     };
     if let Some(action) = action {
         let (namespace, _) = s.scope(c, &q, None)?;
-        let app = if let Some((tenant, elf)) = &registered {
-            if c.is_some_and(|c| !c.manage_apps && c.tenant != *tenant) {
-                return Err(fail(403, "another tenant cannot be selected"));
-            }
-            if !s.fleet.app_known(&namespace, tenant, elf) { return Err(fail(404, "unknown app")); }
-            format!("{tenant}/{elf}")
-        } else {
-            let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace && s.app_visible(a, c, &q))
-                .cloned().ok_or_else(|| fail(404, "unknown app"))?;
-            if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
-                )); }
-            app.name
-        };
-        WorkloadController::require_grant(c, &app)?;
-        if action == "logs" {
-            if method != Method::GET {
-                return Err(fail(405, "GET required"));
-            }
-            return s.app_logs(c, &namespace, &app, &q).await;
-        }
-        if action == "settings" {
-            if method != Method::PUT {
-                return Err(fail(405, "PUT required"));
-            }
-            WorkloadController::require_management(c, &app)?;
-            let node = q.get("node").map(String::as_str);
-            s.require_service_scope(c, &namespace, &app, node)?;
-            let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-            return Ok((StatusCode::ACCEPTED, Json(s.request_update(&namespace, &app, node, set).await?)).into_response());
-        }
-        if method == Method::GET {
-            s.require_service_scope(c, &namespace, &app, q.get("node").map(String::as_str))?;
-            return Ok(Json(s.scale_status(&namespace, &app, q.get("node").map(String::as_str),
-            )?).into_response());
-        }
-        if method == Method::PUT {
-            WorkloadController::require_management(c, &app)?;
-            let body: fleet_proto::model::v1::ScaleRequest = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
-            s.require_service_scope(c, &namespace, &app, body.node.as_deref())?;
-            return Ok((StatusCode::ACCEPTED, Json(s.request_scale(&namespace, &app, body).await?),
-            ).into_response());
-        }
-        return Err(fail(405, "GET or PUT required"));
+        let app = s.inner.lock().apps.get(parts[1]).filter(|a| !a.removed && a.namespace == namespace && s.app_visible(a, c, &q))
+            .cloned().ok_or_else(|| fail(404, "unknown app"))?;
+        if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
+            )); }
+        WorkloadController::require_grant(c, &app.name)?;
+        return s.service_action(c, &q, &namespace, &app.name, action, &method, request).await;
     }
     if method == Method::GET && parts == ["apps"] {
         if q.contains_key("tag") { s.scope(c, &q, None)?; }
-        let apps = {
+        let templates = {
             let i = s.inner.lock();
             let with_jobs: HashSet<&str> = i.jobs.values().filter(|r| !r.purged).map(|r| r.batch.as_str()).collect();
             i.apps
@@ -1878,27 +1834,40 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 .collect::<Vec<_>>()
         };
         let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
-        return Ok(Json(apps.iter().map(|a| s.app_value(a, tag)).collect::<Vec<_>>()).into_response(),
-        );
+        if batch {
+            return Ok(Json(templates.iter().map(|a| s.app_value(a, tag)).collect::<Vec<_>>()).into_response());
+        }
+        let mut apps: Vec<Value> = templates.iter().map(|a| s.serving_app_value(a, tag)).collect();
+        apps.extend(s.proof_app_values(c, &q, tag).await?);
+        let last = |a: &Value| a["jobs"]["last_at"].as_f64().unwrap_or(0.0);
+        apps.sort_by(|a, b| last(b).total_cmp(&last(a)));
+        return Ok(Json(apps).into_response());
     }
     if method == Method::POST && parts == ["apps"] {
         if !batch {
-            return Err(fail(400, "configure serving deployments in services.yaml; batches use POST /batches"));
-        }
-        if c.is_some_and(|c| !c.manage_apps) {
-            return Err(fail(403, "app management grant required"));
+            let body: fleet_proto::model::v1::RegisterAppRequest =
+                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            let (namespace, tag) = s.scope(c, &q, body.namespace.as_deref())?;
+            WorkloadController::require_grant(c, &body.name)?;
+            let _ops = s.ops.lock().await;
+            if s.inner.lock().apps.get(&body.name).is_some_and(|a| !a.removed) {
+                return Err(fail(409, format!("an app or batch named {} exists", body.name)));
+            }
+            let app = s.fleet.add_app(&namespace, &body).await?;
+            drop(_ops);
+            return Ok((StatusCode::CREATED, Json(s.proof_app_value(&app, None, tag.as_deref()).await?)).into_response());
         }
         let mut body: Value =
             serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
         let name = text(&body, "name").to_string();
-        if !is_safe_id(&name) || name.len() > 63 {
-            return Err(fail(400, "invalid app name"));
+        if !crate::fleet::valid_app_name(&name) {
+            return Err(fail(400, "invalid batch name"));
         }
         let (namespace, tag) = s.scope(c, &q, body["namespace"].as_str())?;
         if !body["image"].is_string() {
             return Err(fail(400, "image is required"));
         }
-        WorkloadController::require_management(c, &name)?;
+        WorkloadController::require_grant(c, &name)?;
         let allowed = [
             "name",
             "namespace",
@@ -1919,7 +1888,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             .as_object()
             .is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
         {
-            return Err(fail(400, "unknown app fields"));
+            return Err(fail(400, "unknown batch fields"));
         }
         for (key, default) in [
             ("max_gpus", json!(8)),
@@ -1941,8 +1910,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");
         let _ops = s.ops.lock().await;
-        if s.inner.lock().apps.get(&name).is_some_and(|a| !a.removed) {
-            return Err(fail(409, "app exists"));
+        if s.inner.lock().apps.get(&name).is_some_and(|a| !a.removed) || s.fleet.app_known(&namespace, &name) {
+            return Err(fail(409, format!("an app or batch named {name} exists")));
         }
         let app = WorkloadTemplate {
             name: name.clone(),
@@ -1958,7 +1927,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         return Ok((StatusCode::CREATED, Json(s.app_value(&app, app.tag.as_deref())),
         ).into_response());
     }
-    if parts.first() == Some(&"apps") && parts.len() >= 2 && registered.is_none() {
+    if parts.first() == Some(&"apps") && parts.len() >= 2 {
         let name = parts[1];
         // A deleted batch stays readable while it has job records: they are its history.
         let readable_deleted = batch && method == Method::GET && parts.len() == 2 && s.has_jobs(name);
@@ -1969,19 +1938,17 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             .get(name)
             .filter(|a| (!a.removed || readable_deleted) && a.persistent != batch)
             .cloned()
-            .ok_or_else(|| fail(404, "unknown app"))?;
+            .ok_or_else(|| fail(404, if batch { "unknown batch" } else { "unknown app" }))?;
         WorkloadController::require_grant(c, name)?;
         if !s.app_visible(&app, c, &q) {
-            return Err(fail(404, "unknown app"));
+            return Err(fail(404, if batch { "unknown batch" } else { "unknown app" }));
         }
         let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
+        let view = |s: &WorkloadController, app: &WorkloadTemplate| if batch { s.app_value(app, tag) } else { s.serving_app_value(app, tag) };
         if method == Method::GET && parts.len() == 2 {
-            return Ok(Json(s.app_value(&app, tag)).into_response());
+            return Ok(Json(view(&s, &app)).into_response());
         }
         if method == Method::DELETE && parts.len() == 2 {
-            if c.is_some_and(|c| !c.manage_apps) {
-                return Err(fail(403, "app management grant required"));
-            }
             let _ops = s.ops.lock().await;
             s.ensure_not_scaling(&app.namespace, name)?;
             let persistent_ready_to_remove = !app.persistent
@@ -2017,7 +1984,6 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(json!({"name":name,"removed":true})).into_response());
         }
         if batch && parts.len() == 3 && parts[2] == "settings" && method == Method::PUT {
-            WorkloadController::require_management(c, name)?;
             let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
             let set = set.as_object().filter(|o| !o.is_empty()).cloned()
                 .ok_or_else(|| fail(400, "set at least one setting"))?;
@@ -2038,13 +2004,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(s.app_value(&app, tag)).into_response());
         }
         if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {
-            WorkloadController::require_management(c, name)?;
-            let body: Value =
-                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-            let p = body["priority"]
-                .as_i64()
-                .filter(|p| i32::try_from(*p).is_ok())
-                .ok_or_else(|| fail(400, "priority must be a signed 32-bit integer"))?;
+            let p = priority_of(request).await?;
             let _ops = s.ops.lock().await;
             app = s
                 .inner
@@ -2057,13 +2017,12 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             app.spec["priority"] = json!(p);
             s.save("apps", name, &app)?;
             s.inner.lock().apps.insert(name.into(), app.clone());
-            return Ok(Json(s.app_value(&app, tag)).into_response());
+            return Ok(Json(view(&s, &app)).into_response());
         }
         if parts.len() == 3
             && parts[2] == "disabled"
             && matches!(method, Method::PUT | Method::DELETE)
         {
-            WorkloadController::require_management(c, name)?;
             let disabled = method == Method::PUT;
             let ids = {
                 let _ops = s.ops.lock().await;
@@ -2080,10 +2039,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 s.inner.lock().apps.insert(name.into(), app.clone());
                 if app.persistent {
                     // Every deployment changes; an offline node's waits until it reconnects.
-                    let keys: Vec<String> = s.inner.lock().services.iter()
-                        .filter(|(_, d)| text(&d.service, "app") == name && text(&d.service, "namespace") == app.namespace)
-                        .map(|(k, _)| k.clone())
-                        .collect();
+                    let keys = s.app_services(&app.namespace, name);
                     s.begin_toggle(&keys, disabled)?;
                     s.online(&keys)
                 } else {
@@ -2092,11 +2048,12 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             };
             s.wait_scales(&ids).await?;
             app = s.inner.lock().apps.get(name).cloned().unwrap_or(app);
-            return Ok(Json(s.app_value(&app, tag)).into_response());
+            return Ok(Json(view(&s, &app)).into_response());
         }
     }
     if batch_jobs {
         let batch = parts[1];
+        WorkloadController::require_grant(c, batch)?;
         if method == Method::GET && parts.len() == 3 {
             let limit = q
                 .get("limit")
@@ -2179,9 +2136,6 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
             if method == Method::POST && parts.len() == 5 && matches!(parts[4], "cancel" | "preempt") {
                 let preempt = parts[4] == "preempt";
-                if preempt && c.is_some() {
-                    return Err(fail(403, "administrator required"));
-                }
                 let _ops = s.ops.lock().await;
                 let r = job(&s)?;
                 return Ok(Json(s.stop_job(r, preempt).await?.value()).into_response());
@@ -2196,60 +2150,137 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
         }
     }
-    if let Some((tenant, elf)) = &registered {
-        if c.is_some_and(|c| !c.manage_apps) {
-            return Err(fail(403, "app management grant required"));
+    Err(fail(404, "unknown workload API operation"))
+}
+
+/// A `{"priority": N}` body's priority.
+async fn priority_of(request: Request) -> anyhow::Result<i32> {
+    let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+    body["priority"]
+        .as_i64()
+        .and_then(|p| i32::try_from(p).ok())
+        .ok_or_else(|| fail(400, "priority must be a signed 32-bit integer"))
+}
+
+impl WorkloadController {
+    /// The keys of `app`'s service records in `namespace`.
+    pub(crate) fn app_services(&self, namespace: &str, app: &str) -> Vec<String> {
+        self.inner.lock().services.iter()
+            .filter(|(_, d)| text(&d.service, "app") == app && text(&d.service, "namespace") == namespace)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    /// The registered proof app `name` the caller selects: in its namespace (a token's, or the
+    /// one `?namespace=` gives), or for an administrator who gives none, the one of that name.
+    fn proof_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>, name: &str) -> anyhow::Result<Option<crate::store::App>> {
+        if c.is_some() || q.contains_key("namespace") {
+            let (namespace, _) = self.scope(c, q, None)?;
+            return Ok(self.fleet.app(&namespace, name));
         }
-        let (namespace, _) = s.scope(c, &q, None)?;
-        let key = format!("{tenant}/{elf}");
-        WorkloadController::require_grant(c, &key)?;
-        let services = {
-            let i = s.inner.lock();
-            i.workers
-                .iter()
-                .flat_map(|(w, r)| {
-                    r.report
-                        .services
-                        .iter()
-                        .filter(|svc| {
-                            text(svc, "app") == key && text(svc, "namespace") == namespace
-                                && c.is_none_or(|c| svc["tag"].as_str().is_none_or(|tag| c.tag.as_deref() == Some(tag)))
-                        })
-                        .map(|svc| (w.clone(), svc.clone()))
-                })
-                .collect::<Vec<_>>()
-        };
-        if services.is_empty() {
-            return Err(fail(404, "no service of this app is configured"));
-        }
-        if method == Method::GET && parts[1] == "available" {
-            return Ok(Json(json!({"namespace":namespace,"tenant":tenant,"elf_id":elf,"servers":services.iter().map(|(_,s)|text(s,"name")).collect::<Vec<_>>()})).into_response());
-        }
-        if parts[1] == "disabled" && matches!(method, Method::PUT | Method::DELETE) {
-            WorkloadController::require_management(c, &key)?;
-            let disabled = method == Method::PUT;
-            // Every deployment changes; an offline node's waits until it reconnects.
-            let ids: Vec<String> = s.inner.lock().services.iter()
-                .filter(|(_, d)| text(&d.service, "app") == key && text(&d.service, "namespace") == namespace)
-                .map(|(k, _)| k.clone())
-                .collect();
-            {
-                let _ops = s.ops.lock().await;
-                // Refused while another change is under way, before anything changes.
-                s.begin_toggle(&ids, disabled)?;
-                s.fleet
-                    .set_app_disabled(&namespace, tenant, elf, true)
-                    .await?;
-            }
-            s.wait_scales(&s.online(&ids)).await?;
-            let servers: Vec<&str> = services.iter().map(|(_, svc)| text(svc, "name")).collect();
-            return Ok(Json(
-                json!({"namespace":namespace,"app":key,"disabled":disabled,"servers":servers}),
-            )
-            .into_response());
+        let all: Vec<_> = self.fleet.namespaces().into_iter().filter_map(|n| self.fleet.app(&n.id, name)).collect();
+        match all.len() {
+            0 | 1 => Ok(all.into_iter().next()),
+            n => Err(fail(400, format!("{n} namespaces have an app {name}: select one with --namespace"))),
         }
     }
-    Err(fail(404, "unknown workload API operation"))
+
+    /// The registered app `name` of the namespace as it is now, with its job counts.
+    async fn stored_proof_app(&self, namespace: &str, name: &str, tag: Option<&str>) -> anyhow::Result<Value> {
+        let (app, anchored) = self.fleet.apps().await?.into_iter()
+            .find(|(a, _)| a.namespace == namespace && a.name == name)
+            .ok_or_else(|| fail(404, "unknown app"))?;
+        self.proof_app_value(&app, anchored.as_deref(), tag).await
+    }
+
+    /// A scale, logs or settings request for `app`'s services.
+    #[allow(clippy::too_many_arguments)]
+    async fn service_action(&self, c: Option<&Token>, q: &BTreeMap<String, String>, namespace: &str, app: &str,
+        action: &str, method: &Method, request: Request,
+    ) -> anyhow::Result<Response> {
+        if action == "logs" {
+            if method != Method::GET {
+                return Err(fail(405, "GET required"));
+            }
+            return self.app_logs(c, namespace, app, q).await;
+        }
+        if action == "settings" {
+            if method != Method::PUT {
+                return Err(fail(405, "PUT required"));
+            }
+            let node = q.get("node").map(String::as_str);
+            self.require_service_scope(c, namespace, app, node)?;
+            let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            return Ok((StatusCode::ACCEPTED, Json(self.request_update(namespace, app, node, set).await?)).into_response());
+        }
+        if method == Method::GET {
+            self.require_service_scope(c, namespace, app, q.get("node").map(String::as_str))?;
+            return Ok(Json(self.scale_status(namespace, app, q.get("node").map(String::as_str))?).into_response());
+        }
+        if method == Method::PUT {
+            let body: fleet_proto::model::v1::ScaleRequest = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
+            self.require_service_scope(c, namespace, app, body.node.as_deref())?;
+            return Ok((StatusCode::ACCEPTED, Json(self.request_scale(namespace, app, body).await?)).into_response());
+        }
+        Err(fail(405, "GET or PUT required"))
+    }
+
+    /// A request for a registered proof app: `rest` is the path after `/apps/NAME`.
+    async fn proof_app_request(&self, c: Option<&Token>, q: &BTreeMap<String, String>, app: crate::store::App,
+        method: &Method, rest: &[&str], request: Request,
+    ) -> anyhow::Result<Response> {
+        WorkloadController::require_grant(c, &app.name)?;
+        let tag = c.map(|c| c.tag.clone().unwrap_or_default()).or_else(|| q.get("tag").cloned());
+        if c.is_some_and(|c| app.namespace != c.namespace.clone().unwrap_or_default()) {
+            return Err(fail(404, "unknown app"));
+        }
+        let (namespace, name) = (app.namespace.clone(), app.name.clone());
+        // Changing the app changes every service that runs it: a token's tag must cover them.
+        let changes = !matches!((method, rest), (&Method::GET, _) | (&Method::POST, ["jobs"]) | (_, ["scale" | "logs" | "settings"]));
+        if changes {
+            if let Some(c) = c {
+                let i = self.inner.lock();
+                if i.services.values().any(|d| text(&d.service, "namespace") == namespace && text(&d.service, "app") == name
+                    && d.service["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag))) {
+                    return Err(fail(403, "another tag's services run this app"));
+                }
+            }
+        }
+        match (method, rest) {
+            (&Method::GET, []) => Ok(Json(self.stored_proof_app(&namespace, &name, tag.as_deref()).await?).into_response()),
+            (&Method::DELETE, []) => {
+                let _guard = self.app_lifecycle_guard(&namespace, &name).await?;
+                let deleted = self.fleet.delete_app(&namespace, &name).await?;
+                self.remove_app(&namespace, &name)?;
+                Ok(Json(deleted).into_response())
+            }
+            (&Method::PUT, ["priority"]) => {
+                let p = priority_of(request).await?;
+                Ok(Json(self.fleet.set_app_priority(&namespace, &name, p).await?).into_response())
+            }
+            (&Method::PUT | &Method::DELETE, ["disabled"]) => {
+                let disabled = method == Method::PUT;
+                // Every deployment changes; an offline node's waits until it reconnects.
+                let keys = self.app_services(&namespace, &name);
+                {
+                    let _ops = self.ops.lock().await;
+                    // Refused while another change is under way, before anything changes.
+                    self.begin_toggle(&keys, disabled)?;
+                    // Its jobs are refused until its prover is up again, which re-enables it.
+                    self.fleet.set_app_disabled(&namespace, &name, disabled || !keys.is_empty()).await?;
+                }
+                self.wait_scales(&self.online(&keys)).await?;
+                Ok(Json(self.stored_proof_app(&namespace, &name, tag.as_deref()).await?).into_response())
+            }
+            (_, [action]) if matches!(*action, "scale" | "logs" | "settings") => {
+                self.service_action(c, q, &namespace, &name, action, method, request).await
+            }
+            (_, ["jobs", jobs @ ..]) => {
+                crate::proof_api::app_jobs(self, c, q, &app, tag.as_deref(), method, jobs, request).await
+            }
+            _ => Err(fail(404, "unknown app operation")),
+        }
+    }
 }
 async fn log_response(
     s: &WorkloadController,

@@ -15,7 +15,8 @@ services:
     kind: ziren-gpu
     namespace: ethproofs-user
     tag: scope=default
-    app: ethproofs/FULL_ELF_SHA256 # bind this server exclusively to one namespace app
+    app: ethproofs # the namespace's proof app this server proves for, alone
+    elf_id: FULL_ELF_SHA256 # its program (fleetctl app add ethproofs --elf-id FULL_ELF_SHA256)
     proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1
     gpus: 2

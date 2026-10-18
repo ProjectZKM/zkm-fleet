@@ -1,6 +1,80 @@
-//! Which node jobs a job. Pure, so the rules are tested without a cluster.
+//! Which node runs a job. Pure, so the rules are tested without a cluster.
 
-use crate::config::{AnchorPolicy, SchedulingClass, TenantConfig};
+/// How an app's jobs are placed: its registration's class, anchor, backends and version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppPolicy {
+    /// The app, `namespace/name`: what an exclusive anchor reserves its node for.
+    pub key: String,
+    pub class: SchedulingClass,
+    pub anchor: AnchorPolicy,
+    /// Only nodes proving with this circuit version serve the app.
+    pub zkm_version: Option<String>,
+    /// Allowed node backends ("cuda", "cpu", "mock"); empty means any.
+    pub backends: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SchedulingClass {
+    /// The biggest free prover first.
+    Latency,
+    /// The smallest prover that is free.
+    #[default]
+    Batch,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AnchorPolicy {
+    /// Any eligible node.
+    #[default]
+    None,
+    /// Keep a program on the node it first ran on while that node is healthy.
+    Shared,
+    /// As `shared`, and the anchor node serves this app only.
+    Exclusive,
+}
+
+impl SchedulingClass {
+    pub const NAMES: [&'static str; 2] = ["latency", "batch"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "latency" => Some(Self::Latency),
+            "batch" => Some(Self::Batch),
+            _ => None,
+        }
+    }
+}
+
+impl AnchorPolicy {
+    pub const NAMES: [&'static str; 3] = ["none", "shared", "exclusive"];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "shared" => Some(Self::Shared),
+            "exclusive" => Some(Self::Exclusive),
+            _ => None,
+        }
+    }
+}
+
+impl AppPolicy {
+    /// A registered app's policy; its names were checked when it was registered.
+    pub fn of(app: &fleet_proto::model::v1::App) -> Self {
+        Self {
+            key: app_key(&app.namespace, &app.name),
+            class: SchedulingClass::from_name(&app.class).unwrap_or_default(),
+            anchor: AnchorPolicy::from_name(&app.anchor).unwrap_or_default(),
+            zkm_version: app.zkm_version.clone(),
+            backends: app.backends.clone(),
+        }
+    }
+}
+
+/// An app's key across namespaces: `namespace/name`.
+pub fn app_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}/{name}")
+}
 
 #[derive(Debug, Clone)]
 pub struct PlacementCandidate {
@@ -11,7 +85,7 @@ pub struct PlacementCandidate {
     /// Heartbeating and its prover answers `Ready`.
     pub ready: bool,
     pub busy: bool,
-    /// Tenant this node is reserved for (an exclusive anchor), if any.
+    /// The app this node is reserved for (an exclusive anchor), if any.
     pub reserved_for: Option<String>,
     pub has_elf: bool,
 }
@@ -26,49 +100,37 @@ pub enum PlacementDecision {
     NoNode,
 }
 
-/// Whether the tenant's node list admits a node of this name.
-pub fn allowed(tenant: &TenantConfig, name: &str) -> bool {
-    tenant.nodes.is_empty() || tenant.nodes.iter().any(|p| name.starts_with(p.as_str()))
-}
-
-pub fn eligible(node: &PlacementCandidate, tenant: &TenantConfig, failed_on: &[String]) -> bool {
+pub fn eligible(node: &PlacementCandidate, app: &AppPolicy, failed_on: &[String]) -> bool {
     node.ready
-        && allowed(tenant, &node.name)
         && !failed_on.iter().any(|f| f == &node.name)
-        && tenant
-            .zkm_version
-            .as_ref()
-            .map_or(true, |v| v == &node.zkm_version)
-        && (tenant.backends.is_empty() || tenant.backends.iter().any(|b| b == &node.backend))
-        && node
-            .reserved_for
-            .as_ref()
-            .map_or(true, |r| r == &tenant.name)
+        && app.zkm_version.as_ref().map_or(true, |v| v == &node.zkm_version)
+        && (app.backends.is_empty() || app.backends.iter().any(|b| b == &node.backend))
+        && node.reserved_for.as_ref().map_or(true, |r| r == &app.key)
 }
 
-/// `anchor` is the name of the node this (tenant, program) is anchored to. Nodes the
-/// job failed on are avoided while another node could take it; when none could (a
-/// tenant with one node), they are tried again: the attempt limit ends the retries.
+/// `anchor` is the name of the node this app is anchored to. Nodes the job failed on are
+/// avoided while another node could take it; when none could (an app with one node), they
+/// are tried again: the attempt limit ends the retries.
 pub fn choose(
-    tenant: &TenantConfig,
+    app: &AppPolicy,
     failed_on: &[String],
     anchor: Option<&str>,
     nodes: &[PlacementCandidate],
 ) -> PlacementDecision {
     let elsewhere = nodes
         .iter()
-        .any(|n| eligible(n, tenant, &[]) && !failed_on.contains(&n.name));
+        .any(|n| eligible(n, app, &[]) && !failed_on.contains(&n.name));
     let failed_on: &[String] = if elsewhere { failed_on } else { &[] };
-    if tenant.anchor != AnchorPolicy::None {
+    if app.anchor != AnchorPolicy::None {
         if let Some(name) = anchor {
             if let Some((i, n)) = nodes.iter().enumerate().find(|(_, n)| n.name == name) {
-                if eligible(n, tenant, failed_on) {
+                if eligible(n, app, failed_on) {
                     if !n.busy {
                         return PlacementDecision::Selected(i);
                     }
-                    // Exclusive: the reserved node is the tenant's; wait for it.
+                    // Exclusive: the reserved node is the app's; wait for it.
                     // Shared: prefer the anchor, but a free node beats waiting.
-                    if tenant.anchor == AnchorPolicy::Exclusive {
+                    if app.anchor == AnchorPolicy::Exclusive {
                         return PlacementDecision::WaitForAnchor;
                     }
                 }
@@ -77,10 +139,10 @@ pub fn choose(
     }
     let mut best: Option<(usize, (bool, i64, &str))> = None;
     for (i, n) in nodes.iter().enumerate() {
-        if n.busy || !eligible(n, tenant, failed_on) {
+        if n.busy || !eligible(n, app, failed_on) {
             continue;
         }
-        let size = match tenant.class {
+        let size = match app.class {
             SchedulingClass::Latency => -(n.gpus as i64),
             SchedulingClass::Batch => n.gpus as i64,
         };
@@ -96,17 +158,8 @@ pub fn choose(
 mod tests {
     use super::*;
 
-    fn tenant(class: SchedulingClass, anchor: AnchorPolicy) -> TenantConfig {
-        TenantConfig {
-            name: "t".into(),
-            addresses: vec![],
-            class,
-            anchor,
-            zkm_version: Some("v2".into()),
-            backends: vec![],
-            nodes: vec![],
-            max_queued: 8,
-        }
+    fn app(class: SchedulingClass, anchor: AnchorPolicy) -> AppPolicy {
+        AppPolicy { key: "n/t".into(), class, anchor, zkm_version: Some("v2".into()), backends: vec![] }
     }
 
     fn node(name: &str, gpus: u32) -> PlacementCandidate {
@@ -126,11 +179,11 @@ mod tests {
     fn latency_prefers_the_largest_free_node_and_batch_the_smallest() {
         let nodes = vec![node("a", 1), node("b", 4), node("c", 2)];
         assert_eq!(
-            choose(&tenant(SchedulingClass::Latency, AnchorPolicy::None), &[], None, &nodes),
+            choose(&app(SchedulingClass::Latency, AnchorPolicy::None), &[], None, &nodes),
             PlacementDecision::Selected(1)
         );
         assert_eq!(
-            choose(&tenant(SchedulingClass::Batch, AnchorPolicy::None), &[], None, &nodes),
+            choose(&app(SchedulingClass::Batch, AnchorPolicy::None), &[], None, &nodes),
             PlacementDecision::Selected(0)
         );
     }
@@ -140,14 +193,14 @@ mod tests {
         let mut nodes = vec![node("a", 4), node("b", 1)];
         nodes[1].has_elf = true;
         assert_eq!(
-            choose(&tenant(SchedulingClass::Latency, AnchorPolicy::None), &[], None, &nodes),
+            choose(&app(SchedulingClass::Latency, AnchorPolicy::None), &[], None, &nodes),
             PlacementDecision::Selected(1)
         );
     }
 
     #[test]
     fn version_backend_reservation_and_readiness_exclude() {
-        let t = tenant(SchedulingClass::Batch, AnchorPolicy::None);
+        let t = app(SchedulingClass::Batch, AnchorPolicy::None);
         let mut nodes = vec![node("a", 1), node("b", 1), node("c", 1), node("d", 1)];
         nodes[0].zkm_version = "v1".into();
         nodes[1].reserved_for = Some("other".into());
@@ -159,40 +212,27 @@ mod tests {
 
     #[test]
     fn a_failed_node_is_avoided_while_another_could_run_the_job() {
-        let t = tenant(SchedulingClass::Batch, AnchorPolicy::None);
+        let t = app(SchedulingClass::Batch, AnchorPolicy::None);
         let mut nodes = vec![node("a", 1), node("b", 1)];
         assert_eq!(choose(&t, &["a".into()], None, &nodes), PlacementDecision::Selected(1));
         // The other node is busy, not gone: wait for it rather than retry on `a`.
         nodes[1].busy = true;
         assert_eq!(choose(&t, &["a".into()], None, &nodes), PlacementDecision::NoNode);
-        // Only the failed node is left (a tenant with one node): try it again.
+        // Only the failed node is left (an app with one node): try it again.
         nodes[1].ready = false;
         assert_eq!(choose(&t, &["a".into()], None, &nodes), PlacementDecision::Selected(0));
     }
 
     #[test]
-    fn a_tenant_runs_only_on_the_nodes_it_names() {
-        let mut t = tenant(SchedulingClass::Latency, AnchorPolicy::Exclusive);
-        t.nodes = vec!["eth-gpu".into()];
-        let mut nodes = vec![node("goat-gpu-0", 1), node("eth-gpu-0", 4)];
-        nodes[1].ready = false;
-        // The only ready node is someone else's: wait rather than run there.
-        assert_eq!(choose(&t, &[], None, &nodes), PlacementDecision::NoNode);
-        assert_eq!(choose(&t, &[], Some("goat-gpu-0"), &nodes), PlacementDecision::NoNode);
-        nodes[1].ready = true;
-        assert_eq!(choose(&t, &[], Some("goat-gpu-0"), &nodes), PlacementDecision::Selected(1));
-    }
-
-    #[test]
-    fn a_tenant_with_one_node_retries_on_it_even_when_anchored() {
-        let t = tenant(SchedulingClass::Latency, AnchorPolicy::Exclusive);
+    fn an_app_with_one_node_retries_on_it_even_when_anchored() {
+        let t = app(SchedulingClass::Latency, AnchorPolicy::Exclusive);
         let nodes = vec![node("a", 4)];
         assert_eq!(choose(&t, &["a".into()], Some("a"), &nodes), PlacementDecision::Selected(0));
     }
 
     #[test]
     fn a_shared_anchor_spills_to_a_free_node_when_busy() {
-        let t = tenant(SchedulingClass::Latency, AnchorPolicy::Shared);
+        let t = app(SchedulingClass::Latency, AnchorPolicy::Shared);
         let mut nodes = vec![node("a", 4), node("b", 4)];
         nodes[0].busy = true;
         assert_eq!(choose(&t, &[], Some("a"), &nodes), PlacementDecision::Selected(1));
@@ -202,7 +242,7 @@ mod tests {
 
     #[test]
     fn an_exclusive_anchor_waits_for_its_busy_node_and_moves_when_it_is_gone() {
-        let t = tenant(SchedulingClass::Latency, AnchorPolicy::Exclusive);
+        let t = app(SchedulingClass::Latency, AnchorPolicy::Exclusive);
         let mut nodes = vec![node("a", 4), node("b", 4)];
         nodes[0].busy = true;
         assert_eq!(choose(&t, &[], Some("a"), &nodes), PlacementDecision::WaitForAnchor);
@@ -215,7 +255,7 @@ mod tests {
 
     #[test]
     fn an_anchor_that_failed_the_job_is_not_reused() {
-        let t = tenant(SchedulingClass::Latency, AnchorPolicy::Exclusive);
+        let t = app(SchedulingClass::Latency, AnchorPolicy::Exclusive);
         let nodes = vec![node("a", 4), node("b", 4)];
         assert_eq!(choose(&t, &["a".into()], Some("a"), &nodes), PlacementDecision::Selected(1));
     }

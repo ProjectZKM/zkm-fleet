@@ -59,7 +59,6 @@ if [ "$ROLE" = control ]; then
   cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in,Dockerfile.scheduler} "$PREFIX/deploy/"
   FLEETCTL="$PREFIX/bin/fleetctl"
   [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" >/dev/null
-  [ -f "$ETC/admin.token" ] || "$FLEETCTL" init token --out "$ETC/admin.token" >/dev/null
   [ -f "$ETC/pg_password" ] || (umask 077; openssl rand -hex 24 > "$ETC/pg_password")
   [ -f "$ETC/database_url" ] || (umask 077; printf 'postgres://fleet:%s@postgres:5432/fleet\n' "$(cat "$ETC/pg_password")" > "$ETC/database_url")
   [ -n "$PUBLIC_URL" ] || PUBLIC_URL="https://$IP:8905"
@@ -74,10 +73,7 @@ http_addr: 0.0.0.0:9191
 public_url: $PUBLIC_URL
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
-require_signature: true
 cluster_token_file: /etc/zkm-fleet/cluster.token
-admin_token_file: /etc/zkm-fleet/admin.token
-tenants: [] # configure proof tenants here
 EOF
   MCP_AUTHORITY=${PUBLIC_URL#https://}; MCP_AUTHORITY=${MCP_AUTHORITY%%/*}
   SCHED_IP="${SUBNET%.*}.10"
@@ -103,6 +99,13 @@ EOF
   docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d
   for _ in $(seq 1 30); do curl -sf http://127.0.0.1:9191/healthz >/dev/null && break; sleep 2; done
   curl -sf http://127.0.0.1:9191/healthz >/dev/null || die "scheduler health check failed"
+  # The first administrator's token goes into the database; its secret lands in the data
+  # directory (the configuration is mounted read-only) and moves beside the other secrets.
+  if [ ! -f "$ETC/admin.token" ]; then
+    docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" exec -T scheduler \
+      fleet-scheduler -c /etc/zkm-fleet/fleet.yaml issue-admin --label install --out /var/lib/zkm-fleet/admin.token >/dev/null
+    (umask 077; mv "$PREFIX/data/admin.token" "$ETC/admin.token")
+  fi
   echo "[install] control plane ready; fleetctl connects to http://127.0.0.1:9191"
   echo "[install] HTTPS gateway: $PUBLIC_URL; MCP: $PUBLIC_URL/mcp"
 else

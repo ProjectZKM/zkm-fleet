@@ -95,10 +95,10 @@ message NodeInfo {
   string machine = 8;
   // Version 1 pulls work through heartbeat responses; push-only workers are refused.
   uint32 control_version = 9;
-  // Dedicated proof app served by this prover node. All three are set together;
-  // an app-specific node never accepts another app's proof jobs.
+  // Dedicated proof app served by this prover node: its namespace, name and program, all
+  // three set together; an app-specific node never accepts another app's proof jobs.
   string app_namespace = 10;
-  string app_tenant = 11;
+  string app = 11;
   string app_elf_id = 12;
 }
 

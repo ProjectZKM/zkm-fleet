@@ -41,8 +41,7 @@ pub struct ProofAppArgs {
     /// Immutable Fleet namespace ID for this app endpoint.
     #[arg(long)]
     pub namespace: String,
-    #[arg(long)]
-    pub tenant: String,
+    /// The programs this endpoint proves (repeat); each is an app of the namespace.
     #[arg(long, required = true)]
     pub elf_id: Vec<String>,
     #[arg(long)]
@@ -55,6 +54,7 @@ pub struct ProofAppArgs {
 #[derive(Clone)]
 struct PublicValuesCredential {
     bearer: String,
+    app: String,
     job_id: String,
     expires: Instant,
 }
@@ -64,18 +64,18 @@ pub struct ProofAppServer {
     pub elf_ids: HashSet<String>,
     pub token_file: Option<PathBuf>,
     pub namespace: String,
-    pub tenant: String,
     pub scheduler: String,
     pub public_values_url: String,
     client: reqwest::Client,
     capabilities: Mutex<HashMap<String, PublicValuesCredential>>,
+    /// Program -> the namespace's app of it, as the scheduler named it.
+    apps: Mutex<HashMap<String, String>>,
 }
 
 impl ProofAppServer {
     pub fn new(
         storage_root: PathBuf,
         namespace: String,
-        tenant: String,
         elf_ids: Vec<String>,
         scheduler: String,
         public_values_url: String,
@@ -110,14 +110,12 @@ impl ProofAppServer {
                         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
             "ELF ids must be SHA-256 hashes"
         );
-        anyhow::ensure!(!tenant.is_empty(), "app tenant required");
         std::fs::create_dir_all(storage_root.join("elf"))?;
         std::fs::create_dir_all(storage_root.join("inputs"))?;
         std::fs::create_dir_all(storage_root.join("outputs"))?;
         Ok(Self {
             storage_root: storage_root.canonicalize()?,
             namespace,
-            tenant,
             elf_ids: elf_ids.into_iter().collect(),
             token_file: None,
             scheduler: scheduler.trim_end_matches('/').into(),
@@ -128,6 +126,7 @@ impl ProofAppServer {
                 .timeout(Duration::from_secs(75))
                 .build()?,
             capabilities: Mutex::new(HashMap::new()),
+            apps: Mutex::new(HashMap::new()),
         })
     }
 
@@ -183,31 +182,37 @@ impl ProofAppServer {
             .map_err(|e| Status::internal(e.to_string()))
     }
 
-    async fn authorize(&self, bearer: &str, elf_id: Option<&str>) -> Result<(), Status> {
+    /// The token belongs to this endpoint's namespace; with a program, the token may use
+    /// the namespace's app of it, whose name it returns.
+    async fn authorize(&self, bearer: &str, elf_id: Option<&str>) -> Result<Option<String>, Status> {
         let access = self
             .call(bearer, reqwest::Method::GET, "/access", None)
             .await?;
-        if access["namespace"].as_str() != Some(self.namespace.as_str())
-            || access["tenant"].as_str() != Some(self.tenant.as_str())
-        {
+        if access["namespace"].as_str() != Some(self.namespace.as_str()) {
             return Err(Status::permission_denied(
-                "token does not belong to this app's namespace and tenant",
+                "token does not belong to this app's namespace",
             ));
         }
-        let Some(elf_id) = elf_id else {
-            return Ok(());
-        };
-        let granted = access["manage_apps"].as_bool().unwrap_or(false)
-            || access["apps"].as_array().is_some_and(|apps| {
-                apps.iter()
-                    .any(|a| a.as_str() == Some(format!("{}/{}", self.tenant, elf_id).as_str()))
-            });
-        if !granted {
-            return Err(Status::permission_denied(
-                "app is not granted to this token",
-            ));
+        match elf_id {
+            Some(elf_id) => self.app_for(bearer, elf_id).await.map(Some),
+            None => Ok(None),
         }
-        Ok(())
+    }
+
+    /// The namespace's app of program `elf_id`, among the apps the token may use.
+    async fn app_for(&self, bearer: &str, elf_id: &str) -> Result<String, Status> {
+        if let Some(app) = self.apps.lock().await.get(elf_id) {
+            return Ok(app.clone());
+        }
+        let apps = self.call(bearer, reqwest::Method::GET, "/apps", None).await?;
+        let app = apps.as_array().into_iter().flatten()
+            .find(|a| a["kind"] == "proof" && a["namespace"].as_str() == Some(self.namespace.as_str())
+                && a["proof"]["elf_id"].as_str() == Some(elf_id))
+            .and_then(|a| a["name"].as_str())
+            .ok_or_else(|| Status::permission_denied("the program is no app this token may use"))?
+            .to_string();
+        self.apps.lock().await.insert(elf_id.into(), app.clone());
+        Ok(app)
     }
 
     fn store(
@@ -276,7 +281,6 @@ impl ProofAppServer {
         };
         if job["state"] != "succeeded"
             || job["namespace"].as_str() != Some(&self.namespace)
-            || job["tenant"].as_str() != Some(&self.tenant)
             || !job["elf_id"]
                 .as_str()
                 .is_some_and(|id| self.elf_ids.contains(id))
@@ -379,7 +383,7 @@ impl StageService for ProofAppStageService {
         let elf_id = self
             .select_elf(request.get_ref())
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        self.authorize(&bearer, Some(&elf_id)).await?;
+        let app_name = self.authorize(&bearer, Some(&elf_id)).await?.expect("a program's app");
         let start = Instant::now();
         let app = self.clone();
         let request = request.into_inner();
@@ -393,7 +397,7 @@ impl StageService for ProofAppStageService {
             .call(
                 &bearer,
                 reqwest::Method::POST,
-                "/admin/proof-jobs",
+                &format!("/apps/{app_name}/jobs"),
                 Some(&metadata),
             )
             .await?;
@@ -418,39 +422,37 @@ impl StageService for ProofAppStageService {
         if !artifacts::is_safe_id(&id) {
             return Err(Status::invalid_argument("invalid proof_id"));
         }
-        let job = match self
-            .call(
-                &bearer,
-                reqwest::Method::GET,
-                &format!("/admin/jobs/{id}"),
-                None,
-            )
-            .await
-        {
-            Ok(job) => job,
-            Err(e) if e.code() == tonic::Code::NotFound => {
-                return Ok(Response::new(stage::GetStatusResponse {
-                    proof_id: id,
-                    status: stage::Status::Unspecified as i32,
-                    ..Default::default()
-                }))
+        // The job is one of this endpoint's apps'.
+        let mut found = None;
+        let mut elf_ids: Vec<&String> = self.elf_ids.iter().collect();
+        elf_ids.sort();
+        for elf_id in elf_ids {
+            let Ok(app) = self.app_for(&bearer, elf_id).await else { continue };
+            match self.call(&bearer, reqwest::Method::GET, &format!("/apps/{app}/jobs/{id}"), None).await {
+                Ok(job) => {
+                    found = Some((app, job));
+                    break;
+                }
+                Err(e) if e.code() == tonic::Code::NotFound || e.code() == tonic::Code::PermissionDenied => {}
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
+        }
+        let Some((app, job)) = found else {
+            return Ok(Response::new(stage::GetStatusResponse {
+                proof_id: id,
+                status: stage::Status::Unspecified as i32,
+                ..Default::default()
+            }));
         };
         let elf_id = job["elf_id"]
             .as_str()
             .ok_or_else(|| Status::internal("job ELF missing"))?;
         // Fleet records admission failures without an ELF; SDKs still poll their IDs.
         let rejected = job["state"] == "failed" && elf_id.is_empty();
-        if job["tenant"].as_str() != Some(self.tenant.as_str())
-            || (!rejected && !self.elf_ids.contains(elf_id))
-        {
+        if job["app"].as_str() != Some(app.as_str()) || (!rejected && !self.elf_ids.contains(elf_id)) {
             return Err(Status::permission_denied(
                 "job belongs to another app endpoint",
             ));
-        }
-        if !rejected {
-            self.authorize(&bearer, Some(elf_id)).await?;
         }
         let mut response = stage::GetStatusResponse {
             proof_id: id,
@@ -489,6 +491,7 @@ impl StageService for ProofAppStageService {
                     key.clone(),
                     PublicValuesCredential {
                         bearer,
+                        app,
                         job_id: job["id"].as_str().unwrap().into(),
                         expires: Instant::now() + Duration::from_secs(300),
                     },
@@ -519,7 +522,7 @@ async fn values(State(app): State<Arc<ProofAppServer>>, HttpPath(key): HttpPath<
         .call(
             &capability.bearer,
             reqwest::Method::GET,
-            &format!("/admin/jobs/{}", capability.job_id),
+            &format!("/apps/{}/jobs/{}", capability.app, capability.job_id),
             None,
         )
         .await
@@ -561,7 +564,6 @@ pub async fn serve(args: ProofAppArgs) -> anyhow::Result<()> {
     let mut app = ProofAppServer::new(
         args.storage_root,
         args.namespace,
-        args.tenant,
         args.elf_id,
         args.scheduler,
         format!("http://{}", args.http_addr),
@@ -609,7 +611,6 @@ mod tests {
         let app = ProofAppServer::new(
             storage.path().into(),
             "a".repeat(32),
-            "app".into(),
             vec![first.clone(), second.clone()],
             "http://127.0.0.1:9191".into(),
             "http://127.0.0.1:51011".into(),

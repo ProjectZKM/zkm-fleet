@@ -35,22 +35,16 @@ pub trait Store: Send + Sync {
     async fn get(&self, id: &str) -> anyhow::Result<Option<ProofJob>>;
     /// Queued and running jobs, oldest first, for recovery after a restart.
     async fn incomplete(&self) -> anyhow::Result<Vec<ProofJob>>;
-    /// The newest jobs, of one tenant or all.
+    /// The newest jobs the filter selects.
     async fn recent(&self, f: &ProofJobFilter, limit: usize) -> anyhow::Result<Vec<ProofJob>>;
-    /// Every (tenant, program) that has had a job, most recently used first.
+    /// Every registered app with its job counts, most recently used first.
     async fn apps(&self) -> anyhow::Result<Vec<App>>;
     /// Deletes an app and its finished jobs; returns the jobs' ids.
-    async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str,
-    ) -> anyhow::Result<Vec<String>>;
-    /// Every registered app: (namespace, tenant, elf_id, disabled).
-    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, String, bool)>>;
-    /// Registers an app; false when it already was.
-    async fn add_app(&self, namespace: &str, tenant: &str, elf_id: &str, at_ms: u64, priority: i32,
-    ) -> anyhow::Result<bool>;
-    async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32,
-    ) -> anyhow::Result<()>;
-    async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64,
-    ) -> anyhow::Result<()>;
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>>;
+    /// Registers an app; false when its name or program is one of the namespace's already.
+    async fn add_app(&self, app: &App) -> anyhow::Result<bool>;
+    async fn set_app_priority(&self, namespace: &str, name: &str, priority: i32) -> anyhow::Result<()>;
+    async fn set_app_disabled(&self, namespace: &str, name: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()>;
 
     async fn add_token(&self, c: &Token) -> anyhow::Result<()>;
     /// Marks the token revoked; returns false when the address is unknown.
@@ -76,8 +70,8 @@ pub struct MemoryStore {
     namespaces: Mutex<HashMap<String, Namespace>>,
     jobs: Mutex<HashMap<String, ProofJob>>,
     tokens: Mutex<HashMap<String, Token>>,
-    /// (namespace, tenant, elf_id) -> (created_ms, disabled_ms, priority).
-    apps: Mutex<HashMap<(String, String, String), (u64, Option<u64>, i32)>>,
+    /// (namespace, name) -> the registration (job counts left at zero).
+    apps: Mutex<HashMap<(String, String), App>>,
 }
 
 #[async_trait]
@@ -91,7 +85,7 @@ impl Store for MemoryStore {
             saved.namespace = existing.namespace.clone();
             saved.client_id = existing.client_id.clone();
             saved.tag = existing.tag.clone();
-            saved.tenant = existing.tenant.clone();
+            saved.app = existing.app.clone();
             saved.elf_id = existing.elf_id.clone();
             saved.kind = existing.kind;
             saved.priority = existing.priority;
@@ -128,28 +122,15 @@ impl Store for MemoryStore {
     }
 
     async fn apps(&self) -> anyhow::Result<Vec<App>> {
-        let blank = |namespace: &str, tenant: &str, elf_id: &str, created_ms, disabled, priority| {
-                App {
-            namespace: namespace.into(), tenant: tenant.into(), elf_id: elf_id.into(), created_ms, jobs: 0, active: 0, succeeded: 0, failed: 0,
-            last_created_ms: None, mean_prove_ms: None, disabled, priority,
-        }
-            };
-        let mut apps: HashMap<(String, String, String), (App, f64)> = self
-            .apps
-            .lock()
-            .iter()
-            .map(|((n, t, e), (created, disabled, priority))| {
-                ((n.clone(), t.clone(), e.clone()), (blank(n, t, e, *created, disabled.is_some(), *priority), 0.0),
-                )
-            })
+        let mut apps: HashMap<(String, String), (App, f64)> = self.apps.lock().iter()
+            .map(|(k, a)| (k.clone(), (a.clone(), 0.0)))
             .collect();
         for j in self.jobs.lock().values() {
-            let Some((a, prove_sum)) = apps.get_mut(&(j.namespace.clone(), j.tenant.clone(), j.elf_id.clone())) else {
+            let Some((a, prove_sum)) = apps.get_mut(&(j.namespace.clone(), j.app.clone())) else {
                 continue;
             };
             a.jobs += 1;
-            a.last_created_ms = Some(a.last_created_ms.map_or(j.created_ms, |t| t.max(j.created_ms)),
-            );
+            a.last_created_ms = Some(a.last_created_ms.map_or(j.created_ms, |t| t.max(j.created_ms)));
             match j.state() {
                 ProofJobState::Queued | ProofJobState::Running => a.active += 1,
                 ProofJobState::Succeeded => {
@@ -172,54 +153,36 @@ impl Store for MemoryStore {
         Ok(v)
     }
 
-    async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str,
-    ) -> anyhow::Result<Vec<String>> {
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>> {
         let mut jobs = self.jobs.lock();
         let ids: Vec<String> = jobs
             .values()
-            .filter(|j| {
-                j.namespace.as_str() == namespace && j.tenant == tenant && j.elf_id == elf_id && j.state().is_terminal()
-            })
+            .filter(|j| j.namespace == namespace && j.app == name && j.state().is_terminal())
             .map(|j| j.id.clone())
             .collect();
         for id in &ids {
             jobs.remove(id);
         }
-        self.apps.lock().remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        ));
+        self.apps.lock().remove(&(namespace.to_string(), name.to_string()));
         Ok(ids)
     }
 
-    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, String, bool)>> {
-        let mut v: Vec<_> = self.apps.lock().iter().map(|((n, t, e), (_, d, _))| (n.clone(), t.clone(), e.clone(), d.is_some())).collect();
-        v.sort();
-        Ok(v)
-    }
-
-    async fn add_app(&self, namespace: &str, tenant: &str, elf_id: &str, at_ms: u64, priority: i32,
-    ) -> anyhow::Result<bool> {
+    async fn add_app(&self, app: &App) -> anyhow::Result<bool> {
         let mut apps = self.apps.lock();
-        let key = (namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        );
-        if apps.contains_key(&key) {
+        if apps.values().any(|a| a.namespace == app.namespace && (a.name == app.name || a.elf_id == app.elf_id)) {
             return Ok(false);
         }
-        apps.insert(key, (at_ms, None, priority));
+        apps.insert((app.namespace.clone(), app.name.clone()), app.clone());
         Ok(true)
     }
 
-    async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32,
-    ) -> anyhow::Result<()> {
-        if let Some((_, _, p)) = self.apps.lock().get_mut(&(namespace.into(), tenant.into(), elf_id.into())) { *p = priority; }
+    async fn set_app_priority(&self, namespace: &str, name: &str, priority: i32) -> anyhow::Result<()> {
+        if let Some(a) = self.apps.lock().get_mut(&(namespace.into(), name.into())) { a.priority = priority; }
         Ok(())
     }
 
-    async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64,
-    ) -> anyhow::Result<()> {
-        if let Some((_, d, _)) = self.apps.lock().get_mut(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        )) {
-            *d = disabled.then_some(at_ms);
-        }
+    async fn set_app_disabled(&self, namespace: &str, name: &str, disabled: bool, _at_ms: u64) -> anyhow::Result<()> {
+        if let Some(a) = self.apps.lock().get_mut(&(namespace.into(), name.into())) { a.disabled = disabled; }
         Ok(())
     }
 
@@ -317,7 +280,7 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 14;
+const SCHEMA_VERSION: i32 = 16;
 const TAG_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_.-]{0,62}=[A-Za-z0-9_.-]{1,63}$";
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
@@ -365,7 +328,7 @@ CREATE TABLE fleet_jobs (
     tag         TEXT    NOT NULL CONSTRAINT fleet_jobs_tag_scope CHECK(tag = '' OR tag ~ '{TAG_PATTERN}'),
     client_id   TEXT    NOT NULL CONSTRAINT fleet_jobs_client_id_safe CHECK(client_id ~ '^[A-Za-z0-9_-]{{1,128}}$'),
     priority    INT     NOT NULL DEFAULT 0,
-    tenant      TEXT    NOT NULL,
+    app         TEXT    NOT NULL,
     elf_id      TEXT    NOT NULL,
     inputs      JSONB,
     outputs     JSONB,
@@ -388,25 +351,24 @@ CREATE UNIQUE INDEX fleet_jobs_namespace_client ON fleet_jobs(namespace,tag,clie
 CREATE INDEX fleet_jobs_namespace_created ON fleet_jobs(namespace,created_ms DESC);
 CREATE INDEX fleet_jobs_owner ON fleet_jobs(owner,created_ms DESC);
 CREATE INDEX fleet_jobs_created ON fleet_jobs (created_ms DESC);
-CREATE INDEX fleet_jobs_app ON fleet_jobs (tenant, elf_id, created_ms DESC);
+CREATE INDEX fleet_jobs_app ON fleet_jobs (namespace, app, created_ms DESC);
 CREATE INDEX fleet_jobs_active ON fleet_jobs (created_ms) WHERE state IN ('queued', 'running');
-COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a tenant''s program). Payloads are files in the data dir.';
+COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Payloads are files in the data dir.';
 COMMENT ON COLUMN fleet_jobs.id IS 'Internal proof ID; namespaced requests retain the SDK ID in client_id.';
 COMMENT ON COLUMN fleet_jobs.owner IS 'Authenticated submitting address; immutable audit identity.';
 COMMENT ON COLUMN fleet_jobs.namespace IS 'Immutable namespace ID; resource accounting and access scope.';
 COMMENT ON COLUMN fleet_jobs.tag IS 'Immutable optional isolation label; empty string means untagged.';
 COMMENT ON COLUMN fleet_jobs.client_id IS 'Required SDK proof_id; immutable within namespace and tag.';
-COMMENT ON COLUMN fleet_jobs.tenant IS 'Empty for a request refused before its tenant was known.';
+COMMENT ON COLUMN fleet_jobs.app IS 'The app''s name in the namespace; empty for a request refused before its app was known.';
 COMMENT ON COLUMN fleet_jobs.elf_id IS 'Hex SHA-256 of the guest ELF; empty for a request refused before it was read.';
 COMMENT ON COLUMN fleet_jobs.fail_status IS 'The stage status a failed job ended with (what GetStatus answers).';
-COMMENT ON COLUMN fleet_jobs.node IS 'Name of the node it jobs or ran on (stable across node restarts).';
+COMMENT ON COLUMN fleet_jobs.node IS 'Name of the node it runs or ran on (stable across node restarts).';
 COMMENT ON COLUMN fleet_jobs.failed_on IS 'Nodes an attempt failed on; a retry avoids them.';
 COMMENT ON COLUMN fleet_jobs.started_ms IS 'Unix ms the current (or last) attempt started; cleared when it is queued again.';
 
 CREATE TABLE fleet_tokens (
     id         TEXT   PRIMARY KEY CONSTRAINT fleet_tokens_id_hex CHECK (id ~ '^[0-9a-f]{{32}}$'),
     address    TEXT   NOT NULL UNIQUE CONSTRAINT fleet_tokens_address_hex CHECK (address ~ '^[0-9a-f]{{40}}$'),
-    tenant     TEXT   NOT NULL CONSTRAINT fleet_tokens_tenant_named CHECK (tenant <> ''),
     label      TEXT   NOT NULL DEFAULT '',
     created_ms BIGINT NOT NULL,
     revoked_ms BIGINT,
@@ -414,31 +376,98 @@ CREATE TABLE fleet_tokens (
     tag        TEXT CONSTRAINT fleet_tokens_tag_scope CHECK(tag IS NULL OR (namespace IS NOT NULL AND tag ~ '{TAG_PATTERN}')),
     apps       TEXT[],
     token_hash TEXT UNIQUE,
-    manage_apps BOOLEAN NOT NULL DEFAULT FALSE
+    permissions TEXT[] NOT NULL DEFAULT '{{read,submit}}'
+        {PERMISSIONS},
+    {ADMIN_UNSCOPED}
 );
-COMMENT ON TABLE fleet_tokens IS 'Administrator-managed API tokens with optional namespace, tag and app scope; the address binds the token to the SDK proof signer.';
+COMMENT ON TABLE fleet_tokens IS 'API tokens: an administrator''s, or one scoped to a namespace with an optional tag and app grants; the address binds the token to the SDK proof signer.';
 COMMENT ON COLUMN fleet_tokens.id IS 'Opaque token resource identifier; unrelated to proof signing identity.';
 COMMENT ON COLUMN fleet_tokens.address IS 'Internal SDK proof signer binding; not exposed by token APIs.';
+COMMENT ON COLUMN fleet_tokens.apps IS 'The app and batch names it may use; NULL for all of its namespace''s.';
+COMMENT ON COLUMN fleet_tokens.permissions IS '{PERMISSIONS_COMMENT}';
 "#
     )
 }
 
-/// The proof apps: a tenant's registered programs. A job executes only for one
-/// of them; `disabled_ms` is set while the app takes no new jobs.
+/// The tokens' permissions, and that an administrator's token alone has no namespace.
+const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','admin']::text[])";
+const ADMIN_UNSCOPED: &str = "CONSTRAINT fleet_tokens_admin_unscoped CHECK (('admin' = ANY(permissions)) = (namespace IS NULL))";
+const PERMISSIONS_COMMENT: &str = "What the token may do: some of read, submit, manage within its scope; or admin, alone and with no namespace.";
+
+/// The proof apps: a namespace's named programs and how their jobs are placed. A job
+/// executes only for one of them; `disabled_ms` is set while the app takes no new jobs.
 fn apps() -> String {
-    r#"
+    let policy = APP_POLICY.join(",\n    ");
+    format!(r#"
 CREATE TABLE fleet_apps (
-    priority    INT    NOT NULL DEFAULT 0,
     namespace   TEXT   NOT NULL REFERENCES fleet_namespaces(id),
-    tenant      TEXT   NOT NULL CONSTRAINT fleet_apps_tenant_named CHECK (tenant <> ''),
-    elf_id      TEXT   NOT NULL CONSTRAINT fleet_apps_elf_id_hex CHECK (elf_id ~ '^[0-9a-f]{64}$'),
+    name        TEXT   NOT NULL {APP_NAME},
+    elf_id      TEXT   NOT NULL CONSTRAINT fleet_apps_elf_id_hex CHECK (elf_id ~ '^[0-9a-f]{{64}}$'),
+    priority    INT    NOT NULL DEFAULT 0,
     created_ms  BIGINT NOT NULL,
     disabled_ms BIGINT,
-    PRIMARY KEY (namespace, tenant, elf_id)
+    {policy},
+    PRIMARY KEY (namespace, name),
+    CONSTRAINT fleet_apps_program_once UNIQUE (namespace, elf_id)
 );
-COMMENT ON TABLE fleet_apps IS 'Proof apps: a tenant''s registered programs (sha256 of the ELF). A job executes only for one of them; disabled_ms is set while the app takes no new jobs.';
-"#
-    .to_string()
+{APP_COMMENTS}
+"#)
+}
+
+const APP_NAME: &str = "CONSTRAINT fleet_apps_name_valid CHECK (name ~ '^[A-Za-z0-9_.-]{1,63}$')";
+/// An app's placement policy columns.
+const APP_POLICY: [&str; 5] = [
+    "class TEXT NOT NULL DEFAULT 'batch' CONSTRAINT fleet_apps_class_known CHECK (class IN ('latency', 'batch'))",
+    "anchor TEXT NOT NULL DEFAULT 'none' CONSTRAINT fleet_apps_anchor_known CHECK (anchor IN ('none', 'shared', 'exclusive'))",
+    "backends TEXT[] NOT NULL DEFAULT '{}' CONSTRAINT fleet_apps_backends_known CHECK (backends <@ ARRAY['cuda', 'cpu', 'mock']::text[])",
+    "zkm_version TEXT",
+    "max_queued INT NOT NULL DEFAULT 64 CONSTRAINT fleet_apps_max_queued_positive CHECK (max_queued > 0)",
+];
+const APP_COMMENTS: &str = "COMMENT ON TABLE fleet_apps IS 'Proof apps: a namespace''s named programs (sha256 of the ELF), each registered once. A job executes only for one of them; disabled_ms is set while the app takes no new jobs.';
+COMMENT ON COLUMN fleet_apps.class IS 'latency: its jobs take the biggest free prover; batch: the smallest.';
+COMMENT ON COLUMN fleet_apps.anchor IS 'none; shared: its program stays on the prover it first ran on while healthy; exclusive: as shared, and that prover serves this app only.';
+COMMENT ON COLUMN fleet_apps.backends IS 'Node backends that may prove it; empty for any.';
+COMMENT ON COLUMN fleet_apps.zkm_version IS 'Only provers of this circuit version prove it; NULL for any.';
+COMMENT ON COLUMN fleet_apps.max_queued IS 'Jobs queued or running at most; more are refused.';";
+
+/// 14 -> 15: a token's manage_apps flag became its permissions.
+const MIGRATE_14: &str = "ALTER TABLE fleet_tokens ADD COLUMN permissions TEXT[] NOT NULL DEFAULT '{read,submit}'
+         CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage']::text[]);
+     UPDATE fleet_tokens SET permissions = '{read,submit,manage}' WHERE manage_apps;
+     ALTER TABLE fleet_tokens DROP COLUMN manage_apps;";
+
+/// 15 -> 16: tenants are gone. An app is a namespace's named program with its own placement
+/// policy (the defaults: the tenants' were in fleet.yaml): one named after its tenant, or
+/// `TENANT-<elf id prefix>` where the tenant had several in the namespace. Jobs name their app;
+/// a grant of `TENANT/ELF` becomes the app's name; a token without a namespace (a tenant's
+/// SDK signer) goes, and only an administrator's has none from now on.
+fn migrate_15() -> String {
+    let policy: String = APP_POLICY.iter().map(|c| format!(", ADD COLUMN {c}")).collect();
+    format!("ALTER TABLE fleet_apps ADD COLUMN name TEXT;
+     UPDATE fleet_apps a SET name = n.name FROM (
+         SELECT namespace, tenant, elf_id, CASE WHEN count(*) OVER (PARTITION BY namespace, tenant) = 1
+             THEN tenant ELSE tenant || '-' || left(elf_id, 8) END AS name FROM fleet_apps) n
+         WHERE a.namespace = n.namespace AND a.tenant = n.tenant AND a.elf_id = n.elf_id;
+     ALTER TABLE fleet_apps ALTER COLUMN name SET NOT NULL, ADD {APP_NAME}{policy};
+     ALTER TABLE fleet_jobs RENAME COLUMN tenant TO app;
+     UPDATE fleet_jobs j SET app = coalesce((SELECT a.name FROM fleet_apps a
+         WHERE a.namespace = j.namespace AND a.tenant = j.app AND a.elf_id = j.elf_id), '');
+     DROP INDEX fleet_jobs_app;
+     CREATE INDEX fleet_jobs_app ON fleet_jobs (namespace, app, created_ms DESC);
+     COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Payloads are files in the data dir.';
+     COMMENT ON COLUMN fleet_jobs.app IS 'The app''s name in the namespace; empty for a request refused before its app was known.';
+     UPDATE fleet_tokens t SET apps = array_remove(ARRAY(SELECT CASE WHEN g LIKE '%/%' THEN
+         (SELECT a.name FROM fleet_apps a WHERE a.namespace = t.namespace AND a.tenant || '/' || a.elf_id = g) ELSE g END
+         FROM unnest(t.apps) g), NULL) WHERE apps IS NOT NULL;
+     DELETE FROM fleet_tokens WHERE namespace IS NULL;
+     ALTER TABLE fleet_tokens DROP COLUMN tenant, DROP CONSTRAINT fleet_tokens_permissions_known,
+         ADD {PERMISSIONS}, ADD {ADMIN_UNSCOPED};
+     COMMENT ON TABLE fleet_tokens IS 'API tokens: an administrator''s, or one scoped to a namespace with an optional tag and app grants; the address binds the token to the SDK proof signer.';
+     COMMENT ON COLUMN fleet_tokens.apps IS 'The app and batch names it may use; NULL for all of its namespace''s.';
+     COMMENT ON COLUMN fleet_tokens.permissions IS '{PERMISSIONS_COMMENT}';
+     ALTER TABLE fleet_apps DROP CONSTRAINT fleet_apps_pkey, DROP COLUMN tenant, ADD PRIMARY KEY (namespace, name),
+         ADD CONSTRAINT fleet_apps_program_once UNIQUE (namespace, elf_id);
+     {APP_COMMENTS}")
 }
 
 impl PgStore {
@@ -467,11 +496,19 @@ impl PgStore {
         ).execute(pool).await?;
         let have: Option<i32> = sqlx::query_scalar("SELECT max(version) FROM fleet_schema").fetch_one(pool).await?;
         let jobs_table: bool = sqlx::query_scalar("SELECT to_regclass('fleet_jobs') IS NOT NULL").fetch_one(pool).await?;
+        let stamp = format!("INSERT INTO fleet_schema (version, applied_ms) VALUES ({SCHEMA_VERSION}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint);");
         match (have, jobs_table) {
             (Some(SCHEMA_VERSION), true) => Ok(()),
+            // Every migration from the database's schema on, in one transaction.
+            (Some(from @ 14..), true) if from < SCHEMA_VERSION => {
+                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15())];
+                let sql: String = steps.into_iter().filter(|(v, _)| *v >= from).map(|(_, sql)| sql + "\n").collect();
+                sqlx::raw_sql(&format!("BEGIN;\n{sql}{stamp}\nCOMMIT;")).execute(pool).await?;
+                tracing::info!(from, schema = SCHEMA_VERSION, "database migrated");
+                Ok(())
+            }
             (None, false) => {
-                let create = format!("{}\nINSERT INTO fleet_schema (version, applied_ms) VALUES ({SCHEMA_VERSION}, (extract(epoch FROM clock_timestamp()) * 1000)::bigint);", schema());
-                sqlx::raw_sql(&create).execute(pool).await?;
+                sqlx::raw_sql(&format!("{}\n{stamp}", schema())).execute(pool).await?;
                 tracing::info!(schema = SCHEMA_VERSION, "database created");
                 Ok(())
             }
@@ -484,7 +521,7 @@ impl PgStore {
             inputs: row.try_get::<Option<serde_json::Value>, _>("inputs")?.map(serde_json::from_value).transpose()?,
             outputs: row.try_get::<Option<serde_json::Value>, _>("outputs")?.map(serde_json::from_value).transpose()?,
             id: row.try_get("id")?,
-            tenant: row.try_get("tenant")?,
+            app: row.try_get("app")?,
             owner: row.try_get("owner")?,
             namespace: row.try_get("namespace")?,
             tag: row.try_get("tag")?,
@@ -519,14 +556,14 @@ impl Store for PgStore {
     async fn upsert(&self, j: &ProofJob) -> anyhow::Result<()> {
         j.validate()?;
         sqlx::query(
-            "INSERT INTO fleet_jobs (id, tenant, elf_id, kind, state, fail_status, error, node, attempts, failed_on, \
+            "INSERT INTO fleet_jobs (id, app, elf_id, kind, state, fail_status, error, node, attempts, failed_on, \
              cycles, prove_ms, created_ms, started_ms, finished_ms, owner, namespace, client_id, tag, priority, inputs, outputs) \
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) \
              ON CONFLICT (id) DO UPDATE SET state=$5, fail_status=$6, error=$7, node=$8, attempts=$9, failed_on=$10, \
              cycles=$11, prove_ms=$12, started_ms=$14, finished_ms=$15, outputs=$22",
         )
         .bind(&j.id)
-        .bind(&j.tenant)
+        .bind(&j.app)
         .bind(&j.elf_id)
         .bind(kind_name(j.kind()))
         .bind(j.state().name())
@@ -570,12 +607,10 @@ impl Store for PgStore {
 
     async fn recent(&self, f: &ProofJobFilter, limit: usize) -> anyhow::Result<Vec<ProofJob>> {
         let rows = sqlx::query(
-            "SELECT * FROM fleet_jobs WHERE ($1::text IS NULL OR tenant = $1)
-               AND ($2::text IS NULL OR starts_with(elf_id, $2)) AND (NOT $3 OR state IN ('queued', 'running'))
-             AND ($5::text IS NULL OR owner = $5) AND ($6::text IS NULL OR namespace = $6) AND ($7::text IS NULL OR tag = $7) ORDER BY created_ms DESC LIMIT $4",
+            "SELECT * FROM fleet_jobs WHERE ($1::text IS NULL OR app = $1) AND (NOT $2 OR state IN ('queued', 'running'))
+             AND ($4::text IS NULL OR owner = $4) AND ($5::text IS NULL OR namespace = $5) AND ($6::text IS NULL OR tag = $6) ORDER BY created_ms DESC LIMIT $3",
         )
-        .bind(&f.tenant)
-        .bind(&f.elf)
+        .bind(&f.app)
         .bind(f.active)
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .bind(&f.owner)
@@ -591,105 +626,98 @@ impl Store for PgStore {
              count(*) FILTER (WHERE state = 'succeeded') AS succeeded, count(*) FILTER (WHERE state = 'failed') AS failed, \
              max(created_ms) AS last_created_ms, avg(prove_ms) FILTER (WHERE state = 'succeeded')::float8 AS mean_prove_ms";
         let sql = format!(
-            "SELECT a.namespace, a.tenant, a.elf_id, a.created_ms, a.priority, a.disabled_ms IS NOT NULL AS disabled, coalesce(j.jobs, 0) AS jobs, \
+            "SELECT a.*, a.disabled_ms IS NOT NULL AS disabled, coalesce(j.jobs, 0) AS jobs, \
                     coalesce(j.active, 0) AS active, coalesce(j.succeeded, 0) AS succeeded, coalesce(j.failed, 0) AS failed, \
                     j.last_created_ms, j.mean_prove_ms \
-             FROM fleet_apps a LEFT JOIN (SELECT namespace, tenant, elf_id, {COUNTS} FROM fleet_jobs GROUP BY namespace, tenant, elf_id) j \
-                  ON j.namespace = a.namespace AND j.tenant = a.tenant AND j.elf_id = a.elf_id \
+             FROM fleet_apps a LEFT JOIN (SELECT namespace, app, {COUNTS} FROM fleet_jobs GROUP BY namespace, app) j \
+                  ON j.namespace = a.namespace AND j.app = a.name \
              ORDER BY last_created_ms DESC NULLS LAST, created_ms DESC"
         );
         let rows = sqlx::query(&sql).fetch_all(&self.pool).await?;
         rows.iter()
             .map(|r| {
                 Ok(App {
-                    priority: r.try_get("priority")?,
                     namespace: r.try_get("namespace")?,
-                    tenant: r.try_get("tenant")?,
+                    name: r.try_get("name")?,
                     elf_id: r.try_get("elf_id")?,
+                    priority: r.try_get("priority")?,
+                    disabled: r.try_get("disabled")?,
                     created_ms: r.try_get::<i64, _>("created_ms")? as u64,
+                    class: r.try_get("class")?,
+                    anchor: r.try_get("anchor")?,
+                    backends: r.try_get("backends")?,
+                    zkm_version: r.try_get("zkm_version")?,
+                    max_queued: r.try_get::<i32, _>("max_queued")? as u32,
                     jobs: r.try_get::<i64, _>("jobs")? as u64,
                     active: r.try_get::<i64, _>("active")? as u64,
                     succeeded: r.try_get::<i64, _>("succeeded")? as u64,
                     failed: r.try_get::<i64, _>("failed")? as u64,
                     last_created_ms: r.try_get::<Option<i64>, _>("last_created_ms")?.map(|v| v as u64),
                     mean_prove_ms: r.try_get("mean_prove_ms")?,
-                    disabled: r.try_get("disabled")?,
                 })
             })
             .collect()
     }
 
-    async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str,
-    ) -> anyhow::Result<Vec<String>> {
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>> {
         let rows = sqlx::query(
-            "WITH gone AS (DELETE FROM fleet_jobs WHERE tenant = $1 AND elf_id = $2 AND namespace = $3 AND state IN ('succeeded', 'failed') RETURNING id), \
-                  app AS (DELETE FROM fleet_apps WHERE tenant = $1 AND elf_id = $2 AND namespace = $3) \
+            "WITH gone AS (DELETE FROM fleet_jobs WHERE namespace = $1 AND app = $2 AND state IN ('succeeded', 'failed') RETURNING id), \
+                  app AS (DELETE FROM fleet_apps WHERE namespace = $1 AND name = $2) \
              SELECT id FROM gone",
         )
-            .bind(tenant)
-            .bind(elf_id)
             .bind(namespace)
+            .bind(name)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(|r| Ok(r.try_get("id")?)).collect()
     }
 
-    async fn registered_apps(&self) -> anyhow::Result<Vec<(String, String, String, bool)>> {
-        let rows = sqlx::query("SELECT namespace, tenant, elf_id, disabled_ms IS NOT NULL AS disabled FROM fleet_apps ORDER BY namespace, tenant, elf_id")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter().map(|r| {
-                Ok((r.try_get("namespace")?, r.try_get("tenant")?, r.try_get("elf_id")?, r.try_get("disabled")?,
-                ))
-            }).collect()
-    }
-
-    async fn add_app(&self, namespace: &str, tenant: &str, elf_id: &str, at_ms: u64, priority: i32,
-    ) -> anyhow::Result<bool> {
-        let r = sqlx::query("INSERT INTO fleet_apps (tenant, elf_id, created_ms, namespace, priority) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING")
-            .bind(tenant)
-            .bind(elf_id)
-            .bind(at_ms as i64)
-            .bind(namespace)
-            .bind(priority)
+    async fn add_app(&self, a: &App) -> anyhow::Result<bool> {
+        let r = sqlx::query("INSERT INTO fleet_apps (namespace, name, elf_id, priority, created_ms, class, anchor, backends, zkm_version, max_queued) \
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING")
+            .bind(&a.namespace)
+            .bind(&a.name)
+            .bind(&a.elf_id)
+            .bind(a.priority)
+            .bind(a.created_ms as i64)
+            .bind(&a.class)
+            .bind(&a.anchor)
+            .bind(&a.backends)
+            .bind(&a.zkm_version)
+            .bind(a.max_queued as i32)
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected() > 0)
     }
 
-    async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32,
-    ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE fleet_apps SET priority=$4 WHERE namespace=$1 AND tenant=$2 AND elf_id=$3",
-        )
-            .bind(namespace).bind(tenant).bind(elf_id).bind(priority).execute(&self.pool).await?;
+    async fn set_app_priority(&self, namespace: &str, name: &str, priority: i32) -> anyhow::Result<()> {
+        sqlx::query("UPDATE fleet_apps SET priority = $3 WHERE namespace = $1 AND name = $2")
+            .bind(namespace).bind(name).bind(priority).execute(&self.pool).await?;
         Ok(())
     }
 
-    async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool, at_ms: u64,
-    ) -> anyhow::Result<()> {
-        sqlx::query("UPDATE fleet_apps SET disabled_ms = CASE WHEN $3 THEN $4 ELSE NULL END WHERE tenant = $1 AND elf_id = $2 AND namespace = $5")
-            .bind(tenant)
-            .bind(elf_id)
+    async fn set_app_disabled(&self, namespace: &str, name: &str, disabled: bool, at_ms: u64) -> anyhow::Result<()> {
+        sqlx::query("UPDATE fleet_apps SET disabled_ms = CASE WHEN $3 THEN $4 ELSE NULL END WHERE namespace = $1 AND name = $2")
+            .bind(namespace)
+            .bind(name)
             .bind(disabled)
             .bind(at_ms as i64)
-            .bind(namespace)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
     async fn add_token(&self, c: &Token) -> anyhow::Result<()> {
-        sqlx::query("INSERT INTO fleet_tokens (id, address, tenant, label, created_ms, apps, token_hash, namespace, tag, manage_apps) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+        sqlx::query("INSERT INTO fleet_tokens (id, address, label, created_ms, apps, token_hash, namespace, tag, permissions) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
             .bind(&c.id)
             .bind(&c.address)
-            .bind(&c.tenant)
             .bind(&c.label)
             .bind(c.created_ms as i64)
             .bind(c.apps.as_ref().map(|apps| &apps.values))
             .bind(&c.token_hash)
             .bind(&c.namespace)
             .bind(&c.tag)
-            .bind(c.manage_apps)
+            .bind(&c.permissions)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -779,7 +807,6 @@ impl Store for PgStore {
                 Ok(Token {
                     id: r.try_get("id")?,
                     address: r.try_get("address")?,
-                    tenant: r.try_get("tenant")?,
                     label: r.try_get("label")?,
                     created_ms: r.try_get::<i64, _>("created_ms")? as u64,
                     revoked_ms: r.try_get::<Option<i64>, _>("revoked_ms")?.map(|v| v as u64),
@@ -787,7 +814,7 @@ impl Store for PgStore {
                     token_hash: r.try_get("token_hash")?,
                     namespace: r.try_get("namespace")?,
                     tag: r.try_get("tag")?,
-                    manage_apps: r.try_get("manage_apps")?,
+                    permissions: r.try_get("permissions")?,
                 })
             })
             .collect()

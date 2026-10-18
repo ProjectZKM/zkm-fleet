@@ -1,102 +1,95 @@
-//! HTTP: public values for the SDK (`/{proof_id}/wrap/public_values.bin`), health,
-//! and the fleetctl API: operators manage quotas, owners manage scoped app policy.
+//! HTTP: public values for the SDK (`/{proof_id}/wrap/public_values.bin`), health, the
+//! nodes' internal relays, and the API fleetctl uses. Every API route needs a token holding the
+//! permission `required` names for it; its handler scopes it to the token's namespace, tag and
+//! app grants. An administrator's token reaches every namespace.
 
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Extension, Json, Router,
 };
 use fleet_proto::model::v1::{
-    AppRequest, ProofJobsQuery, NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest, PublicValuesQuery,
+    NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest, PublicValuesQuery,
     AllocationRequest,
 };
 
 use crate::blobs::{self, is_safe_id};
 use crate::fleet::Scheduler;
-use crate::store::{ProofJobFilter, Token};
-use crate::token;
+use crate::store::Token;
+use crate::token::{self, Permission};
 
 #[derive(Clone)]
 pub struct HttpState {
     pub fleet: Arc<Scheduler>,
-    pub admin_token: Arc<String>,
     pub workloads: Arc<crate::workloads::WorkloadController>,
 }
 
 pub fn router(state: HttpState) -> Router {
-    let admin = Router::new()
+    let api = Router::new()
         .route("/status", get(status))
         .route("/namespaces", get(namespaces).post(create_namespace))
         .route("/namespaces/:name", get(namespace))
         .route("/namespaces/:name/quota", put(set_quota))
-        .route("/namespaces/:name/allocations", get(allocations).post(reserve_job),
-        )
-        .route("/namespaces/:name/allocations/:id", axum::routing::delete(release_job),
-        )
-        .route("/allocations/:id", axum::routing::delete(release_allocation),
-        )
+        .route("/namespaces/:name/allocations", get(allocations).post(reserve_job))
+        .route("/namespaces/:name/allocations/:id", axum::routing::delete(release_job))
+        .route("/allocations/:id", axum::routing::delete(release_allocation))
         .route("/preemption/plan", post(preemption_plan))
-        .route("/namespaces/:name/suspended", put(suspend_namespace).delete(resume_namespace),
-        )
+        .route("/namespaces/:name/suspended", put(suspend_namespace).delete(resume_namespace))
         .route("/tokens", get(list_tokens).post(add_token))
-        .route(
-            "/tokens/:id",
-            axum::routing::delete(revoke_token))
-        .route("/apps", get(apps).post(add_app).delete(delete_app))
-        .route("/apps/disabled", put(disable_app).delete(enable_app))
-        .route("/apps/priority", put(set_app_priority))
-        .route("/jobs", get(jobs))
-        .route("/jobs/:id", get(job))
-        .route("/jobs/:id/output/:name", get(proof_output))
-        .route("/proof-jobs", axum::routing::post(crate::proof_api::submit))
-
+        .route("/tokens/:id", axum::routing::delete(revoke_token))
         .route("/nodes/:name/drain", post(drain).delete(undrain))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            authorize_http,
-        ));
-    let fetch = crate::proof_fetch::router(state.clone()).merge(crate::log_relay::router(state.clone()));
+        .with_state(state.clone())
+        .merge(crate::workloads::router(state.workloads.clone()))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/access", get(access))
         .route("/healthz", get(|| async { "ok" }))
         .route("/:proof_id/wrap/public_values.bin", get(public_values))
-        .nest("/admin", admin)
-        .with_state(state)
-        .merge(fetch)
+        .with_state(state.clone())
+        .merge(api)
+        .merge(crate::proof_fetch::router(state.clone()))
+        .merge(crate::log_relay::router(state.clone()))
+        .merge(crate::workloads::internal_router(state.workloads))
 }
 
-async fn authorize_http(
+/// The permission an API route needs. Reading apps, batches, their jobs and the caller's own
+/// namespace needs read; submitting a job (or cancelling a batch job) submit; changing an app
+/// or batch, or purging its jobs, manage; everything else (namespaces and their quotas,
+/// tokens, allocations, preemption, nodes, the fleet's status) admin.
+pub fn required(method: &Method, path: &str) -> Permission {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match (method, parts.as_slice()) {
+        (&Method::GET, ["namespaces"] | ["namespaces", _]) => Permission::Read,
+        (&Method::GET, ["apps" | "batches", ..]) => Permission::Read,
+        (&Method::POST, ["apps" | "batches", _, "jobs"]) => Permission::Submit,
+        (&Method::POST, ["batches", _, "jobs", _, "cancel"]) => Permission::Submit,
+        (_, ["batches", _, "jobs", _, "preempt"]) => Permission::Admin,
+        (_, ["apps" | "batches", ..]) => Permission::Manage,
+        _ => Permission::Admin,
+    }
+}
+
+/// Admits a request whose token holds the route's permission. Handlers get the token as
+/// `Option<Token>`: `None` for an administrator's, which no namespace or grant limits.
+async fn authorize(
     State(s): State<HttpState>,
     headers: HeaderMap,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let header = headers.get(token::HEADER).and_then(|v| v.to_str().ok());
-    let principal = if token::bearer_matches(header, &s.admin_token) {
-        None
-    } else if let Some(c) = s.fleet.token_for_token(header) {
-        let path = req.uri().path().strip_prefix("/admin").unwrap_or(req.uri().path());
-        let read_scoped = req.method() == axum::http::Method::GET
-            && (path == "/apps" || path == "/jobs" || path == "/namespaces"
-                || path.strip_prefix("/namespaces/").is_some_and(|name| !name.is_empty() && !name.contains('/'))
-                || path.strip_prefix("/jobs/").is_some_and(|id| {
-                    let parts = id.split('/').collect::<Vec<_>>();
-                    !parts[0].is_empty() && (parts.len() == 1 ||
-                        (parts.len() == 3 && parts[1] == "output" && matches!(parts[2], blobs::PROOF | blobs::PUBLIC_VALUES)))
-                }));
-        let manage_app = c.manage_apps && matches!((req.method().as_str(), path),
-            ("POST" | "DELETE", "/apps") | ("PUT" | "DELETE", "/apps/disabled") | ("PUT", "/apps/priority"));
-        if !read_scoped && !manage_app && !(path == "/proof-jobs" && req.method() == axum::http::Method::POST) {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-        Some(c)
-    } else {
+    let Some(c) = s.fleet.token_for_token(header) else {
         return (StatusCode::UNAUTHORIZED, "missing or wrong token").into_response();
     };
+    let need = required(req.method(), req.uri().path());
+    if !token::allowed(Some(&c), need) {
+        return (StatusCode::FORBIDDEN, format!("this token lacks the {} permission", need.name())).into_response();
+    }
+    let principal = (!token::allowed(Some(&c), Permission::Admin)).then_some(c);
     req.extensions_mut().insert(principal);
     next.run(req).await
 }
@@ -125,16 +118,11 @@ async fn public_values(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => return internal(e),
     };
-    let allowed = if job.namespace != crate::store::SYSTEM_NAMESPACE {
-        q.token_id.as_ref().and_then(|id| s.fleet.token_for_id(id)).is_some_and(|c| {
-            c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag
-                && c.apps.as_ref().is_none_or(|apps| apps.contains(&format!("{}/{}", job.tenant, job.elf_id))) && s.fleet.public_values_open(
-                &format!("{proof_id}\0{}", c.id), q.key.as_deref())
-        })
-    } else {
-        s.fleet.public_values_open(&proof_id, q.key.as_deref())
-            && s.fleet.tenant_for_signer(&job.owner).is_some()
-    };
+    let allowed = q.token_id.as_ref().and_then(|id| s.fleet.token_for_id(id)).is_some_and(|c| {
+        c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag
+            && c.apps.as_ref().is_none_or(|apps| apps.contains(&job.app))
+            && s.fleet.public_values_open(&format!("{proof_id}\0{}", c.id), q.key.as_deref())
+    });
     if !allowed { return StatusCode::NOT_FOUND.into_response(); }
     match s.fleet.proof_output(&job, blobs::PUBLIC_VALUES).await {
         Ok(bytes) => ([("content-type", "application/octet-stream")], bytes).into_response(),
@@ -306,12 +294,12 @@ async fn list_tokens(State(s): State<HttpState>) -> Response {
 async fn add_token(State(s): State<HttpState>, Json(c): Json<CreateTokenRequest>) -> Response {
     match s
         .fleet
-        .add_user_token(&c.tenant, &c.id, &c.address, &c.label, c.apps.map(|apps| apps.values), c.token_hash, c.namespace, c.tag, c.manage_apps,
+        .add_user_token(&c.id, &c.address, &c.label, c.apps.map(|apps| apps.values), c.token_hash, c.namespace, c.tag, c.permissions,
         )
         .await
     {
         Ok(cred) => {
-            tracing::info!(tenant = %cred.tenant, token_id = %cred.id, label = %cred.label, "token added");
+            tracing::info!(token_id = %cred.id, label = %cred.label, permissions = ?cred.permissions, "token added");
             (StatusCode::CREATED, Json(cred)).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
@@ -329,75 +317,6 @@ async fn revoke_token(State(s): State<HttpState>, Path(id): Path<String>) -> Res
     }
 }
 
-async fn apps(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(q): axum::extract::Query<NamespaceSelector>,
-) -> Response {
-    let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r,
-    };
-    let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r,
-    };
-    match s.fleet.apps().await {
-        Ok(mut v) => {
-            if let Some(c) = &c {
-                if let Some(grants) = &c.apps {
-                    v.retain(|a| {
-                        grants.contains(&format!("{}/{}", a["tenant"].as_str().unwrap_or_default(), a["elf_id"].as_str().unwrap_or_default()))
-                    });
-                }
-            }
-            if namespace.is_some() {
-                v.retain(|a| a["namespace"].as_str() == namespace.as_deref());
-                // Counts and ordering are namespace-local even after rotating tokens.
-                let jobs = match s.fleet.recent_jobs(&ProofJobFilter { namespace, tag: tag.clone(), ..Default::default() }, i64::MAX as usize,
-                    ).await {
-                    Ok(j) => j, Err(e) => return internal(e),
-                };
-                for a in &mut v {
-                    let own: Vec<_> = jobs.iter().filter(|j| {
-                            Some(j.tenant.as_str()) == a["tenant"].as_str() && Some(j.elf_id.as_str()) == a["elf_id"].as_str()
-                        }).collect();
-                    a["jobs"] = serde_json::json!(own.len());
-                    a["active"] = serde_json::json!(own.iter().filter(|j| !j.state().is_terminal()).count());
-                    a["succeeded"] = serde_json::json!(own.iter().filter(|j| matches!(j.state(), crate::store::ProofJobState::Succeeded)).count());
-                    a["failed"] = serde_json::json!(own.iter().filter(|j| matches!(j.state(), crate::store::ProofJobState::Failed)).count());
-                    a["last_created_ms"] = serde_json::json!(own.iter().map(|j| j.created_ms).max());
-                    a["mean_prove_ms"] = serde_json::Value::Null;
-                    a["anchored_on"] = serde_json::Value::Null;
-                }
-                v.sort_by_key(|a| std::cmp::Reverse(a["last_created_ms"].as_u64().unwrap_or(0)));
-            }
-            v = v.into_iter().map(|app| s.workloads.app_record_value(app, tag.as_deref())).collect();
-            Json(v).into_response()
-        }
-        Err(e) => internal(e),
-    }
-}
-
-/// An app by its exact key (both given; empty for the rejected requests' app).
-
-fn app_parts(key: &AppRequest, fleet: &Scheduler) -> Result<(String, String, String), Response> {
-        match (&key.namespace, &key.tenant, &key.elf_id) {
-            (Some(reference), Some(t), Some(e)) => match fleet.namespace(reference) {
-                Some(n) => Ok((n.id, t.clone(), e.clone())),
-                None => Err((StatusCode::NOT_FOUND, "unknown namespace; an administrator must create it first",
-            ).into_response()),
-            },
-            _ => Err((StatusCode::BAD_REQUEST, "give namespace, tenant and elf_id (the full id, as GET /admin/apps lists it)",
-        ).into_response()),
-    }
-}
-
-fn authorize_app_management(c: Option<&Token>, key: &AppRequest, namespace: &str, tenant: &str, elf: &str,
-) -> Result<(), Response> {
-    if let Some(c) = c {
-        if !c.manage_apps || c.namespace.as_deref() != Some(namespace)
-            || key.tag.as_deref().is_some_and(|tag| c.tag.as_deref() != Some(tag))
-            || c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{tenant}/{elf}"))) {
-            return Err(StatusCode::FORBIDDEN.into_response());
-        }
-    }
-    Ok(())
-}
-
 /// An app action's outcome: its JSON, a refusal with its status, or 500.
 fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
     match r {
@@ -407,145 +326,6 @@ fn app_outcome(r: anyhow::Result<serde_json::Value>) -> Response {
             ).into_response(),
             None => internal(e),
         },
-    }
-}
-
-async fn delete_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
-) -> Response {
-    match app_parts(&k, &s.fleet) {
-        Ok((n, t, e)) => {
-            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
-            let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
-                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
-            };
-            let deleted = s.fleet.delete_app(&n, &t, &e).await;
-            if let (Ok(_), Err(error)) = (&deleted, s.workloads.remove_app(&n, &format!("{t}/{e}"))) {
-                return internal(error);
-            }
-            app_outcome(deleted)
-        }
-        Err(r) => r,
-    }
-}
-
-async fn add_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
-) -> Response {
-    let priority = k.priority.unwrap_or(0);
-    if let Some(c) = c {
-        if !c.manage_apps { return StatusCode::FORBIDDEN.into_response(); }
-        match app_parts(&k, &s.fleet) {
-            Ok((namespace, tenant, elf)) if k.tag.as_deref() == c.tag.as_deref()
-                && authorize_app_management(Some(&c), &k, &namespace, &tenant, &elf).is_ok() => {}
-            _ => return StatusCode::FORBIDDEN.into_response(),
-        }
-    }
-    match app_parts(&k, &s.fleet) {
-        Ok((n, t, e)) => app_outcome(s.fleet.add_app(&n, &t, &e, priority).await),
-        Err(r) => r,
-    }
-}
-
-async fn set_app_priority(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
-) -> Response {
-    let Some(priority) = k.priority else { return (StatusCode::BAD_REQUEST, "priority is required").into_response(); };
-    match app_parts(&k, &s.fleet) {
-        Ok((n,t,e)) => {
-            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
-            if !s.fleet.app_known(&n, &t, &e) { return StatusCode::NOT_FOUND.into_response(); }
-            app_outcome(s.fleet.set_app_priority(&n,&t,&e,priority).await)
-        }
-        Err(r) => r,
-    }
-}
-
-async fn disable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
-) -> Response {
-    match app_parts(&k, &s.fleet) {
-        Ok((n, t, e)) => {
-            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
-            let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
-                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
-            };
-            app_outcome(s.fleet.set_app_disabled(&n, &t, &e, true).await)
-        }
-        Err(r) => r,
-    }
-}
-
-async fn enable_app(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(k): axum::extract::Query<AppRequest>,
-) -> Response {
-    match app_parts(&k, &s.fleet) {
-        Ok((n, t, e)) => {
-            if let Err(r) = authorize_app_management(c.as_ref(), &k, &n, &t, &e) { return r; }
-            let _guard = match s.workloads.app_lifecycle_guard(&n, &format!("{t}/{e}")).await {
-                Ok(guard) => guard, Err(error) => return app_outcome(Err(error)),
-            };
-            app_outcome(s.fleet.set_app_disabled(&n, &t, &e, false).await)
-        }
-        Err(r) => r,
-    }
-}
-
-async fn jobs(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, axum::extract::Query(q): axum::extract::Query<ProofJobsQuery>,
-) -> Response {
-    let namespace = match selected_namespace(&s, c.as_ref(), q.namespace.as_deref()) { Ok(n) => n, Err(r) => return r,
-    };
-    let tag = match selected_tag(&s,c.as_ref(),namespace.as_deref(),q.tag.as_deref()) { Ok(g)=>g,Err(r)=>return r,
-    };
-    match s.fleet.recent_jobs(&ProofJobFilter { namespace, tag, owner: None, tenant: q.tenant, elf: q.elf, active: q.active,
-            }, q.limit.min(1000) as usize,
-        ).await {
-        Ok(v) => Json(v.iter().map(|j| s.workloads.proof_job_value(j)).collect::<Vec<_>>(),
-        ).into_response(),
-        Err(e) => internal(e),
-    }
-}
-
-async fn job(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path(id): Path<String>, axum::extract::Query(q): axum::extract::Query<NamespaceSelector>,
-) -> Response {
-    match scoped_job(&s, c.as_ref(), &id, &q).await {
-        Ok(j) => Json(s.workloads.proof_job_value(&j)).into_response(),
-        Err(r) => r,
-    }
-}
-
-async fn scoped_job(s: &HttpState, c: Option<&Token>, id: &str, q: &NamespaceSelector,
-) -> Result<crate::store::ProofJob, Response> {
-    let namespace = selected_namespace(s, c, q.namespace.as_deref())?;
-    let tag = selected_tag(s,c,namespace.as_deref(),q.tag.as_deref())?;
-    let resolved = if let Some(n) = &namespace {
-        match s.fleet.namespace_job(n, tag.as_deref().filter(|t|!t.is_empty()), &id).await {
-            Ok(Some(j)) => Ok(Some(j)),
-            Ok(None) => s.fleet.job(&id).await,
-            Err(e) => Err(e),
-        }
-    } else { s.fleet.job(&id).await };
-    match resolved {
-        Ok(Some(j)) if namespace.as_ref().is_none_or(|n| &j.namespace == n) && tag.as_ref().is_none_or(|g|&j.tag==g) =>
-        {
-            Ok(j)
-        }
-        Ok(_) => Err(StatusCode::NOT_FOUND.into_response()),
-        Err(e) => Err(internal(e)),
-    }
-}
-
-async fn proof_output(State(s): State<HttpState>, Extension(c): Extension<Option<Token>>, Path((id,name)): Path<(String,String)>, axum::extract::Query(q): axum::extract::Query<NamespaceSelector>,
-) -> Response {
-    if !matches!(name.as_str(), blobs::PROOF | blobs::PUBLIC_VALUES) { return StatusCode::NOT_FOUND.into_response(); }
-    let j = match scoped_job(&s,c.as_ref(),&id,&q).await { Ok(j)=>j, Err(r)=>return r,
-    };
-    if c.as_ref().is_some_and(|c| {
-        c.apps.as_ref().is_some_and(|apps| !apps.contains(&format!("{}/{}", j.tenant, j.elf_id)))
-    }) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    if j.state() != crate::store::ProofJobState::Succeeded { return (StatusCode::CONFLICT,"proof has not succeeded").into_response(); }
-    match s.fleet.proof_output(&j, if name == blobs::PROOF {blobs::PROOF} else {blobs::PUBLIC_VALUES},
-        ).await {
-        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE,"application/octet-stream")],bytes,
-        ).into_response(),
-        Err(e) => crate::proof_fetch::response_error(e),
     }
 }
 
@@ -562,5 +342,53 @@ async fn undrain(State(s): State<HttpState>, Path(name): Path<String>) -> Respon
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::NOT_FOUND, "no such machine node").into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_route_needs_the_permission_its_effect_does() {
+        use Permission::*;
+        for (method, path, need) in [
+            (Method::GET, "/namespaces", Read),
+            (Method::GET, "/namespaces/zkm", Read),
+            (Method::GET, "/apps", Read),
+            (Method::GET, "/apps/goat/jobs/p-1/output/proof.json", Read),
+            (Method::GET, "/batches/training/jobs/j/logs", Read),
+            (Method::POST, "/apps/goat/jobs", Submit),
+            (Method::POST, "/batches/training/jobs", Submit),
+            (Method::POST, "/batches/training/jobs/j/cancel", Submit),
+            (Method::POST, "/batches/training/jobs/j/preempt", Admin),
+            (Method::POST, "/apps", Manage),
+            (Method::DELETE, "/apps/goat", Manage),
+            (Method::PUT, "/apps/goat/disabled", Manage),
+            (Method::PUT, "/apps/goat/scale", Manage),
+            (Method::DELETE, "/batches/training/jobs", Manage),
+            (Method::GET, "/status", Admin),
+            (Method::POST, "/namespaces", Admin),
+            (Method::GET, "/namespaces/zkm/allocations", Admin),
+            (Method::PUT, "/namespaces/zkm/quota", Admin),
+            (Method::GET, "/tokens", Admin),
+            (Method::POST, "/nodes/gpu/drain", Admin),
+            (Method::POST, "/preemption/plan", Admin),
+        ] {
+            assert_eq!(required(&method, path), need, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn admin_holds_every_permission_and_others_only_theirs() {
+        let token = |p: &[&str]| fleet_proto::model::v1::Token { permissions: p.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        for p in [Permission::Read, Permission::Submit, Permission::Manage, Permission::Admin] {
+            assert!(token::allowed(Some(&token(&["admin"])), p));
+            assert!(token::allowed(None, p));
+        }
+        let reader = token(&["read", "submit"]);
+        assert!(token::allowed(Some(&reader), Permission::Submit));
+        assert!(!token::allowed(Some(&reader), Permission::Manage));
+        assert!(!token::allowed(Some(&token(&["manage"])), Permission::Admin));
     }
 }

@@ -19,8 +19,9 @@ The [code model](docs/reference.md#code-names) uses jobs, app deployments and a
 workload controller. Shared records come from protobuf; Kubernetes is not required.
 
 App owners manage workload metadata, mount roots, priority, enable/disable and
-scaling with scoped owner tokens. Administrators manage namespace quotas and
-access; owner changes remain subject to namespace and tag limits.
+scaling with namespace tokens holding the `manage` permission. Administrators
+manage namespace quotas and access; owner changes remain subject to namespace and
+tag limits.
 
 EthProofs prepares witnesses, proves locally and reports from one integrated app
 worker. It resumes its saved cursor and proves every block in sequence.

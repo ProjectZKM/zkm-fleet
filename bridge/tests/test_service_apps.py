@@ -62,7 +62,7 @@ def test_integrated_worker_needs_no_native_prover_binary_or_control_credentials(
     from fleet_bridge import actors
     cfg = reconcile.load_services({"log_dir": str(tmp_path), "services": [{
         "name": "worker", "kind": "ziren-gpu", "image": "prover:latest",
-        "namespace": "a" * 32, "app": "worker/" + "b" * 64,
+        "namespace": "a" * 32, "app": "worker", "elf_id": "b" * 64,
         "worker_command": ["/opt/worker"], "proof_storage_root": str(tmp_path / "state"),
         "machine": "local", "gpus": 1}]})
     spec = reconcile.replica_specs(cfg)["worker-0"]
@@ -102,19 +102,26 @@ def test_stop_kills_actor_without_restart_and_removes_reservation(monkeypatch):
 
 
 def test_gpu_services_must_be_bound_to_one_app():
-    with pytest.raises(ValueError, match="app must be TENANT/FULL_ELF_SHA256"):
+    with pytest.raises(ValueError, match="proves one program"):
         reconcile.load_services({"services": [{"name": "shared-gpu", "kind": "ziren-gpu"}]})
+    with pytest.raises(ValueError, match="full ELF SHA-256"):
+        reconcile.load_services({"services": [{"name": "short", "kind": "ziren-gpu", "elf_id": "abc"}]})
+    with pytest.raises(ValueError, match="must be a name"):
+        reconcile.load_services({"services": [{"name": "old", "kind": "ziren-gpu", "app": "eth/" + "a" * 64, "elf_id": "a" * 64}]})
     with pytest.raises(ValueError, match="is its own app"):
-        reconcile.load_services({"services": [{"name": "wrong-kind", "kind": "app",
-                                                 "app": "eth/" + "a" * 64}]})
+        reconcile.load_services({"services": [{"name": "wrong-kind", "kind": "app", "app": "eth"}]})
+    with pytest.raises(ValueError, match="only a Ziren prover"):
+        reconcile.load_services({"services": [{"name": "web", "kind": "app", "elf_id": "a" * 64}]})
     assert reconcile.load_services({"services": [{"name": "web", "kind": "app"}]}).services[0].app == "web"
+    prover = reconcile.load_services({"services": [{"name": "eth-gpu", "kind": "ziren-gpu", "app": "eth", "elf_id": "A" * 64}]}).services[0]
+    assert (prover.app, prover.elf_id) == ("eth", "a" * 64)
 
 
 def test_proof_replicas_each_get_one_server_and_the_same_app_storage_root():
     from fleet_bridge import actors
     cfg = reconcile.load_services({"scheduler": "https://scheduler:8905", "cluster_token_file": "/etc/cluster.token", "services": [{
         "name": "eth", "kind": "ziren-gpu", "namespace": "a"*32,
-        "app": "eth/"+"b"*64, "proof_storage_root": "/srv/eth", "replicas": 2, "gpus": 2,
+        "app": "eth", "elf_id": "b"*64, "proof_storage_root": "/srv/eth", "replicas": 2, "gpus": 2,
     }]})
     specs = reconcile.replica_specs(cfg)
     assert list(specs) == ["eth-0", "eth-1"]
@@ -123,12 +130,13 @@ def test_proof_replicas_each_get_one_server_and_the_same_app_storage_root():
         assert env["FLEET_NODE_NAME"] == name
         assert env["FLEET_APP_STORAGE_ROOT"] == "/srv/eth"
         assert env["FLEET_APP_NAMESPACE"] == "a"*32
+        assert env["FLEET_APP"] == "eth"
         assert env["FLEET_APP_ELF_ID"] == "b"*64
         assert reconcile.bundle(spec).gpu == 2
 
 
 def test_integrated_worker_requires_single_machine_pinned_replica():
-    config = {"name": "eth", "kind": "ziren-gpu", "app": "eth/" + "b" * 64,
+    config = {"name": "eth", "kind": "ziren-gpu", "app": "eth", "elf_id": "b" * 64,
               "worker_command": ["/opt/eth-proofs"], "proof_storage_root": "/srv/eth",
               "machine": "ant", "replicas": 1}
     assert reconcile.load_services({"services": [config]}).services[0].worker_command == ["/opt/eth-proofs"]
@@ -142,7 +150,7 @@ def test_integrated_worker_environment_keeps_replica_scope_and_credentials_separ
     env_file = tmp_path / "worker.env"
     env_file.write_text('ETH_PROOFS_API_TOKEN="worker token"\nFLEET_GPU_ENDPOINT=http://evil\nFLEET_APP_ELF_ID=wrong\n')
     cfg = reconcile.load_services({"services": [{"name": "eth", "kind": "ziren-gpu",
-        "namespace": "a" * 32, "app": "eth/" + "b" * 64, "proof_storage_root": "/srv/eth",
+        "namespace": "a" * 32, "app": "eth", "elf_id": "b" * 64, "proof_storage_root": "/srv/eth",
         "machine": "ant", "worker_command": ["/opt/eth-proofs"], "worker_env_file": str(env_file)}]})
     spec = reconcile.replica_specs(cfg)["eth-0"]
     monkeypatch.setenv("FLEET_CLUSTER_TOKEN_FILE", "/etc/cluster.token")
@@ -150,7 +158,7 @@ def test_integrated_worker_environment_keeps_replica_scope_and_credentials_separ
     env = actors._app_worker_env(spec, "http://127.0.0.1:30100/twirp/")
     assert env["ETH_PROOFS_API_TOKEN"] == "worker token"
     assert env["FLEET_GPU_ENDPOINT"] == "http://127.0.0.1:30100/twirp/"
-    assert env["FLEET_APP_ELF_ID"] == "b" * 64
+    assert (env["FLEET_APP"], env["FLEET_APP_ELF_ID"]) == ("eth", "b" * 64)
     assert env["FLEET_EXIT_WITH_PARENT"] == "true"
     assert "FLEET_CLUSTER_TOKEN_FILE" not in env
     assert "CUDA_VISIBLE_DEVICES" not in env

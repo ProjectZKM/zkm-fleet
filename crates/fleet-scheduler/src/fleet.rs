@@ -14,10 +14,11 @@ use fleet_proto::fleet::v1::{Assignment, Completion, HeartbeatRequest, Heartbeat
 use fleet_proto::stage::v1::Status as StageStatus;
 
 use crate::blobs::{self, BlobStore};
-use crate::config::{AnchorPolicy, SchedulerConfig};
-use crate::placement::{self, PlacementDecision, PlacementCandidate};
+use crate::config::SchedulerConfig;
+use crate::placement::{self, AnchorPolicy, AppPolicy, PlacementDecision, PlacementCandidate, SchedulingClass};
 use crate::quota::{Allocation, Quota, Usage};
-use crate::store::{normalize_address, ProofJob, ProofJobState, Namespace, Store, Token};
+use crate::store::{normalize_address, App, ProofJob, ProofJobState, Namespace, Store, Token};
+use fleet_proto::model::v1::RegisterAppRequest;
 
 
 /// How an attempt failed, which decides whether it counts and what it says about the node.
@@ -63,14 +64,17 @@ fn classify(status: &tonic::Status) -> ProofAttemptFailure {
     }
 }
 
-/// A proof app's name: its tenant and the start of its program's id; `(rejected)` for
-/// requests refused before either was known.
-pub fn app_name(tenant: &str, elf_id: &str) -> String {
-    if tenant.is_empty() && elf_id.is_empty() {
-        return "(rejected)".into();
-    }
-    format!("{}/{}", if tenant.is_empty() { "?" } else { tenant }, &elf_id[..8.min(elf_id.len())])
+/// Whether `name` can name an app or batch: letters, digits, `_`, `-` and `.`, at most 63.
+pub fn valid_app_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 63 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
+
+fn valid_elf_id(elf_id: &str) -> bool {
+    elf_id.len() == 64 && elf_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The node backends an app may name.
+const BACKENDS: [&str; 3] = ["cuda", "cpu", "mock"];
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -101,9 +105,9 @@ pub struct RegisteredProver {
 struct SchedulerState {
     jobs: HashMap<String, ProofJobEntry>,
     nodes: HashMap<String, RegisteredProver>,
-    /// (namespace, tenant, elf_id) -> dedicated node name.
-    anchors: HashMap<(String, String, String), String>,
-    /// node name -> tenant, for exclusive anchors.
+    /// (namespace, app) -> dedicated node name.
+    anchors: HashMap<(String, String), String>,
+    /// node name -> app key (`namespace/name`), for exclusive anchors.
     reserved: HashMap<String, String>,
     /// Machine identities taking no new proofs, including replicas registered later.
     draining_machines: HashSet<String>,
@@ -123,14 +127,15 @@ pub struct Scheduler {
     inner: Mutex<SchedulerState>,
     /// address -> token, mirrored from the store.
     tokens: Mutex<HashMap<String, Token>>,
+    /// Held while the token mirror changes, so a reload does not undo an issue or revoke.
+    token_ops: tokio::sync::Mutex<()>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     allocations: Mutex<HashMap<String, Allocation>>,
     quota_ops: tokio::sync::Mutex<()>,
-    /// The registered proof apps, (namespace, tenant, elf_id) -> disabled, mirrored from the store.
-    /// A job executes only for one of them.
-    apps: Mutex<HashMap<(String, String, String), bool>>,
-    priorities: Mutex<HashMap<(String, String, String), i32>>,
-    worker_owned_apps: Mutex<HashSet<(String, String, String)>>,
+    /// The registered proof apps, (namespace, name) -> record, mirrored from the store. A job
+    /// executes only for one of them.
+    apps: Mutex<HashMap<(String, String), App>>,
+    worker_owned_apps: Mutex<HashSet<(String, String)>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -183,11 +188,11 @@ impl Scheduler {
             completion_ops: tokio::sync::Mutex::new(()),
             inner: Mutex::new(SchedulerState::default()),
             tokens: Mutex::new(HashMap::new()),
+            token_ops: tokio::sync::Mutex::new(()),
             namespaces: Mutex::new(HashMap::new()),
             allocations: Mutex::new(HashMap::new()),
             quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
-            priorities: Mutex::new(HashMap::new()),
             worker_owned_apps: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             started: Instant::now(),
@@ -198,95 +203,111 @@ impl Scheduler {
 
     /// The registered apps, from the store; how many there are.
     pub async fn load_apps(&self) -> anyhow::Result<usize> {
-        let map: HashMap<_, _> = self.store.registered_apps().await?.into_iter().map(|(n, t, e, d)| ((n, t, e), d)).collect();
+        let map: HashMap<_, _> = self.store.apps().await?.into_iter().map(|a| ((a.namespace.clone(), a.name.clone()), a)).collect();
         let n = map.len();
         *self.apps.lock() = map;
-        *self.priorities.lock() = self.store.apps().await?.into_iter().map(|a| ((a.namespace, a.tenant, a.elf_id), a.priority)).collect();
         Ok(n)
     }
 
-    /// Whether the program is a registered app of the tenant.
-    pub fn app_known(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
-        self.apps.lock().contains_key(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        ))
+    /// The registered app `name` of the namespace.
+    pub fn app(&self, namespace: &str, name: &str) -> Option<App> {
+        self.apps.lock().get(&(namespace.to_string(), name.to_string())).cloned()
+    }
+
+    /// The namespace's registered app of this program.
+    pub fn app_for_elf(&self, namespace: &str, elf_id: &str) -> Option<App> {
+        self.apps.lock().values().find(|a| a.namespace == namespace && a.elf_id == elf_id).cloned()
+    }
+
+    pub fn app_known(&self, namespace: &str, name: &str) -> bool {
+        self.apps.lock().contains_key(&(namespace.to_string(), name.to_string()))
     }
 
     /// Whether the app refuses new jobs.
-    pub fn app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
-        self.apps.lock().get(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-            )).copied().unwrap_or(false)
+    pub fn app_disabled(&self, namespace: &str, name: &str) -> bool {
+        self.app(namespace, name).is_some_and(|a| a.disabled)
     }
 
-    pub(crate) fn set_worker_owned_apps(&self, apps: HashSet<(String, String, String)>) {
+    pub(crate) fn set_worker_owned_apps(&self, apps: HashSet<(String, String)>) {
         *self.worker_owned_apps.lock() = apps;
     }
 
-    pub(crate) fn app_worker_owned(&self, namespace: &str, tenant: &str, elf_id: &str) -> bool {
-        self.worker_owned_apps.lock().contains(&(namespace.into(), tenant.into(), elf_id.into()))
+    pub(crate) fn app_worker_owned(&self, namespace: &str, name: &str) -> bool {
+        self.worker_owned_apps.lock().contains(&(namespace.into(), name.into()))
     }
 
-    pub fn app_priority(&self, namespace: &str, tenant: &str, elf_id: &str) -> i32 {
-        self.priorities.lock().get(&(namespace.into(), tenant.into(), elf_id.into())).copied().unwrap_or(0)
+    pub fn app_priority(&self, namespace: &str, name: &str) -> i32 {
+        self.app(namespace, name).map_or(0, |a| a.priority)
     }
 
-    pub async fn set_app_priority(&self, namespace: &str, tenant: &str, elf_id: &str, priority: i32,
+    pub async fn set_app_priority(&self, namespace: &str, name: &str, priority: i32,
     ) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
-        anyhow::ensure!(self.app_known(namespace, tenant, elf_id), "unknown proof app");
-        self.store.set_app_priority(namespace, tenant, elf_id, priority).await?;
-        self.priorities.lock().insert((namespace.into(), tenant.into(), elf_id.into()), priority);
-        Ok(serde_json::json!({"namespace":namespace,"tenant":tenant,"elf_id":elf_id,"priority":priority}),
-        )
+        if !self.app_known(namespace, name) { return Err(refuse(404, format!("no app {name}"))); }
+        self.store.set_app_priority(namespace, name, priority).await?;
+        if let Some(a) = self.apps.lock().get_mut(&(namespace.into(), name.into())) { a.priority = priority; }
+        Ok(serde_json::json!({"namespace":namespace,"name":name,"priority":priority}))
     }
 
-    /// Registers a tenant's program as an app: from then on its jobs are accepted (the
-    /// ELF itself arrives with the first one).
-    pub async fn add_app(&self, reference: &str, tenant: &str, elf_id: &str, priority: i32,
-    ) -> anyhow::Result<serde_json::Value> {
+    /// Registers a program as an app of the namespace: from then on its jobs are accepted (the
+    /// ELF itself arrives with the first one). Its policy says where they are placed.
+    pub async fn add_app(&self, reference: &str, r: &RegisterAppRequest) -> anyhow::Result<App> {
         let _ops = self.app_ops.write().await;
-        if self.cfg.tenant(tenant).is_none() {
-            return Err(refuse(404, format!("unknown tenant {tenant:?}: tenants are configured in fleet.yaml"),
-            ));
-        }
         let namespace = self.namespace(reference).ok_or_else(|| {
-            refuse(404, "unknown namespace; an administrator must create it first".into(),
-            )
+            refuse(404, "unknown namespace; an administrator must create it first".into())
         })?;
         if namespace.suspended_ms.is_some() { return Err(refuse(403, "namespace is suspended".into())); }
-        let elf_id = elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
-        if elf_id.len() != 64 || !elf_id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into(),
-            ));
+        if !valid_app_name(&r.name) {
+            return Err(refuse(400, "name: letters, digits, _ . -, at most 63".into()));
         }
-        if !self.store.add_app(&namespace.id, tenant, &elf_id, now_ms(), priority).await? {
-            return Err(refuse(409, format!("app {} exists", app_name(tenant, &elf_id)),
-            ));
+        let elf_id = r.elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
+        if !valid_elf_id(&elf_id) {
+            return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into()));
         }
-        self.apps.lock().insert((namespace.id.clone(), tenant.to_string(), elf_id.clone()), false,
-        );
-        self.priorities.lock().insert((namespace.id.clone(), tenant.into(), elf_id.clone()), priority,
-        );
-        tracing::info!(app = %app_name(tenant, &elf_id), "app registered");
-        Ok(serde_json::json!({
-            "priority": priority, "namespace": namespace.id, "app": app_name(tenant, &elf_id), "tenant": tenant, "elf_id": elf_id, "elf_stored": self.blobs.has_elf(&elf_id),
-        }))
+        let class = r.class.clone().unwrap_or_else(|| "batch".into());
+        if SchedulingClass::from_name(&class).is_none() {
+            return Err(refuse(400, format!("class: one of {}", SchedulingClass::NAMES.join(", "))));
+        }
+        let anchor = r.anchor.clone().unwrap_or_else(|| "none".into());
+        if AnchorPolicy::from_name(&anchor).is_none() {
+            return Err(refuse(400, format!("anchor: one of {}", AnchorPolicy::NAMES.join(", "))));
+        }
+        if let Some(b) = r.backends.iter().find(|b| !BACKENDS.contains(&b.as_str())) {
+            return Err(refuse(400, format!("backend {b}: one of {}", BACKENDS.join(", "))));
+        }
+        let max_queued = r.max_queued.unwrap_or(64);
+        if max_queued == 0 { return Err(refuse(400, "max_queued must be at least 1".into())); }
+        if self.app_known(&namespace.id, &r.name) {
+            return Err(refuse(409, format!("app {} exists", r.name)));
+        }
+        if let Some(other) = self.app_for_elf(&namespace.id, &elf_id) {
+            return Err(refuse(409, format!("program {elf_id} is app {} of this namespace already", other.name)));
+        }
+        let app = App {
+            namespace: namespace.id.clone(), name: r.name.clone(), elf_id, priority: r.priority.unwrap_or(0),
+            disabled: false, created_ms: now_ms(), class, anchor, backends: r.backends.clone(),
+            zkm_version: r.zkm_version.clone().filter(|v| !v.is_empty()), max_queued, ..Default::default()
+        };
+        if !self.store.add_app(&app).await? {
+            return Err(refuse(409, format!("app {} or its program exists", r.name)));
+        }
+        self.apps.lock().insert((app.namespace.clone(), app.name.clone()), app.clone());
+        tracing::info!(app = %app.name, elf = %app.elf_id, "app registered");
+        Ok(app)
     }
 
     /// Disables an app (its new jobs are refused; queued and running ones finish) or
     /// enables it again.
-    pub async fn set_app_disabled(&self, namespace: &str, tenant: &str, elf_id: &str, disabled: bool,
+    pub async fn set_app_disabled(&self, namespace: &str, name: &str, disabled: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
-        let key = (namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        );
-        if !self.apps.lock().contains_key(&key) {
-            return Err(refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id)),
-            ));
+        if !self.app_known(namespace, name) {
+            return Err(refuse(404, format!("no app {name}")));
         }
-        self.store.set_app_disabled(namespace, tenant, elf_id, disabled, now_ms()).await?;
-        self.apps.lock().insert(key, disabled);
-        tracing::info!(app = %app_name(tenant, elf_id), disabled, "app setting changed");
-        Ok(serde_json::json!({ "app": app_name(tenant, elf_id), "disabled": disabled }))
+        self.store.set_app_disabled(namespace, name, disabled, now_ms()).await?;
+        if let Some(a) = self.apps.lock().get_mut(&(namespace.into(), name.into())) { a.disabled = disabled; }
+        tracing::info!(app = %name, disabled, "app setting changed");
+        Ok(serde_json::json!({ "app": name, "disabled": disabled }))
     }
 
     pub async fn load_tokens(&self) -> anyhow::Result<usize> {
@@ -305,7 +326,16 @@ impl Scheduler {
         Ok(n)
     }
 
-    /// Tenant of a request signer: a live token, else an address listed in the config.
+    /// Tokens issued or revoked outside this process (`fleet-scheduler issue-admin`) take
+    /// effect: the mirror is read again from the store.
+    pub async fn reload_tokens(&self) {
+        let _ops = self.token_ops.lock().await;
+        match self.store.tokens().await {
+            Ok(all) => *self.tokens.lock() = all.into_iter().map(|c| (c.address.clone(), c)).collect(),
+            Err(e) => tracing::warn!("reloading tokens: {e:#}"),
+        }
+    }
+
     /// The key a public values URL carries: an HMAC of the proof id under a secret derived
     /// from the cluster token, so the URL works only for whoever GetStatus gave it to.
     pub fn public_values_key(&self, proof_id: &str) -> String {
@@ -525,7 +555,7 @@ impl Scheduler {
     fn token_active(&self, c: &Token) -> bool {
         c.revoked_ms.is_none() && match &c.namespace {
             Some(id) => self.namespace(id).is_some_and(|n| n.suspended_ms.is_none()),
-            None => c.apps.is_none(),
+            None => crate::token::allowed(Some(c), crate::token::Permission::Admin),
         }
     }
     pub fn access_record(&self, c: &Token) -> serde_json::Value {
@@ -540,20 +570,6 @@ impl Scheduler {
         v
     }
 
-    pub fn tenant_for_signer(&self, address: &str) -> Option<String> {
-        let a = normalize_address(address);
-        let registered = self.tokens.lock().get(&a).cloned();
-        if let Some(c) = registered {
-            return self.token_active(&c).then_some(c.tenant);
-        }
-        self.cfg.tenant_for_address(&a).map(|t| t.name.clone())
-    }
-
-    pub fn token_for_signer(&self, address: &str) -> Option<Token> {
-        let c = self.tokens.lock().get(&normalize_address(address)).cloned()?;
-        self.token_active(&c).then_some(c)
-    }
-
     pub fn token_for_id(&self, id: &str) -> Option<Token> {
         self.tokens.lock().values().find(|t| t.id == id).cloned().filter(|t| self.token_active(t))
     }
@@ -564,10 +580,9 @@ impl Scheduler {
         let token = header?.strip_prefix("Bearer ")?;
         if token.len() < 64 { return None; }
         let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
-        let c = self.tokens.lock().values().find(|c| {
-                (c.apps.is_some() || c.manage_apps)
-            && c.token_hash.as_ref().is_some_and(|h| h.as_bytes().ct_eq(hash.as_bytes()))
-            }).cloned()?;
+        let c = self.tokens.lock().values()
+            .find(|c| c.token_hash.as_ref().is_some_and(|h| h.as_bytes().ct_eq(hash.as_bytes())))
+            .cloned()?;
         self.token_active(&c).then_some(c)
     }
 
@@ -587,20 +602,26 @@ impl Scheduler {
         self.public_values_key(&format!("{id}\0{issuer}"))
     }
 
-    pub async fn add_token(
-        &self,
-        tenant: &str,
-        id: &str,
-        address: &str,
-        label: &str,
+    /// Records a token. An administrator's holds `admin` alone and no namespace; any other
+    /// holds some of read, submit and manage (read and submit by default) in a namespace.
+    pub async fn add_user_token(&self, id: &str, address: &str, label: &str,
+        apps: Option<Vec<String>>, token_hash: Option<String>, namespace: Option<String>, tag: Option<String>, permissions: Vec<String>,
     ) -> anyhow::Result<Token> {
-        self.add_user_token(tenant, id, address, label, None, None, None, None, false).await
-    }
-
-    pub async fn add_user_token(&self, tenant: &str, id: &str, address: &str, label: &str,
-        apps: Option<Vec<String>>, token_hash: Option<String>, namespace: Option<String>, tag: Option<String>, manage_apps: bool,
-    ) -> anyhow::Result<Token> {
-        anyhow::ensure!(self.cfg.tenant(tenant).is_some(), "unknown tenant {tenant}");
+        use crate::token::Permission;
+        let permissions: Vec<String> = if permissions.is_empty() { vec!["read".into(), "submit".into()] } else { permissions };
+        let admin = permissions.iter().any(|p| p == Permission::Admin.name());
+        if admin {
+            anyhow::ensure!(permissions.iter().all(|p| p == Permission::Admin.name()), "an admin token holds admin alone: it may do everything");
+            anyhow::ensure!(namespace.is_none() && tag.is_none() && apps.is_none(), "an admin token has no namespace, tag or app grants");
+            anyhow::ensure!(token_hash.is_some(), "an admin token requires an API token");
+        }
+        for p in &permissions {
+            anyhow::ensure!(admin || Permission::ISSUABLE.iter().any(|q| q.name() == p), "unknown permission {p}; tokens may hold read, submit and manage, or admin");
+        }
+        let permissions: Vec<String> = if admin { vec![Permission::Admin.name().into()] } else {
+            Permission::ISSUABLE.iter().map(|q| q.name()).filter(|q| permissions.iter().any(|p| p == q)).map(Into::into).collect()
+        };
+        let manage = permissions.iter().any(|p| p == "manage");
         let namespace = match namespace {
             Some(reference) => {
                 let n = self.namespace(&reference).ok_or_else(|| anyhow::anyhow!("unknown namespace; create it first"))?;
@@ -613,23 +634,15 @@ impl Scheduler {
             anyhow::ensure!(namespace.is_some(), "tag requires namespace");
             Self::validate_tag(tag)?;
         }
-        anyhow::ensure!(apps.is_none() || namespace.is_some(), "user tokens require an existing namespace");
-        anyhow::ensure!(apps.is_none() || namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved for operator-managed apps");
-        anyhow::ensure!(apps.is_some() || namespace.is_none() || manage_apps, "namespaced tokens require explicit app grants");
-        anyhow::ensure!(!manage_apps || (namespace.is_some() && tag.is_some() && token_hash.is_some()), "app-management tokens require a namespace, tag and API token");
-        anyhow::ensure!(token_hash.is_none() || apps.is_some() || manage_apps, "user token requires explicit app grants or app-management permission");
+        anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
+        anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
+        anyhow::ensure!(admin || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
+        anyhow::ensure!(!manage || (tag.is_some() && token_hash.is_some()), "manage tokens require a tag and API token");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");
         }
-        if let Some(grants) = &apps {
-            for app in grants {
-                if let Some((t, elf)) = app.split_once('/') {
-                    anyhow::ensure!(t == tenant && elf.len() == 64 && elf.bytes().all(|b| b.is_ascii_hexdigit())
-                        && self.app_known(namespace.as_deref().expect("user namespace"), t, elf), "proof grant must name a registered program in this namespace and tenant with its full ELF id");
-                } else {
-                    anyhow::ensure!(!app.is_empty() && app.len() <= 128 && app.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)), "invalid workload name");
-                }
-            }
+        for app in apps.iter().flatten() {
+            anyhow::ensure!(valid_app_name(app), "invalid app grant {app:?}: an app or batch name");
         }
         let address = normalize_address(address);
         anyhow::ensure!(
@@ -641,22 +654,23 @@ impl Scheduler {
         let c = Token {
             id,
             address: address.clone(),
-            tenant: tenant.into(),
             label: label.into(),
             created_ms: now_ms(),
             revoked_ms: None,
             apps: apps.map(Into::into),
             namespace,
             tag,
-            manage_apps,
+            permissions,
             token_hash: token_hash.map(|s| s.to_ascii_lowercase()),
         };
+        let _ops = self.token_ops.lock().await;
         self.store.add_token(&c).await?;
         self.tokens.lock().insert(address, c.clone());
         Ok(c)
     }
 
     pub async fn revoke_token(&self, id: &str) -> anyhow::Result<bool> {
+        let _ops = self.token_ops.lock().await;
         let at = now_ms();
         let found = self.store.revoke_token(id, at).await?;
         if let Some(c) = self.tokens.lock().values_mut().find(|t| t.id == id) {
@@ -711,12 +725,12 @@ impl Scheduler {
         Ok(n)
     }
 
-    pub fn queued_for(&self, tenant: &str) -> usize {
+    pub fn queued_for(&self, namespace: &str, app: &str) -> usize {
         self.inner
             .lock()
             .jobs
             .values()
-            .filter(|e| e.job.tenant == tenant && !e.job.state().is_terminal())
+            .filter(|e| e.job.namespace == namespace && e.job.app == app && !e.job.state().is_terminal())
             .count()
     }
 
@@ -754,76 +768,53 @@ impl Scheduler {
         self.store.get(id).await
     }
 
-    /// The proof apps (a tenant's program) with their job counts, and the node each is
-    /// anchored on now.
-    pub async fn apps(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+    /// The registered apps with their job counts, and the node each is anchored on now.
+    pub async fn apps(&self) -> anyhow::Result<Vec<(App, Option<String>)>> {
         let anchors = self.inner.lock().anchors.clone();
-        Ok(self
-            .store
-            .apps()
-            .await?
-            .into_iter()
-            .map(|a| {
-                let node = anchors.get(&(a.namespace.clone(), a.tenant.clone(), a.elf_id.clone())).cloned();
-                let mut v = serde_json::to_value(&a).unwrap_or_default();
-                v["type"] = serde_json::json!("app");
-                v["name"] = serde_json::json!(app_name(&a.tenant, &a.elf_id));
-                v["anchored_on"] = serde_json::json!(node);
-                v
-            })
-            .collect())
+        Ok(self.store.apps().await?.into_iter().map(|a| {
+            let node = anchors.get(&(a.namespace.clone(), a.name.clone())).cloned();
+            (a, node)
+        }).collect())
     }
 
-    /// Deletes a proof app, its terminal job records and their inputs and outputs, and its
+    /// Deletes an app, its terminal job records and their inputs and outputs, and its
     /// anchor. Removes the ELF only when no other app or job uses it. Refused while any of
     /// its jobs is queued or running.
-    pub async fn delete_app(&self, namespace: &str, tenant: &str, elf_id: &str,
+    pub async fn delete_app(&self, namespace: &str, name: &str,
     ) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         let apps = self.store.apps().await?;
         let app = apps
             .iter()
-            .find(|a| a.namespace == namespace && a.tenant == tenant && a.elf_id == elf_id)
-            .ok_or_else(|| {
-                refuse(404, format!("no app {} (tenant {tenant:?}, elf_id {elf_id:?})", app_name(tenant, elf_id)),
-                )
-            })?;
+            .find(|a| a.namespace == namespace && a.name == name)
+            .ok_or_else(|| refuse(404, format!("no app {name}")))?;
         // Its dedicated worker would keep the node's GPUs with no app left to serve.
-        if self.app_worker_owned(namespace, tenant, elf_id) {
-            return Err(refuse(409, format!("app {} still has a dedicated worker; disable it first: fleetctl app disable {}",
-                app_name(tenant, elf_id), app_name(tenant, elf_id))));
+        if self.app_worker_owned(namespace, name) {
+            return Err(refuse(409, format!("app {name} still has a dedicated worker; disable it first: fleetctl app disable {name}")));
         }
         let live = self
             .inner
             .lock()
             .jobs
             .values()
-            .filter(|e| {
-                e.job.namespace.as_str() == namespace && e.job.tenant == tenant && e.job.elf_id == elf_id && !e.job.state().is_terminal()
-            })
+            .filter(|e| e.job.namespace == namespace && e.job.app == name && !e.job.state().is_terminal())
             .count() as u64;
         if app.active > 0 || live > 0 {
             return Err(refuse(409, format!(
-                "{} has {} job(s) queued or running: delete it when they are done",
-                app_name(tenant, elf_id),
+                "{name} has {} job(s) queued or running: delete it when they are done",
                 app.active.max(live)
-            ),
-            ));
+            )));
         }
-        let ids = self.store.delete_app(namespace, tenant, elf_id).await?;
-        self.apps.lock().remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        ));
-        self.priorities.lock().remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-        ));
+        let elf_id = app.elf_id.clone();
+        let ids = self.store.delete_app(namespace, name).await?;
+        self.apps.lock().remove(&(namespace.to_string(), name.to_string()));
         {
             let mut inner = self.inner.lock();
             for id in &ids {
                 inner.jobs.remove(id);
             }
-            if let Some(node) = inner.anchors.remove(&(namespace.to_string(), tenant.to_string(), elf_id.to_string(),
-            )) {
-                let still = inner.anchors.iter().any(|((_, t, _), n)| t == tenant && *n == node);
-                if !still && inner.reserved.get(&node).map(String::as_str) == Some(tenant) {
+            if let Some(node) = inner.anchors.remove(&(namespace.to_string(), name.to_string())) {
+                if inner.reserved.get(&node) == Some(&placement::app_key(namespace, name)) {
                     inner.reserved.remove(&node);
                 }
             }
@@ -834,17 +825,17 @@ impl Scheduler {
                 files_failed += 1;
             }
         }
-        let shared = apps.iter().any(|a| a.elf_id == elf_id && (a.tenant != tenant || a.namespace != namespace))
+        let shared = apps.iter().any(|a| a.elf_id == elf_id && (a.name != name || a.namespace != namespace))
             || self.inner.lock().jobs.values().any(|e| e.job.elf_id == elf_id);
-        let elf_removed = !elf_id.is_empty() && !shared && self.blobs.remove_elf(elf_id).unwrap_or(false);
-        tracing::info!(app = %app_name(tenant, elf_id), jobs = ids.len(), elf_removed, "app deleted");
+        let elf_removed = !shared && self.blobs.remove_elf(&elf_id).unwrap_or(false);
+        tracing::info!(app = %name, jobs = ids.len(), elf_removed, "app deleted");
         Ok(serde_json::json!({
-            "app": app_name(tenant, elf_id), "jobs_deleted": ids.len(), "elf_removed": elf_removed,
+            "app": name, "jobs_deleted": ids.len(), "elf_removed": elf_removed,
             "files_not_removed": files_failed,
         }))
     }
 
-    /// The newest jobs (the store has every one), of one tenant or all.
+    /// The newest jobs (the store has every one) that the filter selects.
     pub async fn recent_jobs(&self, f: &crate::store::ProofJobFilter, limit: usize,
     ) -> anyhow::Result<Vec<ProofJob>> {
         self.store.recent(f, limit).await
@@ -892,22 +883,27 @@ impl Scheduler {
     pub fn register(&self, mut info: NodeInfo) -> anyhow::Result<String> {
         anyhow::ensure!(!info.name.is_empty(), "node name is empty");
         anyhow::ensure!(info.control_version == 1, "worker must support heartbeat control version 1; upgrade the node binary");
-        let app_fields = [!info.app_namespace.is_empty(), !info.app_tenant.is_empty(), !info.app_elf_id.is_empty(),
+        let app_fields = [!info.app_namespace.is_empty(), !info.app.is_empty(), !info.app_elf_id.is_empty(),
         ];
         anyhow::ensure!(app_fields.iter().all(|v| *v) || app_fields.iter().all(|v| !*v),
-            "dedicated proof app identity requires namespace, tenant and elf_id together");
+            "dedicated proof app identity requires namespace, app and elf_id together");
         if !info.app_namespace.is_empty() {
             let namespace = self.namespace(&info.app_namespace).ok_or_else(|| anyhow::anyhow!("proof node names an unknown namespace"))?;
             info.app_namespace = namespace.id;
-            anyhow::ensure!(self.cfg.tenant(&info.app_tenant).is_some(), "proof node names an unknown tenant");
-            anyhow::ensure!(info.app_elf_id.len() == 64 && info.app_elf_id.bytes().all(|b| b.is_ascii_hexdigit()), "proof node app elf_id must be 64 hex digits");
+            anyhow::ensure!(valid_app_name(&info.app), "proof node names an invalid app");
             info.app_elf_id.make_ascii_lowercase();
+            anyhow::ensure!(valid_elf_id(&info.app_elf_id), "proof node app elf_id must be 64 hex digits");
+            // An app not registered yet has no jobs; once it is, only its program is proven.
+            if let Some(app) = self.app(&info.app_namespace, &info.app) {
+                anyhow::ensure!(app.elf_id == info.app_elf_id,
+                    "proof node proves program {}, but app {} is program {}", info.app_elf_id, app.name, app.elf_id);
+            }
         }
         let id = uuid::Uuid::new_v4().to_string();
         let mut inner = self.inner.lock();
         if let Some(previous) = inner.nodes.values().find(|n| n.info.name == info.name) {
             let same_app = previous.info.app_namespace == info.app_namespace
-                && previous.info.app_tenant == info.app_tenant
+                && previous.info.app == info.app
                 && previous.info.app_elf_id == info.app_elf_id;
             anyhow::ensure!(
                 same_app || previous.busy.is_none(),
@@ -1023,9 +1019,7 @@ impl Scheduler {
                 machine: n.info.machine.clone(),
                 zkm_version: n.info.zkm_version.clone(),
                 image: n.info.image.clone(),
-                app: (!n.info.app_namespace.is_empty()).then(|| {
-                    format!("{}/{}/{}", n.info.app_namespace, n.info.app_tenant, n.info.app_elf_id)
-                }),
+                app: (!n.info.app_namespace.is_empty()).then(|| placement::app_key(&n.info.app_namespace, &n.info.app)),
                 ready: n.ready,
                 busy: n.busy.clone(),
                 reserved_for: inner.reserved.get(&n.info.name).cloned(),
@@ -1038,10 +1032,9 @@ impl Scheduler {
         let anchors = inner
             .anchors
             .iter()
-            .map(|((namespace, t, e), n)| AppAnchor {
+            .map(|((namespace, app), n)| AppAnchor {
                 namespace: namespace.clone(),
-                tenant: t.clone(),
-                elf_id: e.clone(),
+                app: app.clone(),
                 node: n.clone(),
             })
             .collect();
@@ -1065,7 +1058,10 @@ impl Scheduler {
             }
             tokio::select! {
                 _ = self.wake.notified() => {}
-                _ = sweep.tick() => self.sweep(),
+                _ = sweep.tick() => {
+                    self.sweep();
+                    self.reload_tokens().await;
+                }
             }
         }
     }
@@ -1080,6 +1076,8 @@ impl Scheduler {
         if self.stopping.load(Ordering::SeqCst) {
             return Vec::new();
         }
+        let policies: HashMap<(String, String), AppPolicy> = self.apps.lock().iter()
+            .map(|(k, a)| (k.clone(), AppPolicy::of(a))).collect();
         let mut inner = self.inner.lock();
         let mut queued: Vec<(std::cmp::Reverse<i32>, u64, String)> = inner
             .jobs
@@ -1097,7 +1095,7 @@ impl Scheduler {
         let mut out = Vec::new();
         for (_, _, job_id) in queued {
             let job = inner.jobs[&job_id].job.clone();
-            let Some(tenant) = self.cfg.tenant(&job.tenant) else {
+            let Some(policy) = policies.get(&(job.namespace.clone(), job.app.clone())) else {
                 continue;
             };
             // A recovered job goes back to the node it was running on (or that says it is
@@ -1112,9 +1110,9 @@ impl Scheduler {
                     .map(|n| n.info.name.clone())
             });
             if let Some(hint) = hint.as_ref().filter(|h| {
-                placement::allowed(tenant, h) && inner.nodes.values().any(|n| {
+                inner.nodes.values().any(|n| {
                     &n.info.name == *h && n.info.app_namespace == job.namespace
-                        && n.info.app_tenant == job.tenant
+                        && n.info.app == job.app
                         && n.info.app_elf_id.eq_ignore_ascii_case(&job.elf_id)
                 })
             }) {
@@ -1130,7 +1128,7 @@ impl Scheduler {
                         if !self.allocate_proof(&job, &inner.nodes[&node_id], job.started_ms.is_some(),
                         ) { continue; }
                         tracing::info!(job = %job_id, node = %hint, "resuming on the node that was running it");
-                        self.commit(&mut inner, tenant, &job_id, &node_id);
+                        self.commit(&mut inner, policy, &job_id, &node_id);
                         out.push((job_id, node_id));
                         continue;
                     }
@@ -1159,7 +1157,7 @@ impl Scheduler {
                         gpus: n.info.gpus,
                         zkm_version: n.info.zkm_version.clone(),
                         ready: n.ready && n.info.app_namespace == job.namespace
-                            && n.info.app_tenant == job.tenant
+                            && n.info.app == job.app
                             && n.info.app_elf_id.eq_ignore_ascii_case(&job.elf_id)
                             && !inner.draining_machines.contains(&n.info.machine)
                             && self.fits_quota(&job.namespace, (!job.tag.is_empty()).then_some(job.tag.as_str()), &format!("proof:{}", job.id), n.info.gpus as f64, n.info.cpus as f64,
@@ -1170,14 +1168,12 @@ impl Scheduler {
                     }
                 })
                 .collect();
-            let anchor_key = (job.namespace.clone(), job.tenant.clone(), job.elf_id.clone(),
-            );
-            let anchor = inner.anchors.get(&anchor_key).cloned();
-            match placement::choose(tenant, &job.failed_on, anchor.as_deref(), &views) {
+            let anchor = inner.anchors.get(&(job.namespace.clone(), job.app.clone())).cloned();
+            match placement::choose(policy, &job.failed_on, anchor.as_deref(), &views) {
                 PlacementDecision::Selected(i) => {
                     let node_id = ids[i].clone();
                     if !self.allocate_proof(&job, &inner.nodes[&node_id], false) { continue; }
-                    self.commit(&mut inner, tenant, &job_id, &node_id);
+                    self.commit(&mut inner, policy, &job_id, &node_id);
                     out.push((job_id, node_id));
                 }
                 PlacementDecision::WaitForAnchor | PlacementDecision::NoNode => {}
@@ -1186,30 +1182,29 @@ impl Scheduler {
         out
     }
 
-    /// Marks `job_id` running on `node_id`, moving the tenant's anchor there if it has one.
+    /// Marks `job_id` running on `node_id`, moving the app's anchor there if it has one.
     fn commit(
         &self,
         inner: &mut SchedulerState,
-        tenant: &crate::config::TenantConfig,
+        app: &AppPolicy,
         job_id: &str,
         node_id: &str,
     ) {
         let name = inner.nodes[node_id].info.name.clone();
-        let elf_id = inner.jobs[job_id].job.elf_id.clone();
-        let namespace = inner.jobs[job_id].job.namespace.clone();
-        let anchor_key = (namespace, tenant.name.clone(), elf_id.clone());
+        let job = &inner.jobs[job_id].job;
+        let anchor_key = (job.namespace.clone(), job.app.clone());
         let anchor = inner.anchors.get(&anchor_key).cloned();
-        if tenant.anchor != AnchorPolicy::None && anchor.as_deref() != Some(name.as_str()) {
+        if app.anchor != AnchorPolicy::None && anchor.as_deref() != Some(name.as_str()) {
             if let Some(old) = anchor {
-                if inner.reserved.get(&old) == Some(&tenant.name) {
+                if inner.reserved.get(&old) == Some(&app.key) {
                     inner.reserved.remove(&old);
                 }
             }
             inner.anchors.insert(anchor_key, name.clone());
-            if tenant.anchor == AnchorPolicy::Exclusive {
-                inner.reserved.insert(name.clone(), tenant.name.clone());
+            if app.anchor == AnchorPolicy::Exclusive {
+                inner.reserved.insert(name.clone(), app.key.clone());
             }
-            tracing::info!(tenant = %tenant.name, elf = %&elf_id[..12.min(elf_id.len())], node = %name, "anchored");
+            tracing::info!(app = %app.key, node = %name, "anchored");
         }
         inner.nodes.get_mut(node_id).unwrap().busy = Some(job_id.to_string());
         let e = inner.jobs.get_mut(job_id).unwrap();

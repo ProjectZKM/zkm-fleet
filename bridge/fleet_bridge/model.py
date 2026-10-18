@@ -468,9 +468,12 @@ class AppSpec(Record):
     kind: AppRuntime = AppRuntime.ZIREN_GPU
     replicas: int = 1
     disabled: bool = False  # release resources until enabled
-    # The app this service runs: a Ziren prover's dedicated app (tenant/full ELF id; the
-    # service's namespace supplies the other part of its identity), else the service itself.
+    # The app this service runs, by its name in the service's namespace; the service's own
+    # name by default. A Ziren prover's is a proof app.
     app: str = ""
+    # The program a dedicated Ziren prover proves (its app's full ELF SHA-256): required for a
+    # GPU prover, optional for a CPU one.
+    elf_id: str = ""
     proof_storage_root: str | None = None
     gpus: float = 1
     cpus: float = 1
@@ -507,13 +510,20 @@ class AppSpec(Record):
                 raise ModelError("worker executable must be absolute and stop timeout positive")
         elif self.worker_env_file or self.worker_workdir:
             raise ModelError("worker environment and workdir require worker_command")
-        if self.kind is AppRuntime.ZIREN_GPU:
-            tenant, sep, elf_id = self.app.partition("/")
-            if not sep or not tenant or not re.fullmatch(r"[0-9a-fA-F]{64}", elf_id):
-                raise ModelError("a ziren-gpu service's app must be TENANT/FULL_ELF_SHA256")
-        elif self.app not in ("", self.name):
-            raise ModelError(f"{self.name}: a {self.kind.value} service is its own app")
         self.app = self.app or self.name
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", self.app):
+            raise ModelError(f"{self.name}: app must be a name: letters, digits, _ . -, at most 63")
+        if self.kind in (AppRuntime.ZIREN_GPU, AppRuntime.ZIREN_CPU):
+            if self.elf_id and not re.fullmatch(r"[0-9a-fA-F]{64}", self.elf_id):
+                raise ModelError(f"{self.name}: elf_id must be the program's full ELF SHA-256")
+            if self.kind is AppRuntime.ZIREN_GPU and not self.elf_id:
+                raise ModelError(f"{self.name}: a ziren-gpu service proves one program: set its elf_id")
+            self.elf_id = self.elf_id.lower()
+        else:
+            if self.app != self.name:
+                raise ModelError(f"{self.name}: a {self.kind.value} service is its own app")
+            if self.elf_id:
+                raise ModelError(f"{self.name}: only a Ziren prover proves a program (elf_id)")
 
 
 @dataclass(kw_only=True)
@@ -587,7 +597,7 @@ class NodeEnvironment(Record):
     cluster_token_file: str = field(metadata={"env": "FLEET_CLUSTER_TOKEN_FILE"})
     machine: str = field(metadata={"env": "FLEET_MACHINE"})
     app_namespace: str | None = field(default=None, metadata={"env": "FLEET_APP_NAMESPACE"})
-    app_tenant: str | None = field(default=None, metadata={"env": "FLEET_APP_TENANT"})
+    app: str | None = field(default=None, metadata={"env": "FLEET_APP"})
     app_elf_id: str | None = field(default=None, metadata={"env": "FLEET_APP_ELF_ID"})
     rust_log: str = field(metadata={"env": "RUST_LOG"})
     exit_with_parent: bool = field(default=True, metadata={"env": "FLEET_EXIT_WITH_PARENT"})

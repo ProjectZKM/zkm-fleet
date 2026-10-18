@@ -4,9 +4,31 @@ use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
+/// The administrator's token the tests' scheduler has.
+const ADMIN: &str = "adminadminadminadminadminadminadminadminadminadminadminadminadmin1";
+
+/// The proof app the tests' provers serve, and its program.
+const PROOF: &str = "proof";
+
+fn proof_elf() -> String {
+    "a".repeat(64)
+}
+
+/// Registers the tests' proof app (program `elf`) in the namespace.
+async fn register(c: &WorkloadController, ns: &str, name: &str, elf: &str) {
+    c.fleet.add_app(ns, &fleet_proto::model::v1::RegisterAppRequest { name: name.into(), elf_id: elf.into(), ..Default::default() }).await.unwrap();
+}
+
+/// A request through the whole API router: authorized by its token, then handled.
+async fn serve(c: &Arc<WorkloadController>, request: Request) -> Response {
+    use tower::ServiceExt;
+    crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone() })
+        .oneshot(request).await.unwrap()
+}
+
 async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\nadmin_token_file: admin\ntenants: [{{name: eth}}, {{name: goat}}]\n",dir.path().display())).unwrap();
+    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\n",dir.path().display())).unwrap();
     let fleet = Scheduler::new(
         cfg,
         Arc::new(MemoryStore::default()),
@@ -14,6 +36,8 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
         "cluster".into(),
     );
     fleet.load_tokens().await.unwrap();
+    fleet.add_user_token(&"ad".repeat(16), &"ad".repeat(20), "admin", None,
+        Some(hex::encode(sha2::Sha256::digest(ADMIN.as_bytes()))), None, None, vec!["admin".into()]).await.unwrap();
     let namespace = fleet
         .create_namespace(
             "test",
@@ -25,7 +49,7 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
         .await
         .unwrap()
         .id;
-    let control = Arc::new(WorkloadController::new(fleet, "admin".into(), "cluster".into()).unwrap());
+    let control = Arc::new(WorkloadController::new(fleet, "cluster".into()).unwrap());
     (dir, control, namespace)
 }
 fn inventory(namespace: &str) -> NodeReport {
@@ -52,7 +76,7 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
     job.status["type"] = json!("job");
     c.save("jobs", &job.id, &job).unwrap();
     let restarted = Arc::new(
-        WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap());
+        WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap());
     for path in [
         "/apps".to_string(),
         "/batches".to_string(),
@@ -70,7 +94,7 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         for row in rows {
             if path.starts_with("/apps") {
                 assert_eq!(row["type"], "app", "{path}: {row}");
-                assert!(row.get("kind").is_none(), "{path}: {row}");
+                assert_eq!(row["kind"], "service", "{path}: {row}");
                 assert_eq!(row["name"], "service");
             } else {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
@@ -88,14 +112,14 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
         c.fleet.set_tag_quota(&ns, "scope=default", Quota {gpus:Some(1.0),cpus:None,
                 },
             ).await.unwrap();
-        let app = if proof {format!("eth/{}", "a".repeat(64))} else {"service".into()};
+        let app = if proof {PROOF.to_string()} else {"service".into()};
         let views = c.app_resources(&ns, &app, Some("scope=default"));
         assert_eq!(views["resources"], json!({"gpus":2.0,"cpus":4.0,"replicas":2,"nodes":["gpu"]}));
         assert_eq!(views["namespace_quota"],json!({"gpus":2.0,"cpus":8.0}));
         assert_eq!(views["tag_quota"],json!({"gpus":1.0,"cpus":null}));
         assert_eq!(views["tags"], json!(["scope=default"]));
         assert_eq!(views["state"], "disabled");
-        let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+        let restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
         let restored = restarted.app_resources(&ns, &app, Some("scope=default"));
         for field in ["resources", "namespace_quota", "tag_quota", "tags"] {
             assert_eq!(restored[field], views[field]);
@@ -123,7 +147,7 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
 async fn app_readiness_follows_fresh_reports_for_both_runners() {
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
-        let name = if proof { format!("eth/{}", "a".repeat(64)) } else { "service".into() };
+        let name = if proof { PROOF.to_string() } else { "service".into() };
         let mut report = scale_inventory(&ns, proof, false);
         report.services[0]["ready"] = json!(false);
         c.report("gpu", "session", report).await.unwrap();
@@ -159,9 +183,9 @@ async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
         if path.starts_with("/batches") { assert_eq!(rows[0]["jobs"], 1); }
     }
     let secret = "ab".repeat(32);
-    c.fleet.add_user_token("eth", &"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
+    c.fleet.add_user_token(&"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
         Some(vec!["training".into(), "service".into()]),
-        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.clone()), None, false,
+        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.clone()), None, Vec::new(),
         ).await.unwrap();
     let response = scale_call(c.clone(), &secret, "GET", "/batches/training", Value::Null,
     ).await;
@@ -193,10 +217,10 @@ async fn proof_replica_location_is_diagnostic_and_resolves_without_a_live_actor(
     use fleet_proto::fleet::v1::ProofKind;
     let (_dir,c,ns)=setup().await;
     c.report("gpu", "session", scale_inventory(&ns,true,true)).await.unwrap();
-    let mut job=ProofJob{inputs:None,outputs:None,id:"proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"proof".into(),elf_id:"a".repeat(64),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
+    let mut job=ProofJob{inputs:None,outputs:None,id:"proof".into(),app:PROOF.into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"proof".into(),elf_id:"a".repeat(64),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
         fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec!["service-1".into()],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
     };
-    for control in [&*c, &WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap(),
+    for control in [&*c, &WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap(),
     ] {
         let view=control.proof_job_value(&job);
         assert_eq!(view["node"],"gpu");
@@ -327,7 +351,7 @@ async fn commands_survive_restart_and_completed_launch_is_not_replayed() {
     c.dispatch().await.unwrap();
     let assigned = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     let command = c.inner.lock().commands.values().next().unwrap().clone();
-    let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    let restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
     restarted.dispatch().await.unwrap();
     assert_eq!(restarted.inner.lock().commands.len(), 1);
     assert_eq!(
@@ -494,7 +518,6 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
     let token = Token {
         id: "owner".into(),
         address: "internal".into(),
-        tenant: "eth".into(),
         label: "owner".into(),
         created_ms: 0,
         revoked_ms: None,
@@ -502,7 +525,7 @@ async fn tag_scopes_jobs_and_never_widens_a_token() {
         token_hash: None,
         namespace: Some(ns.clone()),
         tag: Some("scope=default".into()),
-        manage_apps: true,
+        permissions: vec!["read".into(),"submit".into(),"manage".into()],
     };
     let job = c
         .submit(
@@ -545,16 +568,14 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
     let (_dir, c, ns) = setup().await;
     let secret = "1".repeat(64);
     c.fleet
-        .add_user_token(
-            "eth",
-            &"a".repeat(32),
+        .add_user_token(&"a".repeat(32),
             &format!("0x{}", "b".repeat(40)),
             "owner",
             None,
             Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),
             Some(ns.clone()),
             Some("scope=default".into()),
-            true,
+            vec!["read".into(),"submit".into(),"manage".into()],
         )
         .await
         .unwrap();
@@ -569,8 +590,8 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         if let Some(token) = token {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
-        handle(
-            State(c),
+        serve(
+            &c,
             builder
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -672,7 +693,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(
-        handle(State(c.clone()), removed_input).await.status(),
+        serve(&c, removed_input).await.status(),
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -696,7 +717,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(
-        handle(State(c.clone()), removed_output).await.status(),
+        serve(&c, removed_output).await.status(),
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -775,7 +796,7 @@ async fn restart_repairs_stop_intent_written_before_its_command() {
     let mut job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
     job.stop = Some("cancel".into());
     c.save("jobs", &job.id, &job).unwrap();
-    let restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
+    let restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
     restarted.dispatch().await.unwrap();
     assert!(restarted
         .inner
@@ -789,23 +810,26 @@ async fn restart_repairs_stop_intent_written_before_its_command() {
 fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> NodeReport {
     let mut report = inventory(ns);
     report.services = vec![json!({"name":"service","kind":if proof {"ziren-gpu"}else{"app"},
-        "namespace":ns,"tag":"scope=default","app":if proof {format!("eth/{}","a".repeat(64))}else{"service".into()},
+        "namespace":ns,"tag":"scope=default","app":if proof {PROOF.to_string()}else{"service".into()},"elf_id":if proof {proof_elf()}else{String::new()},
         "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled}).into()];
     if !disabled { report.free_gpus=0.0;report.free_cpus=4.0; }
     report
 }
 async fn scale_call(c: Arc<WorkloadController>, token: &str, method: &str, path: &str, body: Value,
 ) -> Response {
-    handle(State(c),Request::builder().method(method).uri(path)
+    let token = if token == "admin" { ADMIN } else { token };
+    serve(&c, Request::builder().method(method).uri(path)
         .header("authorization",format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap(),
     ).await
 }
-async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tenant: &str, tag: &str, apps: Option<Vec<String>>, manage_apps: bool,
+/// A user token; `manage` adds the manage permission to read and submit.
+async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tag: &str, apps: Option<Vec<String>>, manage: bool,
 ) -> String {
+    let permissions = if manage { vec!["read".into(), "submit".into(), "manage".into()] } else { Vec::new() };
     let secret = format!("{seed:02x}").repeat(32);
-    c.fleet.add_user_token(tenant, &format!("{seed:02x}").repeat(16), &format!("{seed:02x}").repeat(20), "test",
-        apps, Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.into()), Some(tag.into()), manage_apps,
+    c.fleet.add_user_token(&format!("{seed:02x}").repeat(16), &format!("{seed:02x}").repeat(20), "test",
+        apps, Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.into()), Some(tag.into()), permissions,
     ).await.unwrap();
     secret
 }
@@ -813,12 +837,12 @@ async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tenant: &str, ta
 #[tokio::test]
 async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     let (_dir, c, ns) = setup().await;
-    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
-    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec!["training".into()]), false).await;
-    let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
-    let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec!["training".into()]), false).await;
+    let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec!["other".into()]), true).await;
+    let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
     let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
-    let foreign_ns = user_token(&c, &other_ns, 5, "eth", "scope=default", None, true).await;
+    let foreign_ns = user_token(&c, &other_ns, 5, "scope=default", None, true).await;
     assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches",
         json!({"name":"training","image":"python:3","allow":["/data/models"],"priority":17})).await.status(), StatusCode::CREATED);
     for token in [&consumer, &restricted, &foreign_tag, &foreign_ns] {
@@ -863,16 +887,16 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
         let elf = "a".repeat(64);
-        c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
+        register(&c, &ns, PROOF, &elf).await;
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
-        let app = if proof { format!("eth/{elf}") } else { "service".into() };
-        let owner = user_token(&c, &ns, 1, "goat", "scope=default", None, true).await;
-        let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
-        let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
-        let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
-        let other_signer = user_token(&c, &ns, 5, "goat", "scope=default", Some(vec!["service".into()]), false).await;
-        let scale = if proof { format!("/apps/eth/{elf}/scale") } else { "/apps/service/scale".into() };
-        let disabled = if proof { format!("/apps/eth/{elf}/disabled") } else { "/apps/service/disabled".into() };
+        let app = if proof { PROOF.to_string() } else { "service".into() };
+        let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+        let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec![app]), false).await;
+        let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec!["other".into()]), true).await;
+        let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
+        let other_signer = user_token(&c, &ns, 5, "scope=default", Some(vec!["service".into()]), false).await;
+        let scale = if proof { format!("/apps/{PROOF}/scale") } else { "/apps/service/scale".into() };
+        let disabled = if proof { format!("/apps/{PROOF}/disabled") } else { "/apps/service/disabled".into() };
         for token in [&consumer, &restricted, &foreign_tag] {
             for (method, path, body) in [
                 ("PUT", scale.as_str(), json!({"replicas":1})),
@@ -923,16 +947,16 @@ async fn namespace_reads_are_scoped_for_owners_and_app_tokens_while_writes_requi
     let other = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
     c.fleet.set_tag_quota(&ns, "scope=default", Quota { gpus: Some(0.5), cpus: Some(2.0) }).await.unwrap();
     c.fleet.set_tag_quota(&ns, "scope=research", Quota { gpus: Some(1.0), cpus: Some(4.0) }).await.unwrap();
-    let owner = user_token(&c, &ns, 1, "eth", "scope=default", None, true).await;
-    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec!["training".into()]), false).await;
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec!["training".into()]), false).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone(), admin_token: Arc::new("admin".into()) });
+    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone() });
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let client = reqwest::Client::new();
     for token in [&owner, &consumer] {
         for selector in [String::new(), "?namespace=test".into(), format!("?namespace={ns}&tag=scope%3Ddefault")] {
-            let response = client.get(format!("{url}/admin/namespaces{selector}")).bearer_auth(token).send().await.unwrap();
+            let response = client.get(format!("{url}/namespaces{selector}")).bearer_auth(token).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let rows: Value = response.json().await.unwrap();
             assert_eq!(rows.as_array().unwrap().len(), 1);
@@ -941,7 +965,7 @@ async fn namespace_reads_are_scoped_for_owners_and_app_tokens_while_writes_requi
             assert_eq!(rows[0]["tag_quotas"], json!({"scope=default":{"gpus":0.5,"cpus":2.0}}));
         }
         for selector in ["test".to_string(), ns.clone(), "test?tag=scope%3Ddefault".into()] {
-            let response = client.get(format!("{url}/admin/namespaces/{selector}")).bearer_auth(token).send().await.unwrap();
+            let response = client.get(format!("{url}/namespaces/{selector}")).bearer_auth(token).send().await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let record: Value = response.json().await.unwrap();
             assert_eq!(record["id"], ns);
@@ -952,33 +976,33 @@ async fn namespace_reads_are_scoped_for_owners_and_app_tokens_while_writes_requi
             assert_eq!(record["tag_quotas"].as_object().unwrap().len(), 1);
             assert!(record.get("tags").is_none());
         }
-        for path in ["/admin/namespaces/other".into(), format!("/admin/namespaces/{other}"),
-            "/admin/namespaces?namespace=other".into(), "/admin/namespaces/test?namespace=other".into(),
-            "/admin/namespaces?tag=scope%3Dresearch".into(), "/admin/namespaces/test?tag=scope%3Dresearch".into(),
-            "/admin/namespaces/test/allocations".into(), "/admin/namespaces/test/quota".into(), "/admin/tokens".into(),
+        for path in ["/namespaces/other".into(), format!("/namespaces/{other}"),
+            "/namespaces?namespace=other".into(), "/namespaces/test?namespace=other".into(),
+            "/namespaces?tag=scope%3Dresearch".into(), "/namespaces/test?tag=scope%3Dresearch".into(),
+            "/namespaces/test/allocations".into(), "/namespaces/test/quota".into(), "/tokens".into(),
         ] {
             assert_eq!(client.get(format!("{url}{path}")).bearer_auth(token).send().await.unwrap().status(), StatusCode::FORBIDDEN, "{path}");
         }
         for (method, path) in [
-            (reqwest::Method::POST, "/admin/namespaces"),
-            (reqwest::Method::PUT, "/admin/namespaces/test/quota"),
-            (reqwest::Method::PUT, "/admin/namespaces/test/quota?tag=scope%3Ddefault"),
-            (reqwest::Method::PUT, "/admin/namespaces/test/suspended"),
-            (reqwest::Method::DELETE, "/admin/namespaces/test/suspended"),
+            (reqwest::Method::POST, "/namespaces"),
+            (reqwest::Method::PUT, "/namespaces/test/quota"),
+            (reqwest::Method::PUT, "/namespaces/test/quota?tag=scope%3Ddefault"),
+            (reqwest::Method::PUT, "/namespaces/test/suspended"),
+            (reqwest::Method::DELETE, "/namespaces/test/suspended"),
         ] {
             assert_eq!(client.request(method, format!("{url}{path}")).bearer_auth(token).json(&json!({"gpus":0,"cpus":0})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
         }
     }
-    let all: Value = client.get(format!("{url}/admin/namespaces")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+    let all: Value = client.get(format!("{url}/namespaces")).bearer_auth(ADMIN).send().await.unwrap().json().await.unwrap();
     assert_eq!(all.as_array().unwrap().len(), 3);
-    let full: Value = client.get(format!("{url}/admin/namespaces/test")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+    let full: Value = client.get(format!("{url}/namespaces/test")).bearer_auth(ADMIN).send().await.unwrap().json().await.unwrap();
     assert_eq!(full["tag_quotas"].as_object().unwrap().len(), 2);
     assert!(full["tags"].as_array().unwrap().contains(&json!("scope=research")));
-    assert_eq!(client.get(format!("{url}/admin/namespaces")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(client.get(format!("{url}/namespaces")).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     c.fleet.revoke_token(&"01".repeat(16)).await.unwrap();
-    assert_eq!(client.get(format!("{url}/admin/namespaces")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(client.get(format!("{url}/namespaces")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     c.fleet.suspend_namespace(&ns, true).await.unwrap();
-    assert_eq!(client.get(format!("{url}/admin/namespaces/test")).bearer_auth(&consumer).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(client.get(format!("{url}/namespaces/test")).bearer_auth(&consumer).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
     server.abort();
 }
 
@@ -987,58 +1011,70 @@ async fn app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
     let (_dir, c, ns) = setup().await;
     let elf = "a".repeat(64);
     let other_elf = "b".repeat(64);
-    c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
-    c.fleet.add_app(&ns, "eth", &other_elf, 0).await.unwrap();
-    c.fleet.add_app(&ns, "goat", &elf, 0).await.unwrap();
+    register(&c, &ns, PROOF, &elf).await;
+    register(&c, &ns, "other-proof", &other_elf).await;
     let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
-    c.fleet.add_app(&other_ns, "eth", &elf, 0).await.unwrap();
-    let owner = user_token(&c, &ns, 1, "goat", "scope=default", None, true).await;
-    let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), false).await;
-    let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec![format!("eth/{elf}")]), true).await;
+    register(&c, &other_ns, PROOF, &elf).await;
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec![PROOF.to_string()]), false).await;
+    let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec![PROOF.to_string()]), true).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone(), admin_token: Arc::new("admin".into()) });
+    let router = crate::http::router(crate::http::HttpState { fleet: c.fleet.clone(), workloads: c.clone() });
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let client = reqwest::Client::new();
-    let own = format!("namespace={ns}&tenant=eth&elf_id={elf}");
-    for (method, path) in [
-        (reqwest::Method::PUT, "apps/priority"),
-        (reqwest::Method::PUT, "apps/disabled"),
-        (reqwest::Method::DELETE, "apps/disabled"),
-        (reqwest::Method::DELETE, "apps"),
+    for (method, leaf) in [
+        (reqwest::Method::PUT, "/priority"),
+        (reqwest::Method::PUT, "/disabled"),
+        (reqwest::Method::DELETE, "/disabled"),
+        (reqwest::Method::DELETE, ""),
     ] {
-        for (token, selector) in [
-            (&consumer, own.clone()),
-            (&owner, format!("namespace={other_ns}&tenant=eth&elf_id={elf}")),
-            (&owner, format!("{own}&tag=scope=research")),
-            (&restricted, format!("namespace={ns}&tenant=eth&elf_id={other_elf}")),
-            (&restricted, format!("namespace={ns}&tenant=goat&elf_id={elf}")),
+        for (token, app, selector) in [
+            (&consumer, PROOF, ""),
+            (&owner, PROOF, "?namespace=other"),
+            (&owner, PROOF, "?tag=scope=research"),
+            (&restricted, "other-proof", ""),
         ] {
-            let response = client.request(method.clone(), format!("{url}/admin/{path}?{selector}&priority=31"))
-                .bearer_auth(token).send().await.unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}?{selector}");
+            let response = client.request(method.clone(), format!("{url}/apps/{app}{leaf}{selector}"))
+                .bearer_auth(token).json(&json!({"priority":31})).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {app}{leaf}{selector}");
         }
     }
-    assert_eq!(client.put(format!("{url}/admin/apps/priority?{own}&priority=31")).bearer_auth(&restricted).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(client.put(format!("{url}/apps/{PROOF}/priority")).bearer_auth(&restricted).json(&json!({"priority":31}))
+        .send().await.unwrap().status(), StatusCode::OK);
     for (method, disabled) in [(reqwest::Method::PUT, true), (reqwest::Method::DELETE, false)] {
-        let response = client.request(method, format!("{url}/admin/apps/disabled?{own}"))
+        let response = client.request(method, format!("{url}/apps/{PROOF}/disabled"))
             .bearer_auth(&owner).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let app: Value = response.json().await.unwrap();
         assert_eq!(app["disabled"], disabled);
-        let apps = c.fleet.apps().await.unwrap();
-        assert_eq!(apps.iter().find(|a| a["namespace"] == ns && a["elf_id"] == elf).unwrap()["priority"], 31);
+        assert_eq!(app["kind"], "proof");
+        assert_eq!(c.fleet.app(&ns, PROOF).unwrap().priority, 31);
     }
     for selector in [String::new(), "?tag=scope=default".into()] {
-        let path = format!("{url}/admin/namespaces/{ns}/quota{selector}");
+        let path = format!("{url}/namespaces/{ns}/quota{selector}");
         for token in [&owner, &consumer, &restricted] {
             assert_eq!(client.put(&path).bearer_auth(token).json(&json!({"gpus":1,"cpus":4})).send().await.unwrap().status(), StatusCode::FORBIDDEN);
         }
-        assert_eq!(client.put(&path).bearer_auth("admin").json(&json!({"gpus":1,"cpus":4})).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(client.put(&path).bearer_auth(ADMIN).json(&json!({"gpus":1,"cpus":4})).send().await.unwrap().status(), StatusCode::OK);
     }
-    assert_eq!(client.delete(format!("{url}/admin/apps?{own}")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::OK);
-    assert!(c.fleet.app_known(&other_ns, "eth", &elf));
-    assert_eq!(client.post(format!("{url}/admin/apps?{own}&tag=scope=default&priority=17")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::OK);
+    assert_eq!(client.delete(format!("{url}/apps/{PROOF}")).bearer_auth(&owner).send().await.unwrap().status(), StatusCode::OK);
+    assert!(!c.fleet.app_known(&ns, PROOF));
+    assert!(c.fleet.app_known(&other_ns, PROOF));
+    let again = client.post(format!("{url}/apps")).bearer_auth(&owner)
+        .json(&json!({"name":PROOF,"elf_id":elf,"priority":17,"class":"latency","anchor":"exclusive","backends":["cuda"]})).send().await.unwrap();
+    assert_eq!(again.status(), StatusCode::CREATED);
+    let app: Value = again.json().await.unwrap();
+    assert_eq!((app["priority"].clone(), app["proof"]["class"].clone(), app["proof"]["anchor"].clone()), (json!(17), json!("latency"), json!("exclusive")));
+    for (body, status) in [
+        (json!({"name":"twice","elf_id":elf}), StatusCode::CONFLICT),
+        (json!({"name":PROOF,"elf_id":"c".repeat(64)}), StatusCode::CONFLICT),
+        (json!({"name":"bad","elf_id":"c".repeat(64),"class":"fast"}), StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(client.post(format!("{url}/apps")).bearer_auth(&owner).json(&body).send().await.unwrap().status(), status, "{body}");
+    }
+    assert_eq!(client.post(format!("{url}/apps")).bearer_auth(&consumer).json(&json!({"name":"mine","elf_id":"d".repeat(64)}))
+        .send().await.unwrap().status(), StatusCode::FORBIDDEN);
     server.abort();
 }
 fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body).unwrap() }
@@ -1086,8 +1122,8 @@ async fn owner_scale_rejects_invalid_capacity_quota_and_batches() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     let secret="1".repeat(64);
-    c.fleet.add_user_token("eth",&"a".repeat(32),&"b".repeat(40),"owner",None,
-        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("scope=default".into()),true,
+    c.fleet.add_user_token(&"a".repeat(32),&"b".repeat(40),"owner",None,
+        Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("scope=default".into()),vec!["read".into(),"submit".into(),"manage".into()],
         ).await.unwrap();
     let path=format!("/apps/service/scale?namespace={ns}");
     assert_eq!(scale_call(c.clone(),&secret,"GET",&path,Value::Null).await.status(),StatusCode::OK);
@@ -1140,7 +1176,7 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     }
     assert_eq!(c.inner.lock().apps["service"].spec["disabled"],false);
     assert!(c.request_scale(&ns,"service",request_resources(json!({"replicas":1}))).await.is_err());
-    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="stop").unwrap().clone();
@@ -1158,7 +1194,7 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
     assert!(!start.admitted);
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
-    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"admin".into(),"cluster".into()).unwrap());
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();c.dispatch().await.unwrap();
     assert_eq!(c.inner.lock().commands.len(),3);
     assert!(c.inner.lock().commands[&start.id].admitted);
@@ -1183,35 +1219,22 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     use crate::store::{ProofJob,ProofJobState};
     use fleet_proto::fleet::v1::ProofKind;
     let (_dir,c,ns)=setup().await;let elf="a".repeat(64);
-    c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
+    register(&c, &ns, PROOF, &elf).await;
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
-    let mut job=ProofJob{inputs:None,outputs:None,id:"active-proof".into(),tenant:"eth".into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"active-proof".into(),elf_id:elf.clone(),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
+    let mut job=ProofJob{inputs:None,outputs:None,id:"active-proof".into(),app:PROOF.into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"active-proof".into(),elf_id:elf.clone(),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
         fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
     };
     c.fleet.store.upsert(&job).await.unwrap();
-    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"replicas":1})),
+    c.request_scale(&ns,PROOF,request_resources(json!({"replicas":1})),
     ).await.unwrap();
     for method in ["PUT", "DELETE"] {
-        assert_eq!(scale_call(c.clone(),"admin",method,&format!("/apps/eth/{elf}/disabled?namespace={ns}"),json!({})).await.status(),StatusCode::CONFLICT);
+        assert_eq!(scale_call(c.clone(),"admin",method,&format!("/apps/{PROOF}/disabled?namespace={ns}"),json!({})).await.status(),StatusCode::CONFLICT);
     }
-    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url=format!("http://{}",listener.local_addr().unwrap());
-    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),workloads:c.clone(),admin_token:Arc::new("admin".into()),
-    });
-    let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
-    for (method,path) in [(reqwest::Method::PUT,"/admin/apps/disabled"),
-        (reqwest::Method::DELETE,"/admin/apps/disabled"),(reqwest::Method::DELETE,"/admin/apps"),
-    ] {
-        let response=reqwest::Client::new().request(method,format!("{url}{path}"))
-            .bearer_auth("admin").query(&[("namespace",&ns),("tenant",&"eth".to_string()),("elf_id",&elf),
-            ]).send().await.unwrap();
-        assert_eq!(response.status(),StatusCode::CONFLICT);
-    }
-    server.abort();
-    assert!(c.fleet.app_known(&ns,"eth",&elf));
-    assert!(!c.fleet.app_disabled(&ns,"eth",&elf));
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/{PROOF}?namespace={ns}"),Value::Null).await.status(),StatusCode::CONFLICT);
+    assert!(c.fleet.app_known(&ns, PROOF));
+    assert!(!c.fleet.app_disabled(&ns, PROOF));
     c.dispatch().await.unwrap();
-    assert!(c.fleet.app_disabled(&ns,"eth",&elf));
+    assert!(c.fleet.app_disabled(&ns, PROOF));
     let stop=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="stop").unwrap().clone();
     assert!(!stop.admitted);
     job.state=ProofJobState::Succeeded as i32;job.finished_ms=Some(2);c.fleet.store.upsert(&job).await.unwrap();
@@ -1221,10 +1244,10 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
     let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);
     finish_service_command(&c,&ns,true,&start,false,Some(observed)).await;
-    assert!(c.fleet.app_disabled(&ns,"eth",&elf));
+    assert!(c.fleet.app_disabled(&ns, PROOF));
     c.dispatch().await.unwrap();
-    assert!(!c.fleet.app_disabled(&ns,"eth",&elf));
-    c.fleet.set_app_disabled(&ns,"eth",&elf,true).await.unwrap();
+    assert!(!c.fleet.app_disabled(&ns, PROOF));
+    c.fleet.set_app_disabled(&ns, PROOF,true).await.unwrap();
     // The authoritative lifecycle intent, not an old observed flag, determines whether scaling resumes the app.
     let mut stopped=start.parameters["service"].clone();
     stopped["disabled"]=json!(true);stopped["ready"]=json!(false);stopped["cleaned"]=json!(true);
@@ -1232,7 +1255,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     ).unwrap();
     let normal=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     finish_service_command(&c,&ns,true,&normal,true,Some(stopped)).await;
-    c.request_scale(&ns,&format!("eth/{elf}"),request_resources(json!({"gpus":2,"replicas":1})),
+    c.request_scale(&ns,PROOF,request_resources(json!({"gpus":2,"replicas":1})),
     ).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
@@ -1242,8 +1265,8 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     assert_eq!(apply.parameters["disabled"],true);
     let mut observed=apply.parameters["service"].clone();observed["disabled"]=json!(true);observed["cleaned"]=json!(true);observed["ready"]=json!(false);
     finish_service_command(&c,&ns,true,&apply,true,Some(observed)).await;c.dispatch().await.unwrap();
-    assert!(c.fleet.app_disabled(&ns,"eth",&elf));
-    assert_eq!(c.scale_status(&ns,&format!("eth/{elf}"),None).unwrap()["state"],"complete");
+    assert!(c.fleet.app_disabled(&ns, PROOF));
+    assert_eq!(c.scale_status(&ns,PROOF,None).unwrap()["state"],"complete");
 }
 
 #[tokio::test]
@@ -1286,39 +1309,39 @@ async fn public_nodes_are_machines_and_machine_drain_covers_current_and_future_p
     use fleet_proto::fleet::v1::NodeInfo;
     let (_dir,c,ns)=setup().await;
     let elf="a".repeat(64);
-    c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
+    register(&c, &ns, PROOF, &elf).await;
     let mut report=inventory(&ns);
     report.services=vec![json!({"name":"proof","kind":"ziren-gpu","namespace":ns,
-        "app":format!("eth/{elf}"),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
+        "app":PROOF.to_string(),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
     c.report("gpu","session",report).await.unwrap();
     let replica=NodeInfo{name:"proof-0".into(),machine:"machine".into(),backend:"cuda".into(),
-        gpus:1,cpus:2,control_version:1,app_namespace:ns,app_tenant:"eth".into(),app_elf_id:elf.clone(),..Default::default()};
+        gpus:1,cpus:2,control_version:1,app_namespace:ns,app:PROOF.into(),app_elf_id:elf.clone(),..Default::default()};
     let id=c.fleet.register(replica.clone()).unwrap();
     c.fleet.heartbeat(&id,true,vec![],true,"proof-job");
     c.fleet.register(NodeInfo{name:"other-0".into(),machine:"other-machine".into(),..replica.clone()}).unwrap();
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
-    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),workloads:c.clone(),admin_token:Arc::new("admin".into()),
+    let router=crate::http::router(crate::http::HttpState{fleet:c.fleet.clone(),workloads:c.clone()
     });
     let server=tokio::spawn(async move { axum::serve(listener,router).await.unwrap(); });
     let client=reqwest::Client::new();
-    let status:Value=client.get(format!("{url}/admin/status")).bearer_auth("admin").send().await.unwrap().json().await.unwrap();
+    let status:Value=client.get(format!("{url}/status")).bearer_auth(ADMIN).send().await.unwrap().json().await.unwrap();
     assert_eq!(status["nodes"].as_array().unwrap().len(),1);
     assert_eq!(status["nodes"][0]["name"],"gpu");
     assert_eq!(status["nodes"][0]["gpus"],2.0);
     assert_eq!(status["nodes"][0]["cpus"],8.0);
     assert_eq!(status["nodes"][0]["busy"],"~proof-job");
-    assert_eq!(status["nodes"][0]["apps"],json!([format!("eth/{elf}")]));
+    assert_eq!(status["nodes"][0]["apps"],json!([PROOF.to_string()]));
     for method in [reqwest::Method::POST,reqwest::Method::DELETE] {
-        assert_eq!(client.request(method,format!("{url}/admin/nodes/proof-0/drain")).bearer_auth("admin").send().await.unwrap().status(),StatusCode::NOT_FOUND);
+        assert_eq!(client.request(method,format!("{url}/nodes/proof-0/drain")).bearer_auth(ADMIN).send().await.unwrap().status(),StatusCode::NOT_FOUND);
     }
-    assert_eq!(client.post(format!("{url}/admin/nodes/gpu/drain")).bearer_auth("admin").send().await.unwrap().status(),StatusCode::NO_CONTENT);
+    assert_eq!(client.post(format!("{url}/nodes/gpu/drain")).bearer_auth(ADMIN).send().await.unwrap().status(),StatusCode::NO_CONTENT);
     assert!(c.capacity("gpu").is_none());
     let new=c.fleet.register(NodeInfo{name:"proof-1".into(),..replica}).unwrap();
     c.fleet.heartbeat(&new,true,vec![],false,"");
     assert!(c.fleet.status().nodes.iter().all(|n|n.draining==(n.machine=="machine")));
     assert_eq!(c.worker_status()[0]["busy"],"~proof-job","draining must preserve the active proof");
-    assert_eq!(client.delete(format!("{url}/admin/nodes/gpu/drain")).bearer_auth("admin").send().await.unwrap().status(),StatusCode::NO_CONTENT);
+    assert_eq!(client.delete(format!("{url}/nodes/gpu/drain")).bearer_auth(ADMIN).send().await.unwrap().status(),StatusCode::NO_CONTENT);
     assert!(c.capacity("gpu").is_some());
     assert!(c.fleet.status().nodes.iter().all(|n|!n.draining));
     server.abort();
@@ -1343,20 +1366,19 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
 #[tokio::test]
 async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admission_guard() {
     let (_dir, c, ns) = setup().await;
-    let elf = "a".repeat(64);
     let mut report = scale_inventory(&ns, true, false);
     report.services[0]["worker_command"] = json!(["/opt/eth-proofs"]);
     report.services[0]["machine"] = json!("machine");
     report.services[0]["replicas"] = json!(1);
     c.report("gpu", "session", report).await.unwrap();
-    assert!(c.fleet.app_worker_owned(&ns, "eth", &elf));
-    assert!(!c.fleet.app_worker_owned(&ns, "goat", &elf));
+    assert!(c.fleet.app_worker_owned(&ns, PROOF));
+    assert!(!c.fleet.app_worker_owned(&ns, "other"));
     assert_eq!(c.fleet.usage(&ns).gpus, 1.0);
     assert_eq!(c.fleet.usage(&ns).cpus, 2.0);
-    assert!(c.request_scale(&ns, &format!("eth/{elf}"), request_resources(json!({"replicas":2}))).await.is_err());
+    assert!(c.request_scale(&ns, PROOF, request_resources(json!({"replicas":2}))).await.is_err());
     c.fleet.set_worker_owned_apps(HashSet::new());
-    let _restarted = WorkloadController::new(c.fleet.clone(), "admin".into(), "cluster".into()).unwrap();
-    assert!(c.fleet.app_worker_owned(&ns, "eth", &elf));
+    let _restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
+    assert!(c.fleet.app_worker_owned(&ns, PROOF));
 }
 
 #[tokio::test]
@@ -1409,20 +1431,22 @@ async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
         let elf = "a".repeat(64);
-        c.fleet.add_app(&ns, "eth", &elf, 0).await.unwrap();
+        register(&c, &ns, PROOF, &elf).await;
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
         c.fleet.log_relay.heartbeat("gpu", "session");
-        let app = if proof { format!("eth/{elf}") } else { "service".into() };
-        let consumer = user_token(&c, &ns, 2, "eth", "scope=default", Some(vec![app]), false).await;
-        let restricted = user_token(&c, &ns, 3, "eth", "scope=default", Some(vec!["other".into()]), true).await;
-        let foreign_tag = user_token(&c, &ns, 4, "eth", "scope=research", None, true).await;
-        let logs = if proof { format!("/apps/eth/{elf}/logs") } else { "/apps/service/logs".into() };
+        let app = if proof { PROOF.to_string() } else { "service".into() };
+        let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec![app]), false).await;
+        let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec!["other".into()]), true).await;
+        let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
+        let logs = if proof { format!("/apps/{PROOF}/logs") } else { "/apps/service/logs".into() };
         let query = |extra: &str| format!("{logs}?{extra}");
         for token in [&restricted, &foreign_tag] {
             let status = scale_call(c.clone(), token, "GET", &logs, Value::Null).await.status();
             assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{status}");
         }
-        assert_eq!(scale_call(c.clone(), &consumer, "POST", &logs, Value::Null).await.status(), StatusCode::METHOD_NOT_ALLOWED);
+        // A write needs manage; even with it, logs are only read.
+        assert_eq!(scale_call(c.clone(), &consumer, "POST", &logs, Value::Null).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("{logs}?namespace={ns}"), Value::Null).await.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(scale_call(c.clone(), &consumer, "GET", &query("lines=many"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
 
         let (control, token, path) = (c.clone(), consumer.clone(), query("lines=5"));
@@ -1471,7 +1495,7 @@ async fn a_starting_app_says_why_it_is_not_running() {
 async fn enabling_an_integrated_worker_without_a_registered_app_keeps_heartbeats_accepted() {
     let (_dir,c,ns)=setup().await;
     let report=scale_inventory(&ns,true,true);
-    assert!(!c.fleet.app_known(&ns,"eth",&"a".repeat(64)));
+    assert!(!c.fleet.app_known(&ns, PROOF));
     c.report("gpu","session",report.clone()).await.unwrap();
     let mut service:Value=report.services[0].clone().into();service["disabled"]=json!(false);
     let id=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
@@ -1565,7 +1589,7 @@ async fn deleting_a_registered_app_tells_every_node_which_app_was_deleted() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     c.report("cpu","session",inventory(&ns)).await.unwrap();
-    let app=format!("eth/{}","a".repeat(64));
+    let app=PROOF.to_string();
     c.remove_app(&ns,&app).unwrap();
     c.remove_app(&ns,&app).unwrap();
     let expected=json!({"app":{"namespace":ns,"namespace_name":"test","name":app},"remove":true});
@@ -1680,9 +1704,9 @@ async fn a_batch_update_is_checked_kept_by_the_scheduler_and_sent_to_its_nodes()
 async fn a_registered_app_update_changes_its_server() {
     let (_dir,c,ns)=setup().await;
     let elf="a".repeat(64);
-    c.fleet.add_app(&ns,"eth",&elf,0).await.unwrap();
+    register(&c, &ns, PROOF, &elf).await;
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
-    let path=format!("/apps/eth/{elf}/settings?namespace={ns}");
+    let path=format!("/apps/{PROOF}/settings?namespace={ns}");
     assert_eq!(scale_call(c.clone(),"admin","GET",&path,Value::Null).await.status(),StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"image":"prover:2"})).await.status(),StatusCode::ACCEPTED);
     let scale=c.inner.lock().services["gpu-service"].scale.clone().unwrap();
@@ -1747,4 +1771,59 @@ async fn an_enable_carries_the_apps_current_priority() {
     assert_eq!(enable.await.unwrap().status(),StatusCode::OK);
     let start=command_where(&c,|v|v.parameters["scale_phase"]=="apply").unwrap();
     assert_eq!(start.parameters["service"]["priority"],31,"admission and preemption use the app's priority");
+}
+
+#[tokio::test]
+async fn an_admin_token_has_no_namespace_and_others_need_one() {
+    let (_dir, c, ns) = setup().await;
+    let hash = |seed: &str| Some(hex::encode(sha2::Sha256::digest(seed.repeat(64).as_bytes())));
+    let add = |id: &str, permissions: &[&str], namespace: Option<&str>, tag: Option<&str>, apps: Option<Vec<String>>| {
+        let (id, permissions) = (id.repeat(16), permissions.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        let (namespace, tag) = (namespace.map(str::to_owned), tag.map(str::to_owned));
+        let fleet = c.fleet.clone();
+        let token_hash = hash(&id[..1]);
+        async move { fleet.add_user_token(&id, &id[..2].repeat(20), "t", apps, token_hash, namespace, tag, permissions).await }
+    };
+    assert!(add("a1", &["admin"], None, None, None).await.is_ok());
+    for (id, permissions, namespace, tag) in [
+        ("b2", &["admin", "read"][..], None, None),
+        ("c3", &["admin"], Some(ns.as_str()), None),
+        ("d4", &["read", "submit"], None, None),
+        ("e5", &["root"], Some(ns.as_str()), None),
+        ("f6", &["read", "manage"], Some(ns.as_str()), None),
+    ] {
+        assert!(add(id, permissions, namespace, tag, Some(vec!["proof".into()])).await.is_err(), "{id}");
+    }
+    let reader = add("07", &["submit", "read", "read"], Some(&ns), Some("scope=default"), Some(vec!["proof".into()])).await.unwrap();
+    assert_eq!(reader.permissions, vec!["read", "submit"], "canonical order, once each");
+    assert!(add("08", &["read"], Some(&ns), None, Some(vec!["proof/aaaa".into()])).await.is_err(), "a grant names an app");
+    assert!(add("09", &["read"], Some(&ns), None, None).await.is_err(), "without manage a token needs grants");
+}
+
+#[tokio::test]
+async fn a_token_issued_or_revoked_outside_the_scheduler_takes_effect_on_reload() {
+    let (_dir, c, _) = setup().await;
+    let (token, secret) = crate::token::new_admin_token("from the host");
+    c.fleet.store.add_token(&token).await.unwrap();
+    let bearer = format!("Bearer {secret}");
+    assert!(c.fleet.token_for_token(Some(&bearer)).is_none(), "not until the store is read again");
+    c.fleet.reload_tokens().await;
+    assert_eq!(c.fleet.token_for_token(Some(&bearer)).unwrap().permissions, vec!["admin"]);
+    c.fleet.store.revoke_token(&token.id, 1).await.unwrap();
+    c.fleet.reload_tokens().await;
+    assert!(c.fleet.token_for_token(Some(&bearer)).is_none());
+}
+
+#[tokio::test]
+async fn a_service_record_follows_the_app_its_node_configures() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = scale_inventory(&ns, true, false);
+    report.services[0]["app"] = json!(format!("eth/{}", proof_elf()));
+    report.services[0].as_object_mut().unwrap().remove("elf_id");
+    c.report("gpu", "session", report).await.unwrap();
+    c.report("gpu", "session", scale_inventory(&ns, true, false)).await.unwrap();
+    let service = c.inner.lock().services["gpu-service"].service.clone();
+    assert_eq!((service["app"].clone(), service["elf_id"].clone()), (json!(PROOF), json!(proof_elf())));
+    let saved: AppDeployment = serde_json::from_slice(&std::fs::read(c.dir.join("services/gpu-service.json")).unwrap()).unwrap();
+    assert_eq!(saved.service["app"], PROOF, "and so does its saved record");
 }

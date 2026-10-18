@@ -338,7 +338,8 @@ class NodeExecutor:
         configured = next((s for s in cfg.services if s.name == service["name"]), None)
         if configured is None:
             raise ValueError(f"{service['name']} is not configured on this node")
-        if configured.namespace != service.get("namespace_ref", service["namespace"]) or configured.app != service.get("app"):
+        if (configured.namespace != service.get("namespace_ref", service["namespace"]) or configured.app != service.get("app")
+                or configured.elf_id != (service.get("elf_id") or "").lower()):
             raise ValueError("service scope differs from configured scope")
         if service.get("kind") != configured.kind.value or service.get("tag") != configured.tag:
             raise ValueError("service kind or tag differs from configured scope")
@@ -370,9 +371,8 @@ class NodeExecutor:
                 raise ValueError(f"{name}: service container cleanup is uncertain")
 
     def app(self, p: dict[str, Any]) -> dict[str, Any]:
-        """An app-level change from the scheduler, for an app (`p["app"]`: a proof app's server
-        by its `tenant/elf_id` or a serving app by its name, in a namespace given by id and by
-        name), a batch (`p["batch"]`, by name), or the one service a change of an app stopped
+        """An app-level change from the scheduler, for an app (`p["app"]`: the services that
+        run the app of that name, in a namespace given by id and by name), a batch (`p["batch"]`, by name), or the one service a change of an app stopped
         (`p["service"]`, by name, set only): `remove` it, or `set` some of its configuration.
         A removed service has what is left of its replicas cleaned up the way disabling does;
         app data stays (storage roots, workdirs, env files and images belong to the operator).

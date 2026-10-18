@@ -5,7 +5,7 @@ use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
 use fleet_scheduler::quota::{Allocation, Quota};
 use fleet_scheduler::store::SYSTEM_NAMESPACE;
-use fleet_scheduler::store::{ProofJob, ProofJobFilter, ProofJobState, Namespace, PgStore, Store, Token};
+use fleet_scheduler::store::{App, ProofJob, ProofJobFilter, ProofJobState, Namespace, PgStore, Store, Token};
 use sqlx::{Executor, PgPool, Row};
 
 /// An incomplete development schema must be reset, never assigned invented identities.
@@ -53,6 +53,14 @@ async fn ddl(admin: &PgPool, schema: &str) -> Vec<String> {
         .collect()
 }
 
+/// A registration of `name` (program `elf_id`) with the default policy.
+fn app(namespace: &str, name: &str, elf_id: &str, created_ms: u64, priority: i32) -> App {
+    App {
+        namespace: namespace.into(), name: name.into(), elf_id: elf_id.into(), created_ms, priority,
+        class: "batch".into(), anchor: "none".into(), max_queued: 64, ..Default::default()
+    }
+}
+
 fn job(id: &str, state: ProofJobState) -> ProofJob {
     ProofJob {
                 inputs: None, outputs: None,
@@ -61,7 +69,7 @@ fn job(id: &str, state: ProofJobState) -> ProofJob {
         tag: String::new(),
         client_id: id.into(),
         id: id.into(),
-        tenant: "goat".into(),
+        app: "goat".into(),
         elf_id: "b".repeat(64),
         kind: ProofKind::Groth16 as i32,
         priority: 0,
@@ -93,7 +101,7 @@ async fn check_job_identity(store: &dyn Store) {
     changed.namespace = "1".repeat(32);
     changed.tag = "scope=other".into();
     changed.client_id = "replacement".into();
-    changed.tenant = "eth".into();
+    changed.app = "eth".into();
     changed.elf_id = "a".repeat(64);
     changed.kind = ProofKind::Core as i32;
     changed.priority = 99;
@@ -108,8 +116,8 @@ async fn check_job_identity(store: &dyn Store) {
     let restored = store.get(&original.id).await.unwrap().unwrap();
     assert_eq!((&restored.owner, &restored.namespace, &restored.tag, &restored.client_id),
         (&original.owner, &original.namespace, &original.tag, &original.client_id));
-    assert_eq!((&restored.tenant, &restored.elf_id, restored.kind, restored.created_ms),
-        (&original.tenant, &original.elf_id, original.kind, original.created_ms));
+    assert_eq!((&restored.app, &restored.elf_id, restored.kind, restored.created_ms),
+        (&original.app, &original.elf_id, original.kind, original.created_ms));
     assert_eq!(restored.inputs, original.inputs, "input references are immutable");
     assert_eq!(restored.outputs, changed.outputs, "completion metadata survives storage");
     assert_eq!(restored.priority, original.priority);
@@ -142,16 +150,16 @@ async fn memory_store_preserves_job_identity_and_validates_fields() {
 async fn check_registered_app_inventory(store: &dyn Store) {
     let mut rejected = job("unregistered-attempt", ProofJobState::Failed);
     rejected.fail_status = Some(StageStatus::InvalidParameter as i32);
-    rejected.tenant = "unregistered".into();
+    rejected.app = "unregistered".into();
+    rejected.elf_id = "c".repeat(64);
     store.upsert(&rejected).await.unwrap();
-    assert!(!store.apps().await.unwrap().iter().any(|a| a.tenant == rejected.tenant));
+    assert!(!store.apps().await.unwrap().iter().any(|a| a.name == rejected.app));
     assert!(store.get(&rejected.id).await.unwrap().is_some(), "rejected requests remain in job history");
-    store.add_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id, 3000, 0,
-        ).await.unwrap();
-    let registered = store.apps().await.unwrap().into_iter().find(|a| a.tenant == rejected.tenant).unwrap();
+    assert!(store.add_app(&app(SYSTEM_NAMESPACE, &rejected.app, &rejected.elf_id, 3000, 0)).await.unwrap());
+    let registered = store.apps().await.unwrap().into_iter().find(|a| a.name == rejected.app).unwrap();
     assert_eq!((registered.jobs, registered.failed, registered.created_ms), (1, 1, 3000));
-    store.delete_app(SYSTEM_NAMESPACE, &rejected.tenant, &rejected.elf_id).await.unwrap();
-    assert!(!store.apps().await.unwrap().iter().any(|a| a.tenant == rejected.tenant));
+    store.delete_app(SYSTEM_NAMESPACE, &rejected.app).await.unwrap();
+    assert!(!store.apps().await.unwrap().iter().any(|a| a.name == rejected.app));
 }
 
 #[tokio::test]
@@ -175,12 +183,13 @@ async fn fresh_schema_requires_complete_job_identity() {
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![14]);
+    assert_eq!(versions, vec![16]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
-        assert!(store.add_app(SYSTEM_NAMESPACE, "goat", &bb, 1999, 0).await.unwrap());
-        assert!(!store.add_app(SYSTEM_NAMESPACE, "goat", &bb, 2000, 0).await.unwrap(), "registered once");
+        assert!(store.add_app(&app(SYSTEM_NAMESPACE, "goat", &bb, 1999, 0)).await.unwrap());
+        assert!(!store.add_app(&app(SYSTEM_NAMESPACE, "goat", &"d".repeat(64), 2000, 0)).await.unwrap(), "a name is registered once");
+        assert!(!store.add_app(&app(SYSTEM_NAMESPACE, "goat-again", &bb, 2000, 0)).await.unwrap(), "a program is one app of a namespace");
         let fresh_app = store.apps().await.unwrap().into_iter().find(|a| a.elf_id == bb).unwrap();
         assert_eq!((fresh_app.jobs, fresh_app.created_ms, fresh_app.last_created_ms), (0, 1999, None), "listed with no job yet");
         store.upsert(&job("g1", ProofJobState::Running)).await.unwrap();
@@ -189,37 +198,44 @@ async fn fresh_schema_requires_complete_job_identity() {
         store.upsert(&failed).await.unwrap();
         store.upsert(&failed).await.unwrap();
         let active = store
-            .recent(&ProofJobFilter { tag: None, namespace: None, owner: None, tenant: Some("goat".into()), elf: Some("b".into()), active: true,
+            .recent(&ProofJobFilter { tag: None, namespace: None, owner: None, app: Some("goat".into()), active: true,
                 }, 10,
             )
             .await
             .unwrap();
         assert_eq!(active.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), vec!["g1"]);
         let apps = store.apps().await.unwrap();
-        let goat = apps.iter().find(|a| a.tenant == "goat").unwrap();
+        let goat = apps.iter().find(|a| a.name == "goat").unwrap();
         assert_eq!((goat.jobs, goat.active, goat.failed), (2, 1, 1));
-        store.set_app_disabled(SYSTEM_NAMESPACE, "goat", &bb, true, 5).await.unwrap();
-        assert!(store.registered_apps().await.unwrap().contains(&(SYSTEM_NAMESPACE.into(), "goat".to_string(), bb.clone(), true)));
-        assert!(store.apps().await.unwrap().iter().find(|a| a.tenant == "goat").unwrap().disabled);
-        store.set_app_disabled(SYSTEM_NAMESPACE, "goat", &bb, false, 7).await.unwrap();
-        assert!(store.registered_apps().await.unwrap().contains(&(SYSTEM_NAMESPACE.into(), "goat".to_string(), bb.clone(), false)));
-        assert_eq!(store.delete_app(SYSTEM_NAMESPACE, "goat", &bb).await.unwrap(), vec!["g2".to_string()], "the running one stays");
-        assert!(!store.registered_apps().await.unwrap().iter().any(|(_, t, _, _)| t == "goat"), "the app is gone");
+        assert_eq!((goat.class.as_str(), goat.anchor.as_str(), goat.max_queued), ("batch", "none", 64));
+        store.set_app_disabled(SYSTEM_NAMESPACE, "goat", true, 5).await.unwrap();
+        assert!(store.apps().await.unwrap().iter().find(|a| a.name == "goat").unwrap().disabled);
+        store.set_app_disabled(SYSTEM_NAMESPACE, "goat", false, 7).await.unwrap();
+        assert!(!store.apps().await.unwrap().iter().find(|a| a.name == "goat").unwrap().disabled);
+        assert_eq!(store.delete_app(SYSTEM_NAMESPACE, "goat").await.unwrap(), vec!["g2".to_string()], "the running one stays");
+        assert!(!store.apps().await.unwrap().iter().any(|a| a.name == "goat"), "the app is gone");
         assert_eq!(store.incomplete().await.unwrap().iter().filter(|j| j.id == "g1").count(), 1);
     }
     // what the constraints refuse
     let bad = [
-        "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b1', 't', 'e', 'core', 'done', 1, repeat('a',40), repeat('0',32), '', 'b1')",
-        "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, finished_ms, owner, namespace, tag, client_id) VALUES ('b2', 't', 'e', 'core', 'failed', 1, 2, repeat('a',40), repeat('0',32), '', 'b2')",
-        "INSERT INTO fresh.fleet_jobs (id, tenant, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b3', 't', 'e', 'core', 'succeeded', 1, repeat('a',40), repeat('0',32), '', 'b3')",
-        "INSERT INTO fresh.fleet_tokens (address, tenant, created_ms) VALUES ('0xABC', 't', 1)",
-        "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms, namespace) VALUES ('', repeat('a', 64), 1, repeat('0',32))",
-        "INSERT INTO fresh.fleet_apps (tenant, elf_id, created_ms, namespace) VALUES ('t', 'abc', 1, repeat('0',32))",
+        "INSERT INTO fresh.fleet_jobs (id, app, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b1', 't', 'e', 'core', 'done', 1, repeat('a',40), repeat('0',32), '', 'b1')",
+        "INSERT INTO fresh.fleet_jobs (id, app, elf_id, kind, state, created_ms, finished_ms, owner, namespace, tag, client_id) VALUES ('b2', 't', 'e', 'core', 'failed', 1, 2, repeat('a',40), repeat('0',32), '', 'b2')",
+        "INSERT INTO fresh.fleet_jobs (id, app, elf_id, kind, state, created_ms, owner, namespace, tag, client_id) VALUES ('b3', 't', 'e', 'core', 'succeeded', 1, repeat('a',40), repeat('0',32), '', 'b3')",
+        "INSERT INTO fresh.fleet_tokens (id, address, created_ms) VALUES (repeat('1', 32), '0xABC', 1)",
+        "INSERT INTO fresh.fleet_tokens (id, address, created_ms, permissions) VALUES (repeat('2', 32), repeat('2', 40), 1, '{read,root}')",
+        "INSERT INTO fresh.fleet_tokens (id, address, created_ms) VALUES (repeat('3', 32), repeat('3', 40), 1)",
+        "INSERT INTO fresh.fleet_tokens (id, address, created_ms, namespace, permissions) VALUES (repeat('4', 32), repeat('4', 40), 1, repeat('0',32), '{admin}')",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace) VALUES ('', repeat('a', 64), 1, repeat('0',32))",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace) VALUES ('t/e', repeat('a', 64), 1, repeat('0',32))",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace) VALUES ('t', 'abc', 1, repeat('0',32))",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace, class) VALUES ('t', repeat('a', 64), 1, repeat('0',32), 'fast')",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace, backends) VALUES ('t', repeat('a', 64), 1, repeat('0',32), '{tpu}')",
+        "INSERT INTO fresh.fleet_apps (name, elf_id, created_ms, namespace, max_queued) VALUES ('t', repeat('a', 64), 1, repeat('0',32), 0)",
     ];
     for sql in bad {
         assert!(sqlx::query(sql).execute(&admin).await.is_err(), "accepted: {sql}");
     }
-    let c = Token { id: "84".repeat(16), address: "84".repeat(20), tenant: "eth".into(), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: None, tag: None, namespace: None, manage_apps: false,
+    let c = Token { id: "84".repeat(16), address: "84".repeat(20), label: String::new(), created_ms: 1, revoked_ms: None, apps: None, token_hash: Some("84".repeat(32)), tag: None, namespace: None, permissions: vec!["admin".into()],
     };
     fresh.add_token(&c).await.unwrap();
 
@@ -229,24 +245,29 @@ async fn fresh_schema_requires_complete_job_identity() {
     check_job_identity(&fresh).await;
     check_registered_app_inventory(&fresh).await;
     let shared_elf = "a".repeat(64);
-    assert!(fresh.add_app("missing-namespace", "goat", &shared_elf, 1, 0).await.is_err());
-    fresh.add_app(SYSTEM_NAMESPACE, "goat", &shared_elf, 1, 0).await.unwrap();
-    fresh.add_app(&namespace.id, "goat", &shared_elf, 1, 7).await.unwrap();
-    fresh.set_app_disabled(&namespace.id, "goat", &shared_elf, true, 2).await.unwrap();
+    assert!(fresh.add_app(&app("missing-namespace", "goat", &shared_elf, 1, 0)).await.is_err());
+    fresh.add_app(&app(SYSTEM_NAMESPACE, "goat", &shared_elf, 1, 0)).await.unwrap();
+    let mut policy = app(&namespace.id, "goat", &shared_elf, 1, 7);
+    (policy.class, policy.anchor, policy.backends, policy.zkm_version, policy.max_queued) =
+        ("latency".into(), "exclusive".into(), vec!["cuda".into()], Some("v1.2".into()), 3);
+    fresh.add_app(&policy).await.unwrap();
+    fresh.set_app_disabled(&namespace.id, "goat", true, 2).await.unwrap();
     let app_priority = |apps: Vec<fleet_scheduler::store::App>| {
         apps.into_iter()
         .find(|a| a.namespace == namespace.id && a.elf_id == shared_elf).unwrap().priority
     };
     assert_eq!(app_priority(fresh.apps().await.unwrap()), 7);
-    fresh.set_app_priority(&namespace.id, "goat", &shared_elf, -5).await.unwrap();
+    fresh.set_app_priority(&namespace.id, "goat", -5).await.unwrap();
     let reopened = PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(app_priority(reopened.apps().await.unwrap()), -5);
 
-    let registered = fresh.registered_apps().await.unwrap();
-    assert!(registered.contains(&(namespace.id.clone(), "goat".into(), shared_elf.clone(), true)));
-    assert!(registered.contains(&(SYSTEM_NAMESPACE.into(), "goat".into(), shared_elf.clone(), false)));
-    fresh.delete_app(&namespace.id, "goat", &shared_elf).await.unwrap();
-    assert!(fresh.registered_apps().await.unwrap().contains(&(SYSTEM_NAMESPACE.into(), "goat".into(), shared_elf, false)));
+    let registered = fresh.apps().await.unwrap();
+    let mine = registered.iter().find(|a| a.namespace == namespace.id).unwrap();
+    assert_eq!((mine.disabled, mine.class.as_str(), mine.anchor.as_str(), mine.backends.clone(), mine.zkm_version.as_deref(), mine.max_queued),
+        (true, "latency", "exclusive", vec!["cuda".to_string()], Some("v1.2"), 3));
+    assert!(registered.iter().any(|a| a.namespace == SYSTEM_NAMESPACE && a.name == "goat" && !a.disabled));
+    fresh.delete_app(&namespace.id, "goat").await.unwrap();
+    assert!(fresh.apps().await.unwrap().iter().any(|a| a.namespace == SYSTEM_NAMESPACE && a.name == "goat"));
     let mut owned = job("owned", ProofJobState::Running);
     owned.namespace = namespace.id.clone();
     owned.tag = String::new();
@@ -261,7 +282,7 @@ async fn fresh_schema_requires_complete_job_identity() {
         ).await.unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].id, "owned");
-    let scoped = Token { id: "85".repeat(16), namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()].into()), token_hash: Some("ab".repeat(32)), ..c.clone() };
+    let scoped = Token { id: "85".repeat(16), namespace: Some(namespace.id.clone()), tag: None, address: "85".repeat(20), apps: Some(vec!["training".into()].into()), token_hash: Some("ab".repeat(32)), permissions: vec!["read".into()], ..c.clone() };
     fresh.add_token(&scoped).await.unwrap();
     let restored = fresh.tokens().await.unwrap().into_iter().find(|r| r.address == scoped.address).unwrap();
     assert_eq!(restored.apps, scoped.apps);
@@ -362,8 +383,8 @@ async fn postgres_validates_key_value_tags_for_jobs_tokens_and_allocations() {
         let mut tagged = job(&format!("tagged-{index}"), ProofJobState::Succeeded);
         tagged.tag = tag.into();
         store.upsert(&tagged).await.unwrap();
-        let token = Token { id: format!("{index:032x}"), address: format!("{index:040x}"), tenant: "eth".into(), label: tag.into(), created_ms: 1, revoked_ms: None,
-            namespace: Some(SYSTEM_NAMESPACE.into()), tag: Some(tag.into()), apps: None, token_hash: None, manage_apps: false,
+        let token = Token { id: format!("{index:032x}"), address: format!("{index:040x}"), label: tag.into(), created_ms: 1, revoked_ms: None,
+            namespace: Some(SYSTEM_NAMESPACE.into()), tag: Some(tag.into()), apps: None, token_hash: None, permissions: Vec::new(),
         };
         store.add_token(&token).await.unwrap();
         store.reserve(&Allocation { id: format!("allocation-{index}"), namespace: SYSTEM_NAMESPACE.into(), tag: Some(tag.into()), gpus: 1.0, cpus: 4.0,
@@ -379,4 +400,83 @@ async fn postgres_validates_key_value_tags_for_jobs_tokens_and_allocations() {
     }
     PgStore::connect(&db).await.unwrap();
     assert_eq!(store.get("tagged-0").await.unwrap().unwrap().tag, "scope=default");
+}
+
+/// Schema 14, as a production database had it.
+const SCHEMA_14: &str = include_str!("fixtures/schema-14.sql");
+
+#[tokio::test]
+async fn schema_14_migrates_to_the_current_schema_and_keeps_its_records() {
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "v14").await;
+    fresh_schema(&admin, "current").await;
+    let db = in_schema(&url, "v14");
+    let old = PgPool::connect(&db).await.unwrap();
+    let (zkm, eth, goat, other) = ("5".repeat(32), "6f".repeat(32), "ab".repeat(32), "cd".repeat(32));
+    sqlx::raw_sql(&format!("{SCHEMA_14}
+        INSERT INTO fleet_schema VALUES (14, 1);
+        INSERT INTO fleet_namespaces (id, name, created_ms) VALUES ('{SYSTEM_NAMESPACE}', 'system', 0), ('{zkm}', 'zkm', 1);
+        INSERT INTO fleet_apps (namespace, tenant, elf_id, created_ms, priority, disabled_ms) VALUES
+            ('{zkm}', 'ethproofs', '{eth}', 1, 3, NULL), ('{zkm}', 'goat', '{goat}', 2, 0, 9), ('{zkm}', 'goat', '{other}', 3, 0, NULL);
+        INSERT INTO fleet_tokens (id, address, tenant, created_ms, namespace, tag, apps, token_hash, manage_apps) VALUES
+            (repeat('1', 32), repeat('1', 40), 'goat', 1, '{zkm}', 'scope=default', NULL, repeat('1', 64), true),
+            (repeat('2', 32), repeat('2', 40), 'ethproofs', 1, '{zkm}', 'scope=default', ARRAY['ethproofs/{eth}', 'ethproofs/{goat}', 'training'], repeat('2', 64), false),
+            (repeat('3', 32), repeat('3', 40), 'ethproofs', 1, NULL, NULL, NULL, NULL, false);
+        INSERT INTO fleet_jobs (id, owner, namespace, tag, client_id, tenant, elf_id, kind, state, created_ms) VALUES
+            ('eth-job', repeat('2', 40), '{zkm}', 'scope=default', 'eth-job', 'ethproofs', '{eth}', 'groth16', 'queued', 5),
+            ('lost-job', repeat('2', 40), '{zkm}', 'scope=default', 'lost-job', 'gone', '{eth}', 'groth16', 'queued', 6);
+    ")).execute(&old).await.unwrap();
+    let store = PgStore::connect(&db).await.unwrap();
+    PgStore::connect(&in_schema(&url, "current")).await.unwrap();
+    assert_eq!(ddl(&admin, "v14").await, ddl(&admin, "current").await, "a migrated database has the schema a new one has");
+    let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM v14.fleet_schema ORDER BY 1").fetch_all(&admin).await.unwrap();
+    assert_eq!(versions, vec![14, 16]);
+
+    let apps = store.apps().await.unwrap();
+    let named = |n: &str| apps.iter().find(|a| a.name == n).unwrap_or_else(|| panic!("no app {n}: {apps:?}"));
+    let ethproofs = named("ethproofs");
+    assert_eq!((ethproofs.elf_id.as_str(), ethproofs.priority, ethproofs.disabled, ethproofs.jobs), (eth.as_str(), 3, false, 1));
+    assert_eq!((ethproofs.class.as_str(), ethproofs.anchor.as_str(), ethproofs.backends.len(), ethproofs.max_queued), ("batch", "none", 0, 64));
+    assert!(named(&format!("goat-{}", &goat[..8])).disabled, "a tenant's several apps are told apart by their program");
+    assert!(!named(&format!("goat-{}", &other[..8])).disabled);
+    assert_eq!(store.get("eth-job").await.unwrap().unwrap().app, "ethproofs");
+    assert_eq!(store.get("lost-job").await.unwrap().unwrap().app, "", "a job of no registered app keeps no app");
+
+    let tokens = store.tokens().await.unwrap();
+    assert_eq!(tokens.len(), 2, "a token without a namespace (a tenant's signer) goes");
+    let token = |id: char| tokens.iter().find(|t| t.id == id.to_string().repeat(32)).unwrap();
+    assert_eq!(token('1').permissions, vec!["read", "submit", "manage"]);
+    assert_eq!(token('2').permissions, vec!["read", "submit"]);
+    assert_eq!(token('2').apps.as_ref().unwrap().values, vec!["ethproofs", "training"], "a grant names its app; one of no app goes");
+    // Only an administrator's token has no namespace from now on.
+    assert!(sqlx::query("INSERT INTO v14.fleet_tokens (id, address, created_ms) VALUES (repeat('4', 32), repeat('4', 40), 1)").execute(&admin).await.is_err());
+    assert!(sqlx::query("INSERT INTO v14.fleet_tokens (id, address, created_ms, permissions) VALUES (repeat('4', 32), repeat('4', 40), 1, '{admin}')").execute(&admin).await.is_ok());
+    old.close().await;
+    admin.execute("DROP SCHEMA v14 CASCADE; DROP SCHEMA current CASCADE").await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_issue_writes_the_first_administrators_token_into_the_database() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "issue").await;
+    let db = in_schema(&url, "issue");
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: fleet_scheduler::config::SchedulerConfig = serde_yaml::from_str(&format!(
+        "public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\ndatabase_url: \"{db}\"\n", dir.path().display())).unwrap();
+    let out = dir.path().join("admin.token");
+    let token = fleet_scheduler::issue_admin_token(&cfg, "ops", &out).await.unwrap();
+    let secret = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+    let stored = PgStore::connect(&db).await.unwrap().tokens().await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!((stored[0].id.as_str(), stored[0].label.as_str(), stored[0].permissions.clone(), stored[0].namespace.clone()),
+        (token.id.as_str(), "ops", vec!["admin".to_string()], None));
+    assert_eq!(stored[0].token_hash.as_deref(), Some(hex::encode(sha2::Sha256::digest(secret.trim().as_bytes()))).as_deref());
+    assert!(fleet_scheduler::issue_admin_token(&cfg, "again", &out).await.is_err(), "an existing file is never overwritten");
+    assert_eq!(PgStore::connect(&db).await.unwrap().tokens().await.unwrap().len(), 1, "and no token is added");
+    admin.execute("DROP SCHEMA issue CASCADE").await.unwrap();
 }

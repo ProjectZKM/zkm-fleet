@@ -68,16 +68,13 @@ def _node_env(spec: AppReplicaSpec, backend: str, service_env: bool = False, **e
     c = spec.cluster
     if not (c.scheduler and c.cluster_token_file):
         raise RuntimeError(f"{spec.name}: services.yaml needs scheduler and cluster_token_file for a prover")
-    app_namespace = None
-    app_tenant = None
-    app_elf_id = None
-    tenant, dedicated, elf_id = spec.service.app.partition("/")
-    if dedicated:
-        app_tenant, app_elf_id = tenant, elf_id
-        app_namespace = spec.service.namespace
+    # A prover of one program is its app's dedicated server.
+    app_namespace = app = app_elf_id = None
+    if spec.service.elf_id:
+        app_namespace, app, app_elf_id = spec.service.namespace, spec.service.app, spec.service.elf_id
     node = NodeEnvironment(name=spec.name, backend=backend, scheduler=c.scheduler, scheduler_ca_file=c.scheduler_ca_file,
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
-                   app_namespace=app_namespace, app_tenant=app_tenant, app_elf_id=app_elf_id,
+                   app_namespace=app_namespace, app=app, app_elf_id=app_elf_id,
                    app_storage_root=spec.service.proof_storage_root,
                    rust_log=spec.service.rust_log, cpus=int(spec.service.cpus),
                    output_dir=c.proof_output_dir or os.path.join(c.log_dir, "proofs"), **extra)  # type: ignore[arg-type]
@@ -218,7 +215,7 @@ def _node_binary(spec: AppReplicaSpec) -> str:
 
 def _app_worker_env(spec: AppReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
     """Scoped environment for an integrated worker; never evaluated by a shell."""
-    assert "/" in spec.service.app and spec.service.proof_storage_root is not None
+    assert spec.service.elf_id and spec.service.proof_storage_root is not None
     env = dict(os.environ)
     if spec.service.worker_env_file:
         with open(spec.service.worker_env_file) as source:
@@ -236,10 +233,9 @@ def _app_worker_env(spec: AppReplicaSpec, gpu_endpoint: str) -> dict[str, str]:
                     raise ValueError(f"quote worker environment values on line {number}")
                 env[key] = values[0] if values else ""
     # Deployment files cannot override the replica's identity or server binding.
-    tenant, elf_id = spec.service.app.split("/", 1)
     env.update({"FLEET_NODE_NAME": spec.name, "FLEET_WORKER_ROLE": "app",
                 "FLEET_EXIT_WITH_PARENT": "true", "FLEET_APP_NAMESPACE": spec.service.namespace,
-                "FLEET_APP_TENANT": tenant, "FLEET_APP_ELF_ID": elf_id,
+                "FLEET_APP": spec.service.app, "FLEET_APP_ELF_ID": spec.service.elf_id,
                 "FLEET_APP_STORAGE_ROOT": spec.service.proof_storage_root,
                 "FLEET_GPU_ENDPOINT": gpu_endpoint, "RUST_LOG": spec.service.rust_log,
                 "RAYON_NUM_THREADS": str(max(1, int(spec.service.cpus)))})

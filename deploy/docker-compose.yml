@@ -30,7 +30,7 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-info}
       FLEET_URL: http://127.0.0.1:9191
-      FLEET_ADMIN_TOKEN_FILE: /etc/zkm-fleet/admin.token
+      FLEET_TOKEN_FILE: /etc/zkm-fleet/admin.token
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
       - ${FLEET_DATA:-fleet-data}:/var/lib/zkm-fleet    # a host path works too (owned by FLEET_UID)

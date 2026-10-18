@@ -4,14 +4,16 @@
 #   status                        control services, health, nodes and apps (and the node, if configured)
 #   scheduler upgrade [BIN_DIR]   install fleet-scheduler, fleetctl and fleet-mcp (default target/release)
 #   scheduler rollback            restore the binaries the last upgrade replaced
-#   node upgrade FLEET_NODE BRIDGE_DIR   install a fleet-node binary and bridge/fleet_bridge
+#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   install a fleet-node binary and
+#                                 bridge/fleet_bridge, and a fleet-proof-app binary when given
 #   node rollback                 restore what the last node upgrade replaced
 #   app cleanup SERVICE-0         remove the placement group and container a failed app start left
 #
 # -n prints what would change and changes nothing. Settings come from the environment or
 # ${FLEET_CTL_ENV:-~/.config/zkm-fleet/ctl.env}: FLEET_PREFIX (install dir), FLEET_NODE_SSH
 # (ssh host of the node; node commands then run there) and FLEET_NODE_PREFIX (its install
-# dir, default ~/app/fleet). Units follow docs/maintenance.md; FLEET_*_UNIT renames them.
+# dir, default ~/app/fleet). Units follow docs/maintenance.md; FLEET_*_UNIT renames them, and
+# FLEET_PROOF_APP_UNITS names the node's app endpoint units a fleet-proof-app upgrade restarts.
 # Every upgrade copies what it replaces to PREFIX/backup first.
 set -euo pipefail
 SELF=$(readlink -f "$0")
@@ -21,7 +23,8 @@ PREFIX=${FLEET_PREFIX:-$(dirname "$(dirname "$SELF")")}
 NODE_SSH=${FLEET_NODE_SSH:-}; NODE_PREFIX=${FLEET_NODE_PREFIX:-\$HOME/app/fleet}
 SCHEDULER_UNIT=${FLEET_SCHEDULER_UNIT:-zkm-scheduler.service}; MCP_UNIT=${FLEET_MCP_UNIT:-zkm-fleet-mcp.service}
 NODE_UNIT=${FLEET_NODE_UNIT:-zkm-fleet-node.service}
-[ -n "${FLEET_ADMIN_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_ADMIN_TOKEN_FILE=$PREFIX/etc/admin.token
+PROOF_APP_UNITS=${FLEET_PROOF_APP_UNITS:-}
+[ -n "${FLEET_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_TOKEN_FILE=$PREFIX/etc/admin.token
 DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }
 run() { if [ "$DRY" = 1 ]; then echo "+ $*"; else "$@"; fi; }
@@ -55,18 +58,24 @@ scheduler_rollback() {
   echo "restored $b"
 }
 
-node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR, both local to where this runs
-  local bin=$1 bridge=$2
+node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], all local to where this runs
+  local bin=$1 bridge=$2 proof_app=${3:-}
   # A dry run never ships the files, so on the node there is nothing to check.
   if ! { [ "$DRY" = 1 ] && [ "${FLEET_CTL_ON_NODE:-0}" = 1 ]; }; then
-    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge"
+    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge [FLEET_PROOF_APP_BINARY]"
+    [ -z "$proof_app" ] || [ -f "$proof_app" ] || die "no fleet-proof-app binary $proof_app"
   fi
-  if remote; then # ship both, then upgrade on the node
+  if remote; then # ship them, then upgrade on the node
     local stage; stage=/tmp/fleet-ctl-$(stamp)
     run ssh "$NODE_SSH" "mkdir -p $stage/bridge"
     run scp -q "$bin" "$NODE_SSH:$stage/fleet-node"
     run scp -q -r "$bridge/fleet_bridge" "$NODE_SSH:$stage/bridge/"
-    on_node node upgrade "$stage/fleet-node" "$stage/bridge"
+    if [ -n "$proof_app" ]; then
+      run scp -q "$proof_app" "$NODE_SSH:$stage/fleet-proof-app"
+      on_node node upgrade "$stage/fleet-node" "$stage/bridge" "$stage/fleet-proof-app"
+    else
+      on_node node upgrade "$stage/fleet-node" "$stage/bridge"
+    fi
     run ssh "$NODE_SSH" "rm -rf $stage"
     return
   fi
@@ -74,12 +83,18 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR, both local to where this 
   # Check the new bridge imports in the node's own venv before the agent is touched.
   [ "$DRY" = 1 ] || (cd "$bridge" && "$PREFIX/venv/bin/python" -c "import fleet_bridge.node") || die "the new bridge does not import; nothing changed"
   run mkdir -p "$b"; run cp -a "$PREFIX/bin/fleet-node" "$PREFIX/bridge" "$b/"
+  [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
   run install -m 755 "$bin" "$PREFIX/bin/fleet-node.new"
   run sudo systemctl stop "$NODE_UNIT"
   run mv "$PREFIX/bin/fleet-node.new" "$PREFIX/bin/fleet-node"
   run cp -a "$bridge/fleet_bridge/." "$PREFIX/bridge/fleet_bridge/"
   run sudo systemctl start "$NODE_UNIT"
   [ "$DRY" = 1 ] || node_connected || die "node did not reconnect; run: fleet-ctl.sh node rollback"
+  if [ -n "$proof_app" ]; then
+    run install -m 755 "$proof_app" "$PREFIX/bin/fleet-proof-app.new"
+    run mv "$PREFIX/bin/fleet-proof-app.new" "$PREFIX/bin/fleet-proof-app"
+    local unit; for unit in $PROOF_APP_UNITS; do run sudo systemctl restart "$unit"; done
+  fi
   echo "node upgraded; previous files in $b"
 }
 node_connected() { # the agent reconnecting, not just the unit running
@@ -93,6 +108,10 @@ node_rollback() {
   run install -m 755 "$b/fleet-node" "$PREFIX/bin/fleet-node"
   run cp -a "$b/bridge/." "$PREFIX/bridge/"
   run sudo systemctl start "$NODE_UNIT"
+  if [ -f "$b/fleet-proof-app" ]; then
+    run install -m 755 "$b/fleet-proof-app" "$PREFIX/bin/fleet-proof-app"
+    local unit; for unit in $PROOF_APP_UNITS; do run sudo systemctl restart "$unit"; done
+  fi
   echo "restored $b"
 }
 
@@ -143,7 +162,7 @@ case "${1:-}/${2:-}" in
   status/) status;;
   scheduler/upgrade) scheduler_upgrade "${3:-}";;
   scheduler/rollback) scheduler_rollback;;
-  node/upgrade) node_upgrade "${3:-}" "${4:-}";;
+  node/upgrade) node_upgrade "${3:-}" "${4:-}" "${5:-}";;
   node/rollback) if remote; then on_node node rollback; else node_rollback; fi;;
   app/cleanup) if remote; then on_node app cleanup "${3:-}"; else app_cleanup "${3:-}"; fi;;
   *) sed -n '2,/^set -euo/p' "$SELF" | sed '$d;s/^# \{0,1\}//'; exit 2;;

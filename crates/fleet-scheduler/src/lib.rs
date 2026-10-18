@@ -37,7 +37,6 @@ async fn terminated() {
 /// graceful stop on SIGTERM: listeners close, calls in flight (long polls included) finish.
 pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let cluster_token = token::load(&cfg.cluster_token_file)?;
-    let admin_token = token::load(&cfg.admin_token_file)?;
     let (store, _leader_lock): (Arc<dyn store::Store>, Option<store::PgLeaderLock>) =
         match &cfg.database_url {
             Some(url) => {
@@ -56,7 +55,17 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
             .unwrap_or_else(|| cfg.data_dir.join("proofs")),
     );
     let fleet = fleet::Scheduler::new(cfg.clone(), store, blobs, cluster_token.clone());
-    let tokens = fleet.load_tokens().await?;
+    let mut tokens = fleet.load_tokens().await?;
+    if cfg.database_url.is_none() {
+        // Nothing outside this process can issue one into memory: it issues its own.
+        let path = cfg.data_dir.join("admin.token");
+        let (admin, secret) = token::new_admin_token("in-memory scheduler");
+        fleet.add_user_token(&admin.id, &admin.address, &admin.label, None, admin.token_hash.clone(), None, None, admin.permissions.clone()).await?;
+        let _ = std::fs::remove_file(&path);
+        write_secret(&path, &secret)?;
+        tracing::warn!(path = %path.display(), "administrator token for this in-memory scheduler");
+        tokens += 1;
+    }
     let apps = fleet.load_apps().await?;
     let recovered = fleet.recover().await?;
     tracing::info!(
@@ -95,7 +104,6 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
 
     let workloads = Arc::new(workloads::WorkloadController::new(
         fleet.clone(),
-        admin_token.clone(),
         cluster_token.clone(),
     )?);
     let worker_service = tonic::codegen::InterceptedService::new(
@@ -132,10 +140,9 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
 
     let http_state = http::HttpState {
         fleet: fleet.clone(),
-        admin_token: Arc::new(admin_token),
         workloads: workloads.clone(),
     };
-    let http = http::router(http_state).merge(workloads::router(workloads.clone()));
+    let http = http::router(http_state);
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
     let http_task = axum::serve(listener, http).with_graceful_shutdown(stopping());
 
@@ -163,6 +170,32 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = dispatcher => r?,
         r = dispatch_loop => r??,
     }
+    Ok(())
+}
+
+/// Issues an administrator's token into the configured database: its secret goes to `out`
+/// (0600, never overwritten), its record to the database, where a running scheduler finds it
+/// within a heartbeat.
+pub async fn issue_admin_token(cfg: &config::SchedulerConfig, label: &str, out: &std::path::Path) -> anyhow::Result<store::Token> {
+    use store::Store;
+    let url = cfg.database_url.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("no database_url: an in-memory scheduler writes its own admin token to data_dir/admin.token"))?;
+    let pg = store::PgStore::connect(url).await?;
+    let (admin, secret) = token::new_admin_token(label);
+    write_secret(out, &secret)?;
+    if let Err(e) = pg.add_token(&admin).await {
+        let _ = std::fs::remove_file(out);
+        return Err(e);
+    }
+    Ok(admin)
+}
+
+fn write_secret(path: &std::path::Path, secret: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
+    f.write_all(format!("{secret}\n").as_bytes())?;
     Ok(())
 }
 

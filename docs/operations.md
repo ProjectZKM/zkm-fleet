@@ -4,15 +4,15 @@ Follow the [installation guide](installation.md) to set up the control host and
 nodes. These commands use the control-plane API; no SSH connection to a node is
 needed for app scaling.
 
-Run these on the control host. Remote operators set `FLEET_URL` to the HTTPS
-gateway and `FLEET_ADMIN_TOKEN_FILE` to their private administrator token file.
-Namespace users use `FLEET_TOKEN_FILE`. Owner tokens (`manage_apps: true`) manage
-app and batch metadata; ordinary app tokens submit and inspect permitted jobs.
-Scoped tokens can list and inspect their own namespace, including its shared
-quota and their tag's quota and usage. Node administration and namespace writes
-require the administrator token. Clear
-`FLEET_TOKEN_FILE` when switching to administrator commands: it takes precedence
-over `FLEET_ADMIN_TOKEN_FILE`. Add `--json` for structured output.
+Run these on the control host, where `fleetctl` reads the administrator's
+`etc/admin.token` by default. Remote operators set `FLEET_URL` to the HTTPS
+gateway and `FLEET_TOKEN_FILE` to their private administrator token file.
+Namespace users set `FLEET_TOKEN_FILE` or `--token-file` to their own token.
+Tokens with the `manage` permission change app and batch metadata; tokens with
+`read` and `submit` submit and inspect permitted jobs. Scoped tokens can list and
+inspect their own namespace, including its shared quota and their tag's quota and
+usage. Node administration and namespace writes require an administrator token.
+Add `--json` for structured output.
 
 ## Namespaces and access
 
@@ -23,7 +23,7 @@ ownership, access and quotas:
 | Command | Purpose | Access |
 |---|---|---|
 | `fleetctl namespace` or `namespace list` | List namespace identities; JSON also includes configured quotas. | Scoped users: own namespace; administrators: all namespaces. |
-| `namespace create NAME --tenant TENANT --endpoint URL --out NAME.env` | Create the namespace and its owner bundle for `scope=default`. | Administrator |
+| `namespace create NAME --endpoint URL --out NAME.env` | Create the namespace and its owner bundle for `scope=default`. | Administrator |
 | `namespace get NAME` | Inspect shared quota and usage, plus tag caps and usage. | Scoped users: own namespace/tag; administrators: any namespace/tag. |
 | `namespace quota NAME --gpus N --cpus N` | Replace the namespace's shared limits. | Administrator |
 | `namespace quota NAME --tag team=research --gpus N --cpus N` | Replace that tag's limits within the namespace. | Administrator |
@@ -44,7 +44,7 @@ settings and job allocation records are not exposed to scoped users.
 For example:
 
 ```bash
-fleetctl namespace create alice --tenant eth --gpus 6 --cpus 64 \
+fleetctl namespace create alice --gpus 6 --cpus 64 \
   --endpoint https://fleet.example:8905 --domain-name stage \
   --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
 fleetctl namespace get alice
@@ -77,22 +77,21 @@ configured allocations, including disabled apps; they do not show live utilizati
 Namespace and optional tag quotas further limit allocation.
 
 For example, set the EthProofs worker's allocation to five GPUs and 96 CPUs using
-the namespace `zkm` owner's token. The token's proof-signing tenant can differ
-from the app's `ethproofs` tenant:
+the namespace `zkm` owner's token:
 
 ```bash
-fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8 \
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 \
   --gpus 5 --cpus 96 --replicas 1 --node ant-5090-2
 
 # Read desired/observed allocation and operation status.
-fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4
 # Node inspection uses administrator credentials.
 fleetctl node ant-5090-2
 ```
 
-Scaling requires app-owner access (`manage_apps: true`) and an online, ready node.
-The token must cover the app's namespace, tag and app grant. An owner's signing
-tenant does not restrict metadata or scaling. Namespace and tag quotas remain
+Scaling requires the `manage` permission and an online, ready node.
+The token must cover the app's namespace, tag and app grant; for a proof app its
+tag must cover every service running it. Namespace and tag quotas remain
 administrator-managed. Requests are asynchronous; inspect until
 the state is `complete` or `failed`. Omitted resource flags retain their current
 values. Disabled apps stay disabled. Use `--node` to
@@ -133,8 +132,8 @@ fleetctl --namespace pi --tag team=research job
 fleetctl node
 fleetctl --namespace zkm app
 fleetctl --namespace zkm job
-fleetctl --token-file zkm-owner.token --namespace zkm app disable ethproofs/334b45b8
-fleetctl --token-file zkm-owner.token --namespace zkm app enable ethproofs/334b45b8
+fleetctl --token-file zkm-owner.token --namespace zkm app disable ethproofs-z4
+fleetctl --token-file zkm-owner.token --namespace zkm app enable ethproofs-z4
 ```
 
 Disabling releases the app's execution resources after cleanup. Durable app data
@@ -177,7 +176,7 @@ node that runs the app through its next heartbeat, so nothing is stored centrall
 the answer takes a moment:
 
 ```bash
-fleetctl app logs ethproofs/ELF_ID -n 200     # the last 200 lines (default 100, at most 2000)
+fleetctl app logs ethproofs-z4 -n 200         # the last 200 lines (default 100, at most 2000)
 fleetctl app logs APP --node NODE             # when the app runs on several machines
 ```
 

@@ -111,9 +111,18 @@ cargo build --locked --release \
 ```
 
 Keep the existing `etc/`, Postgres database, control `data_dir` and node `work/`.
-Schema 14 installations retain namespaces and tokens across ordinary updates.
-Only an incompatible schema requires an explicit metadata reset; there are no
-database migrations. A reset invalidates namespace access, so recreate and
+Schema 16 installations retain namespaces and tokens across ordinary updates. A
+schema 14 or 15 database migrates automatically when the scheduler starts, in one
+transaction: each app takes a name (its tenant's when that tenant had one app in
+the namespace, else `TENANT-<first 8 hex of the ELF id>`) and the default
+placement policy, jobs name their app, `TENANT/ELF` grants become app names, and
+namespace-less tenant signer tokens are removed. Update each prover's
+`services.yaml` entry to `app: NAME` plus `elf_id`. Remove `tenants`,
+`default_tenant`, `require_signature` and `admin_token_file` from `fleet.yaml`
+first; the scheduler refuses to start with them. Issue an administrator token with
+`fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`, since the old
+`admin_token_file` no longer applies. Only another schema requires an explicit
+metadata reset. A reset invalidates namespace access, so recreate and
 redistribute scoped credentials before resuming clients.
 
 ### Control host
@@ -149,9 +158,9 @@ sudo systemctl start zkm-scheduler.service zkm-fleet-mcp.service
 
 Verify the gateway's `/healthz`, `fleetctl namespace` and `fleetctl node`.
 When enabled, also check MCP initialization and an authenticated tool call.
-For an owner-permission update, use a temporary workload to check owner metadata
-changes and ordinary-token rejection, and confirm that owner quota updates are
-refused. Remove the smoke workload and revoke temporary tokens afterward. Compare
+For a permission update, use a temporary workload to check `manage` metadata
+changes and their rejection for a token without `manage`, and confirm that owner
+quota updates are refused. Remove the smoke workload and revoke temporary tokens afterward. Compare
 namespace quotas and existing app allocations with the pre-update snapshot;
 record the deployed control revision and binary checksums.
 
@@ -190,6 +199,7 @@ deploy/fleet-ctl.sh status                       # control services, health, nod
 deploy/fleet-ctl.sh -n scheduler upgrade         # -n prints every step and changes nothing
 deploy/fleet-ctl.sh scheduler upgrade target/release   # scheduler, fleetctl and fleet-mcp
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # copied to the node over ssh
+deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
 deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start
 ```
@@ -198,6 +208,8 @@ An upgrade copies what it replaces to `backup/` first, then waits for the schedu
 health check or the node's reconnection. Upgrade the scheduler and nodes together when a
 release changes the protocol. The script uses `sudo systemctl` with the unit names in this
 guide; set `FLEET_SCHEDULER_UNIT`, `FLEET_MCP_UNIT` or `FLEET_NODE_UNIT` for others.
+A third `node upgrade` argument also installs `fleet-proof-app` and restarts the app
+endpoint units listed in `FLEET_PROOF_APP_UNITS`.
 
 ## Installed files and backups
 

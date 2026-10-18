@@ -7,6 +7,63 @@ use tonic::{metadata::MetadataValue, Request, Status};
 
 pub const HEADER: &str = "authorization";
 
+/// What a token may do. An administrator's token holds admin and may do everything; any
+/// other holds some of read, submit and manage, within its namespace, tag and app grants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permission {
+    /// List and inspect apps, batches, their jobs and the namespace.
+    Read,
+    /// Submit proof and batch jobs; cancel a batch job.
+    Submit,
+    /// Register, delete, update, scale, enable and disable apps and batches; purge jobs.
+    Manage,
+    /// Namespaces, quotas, tokens, allocations, preemption and nodes, in any namespace.
+    Admin,
+}
+
+impl Permission {
+    /// The permissions a namespace's token may hold.
+    pub const ISSUABLE: [Permission; 3] = [Permission::Read, Permission::Submit, Permission::Manage];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Permission::Read => "read",
+            Permission::Submit => "submit",
+            Permission::Manage => "manage",
+            Permission::Admin => "admin",
+        }
+    }
+}
+
+/// Whether the caller holds `permission`; `None` is an administrator, who holds all of them,
+/// as does a token with admin.
+pub fn allowed(caller: Option<&fleet_proto::model::v1::Token>, permission: Permission) -> bool {
+    caller.is_none_or(|c| c.permissions.iter().any(|p| p == permission.name() || p == Permission::Admin.name()))
+}
+
+/// A new administrator's token: its record (no namespace, the admin permission alone, a signer
+/// address nobody holds the key of) and the secret its holder sends as `Bearer`.
+pub fn new_admin_token(label: &str) -> (fleet_proto::model::v1::Token, String) {
+    use rand::RngCore;
+    use sha2::Digest;
+    let random = |n: usize| {
+        let mut bytes = vec![0u8; n];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    };
+    let secret = random(48);
+    let token = fleet_proto::model::v1::Token {
+        id: random(16),
+        address: random(20),
+        label: label.into(),
+        created_ms: crate::fleet::now_ms(),
+        token_hash: Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),
+        permissions: vec![Permission::Admin.name().into()],
+        ..Default::default()
+    };
+    (token, secret)
+}
+
 /// Constant-time comparison, so a wrong token leaks nothing through timing.
 pub fn equal(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {

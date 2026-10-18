@@ -44,7 +44,7 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                 }
                 let headers = String::from_utf8(headers).unwrap();
                 assert!(
-                    headers.starts_with("GET /admin/status HTTP/1.1"),
+                    headers.starts_with("GET /status HTTP/1.1"),
                     "{headers}"
                 );
                 assert!(headers
@@ -64,11 +64,10 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                 "FLEET_NAMESPACE",
                 "FLEET_TAG",
                 "FLEET_TOKEN_FILE",
-                "FLEET_ADMIN_TOKEN_FILE",
             ] {
                 cmd.env_remove(name);
             }
-            cmd.args(["--url", &url, "--admin-token-file"]).arg(&token);
+            cmd.args(["--url", &url, "--token-file"]).arg(&token);
             if json {
                 cmd.arg("--json");
             }

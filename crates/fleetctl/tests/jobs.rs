@@ -1,235 +1,128 @@
-//! Job listing sends selectors and uses each API's supported limit parameter.
-use std::io::{Read, Write};
+//! Job listing, lookup and proof fetching address each app's or batch's jobs, with the selectors.
+mod common;
+use common::{cli, stub, token_file};
 use std::net::TcpListener;
-use std::process::Command;
 
-fn cli() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fleetctl"));
-    for name in [
-        "FLEET_URL",
-        "FLEET_NAMESPACE",
-        "FLEET_TAG",
-        "FLEET_TOKEN_FILE",
-        "FLEET_ADMIN_TOKEN_FILE",
-    ] {
-        cmd.env_remove(name);
-    }
-    cmd
-}
-
-fn list_query_is_scoped(command: &str, kind: &str, endpoint: &str, limit_param: &str, other_param: &str) {
+/// `fleetctl job --type KIND` lists the active jobs, then the newest, of every app or batch.
+fn list_query_is_scoped(kind: &str) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let token = std::env::temp_dir().join(format!("fleet-jobs-test-{}.token", std::process::id()));
-    std::fs::write(&token, "test-admin").unwrap();
-    let endpoint = endpoint.to_string();
-    let limit_param = limit_param.to_string();
-    let other_param = other_param.to_string();
+    let token = token_file(&format!("jobs-{kind}"));
     let batch = kind == "batch";
-    let server = std::thread::spawn(move || {
-        for expected_limit in ["1000", "10"] {
-            if batch {
-                // Batch jobs are listed per batch: the batches first.
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut request = [0; 2048];
-                let count = stream.read(&mut request).unwrap();
-                let line = String::from_utf8_lossy(&request[..count]).lines().next().unwrap().to_string();
-                assert!(line.starts_with("GET /batches?namespace=alice"), "{line}");
-                let body = r#"[{"name":"training"}]"#;
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0; 2048];
-            loop {
-                let count = stream.read(&mut buffer).unwrap();
-                assert!(count > 0);
-                request.extend_from_slice(&buffer[..count]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let headers = String::from_utf8_lossy(&request);
-            let request_line = headers.lines().next().unwrap();
-            assert!(
-                request_line.starts_with(&format!("GET {endpoint}?")),
-                "{request_line}"
-            );
-            assert!(request_line.contains("namespace=alice"), "{request_line}");
-            assert!(
-                request_line.contains(&format!("{limit_param}={expected_limit}")),
-                "{request_line}"
-            );
-            assert!(
-                !request_line.contains(&format!("{other_param}=")),
-                "unsupported query was sent: {request_line}"
-            );
-            let body = if batch {
-                r#"[{"id":"training-job","type":"run","batch":"training","namespace":"alice","state":"succeeded","node":"gpu-machine","gpus":["0","1"]}]"#
-            } else {
-                "[]"
-            };
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-        }
+    // The apps (or batches), then their jobs: for the active ones and for the newest.
+    let server = stub(listener, 4, move |line, _| {
+        let path = line.split_whitespace().nth(1).unwrap();
+        (200, if path.starts_with("/apps?") {
+            r#"[{"kind":"proof","name":"ethproofs"},{"kind":"service","name":"comfyui"}]"#.into()
+        } else if path.starts_with("/batches?") {
+            r#"[{"name":"training"}]"#.into()
+        } else if batch {
+            r#"[{"id":"training-job","type":"batch","batch":"training","namespace":"alice","state":"succeeded","node":"gpu-machine","gpus":["0","1"]}]"#.into()
+        } else {
+            r#"[{"id":"p-1","client_id":"job-1","app":"ethproofs","namespace":"alice","state":"succeeded","created_ms":2000,"node":"gpu-machine"}]"#.into()
+        })
     });
-
-    let mut command_line = cli();
-    command_line
-        .args([
-            "--json",
-            command,
-            "--namespace",
-            "alice",
-            "--url",
-            &url,
-            "--admin-token-file",
-        ])
-        .arg(&token);
-    if command == "job" { command_line.args(["--type", kind]); }
-    let output = command_line.output().unwrap();
+    let output = cli().args(["--json", "job", "--type", kind, "--namespace", "alice", "--url", &url, "--token-file"])
+        .arg(&token).output().unwrap();
+    let seen = server.join().unwrap();
     std::fs::remove_file(token).unwrap();
-    server.join().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    if batch {
-        assert_eq!(rows.as_array().unwrap().len(), 1);
-        assert_eq!(rows[0]["type"], "batch");
-        assert_eq!(rows[0]["record"]["type"], "batch");
-        assert_eq!(rows[0]["namespace"], "alice");
-        assert_eq!(rows[0]["app"], "training");
-        assert_eq!(rows[0]["where"], "gpu-machine", "GPU card indices are execution details, not a node");
-    } else {
-        assert_eq!(rows, serde_json::json!([]));
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let (list, jobs) = if batch { ("/batches?", "/batches/training/jobs?") } else { ("/apps?", "/apps/ethproofs/jobs?") };
+    for (index, limit) in [(1, "1000"), (3, "10")] {
+        assert!(seen[index - 1].line.contains(list), "{}", seen[index - 1].line);
+        let line = &seen[index].line;
+        assert!(line.starts_with(&format!("GET {jobs}")) && line.contains("namespace=alice") && line.contains(&format!("limit={limit}")), "{line}");
+        assert!(!line.contains("n="), "unsupported query was sent: {line}");
     }
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["type"], if batch { "batch" } else { "app" });
+    assert_eq!(rows[0]["namespace"], "alice");
+    assert_eq!(rows[0]["app"], if batch { "training" } else { "ethproofs" });
+    assert_eq!(rows[0]["where"], "gpu-machine", "GPU card indices are execution details, not a node");
 }
 
 #[test]
 fn job_lists_send_namespace_and_api_specific_limit_query() {
-    list_query_is_scoped("job", "app", "/admin/jobs", "limit", "n");
-    list_query_is_scoped("job", "batch", "/batches/training/jobs", "limit", "n");
+    list_query_is_scoped("app");
+    list_query_is_scoped("batch");
 }
 
 #[test]
 fn batch_submission_passes_storage_references_without_uploading_files() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let token =
-        std::env::temp_dir().join(format!("fleet-submit-test-{}.token", std::process::id()));
-    std::fs::write(&token, "test-admin").unwrap();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 2048];
-        let (header_end, body_length) = loop {
-            let count = stream.read(&mut buffer).unwrap();
-            assert!(count > 0);
-            bytes.extend_from_slice(&buffer[..count]);
-            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                let headers = String::from_utf8_lossy(&bytes[..end]);
-                assert!(headers.starts_with("POST /batches/training/jobs HTTP/1.1"));
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length: ")
-                            .map(|v| v.parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                if bytes.len() >= end + 4 + length {
-                    break (end + 4, length);
-                }
-            }
-        };
-        let body: serde_json::Value =
-            serde_json::from_slice(&bytes[header_end..header_end + body_length]).unwrap();
-        assert_eq!(
-            body["env"],
-            serde_json::json!(["INPUT_URI=s3://owner-bucket/dataset"])
-        );
-        assert_eq!(
-            body["command"],
-            serde_json::json!(["train", "--input", "s3://owner-bucket/dataset"])
-        );
-        assert!(body.get("code").is_none());
-        assert!(body.get("batch").is_none(), "the batch is in the path");
-        let response = r#"{"id":"storage-job","state":"queued"}"#;
-        write!(stream, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
-    });
+    let token = token_file("submit");
+    let server = stub(listener, 1, |_, _| (201, r#"{"id":"storage-job","state":"queued"}"#.into()));
     let output = cli()
-        .args(["--json", "--url", &url, "--admin-token-file"])
+        .args(["--json", "--url", &url, "--token-file"])
         .arg(&token)
-        .args([
-            "batch",
-            "submit",
-            "training",
-            "--env",
-            "INPUT_URI=s3://owner-bucket/dataset",
-            "--",
-            "train",
-            "--input",
-            "s3://owner-bucket/dataset",
-        ])
+        .args(["batch", "submit", "training", "--env", "INPUT_URI=s3://owner-bucket/dataset", "--",
+            "train", "--input", "s3://owner-bucket/dataset"])
         .output()
         .unwrap();
+    let seen = server.join().unwrap();
     std::fs::remove_file(token).unwrap();
-    server.join().unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(seen[0].line.starts_with("POST /batches/training/jobs HTTP/1.1"), "{}", seen[0].line);
+    let body = &seen[0].body;
+    assert_eq!(body["env"], serde_json::json!(["INPUT_URI=s3://owner-bucket/dataset"]));
+    assert_eq!(body["command"], serde_json::json!(["train", "--input", "s3://owner-bucket/dataset"]));
+    assert!(body.get("code").is_none());
+    assert!(body.get("batch").is_none(), "the batch is in the path");
 }
 
 #[test]
 fn proof_fetch_downloads_both_files_through_the_scoped_control_plane() {
-    let listener=TcpListener::bind("127.0.0.1:0").unwrap();
-    let url=format!("http://{}",listener.local_addr().unwrap());
-    let root=std::env::temp_dir().join(format!("fleet-fetch-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let root = std::env::temp_dir().join(format!("fleet-fetch-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir(&root).unwrap();
-    let token=root.join("token");std::fs::write(&token,"test-admin").unwrap();
-    let server=std::thread::spawn(move || {
-        for (name,body) in [("proof.json",b"{\"proof\":1}".as_slice()),("public_values.bin",b"\x00\x01\xff".as_slice())] {
-            let (mut stream,_)=listener.accept().unwrap();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
-            let mut request=Vec::new();let mut buf=[0;2048];
-            while !request.windows(4).any(|w|w==b"\r\n\r\n") {let n=stream.read(&mut buf).unwrap();assert!(n>0);request.extend_from_slice(&buf[..n]);}
-            let request=String::from_utf8_lossy(&request);
-            assert!(request.starts_with(&format!("GET /admin/jobs/proof-job/output/{name}?namespace=alice&tag=scope%3Dproduction ")));
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer test-admin"));
-            write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();stream.write_all(body).unwrap();
-        }
+    let token = root.join("token");
+    std::fs::write(&token, "test-admin").unwrap();
+    // The proof apps, the job (it is found under one), then its two files.
+    let server = stub(listener, 4, |line, _| {
+        let path = line.split_whitespace().nth(1).unwrap();
+        (200, if path.starts_with("/apps?") {
+            r#"[{"kind":"proof","name":"ethproofs"}]"#.into()
+        } else if path.starts_with("/apps/ethproofs/jobs/proof-job/output/proof.json?") {
+            "{\"proof\":1}".into()
+        } else if path.starts_with("/apps/ethproofs/jobs/proof-job/output/public_values.bin?") {
+            "values".into()
+        } else if path.starts_with("/apps/ethproofs/jobs/proof-job?") {
+            r#"{"id":"p-1","client_id":"proof-job"}"#.into()
+        } else {
+            panic!("unexpected request {line}");
+        })
     });
-    let dest=root.join("output");
-    let result=cli().args(["job","fetch","proof-job","--namespace","alice","--tag","scope=production","--url",&url,"--admin-token-file"]).arg(&token).arg("--out").arg(&dest).output().unwrap();
-    server.join().unwrap();
-    assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
-    assert_eq!(std::fs::read(dest.join("proof.json")).unwrap(),b"{\"proof\":1}");
-    assert_eq!(std::fs::read(dest.join("public_values.bin")).unwrap(),b"\x00\x01\xff");
+    let dest = root.join("output");
+    let result = cli().args(["job", "fetch", "proof-job", "--namespace", "alice", "--tag", "scope=production", "--url", &url, "--token-file"])
+        .arg(&token).arg("--out").arg(&dest).output().unwrap();
+    let seen = server.join().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    for s in &seen {
+        assert!(s.line.contains("namespace=alice&tag=scope%3Dproduction"), "{}", s.line);
+        assert!(s.headers.contains("authorization: bearer test-admin"));
+    }
+    assert_eq!(std::fs::read(dest.join("proof.json")).unwrap(), b"{\"proof\":1}");
+    assert_eq!(std::fs::read(dest.join("public_values.bin")).unwrap(), b"values");
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn proof_fetch_rejects_existing_destination_before_requesting_output() {
-    let root = std::env::temp_dir().join(format!("fleet-existing-output-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let root = std::env::temp_dir().join(format!("fleet-existing-output-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir(&root).unwrap();
     let token = root.join("token");
-    std::fs::write(&token,"test-admin").unwrap();
+    std::fs::write(&token, "test-admin").unwrap();
     let marker = root.join("existing.txt");
-    std::fs::write(&marker,"keep").unwrap();
-    let result = cli().args(["job","fetch","proof-job","--url","http://127.0.0.1:1","--admin-token-file"])
+    std::fs::write(&marker, "keep").unwrap();
+    let result = cli().args(["job", "fetch", "proof-job", "--url", "http://127.0.0.1:1", "--token-file"])
         .arg(&token).arg("--out").arg(&root).output().unwrap();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("already exists; choose a new directory"));
-    assert_eq!(std::fs::read_to_string(marker).unwrap(),"keep");
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "keep");
     std::fs::remove_dir_all(root).unwrap();
 }

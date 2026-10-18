@@ -1,7 +1,7 @@
 # fleet-scheduler configuration (inside the compose container: paths under /etc/zkm-fleet).
 stage_addr: 0.0.0.0:51000          # SDK proof API (server TLS; authorize with the user bearer token)
 control_addr: 0.0.0.0:51001        # node-initiated gRPC; TLS uses the certificate below
-http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, /admin (admin token)
+http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, the API (each route needs a token permission)
 public_url: https://fleet.example.com:8905
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
@@ -10,22 +10,12 @@ long_poll_ms: 2000
 heartbeat_secs: 5
 node_stale_secs: 20
 max_attempts: 2
-require_signature: true
+# Nodes' shared secret. Every other caller has a token from the database: the first
+# administrator's comes from `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`.
 cluster_token_file: /etc/zkm-fleet/cluster.token
-admin_token_file: /etc/zkm-fleet/admin.token
 tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
 control_tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
-tenants:
-  - name: ethproofs
-    class: latency
-    anchor: exclusive
-    backends: [cuda]
-    max_queued: 16
-  - name: goat
-    class: batch
-    anchor: shared
-    max_queued: 64
