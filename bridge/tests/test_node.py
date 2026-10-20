@@ -366,3 +366,52 @@ def test_a_stopped_service_gets_its_configuration_by_name(executor):
     assert (web["disabled"],web["replicas"],web["image"])==(True,2,"web:3")
     executor.execute({"id":"set-2","operation":7,"parameters":{"service":{"name":"missing"},"set":{"disabled":True}}})
     assert node.read_json(executor.journal/"set-2.json")["result"]=={"updated":[]}
+
+
+@pytest.mark.parametrize("mount", ["/run", "/var/run", "/dev", "/proc", "/sys", "/var/lib/docker", "/var/lib/containerd"])
+def test_batch_launch_refuses_runtime_mounts_even_when_policy_allows_them(executor, monkeypatch, mount):
+    p = command()["parameters"]
+    p.update({"owner": "owner", "namespace": "a" * 32, "batch": "training", "submitted_at": 1,
+              "policy": {"image": "test", "namespace": "a" * 32, "allow": [mount]},
+              "request": {"command": ["true"], "gpus": 0, "cpus": 1, "mount": [mount]}})
+    launch = Mock()
+    monkeypatch.setattr(jobs, "launch", launch)
+    with pytest.raises(ValueError, match="mount outside allowed roots"):
+        executor.launch(p)
+    launch.assert_not_called()
+
+
+def test_batch_launch_refuses_a_socket_under_an_allowed_storage_root(executor, monkeypatch, tmp_path_factory):
+    import socket
+    storage = tmp_path_factory.mktemp("batch-storage")
+    path = storage / "daemon.sock"
+    p = command()["parameters"]
+    p.update({"owner": "owner", "namespace": "a" * 32, "batch": "training", "submitted_at": 1,
+              "policy": {"image": "test", "namespace": "a" * 32, "allow": [str(storage)]},
+              "request": {"command": ["true"], "gpus": 0, "cpus": 1, "mount": [str(path)]}})
+    launch = Mock()
+    monkeypatch.setattr(jobs, "launch", launch)
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(path))
+        with pytest.raises(ValueError, match="regular files or directories"):
+            executor.launch(p)
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_batch_launch_keeps_approved_regular_storage_usable(executor, monkeypatch, tmp_path_factory, kind):
+    storage = tmp_path_factory.mktemp("approved-storage")
+    path = storage / "input"
+    if kind == "file":
+        path.write_text("input data")
+    else:
+        path.mkdir()
+    p = command()["parameters"]
+    p.update({"owner": "owner", "namespace": "a" * 32, "batch": "training", "submitted_at": 1,
+              "policy": {"image": "test", "namespace": "a" * 32, "allow": [str(storage)]},
+              "request": {"command": ["true"], "gpus": 0, "cpus": 1, "mount": [str(path) + ":ro"]}})
+    monkeypatch.setattr(jobs, "prepare_launch", lambda _: True)
+    launch = Mock()
+    monkeypatch.setattr(jobs, "launch", launch)
+    executor.launch(p)
+    assert launch.call_args.args[0].mounts[0].path == str(path)

@@ -270,13 +270,20 @@ class NodeExecutor:
         job = jobs.JobDirectory(str(self.jobs_dir), ident, must_exist=False)
         os.makedirs(job.out, exist_ok=True)
         mounts = [Mount.parse(m) for m in request.get("mount", [])]
-        protected = [str(self.jobs_dir), str(self.services.parent)]
+        # Batch policy is supplied by the scheduler, but these host resources are
+        # never batch storage, even in a previously accepted or stale launch.
+        protected = [os.path.realpath(root) for root in (
+            self.jobs_dir, self.services.parent, "/dev", "/proc", "/sys", "/run",
+            "/var/run", "/var/lib/docker", "/var/lib/containerd",
+        )]
         for mount in mounts:
             real = os.path.realpath(mount.path)
             if not jobs._inside(real, policy.allow) or any(os.path.commonpath([real, root]) in (real, root) for root in protected):
                 raise ValueError("mount outside allowed roots or overlaps fleet state")
             if not os.path.exists(real):
                 raise ValueError("mount is missing on this machine")
+            if not (os.path.isfile(real) or os.path.isdir(real)):
+                raise ValueError("batch mounts must be regular files or directories")
         spec = JobSpec(id=ident, owner=p["owner"], namespace=p["namespace"], tag=p.get("tag"),
             batch=p["batch"], policy=policy, command=request["command"], gpus=request["gpus"], cpus=request["cpus"],
             out=job.out, mounts=mounts, env=dict(e.split("=", 1) for e in request.get("env", []) if "=" in e),

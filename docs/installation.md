@@ -36,8 +36,9 @@ deploy/install.sh control --public-url https://fleet.example:8905 \
 Omit `--no-mcp` to enable MCP at `/mcp`. The installer creates credentials and puts
 `fleetctl` on the control host's PATH. Administrators use their token for namespace
 quotas, access and node administration. Workload owners receive scoped owner
-tokens (`read`, `submit` and `manage`) for app and batch metadata, priority, mount
-roots, enable/disable and scaling. Tokens without `manage` can use their granted
+tokens (`read`, `submit` and `manage`) for app and batch metadata, priority,
+enable/disable and scaling. Administrators approve batch mount roots and runtime
+users, and service execution settings. Tokens without `manage` can use their granted
 workloads but cannot change their metadata. See [workload ownership](reference.md#workload-ownership).
 
 Use [fleet.example.yaml](../deploy/fleet.example.yaml) for the scheduler settings.

@@ -118,9 +118,16 @@ The same namespace/tag selectors work for apps, batches and jobs.
 
 Owner tokens can register and remove workloads, set priority, enable/disable them
 and scale apps within their grants. Batch owners set image, environment, resource
-policy and allowed mount roots when registering a batch. Batch disabling
+policy when registering a batch. Administrators set batch mount roots and runtime
+users. Service image, environment, command, user, workdir and volume changes also
+require an administrator; owners can change resource sizes and timeouts. Batch disabling
 blocks new submissions; accepted batch jobs continue. App disabling drains the
 configured services before releasing their reservations.
+
+When upgrading from owner-controlled runtime settings, review existing service
+configuration, batch mount roots and runtime users, and queued jobs before
+restoring untrusted owner access. The new authorization checks do not rewrite
+configuration or cancel jobs accepted by an earlier scheduler.
 
 ```bash
 fleetctl --namespace zkm --tag scope=default app
@@ -146,7 +153,9 @@ For a batch, first register reusable configuration, then submit and inspect jobs
 
 ```bash
 fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
-  --image nvidia/cuda:12.8.0-base-ubuntu22.04 --allow /data/models --priority 10
+  --image nvidia/cuda:12.8.0-base-ubuntu22.04 --priority 10
+# An administrator approves host storage and its runtime user before jobs mount it.
+fleetctl --namespace pi batch update gpu-test --allow /data/models --user 1000:1000
 fleetctl --token-file pi-owner.token batch            # the batches, with active jobs and the last job
 fleetctl --token-file pi-owner.token batch gpu-test   # one batch and its newest jobs
 fleetctl --token-file pi-owner.token job --type batch -a   # the queued and running batch jobs

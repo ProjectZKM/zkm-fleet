@@ -422,6 +422,14 @@ impl WorkloadController {
         }
         Ok(())
     }
+    fn require_admin_settings(c: Option<&Token>, settings: &serde_json::Map<String, Value>, keys: &[&str]) -> anyhow::Result<()> {
+        if c.is_some() {
+            if let Some(key) = keys.iter().find(|key| settings.contains_key(**key)) {
+                return Err(fail(403, format!("{key} requires administrator credentials")));
+            }
+        }
+        Ok(())
+    }
     fn require_service_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(c) = c {
@@ -1715,7 +1723,7 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
             })
         })
         || !spec["user"].is_null() && !spec["user"].is_string()
-        || text(spec, "image").is_empty()
+        || text(spec, "image").is_empty() || text(spec, "image").starts_with('-')
     {
         return Err(fail(400, "invalid batch settings"));
     }
@@ -1726,6 +1734,7 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
 /// have their own operations).
 const BATCH_SETTINGS: [&str; 10] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
     "preemptible", "min_runtime_s", "stop_timeout_s"];
+const BATCH_ADMIN_SETTINGS: [&str; 2] = ["user", "allow"];
 
 /// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
@@ -1907,6 +1916,9 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
         }
         check_batch_spec(&body)?;
+        if c.is_some() && (!body["allow"].as_array().unwrap().is_empty() || !body["user"].is_null()) {
+            return Err(fail(403, "batch host mount roots and runtime user require administrator credentials"));
+        }
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");
         let _ops = s.ops.lock().await;
@@ -1990,6 +2002,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             if let Some(key) = set.keys().find(|k| !BATCH_SETTINGS.contains(&k.as_str())) {
                 return Err(fail(400, format!("{key} cannot be updated; settings: {}", BATCH_SETTINGS.join(", "))));
             }
+            WorkloadController::require_admin_settings(c, &set, &BATCH_ADMIN_SETTINGS)?;
             let _ops = s.ops.lock().await;
             app = s.inner.lock().apps.get(name).filter(|a| !a.removed && !a.persistent).cloned()
                 .ok_or_else(|| fail(404, "unknown batch"))?;
@@ -2211,6 +2224,9 @@ impl WorkloadController {
             let node = q.get("node").map(String::as_str);
             self.require_service_scope(c, namespace, app, node)?;
             let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            if let Some(settings) = set.as_object() {
+                Self::require_admin_settings(c, settings, &Self::ADMIN_SERVICE_SETTINGS)?;
+            }
             return Ok((StatusCode::ACCEPTED, Json(self.request_update(namespace, app, node, set).await?)).into_response());
         }
         if method == Method::GET {

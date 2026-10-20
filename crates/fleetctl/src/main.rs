@@ -109,7 +109,8 @@ enum AppCmd {
         /// Select a machine agent when the app has services on multiple nodes.
         #[arg(long)] node: Option<String>,
     },
-    /// App owners: change a proof or persistent app's settings. Its service drains, stops,
+    /// Change a proof or persistent app's settings. Image and environment changes require
+    /// administrator credentials. Its service drains, stops,
     /// takes the new settings on its node and starts again, like a scale.
     Update {
         name: String,
@@ -391,7 +392,7 @@ struct AddBatch {
     /// Container image the batch's jobs run in.
     #[arg(long)]
     image: String,
-    /// UID[:GID] the container jobs as (default: the image's).
+    /// UID[:GID] the container runs as (default: the image's); requires administrator credentials.
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
@@ -407,7 +408,7 @@ struct AddBatch {
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     shm_gb: Option<u32>,
-    /// Absolute mount root the batch's jobs may mount below; repeat.
+    /// Administrator-approved absolute mount root; repeat. Requires administrator credentials.
     #[arg(long)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     allow: Vec<String>,
@@ -535,7 +536,7 @@ enum BatchCmd {
     Update {
         name: String,
         #[arg(long)] image: Option<String>,
-        /// UID[:GID] the container runs as.
+        /// UID[:GID] the container runs as; requires administrator credentials.
         #[arg(long)] user: Option<String>,
         /// Cards a batch job may ask for.
         #[arg(long)] max_gpus: Option<u32>,
@@ -543,7 +544,7 @@ enum BatchCmd {
         #[arg(long = "gpu-mem")] gpu_mem: Option<u32>,
         /// /dev/shm size in GiB.
         #[arg(long)] shm_gb: Option<u32>,
-        /// Absolute mount root jobs may mount below; repeat. Replaces the batch's roots.
+        /// Absolute mount root; repeat. Replaces the roots; requires administrator credentials.
         #[arg(long)] allow: Vec<String>,
         /// K=V every batch job gets; repeat. Replaces the batch's environment.
         #[arg(long)] env: Vec<String>,

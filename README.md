@@ -18,10 +18,10 @@ quotas, placement and lifecycle; workers own their application data and pipeline
 The [code model](docs/reference.md#code-names) uses jobs, app deployments and a
 workload controller. Shared records come from protobuf; Kubernetes is not required.
 
-App owners manage workload metadata, mount roots, priority, enable/disable and
+App owners manage workload metadata, priority, enable/disable and
 scaling with namespace tokens holding the `manage` permission. Administrators
-manage namespace quotas and access; owner changes remain subject to namespace and
-tag limits.
+manage namespace quotas, access, batch mount roots and runtime users, and service
+execution settings; owner changes remain subject to namespace and tag limits.
 
 EthProofs prepares witnesses, proves locally and reports from one integrated app
 worker. It resumes its saved cursor and proves every block in sequence.

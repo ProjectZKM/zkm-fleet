@@ -198,7 +198,9 @@ def docker_command(spec: JobSpec, gpus: list[str], attempt: int = 1, rank: int =
                            "FLEET_METRICS": os.path.join(spec.out, METRICS_FILE), "FLEET_ATTEMPT": str(attempt)}
     for k, v in env.items():
         cmd += ["-e", f"{k}={spec.expand(v)}"]
-    cmd.append(p.image)
+    # Image names are user supplied. End option parsing before the positional
+    # image so a value such as --privileged cannot become a Docker option.
+    cmd += ["--", p.image]
     cmd += [spec.expand(a) for a in spec.command]
     return cmd
 

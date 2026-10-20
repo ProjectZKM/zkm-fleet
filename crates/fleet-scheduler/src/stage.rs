@@ -25,6 +25,14 @@ pub struct ProofStageService {
 pub use fleet_proto::sdk::kind_for;
 
 impl ProofStageService {
+    fn may_read_job(caller: &Token, job: &ProofJob) -> bool {
+        caller.apps.as_ref().is_none_or(|apps| apps.contains(&job.app))
+            // The SDK polls its own rejected submissions, including attempts for an
+            // ungranted or unknown app. These records contain no accepted proof inputs.
+            || (job.state() == ProofJobState::Failed && job.owner == caller.address
+                && job.elf_id.is_empty() && job.inputs.is_none())
+    }
+
     fn reject(&self, proof_id: &str, status: StageStatus, msg: &str) -> GenerateProofResponse {
         tracing::warn!(proof_id, "rejected: {msg}");
         GenerateProofResponse {
@@ -116,6 +124,9 @@ impl ProofStageService {
             Err(e) => return self.reject(&id, StageStatus::InternalError, &format!("{e:#}")),
         };
         if let Ok(Some(job)) = self.fleet.job(&job_id).await {
+            if !Self::may_read_job(&caller, &job) {
+                return self.reject(&id, StageStatus::InvalidParameter, "app is not granted to this token");
+            }
             if inputs.is_some() && (job.inputs != inputs || job.elf_id != req.elf_id.clone().unwrap_or_default()
                 || kind_for(req.from_step, req.target_step).ok() != Some(job.kind())) {
                 return self.reject(&id, StageStatus::InvalidParameter, "proof_id already exists with different inputs or parameters");
@@ -235,7 +246,8 @@ impl ProofStageService {
         };
         let namespace = c.namespace.clone().unwrap_or_default();
         let internal = match self.fleet.namespace_job(&namespace, c.tag.as_deref(), id).await {
-            Ok(Some(j)) => j.id,
+            Ok(Some(j)) if Self::may_read_job(&c, &j) => j.id,
+            Ok(Some(_)) => return resp,
             Ok(None) => return resp,
             Err(e) => {
                 tracing::error!(proof_id = id, "status lookup: {e:#}");
@@ -252,7 +264,8 @@ impl ProofStageService {
             return resp;
         }
         let job = match self.fleet.job(id).await {
-            Ok(Some(j)) if j.namespace == namespace && j.tag == c.tag.as_deref().unwrap_or("") => j,
+            Ok(Some(j)) if j.namespace == namespace && j.tag == c.tag.as_deref().unwrap_or("")
+                && Self::may_read_job(&c, &j) => j,
             Ok(_) => return resp,
             Err(e) => {
                 tracing::error!(proof_id = id, "status lookup: {e:#}");
@@ -273,7 +286,6 @@ impl ProofStageService {
                 resp.status = job.fail_status.unwrap_or(StageStatus::InternalError as i32);
                 resp.step = Step::End as i32;
             }
-            ProofJobState::Succeeded if c.apps.as_ref().is_some_and(|apps| !apps.contains(&job.app)) => {}
             ProofJobState::Succeeded => match self.fleet.proof_output(&job, blobs::PROOF).await {
                 Ok(proof) => {
                     resp.status = StageStatus::Success as i32;
@@ -320,6 +332,52 @@ impl StageService for ProofStageService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_checks_app_grants_before_waiting_or_reporting_any_state() {
+        use crate::{blobs::BlobStore, config::SchedulerConfig, quota::Quota, store::MemoryStore};
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!(
+            "public_url: http://localhost\ndata_dir: {}\ncluster_token_file: unused\nlong_poll_ms: 2000\n", dir.path().display()
+        )).unwrap();
+        let fleet = Scheduler::new(cfg, Arc::new(MemoryStore::default()), BlobStore::new(dir.path()).unwrap(), "cluster".into());
+        fleet.load_tokens().await.unwrap();
+        let namespace = fleet.create_namespace("test", Quota::default()).await.unwrap().id;
+        let elf_id = fleet.blobs.put_elf(b"test program").unwrap();
+        let api = ProofStageService { fleet: fleet.clone() };
+        for (seed, permission) in [(1, "read"), (2, "submit")] {
+            let secret = format!("{seed:02x}").repeat(48);
+            let caller = fleet.add_user_token(&format!("{seed:02x}").repeat(16), &format!("{seed:02x}").repeat(20), "test",
+                Some(vec!["allowed".into()]), Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),
+                Some(namespace.clone()), Some("scope=default".into()), vec![permission.into()]).await.unwrap();
+            for (index, state) in [ProofJobState::Queued, ProofJobState::Running, ProofJobState::Failed, ProofJobState::Succeeded].into_iter().enumerate() {
+                // Even an accepted job submitted by this signer still needs an app grant.
+                let client_id = format!("hidden-{seed}-{index}");
+                fleet.submit(ProofJob {
+                    id: Scheduler::internal_proof_id(&namespace, caller.tag.as_deref(), &client_id), client_id: client_id.clone(),
+                    namespace: namespace.clone(), tag: "scope=default".into(), app: "denied".into(), owner: caller.address.clone(),
+                    elf_id: elf_id.clone(), state: state as i32, fail_status: (state == ProofJobState::Failed).then_some(StageStatus::InvalidParameter as i32),
+                    finished_ms: state.is_terminal().then(now_ms), ..Default::default()
+                }).await.unwrap();
+                let mut request = Request::new(GetStatusRequest { proof_id: client_id.clone() });
+                request.metadata_mut().insert("authorization", format!("Bearer {secret}").parse().unwrap());
+                let response = tokio::time::timeout(Duration::from_millis(200), api.get_status(request)).await
+                    .expect("ungranted jobs must not enter the long poll").unwrap().into_inner();
+                assert_eq!(response.status, StageStatus::Unspecified as i32, "{permission}: {state:?}");
+                assert!(response.proof_with_public_inputs.is_empty() && response.public_values_url.is_empty());
+            }
+            for app in ["denied", ""] {
+                let client_id = format!("rejected-{seed}-{app}");
+                let id = Scheduler::internal_proof_id(&namespace, caller.tag.as_deref(), &client_id);
+                api.record_rejection(&id, &client_id, StageStatus::InvalidParameter, "rejected", &caller, app).await;
+                assert_eq!(api.status(&client_id, Some(caller.clone())).await.status, StageStatus::InvalidParameter as i32);
+                let mut other = caller.clone();
+                other.address = "ff".repeat(20);
+                assert_eq!(api.status(&client_id, Some(other)).await.status, StageStatus::Unspecified as i32);
+            }
+        }
+    }
 
     #[test]
     fn steps_map_to_kinds_like_the_sdk_sets_them() {

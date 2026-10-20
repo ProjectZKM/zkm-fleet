@@ -1,6 +1,7 @@
 """Admission reserves physical capacity; uncertain execution never frees quota."""
 import os
 from types import SimpleNamespace
+import pytest
 
 from fleet_bridge import jobs
 from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
@@ -142,3 +143,13 @@ def test_local_rank_reports_machine_identity_and_ray_granted_cards(monkeypatch):
     info = jobs._Rank(spec).info()
     assert info.machine and info.node_ip == "127.0.0.1"
     assert info.gpus == ["1"] and info.container == "fleet-job-job"
+
+
+@pytest.mark.parametrize("image", ["--privileged", "--volume=/var/run/docker.sock:/socket"])
+def test_batch_image_cannot_become_a_docker_option(image):
+    spec = JobSpec(id="job", batch="test", namespace="namespace", policy=Batch(image=image),
+                   command=["alpine", "true"], gpus=0, cpus=1, out="/tmp/job/out")
+    command = jobs.docker_command(spec, [])
+    boundary = command.index("--")
+    assert command[boundary + 1:] == [image, "alpine", "true"]
+    assert image not in command[:boundary]

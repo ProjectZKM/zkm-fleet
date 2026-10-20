@@ -264,7 +264,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_batch_create",
-        description = "Create an owner-managed batch in the authenticated namespace, including priority and allowed mount roots. The token must have workload-management access; the scheduler validates the batch and enforces namespace quotas.",
+        description = "Create a batch in the authenticated namespace with workload-management access. Nonempty host mount roots require administrator credentials. The scheduler validates the batch and enforces namespace quotas.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn batch_create(

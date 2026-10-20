@@ -181,6 +181,9 @@ impl WorkloadController {
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
     pub(super) const SERVICE_SETTINGS: [&'static str; 11] = ["image", "env", "command", "user", "workdir", "volumes",
         "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s"];
+    // Services can access host networking, storage and prover credentials. Changing
+    // their executable or environment is as privileged as changing their mounts.
+    pub(super) const ADMIN_SERVICE_SETTINGS: [&'static str; 6] = ["image", "env", "command", "user", "workdir", "volumes"];
 
     /// Changes `app`'s service settings like a scale does: drain, stop, have the node write the
     /// settings (NODE_OPERATION_APP), start it again with them.
@@ -250,7 +253,7 @@ impl WorkloadController {
             .ok_or_else(|| fail(400, "set at least one setting"))?;
         for (key, value) in &set {
             let valid = match key.as_str() {
-                "image" => value.as_str().is_some_and(|v| !v.is_empty()),
+                "image" => value.as_str().is_some_and(|v| !v.is_empty() && !v.starts_with('-')),
                 "env" => value.as_object().is_some_and(|o| o.values().all(Value::is_string)),
                 "command" | "volumes" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
                 "user" | "workdir" | "health_path" => value.is_string(),

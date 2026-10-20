@@ -638,7 +638,7 @@ async fn http_user_auth_app_management_and_artifacts_are_checked_in_rust() {
         )
         .await
         .status(),
-        StatusCode::CREATED
+        StatusCode::FORBIDDEN
     );
     assert_eq!(
         call(
@@ -835,6 +835,56 @@ async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tag: &str, apps:
 }
 
 #[tokio::test]
+async fn scoped_managers_cannot_change_service_execution_or_batch_host_access() {
+    for proof in [false, true] {
+        let (_dir, c, ns) = setup().await;
+        register(&c, &ns, PROOF, &proof_elf()).await;
+        c.report("gpu", "session", scale_inventory(&ns, proof, true)).await.unwrap();
+        let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+        let app = if proof { PROOF } else { "service" };
+        let path = format!("/apps/{app}/settings");
+        let before = c.inner.lock().services["gpu-service"].clone();
+        for set in [
+            json!({"image":"untrusted:latest"}), json!({"command":["sh"]}),
+            json!({"env":{"LD_PRELOAD":"/data/owner.so"}}), json!({"user":"0:0"}),
+            json!({"workdir":"/etc/zkm-fleet"}), json!({"volumes":["/var/run/docker.sock","/etc/zkm-fleet:ro"]}),
+            json!({"stop_timeout_s":10,"command":["sh"]}),
+        ] {
+            assert_eq!(scale_call(c.clone(), &owner, "PUT", &path, set.clone()).await.status(), StatusCode::FORBIDDEN, "{set}");
+            assert_eq!(c.inner.lock().services["gpu-service"], before, "a refused update must not create a transition");
+        }
+        assert_eq!(scale_call(c.clone(), "admin", "PUT", &format!("{path}?namespace={ns}"),
+            json!({"image":"trusted:2","user":"1000:1000","volumes":["/srv/app:ro"]})).await.status(), StatusCode::ACCEPTED);
+    }
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/settings", json!({"stop_timeout_s":10})).await.status(), StatusCode::ACCEPTED);
+    for body in [
+        json!({"name":"unsafe","image":"test","allow":["/var/run"]}),
+        json!({"name":"unsafe","image":"test","user":"0:0"}),
+    ] {
+        assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches", body).await.status(), StatusCode::FORBIDDEN);
+        assert!(!c.inner.lock().apps.contains_key("unsafe"));
+    }
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches", json!({"name":"safe","image":"test","allow":[]})).await.status(), StatusCode::CREATED);
+    let path = "/batches/safe/settings";
+    for set in [json!({"allow":["/var/run"]}), json!({"allow":[]}), json!({"user":"0:0"}),
+        json!({"image":"changed","allow":["/etc"]})] {
+        let before = c.inner.lock().apps["safe"].clone();
+        assert_eq!(scale_call(c.clone(), &owner, "PUT", path, set).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(c.inner.lock().apps["safe"], before);
+    }
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches/safe/jobs",
+        json!({"command":["true"],"gpus":0,"cpus":1,"mount":["/var/run/docker.sock"]})).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(), "admin", "PUT", &format!("{path}?namespace={ns}"),
+        json!({"allow":["/srv/app"],"user":"1000:1000"})).await.status(), StatusCode::OK);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", path, json!({"image":"test:2","env":{"A":"1"}})).await.status(), StatusCode::OK);
+    assert_eq!(c.inner.lock().apps["safe"].spec["allow"], json!(["/srv/app"]));
+    assert_eq!(c.inner.lock().apps["safe"].spec["user"], "1000:1000");
+}
+
+#[tokio::test]
 async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     let (_dir, c, ns) = setup().await;
     let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
@@ -844,7 +894,9 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     let other_ns = c.fleet.create_namespace("other", Quota::default()).await.unwrap().id;
     let foreign_ns = user_token(&c, &other_ns, 5, "scope=default", None, true).await;
     assert_eq!(scale_call(c.clone(), &owner, "POST", "/batches",
-        json!({"name":"training","image":"python:3","allow":["/data/models"],"priority":17})).await.status(), StatusCode::CREATED);
+        json!({"name":"training","image":"python:3","priority":17})).await.status(), StatusCode::CREATED);
+    assert_eq!(scale_call(c.clone(), "admin", "PUT", &format!("/batches/training/settings?namespace={ns}"),
+        json!({"allow":["/data/models"],"user":"1000:1000"})).await.status(), StatusCode::OK);
     for token in [&consumer, &restricted, &foreign_tag, &foreign_ns] {
         for (method, path, body) in [
             ("PUT", "/batches/training/priority", json!({"priority":99})),
@@ -859,6 +911,7 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     assert_eq!(scale_call(c.clone(), &consumer, "POST", "/batches",
         json!({"name":"consumer","image":"test"})).await.status(), StatusCode::FORBIDDEN);
     for body in [json!({"name":"invalid","image":"test","allow":["/"]}),
+        json!({"name":"invalid","image":"--privileged"}),
         json!({"name":"invalid","image":"test","allow":["/data/../etc"]}),
         json!({"name":"invalid","image":"test","priority":2147483648_i64}),
     ] {
@@ -1638,7 +1691,7 @@ async fn node_answers(c: &WorkloadController, ns: &str, command: &CommandRecord,
 async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    for bad in [json!({}),json!({"gpus":1}),json!({"image":""}),json!({"env":{"A":1}})] {
+    for bad in [json!({}),json!({"gpus":1}),json!({"image":""}),json!({"image":"--privileged"}),json!({"env":{"A":1}})] {
         let refused=c.request_update(&ns,"service",None,bad.clone()).await.unwrap_err();
         assert_eq!(refused.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,400,"{bad}");
     }
@@ -1688,7 +1741,7 @@ async fn a_batch_update_is_checked_kept_by_the_scheduler_and_sent_to_its_nodes()
         "min_runtime_s":0,"stop_timeout_s":30}).into());
     c.report("gpu","session",report).await.unwrap();
     let path=format!("/batches/trainer/settings?namespace={ns}");
-    for bad in [json!({}),json!({"name":"other"}),json!({"allow":["relative"]})] {
+    for bad in [json!({}),json!({"name":"other"}),json!({"allow":["relative"]}),json!({"image":"--privileged"})] {
         assert_eq!(scale_call(c.clone(),"admin","PUT",&path,bad.clone()).await.status(),StatusCode::BAD_REQUEST,"{bad}");
     }
     assert_eq!(c.inner.lock().apps["trainer"].spec["image"],"t:1","a refused update changes nothing");

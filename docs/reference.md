@@ -258,6 +258,11 @@ needs explicit `--app` grants, by app or batch name. An administrator's token
 holds `admin` alone, has no namespace and may do everything in every namespace.
 Only administrators create namespaces, issue tokens or change access.
 
+Proof status checks the app grant before waiting or revealing any job state.
+The SDK can still poll a rejection recorded for its own signer, including a
+submission refused because the app was not granted; other signers cannot read
+that rejection without the app grant.
+
 User requests infer their namespace from the verified token. A
 `--namespace` selector must match that namespace; it cannot authorize access to
 another tag or namespace. Administrators can select `--namespace NAME --tag TAG`
@@ -296,21 +301,36 @@ cannot change workload metadata.
 | Namespace creation, token issuance, namespace/tag quotas and node administration | `admin` |
 | Namespace listing and quota/usage inspection | `read` for its own namespace and tag; administrators can inspect all |
 | App registration, removal, priority and enable/disable | `manage` in the namespace, with any explicit app grants |
-| Batch creation, mount roots, priority, enable/disable and removal | `manage` for the namespace, tag and batch |
+| Batch creation, priority, enable/disable and removal | `manage` for the namespace, tag and batch |
+| Batch host mount roots and runtime user | `admin` |
+| Service image, environment, command, user, workdir and volumes | `admin` |
 | App GPU/CPU and replica changes | `manage` for the app; namespace/tag quotas and node capacity still apply |
 | Job and log inspection | `read` within its scope |
 | Job submission and batch job cancellation | `submit` within its scope |
 | Batch job preemption | `admin` |
 
-Batch image, environment, resource policy and mount roots are supplied when
+Batch image, environment and resource policy are supplied when
 registering a batch and changed with `fleetctl batch update NAME --image ...`
 (`PUT /batches/NAME/settings`). Accepted jobs keep the settings they were
-submitted with; new jobs use the new ones. Serving deployments start from node
+submitted with; new jobs use the new ones. Only administrators may set batch
+`allow` roots or `user`, at creation or on update. Owner-created batches start
+without host mounts and use the image's default user until an administrator
+configures one. Serving deployments start from node
 `services.yaml`; owners manage their lifecycle, priority, allocation and
 settings through the control plane. `fleetctl app update NAME --image ... --env K=V`
 (`PUT /apps/NAME/settings`) changes an app's server or prover image,
 environment, command, user, workdir, volumes, shm/memory size, health path or
-timeouts.
+timeouts. Changing image, environment, command, user, workdir or volumes requires
+administrator credentials because services can reach host networking, storage
+and prover credentials. Scoped managers retain resource-size, health-path and
+timeout updates. Mixed updates containing an administrator-only field are
+rejected without applying any fields.
+
+Execution nodes independently reject batch mounts overlapping Fleet state,
+device, kernel, runtime or container-daemon directories, and reject direct
+socket, FIFO and device mounts, even if an older accepted policy allows them.
+Administrators must approve storage dedicated to the namespace; an approved
+directory grants access to its contents.
 
 The scheduler is the source of truth for an app's configuration and tells each
 node with one app-level node operation, `NODE_OPERATION_APP`: it addresses an app
@@ -340,7 +360,8 @@ Every API route needs a token permission. `GET /namespaces[/NAME]` (own
 namespace), `GET /apps...` and `GET /batches...` need `read`. `POST /apps/NAME/jobs`,
 `POST /batches/NAME/jobs` and `POST /batches/NAME/jobs/ID/cancel` need `submit`;
 `.../preempt` needs `admin`. Any other `/apps` or `/batches` change (register,
-delete, priority, disabled, scale, settings, purge) needs `manage`. Everything
+delete, priority, disabled, scale, settings, purge) needs `manage`; the settings
+handler additionally requires `admin` for the execution fields listed above. Everything
 else (status, namespace creation, quotas and suspension, allocations, the
 preemption plan, tokens and node drain) needs `admin`. `/healthz` and
 `/{proof_id}/wrap/public_values.bin` need no token, `/access` takes any valid
@@ -366,7 +387,7 @@ registrations persist the ID. A configured batch or persistent `kind: app`
 entry can also specify `namespace: alice`; its namespace is verified before launch.
 The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
-Owners configure host mount roots for their batches. Submit batch jobs through
+Administrators configure host mount roots and runtime users for batches. Submit batch jobs through
 `fleetctl batch submit NAME` or `POST /batches/NAME/jobs`; job records name their
 `batch`, and their reported type is `batch`.
 
@@ -662,7 +683,8 @@ Batch tools are `fleet_batch_create`, `fleet_batches_list`,
 `fleet_batch_job_submit`, `fleet_batch_job_logs` and `fleet_batch_job_cancel`. `fleet_app_logs` reads a visible app's log from its node. Batch job submission
 uses a `batch` name and a command; the jobs list, logs and cancel tools take an optional `batch`. `fleet_jobs_list` remains a combined execution
 view with `kind: "batch"` or `kind: "app"`. Batch creation requires a
-workload-management grant. Its `priority` and `allow` fields are owner-managed.
+workload-management grant. Its `priority` is owner-managed; nonempty `allow`
+roots require an administrator.
 `fleet_batches_list` and `fleet_batch_get` use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batch_jobs_list` and `fleet_batch_job_get` use `fleetctl job --type batch` and `fleetctl job ID`.
 `fleet_batch_job_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
 each path must be inside the batch's allowed roots. Existing metadata changes
@@ -672,11 +694,12 @@ MCP can list and inspect their records.
 
 Tokens with `manage` manage app and batch
 metadata within their namespace, tag and app grants:
-registration, priority, enable/disable, removal and batch mount roots. Owners can
+registration, priority, enable/disable and removal. Owners can
 scale their apps within namespace and tag quotas, and submit
 batch jobs in their tag. SDK proof submissions are signed by the token's key.
 Tokens without `manage` can use their granted apps but cannot change their metadata.
-Administrators manage namespace and tag quotas, namespace access and token issuance.
+Administrators manage namespace and tag quotas, namespace access, token issuance,
+batch host storage and runtime users, and service execution settings.
 App removal refuses while any proof is queued or running and deletes that app's
 terminal proof records and control-host artifacts. App-owned storage retention remains with the app owner. Administrators can also issue tokens limited
 to approved apps and a selected namespace/tag. Token refresh preserves access to jobs.

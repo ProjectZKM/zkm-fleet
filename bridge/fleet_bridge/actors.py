@@ -275,7 +275,7 @@ class _ZirenGpuProver:
             ]
             for v in svc.volumes:
                 cmd += ["-v", v]
-            cmd.append(svc.image)
+            cmd += ["--", svc.image]
             out = _sh(cmd)
             if out.returncode == 0:
                 self.gpu_port = port
@@ -355,7 +355,7 @@ def app_command(spec: AppReplicaSpec, gpus: list[str]) -> tuple[list[str], int]:
         cmd += ["-v", f"{path}:{path}" + (f":{opts}" if opts else "")]
     for k, v in svc.env.items():
         cmd += ["-e", f"{k}={v.format(**fill)}"]
-    cmd.append(svc.image)
+    cmd += ["--", svc.image]
     cmd += [a.format(**fill) for a in svc.command]
     return cmd, port
 
