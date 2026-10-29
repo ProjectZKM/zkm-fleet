@@ -2087,7 +2087,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             };
             let r = job(&s)?;
             if method == Method::GET && parts.len() == 4 {
-                return Ok(Json(r.value()).into_response());
+                // One job also shows the submission it was accepted with; listings stay status only.
+                let mut v = r.value();
+                v["request"] = r.request.0.clone();
+                return Ok(Json(v).into_response());
             }
             if method == Method::POST && parts.len() == 5 && matches!(parts[4], "cancel" | "preempt") {
                 let preempt = parts[4] == "preempt";

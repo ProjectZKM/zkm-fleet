@@ -389,7 +389,9 @@ The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
 Administrators configure host mount roots and runtime users for batches. Submit batch jobs through
 `fleetctl batch submit NAME` or `POST /batches/NAME/jobs`; job records name their
-`batch`, and their reported type is `batch`.
+`batch`, and their reported type is `batch`. `GET /batches/NAME/jobs/ID` (`fleetctl job ID`)
+also returns `request`, the submission as accepted: its name, command, gpus, cpus,
+gpu_mem, mounts, env and nodes. Listings leave it out.
 
 ### GPU and CPU quotas
 

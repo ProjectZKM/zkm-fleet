@@ -100,6 +100,11 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
             }
             assert_eq!(row["namespace"], ns);
+            let one_job = path.contains("/jobs/");
+            assert_eq!(row.get("request").is_some(), one_job, "only one job shows its submission: {path}: {row}");
+            if one_job {
+                assert_eq!((row["request"]["command"].clone(), row["request"]["gpus"].as_f64()), (json!(["true"]), Some(1.0)));
+            }
         }
     }
 }
