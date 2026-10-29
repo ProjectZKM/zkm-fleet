@@ -1008,6 +1008,7 @@ const APP_COLS: &[out::TableColumn] = &[
     col("NODE", "/resources/nodes"),
     col("LAST JOB", "last_at"),
     col("DETAIL", "detail"),
+    col("IMAGE", "image"),
 ];
 
 /// An app by its name, as the control plane describes it.
@@ -1142,11 +1143,11 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
     }
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/batches").json(&body))?;
-    let gpus = v["max_gpus"].as_u64().unwrap_or(0);
+    let gpus = v["batch"]["max_gpus"].as_u64().unwrap_or(0);
     out.done(
         &format!("added batch {}: image {}, up to {gpus} GPU{}, mounts under {}", add.name,
-                 v["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" },
-                 v["allow"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+                 v["batch"]["image"].as_str().unwrap_or("?"), if gpus == 1 { "" } else { "s" },
+                 v["batch"]["allow"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
         v,
     );
     Ok(())
@@ -1229,15 +1230,16 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
     let rows: Vec<Value> = apps.as_array().into_iter().flatten().map(|a| {
         let mean = a["proof"]["mean_prove_ms"].as_f64().map(|m| format!("mean prove {:.1} s", m / 1000.0));
         let anchored = a["proof"]["anchored_on"].as_str().map(|n| format!("anchored on {n}"));
-        let image = a["service"]["image"].as_str().map(|i| format!("image {i}"));
         // Why a starting app is not running yet comes first.
         let why = a["detail"].as_str().filter(|d| !d.is_empty()).map(str::to_owned);
-        let detail: Vec<String> = [why, anchored, mean, image].into_iter().flatten().collect();
+        let detail: Vec<String> = [why, anchored, mean].into_iter().flatten().collect();
+        // A serving app's image is among its settings, a proof app's is its provers'.
+        let image = [&a["service"]["image"], &a["proof"]["image"]].into_iter().find(|i| !i.is_null());
         json!({
             "type": a["kind"], "name": a["name"], "namespace": a["namespace"],
             "tag": a.get("tags").filter(|v| v.as_array().is_some_and(|tags| !tags.is_empty())).unwrap_or(&a["tag"]),
             "state": a["state"], "priority": a["priority"], "resources": a["resources"],
-            "last_at": a["jobs"]["last_at"], "detail": detail.join(", "),
+            "last_at": a["jobs"]["last_at"], "detail": detail.join(", "), "image": image,
         })
     }).collect();
     out.table(&rows, APP_COLS, Some(&apps));
@@ -1326,39 +1328,25 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
     }
 }
 
-/// The batches, like `fleetctl app`: settings plus how many jobs are active and when the last began.
+/// The batches, like `fleetctl app`: each record carries its job counts, last job and image.
 fn batches(conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let batches = FleetClient::new(conn)?.get("/batches")?;
-    // Every active job, however old, and enough recent ones to date each batch's last job.
-    let jobs = fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 1000, active: true, app: None })
-        .and_then(|mut jobs| {
-            jobs.extend(fetch_rows(JobType::Batch, conn, &JobListFilter { limit: 200, active: false, app: None })?);
-            Ok(jobs)
-        })
-        .unwrap_or_else(|e| {
-            tracing::warn!(error=%format!("{e:#}"), "batch jobs not reachable; listing batches only");
-            vec![]
-        });
-    let rows: Vec<Value> = batches.as_array().into_iter().flatten().map(|batch| {
-        let mut row = batch.clone();
-        if row["state"].is_null() {
-            row["state"] = json!(if batch["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
-        }
-        let mut ids = std::collections::HashSet::new();
-        let own: Vec<&Value> = jobs.iter().filter(|j| j["app"] == batch["name"] && ids.insert(j["id"].to_string())).collect();
-        row["active_jobs"] = json!(own.iter().filter(|j| is_active(j)).count());
-        row["last_at"] = json!(own.iter().filter_map(|j| j["created_at"].as_f64()).reduce(f64::max));
-        row
-    }).collect();
-    out.table(&rows, &[
-        col("NAME", "name"), col("NAMESPACE", "namespace"),
-        col("TAG", "tag"), col("STATE", "state"),
-        col("PRIORITY", "priority"), col("MAX GPUS", "max_gpus"),
-        col("ACTIVE", "active_jobs"), col("LAST JOB", "last_at"),
-        col("IMAGE", "image"),
-    ], None);
+    let rows = batches.as_array().cloned().unwrap_or_default();
+    out.table(&rows, BATCH_COLS, Some(&batches));
     Ok(())
 }
+
+const BATCH_COLS: &[out::TableColumn] = &[
+    col("NAME", "name"),
+    col("NAMESPACE", "namespace"),
+    col("PRIORITY", "priority"),
+    col("TAG", "tag"),
+    col("STATE", "state"),
+    col("MAX GPUS", "/batch/max_gpus"),
+    col("ACTIVE", "/jobs/active"),
+    col("LAST JOB", "/jobs/last_at"),
+    col("IMAGE", "/batch/image"),
+];
 
 fn show_batch(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut batch = batch_named(&FleetClient::new(conn)?, name)?;

@@ -75,6 +75,7 @@ impl WorkloadController {
         let mut replicas = 0u64;
         let mut nodes = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
+        let mut images = std::collections::BTreeSet::new();
         let mut states = std::collections::BTreeSet::new();
         let mut reasons = Vec::new();
         for intent in &services {
@@ -97,6 +98,9 @@ impl WorkloadController {
             cpus += s["cpus"].as_f64().unwrap_or(1.0) * count as f64;
             nodes.insert(intent.worker.clone());
             tags.insert(s["tag"].as_str().unwrap_or("").to_owned());
+            if let Some(image) = s["image"].as_str().filter(|i| !i.is_empty()) {
+                images.insert(image.to_owned());
+            }
             let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
             let observed = worker.and_then(|w| {
                 w.report.services.iter()
@@ -129,7 +133,7 @@ impl WorkloadController {
         let n = self.fleet.namespace(namespace);
         json!({
             "resources":(!services.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
-            "tags":tags, "state":state,
+            "tags":tags, "images":images, "state":state,
             "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
             "tag_quota":tag.and_then(|tag|n.as_ref()?.tag_quotas.get(tag)),
@@ -163,7 +167,7 @@ impl WorkloadController {
 
     /// An app as every listing shows one, whichever kind it is: what it is, where it runs, its
     /// state and jobs. A proof app adds its program and placement policy under `proof`, a
-    /// serving app its container settings under `service`.
+    /// serving app its container settings under `service`, a batch its policy under `batch`.
     #[allow(clippy::too_many_arguments)]
     fn app_view(&self, kind: &str, namespace: &str, name: &str, fixed_tag: Option<&str>, priority: Value, disabled: bool,
         jobs: Value, tag: Option<&str>, detail: (&str, Value),
@@ -182,23 +186,64 @@ impl WorkloadController {
             "jobs": jobs,
         });
         v[detail.0] = detail.1;
+        if kind == "proof" {
+            // A proof app runs in its proving services' container: their image when they agree,
+            // each distinct one while an update has moved some of them. A serving app's image is
+            // already among its settings.
+            v["proof"]["image"] = match r["images"].as_array().map(Vec::as_slice) {
+                Some([one]) => one.clone(),
+                Some([]) | None => Value::Null,
+                Some(several) => Value::Array(several.to_vec()),
+            };
+        }
         v
     }
 
-    /// A serving app (a long-running service from a node's services.yaml) in the app shape.
-    pub(crate) fn serving_app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
-        let jobs: Vec<Job> = self.inner.lock().jobs.values()
+    /// A template's job records (not purged; the selected tag's when one is), counted the way
+    /// every app's `jobs` are.
+    fn template_jobs(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let i = self.inner.lock();
+        let jobs: Vec<&Job> = i.jobs.values()
             .filter(|r| !r.purged && r.batch == app.name && r.namespace == app.namespace
                 && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag))
-            .cloned().collect();
+            .collect();
         let count = |f: &dyn Fn(&Job) -> bool| jobs.iter().filter(|r| f(r)).count();
-        let jobs_value = json!({
+        json!({
             "total": jobs.len(),
             "active": count(&|r| !terminal(r.state())),
             "succeeded": count(&|r| r.state() == "succeeded"),
             "failed": count(&|r| matches!(r.state(), "failed" | "lost")),
             "last_at": jobs.iter().filter_map(|r| r.status["submitted_at"].as_f64()).max_by(f64::total_cmp),
-        });
+        })
+    }
+
+    /// A batch in the app shape: `kind: batch`, `state` enabled, disabled or deleted, its job
+    /// counts under `jobs`, and its image, user, resource policy, mount roots, environment and
+    /// workers under `batch`.
+    pub(crate) fn batch_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let jobs = self.template_jobs(app, tag);
+        let mut settings = app.spec.0.clone();
+        if let Some(o) = settings.as_object_mut() {
+            for key in ["name", "type", "kind", "namespace", "namespace_ref", "priority", "disabled", "tag"] {
+                o.remove(key);
+            }
+            o.insert("workers".into(), json!(app.workers));
+        }
+        let disabled = app.spec["disabled"].as_bool() == Some(true);
+        let fixed_tag = app.tag.as_deref().or_else(|| app.spec["tag"].as_str());
+        let mut v = self.app_view("batch", &app.namespace, &app.name, fixed_tag, app.spec["priority"].clone(), disabled,
+            jobs, tag, ("batch", settings));
+        // A batch runs no service of its own: its state is whether it takes jobs, and its tag
+        // is the one it was registered with.
+        v["type"] = json!("batch");
+        v["state"] = json!(if app.removed { "deleted" } else if disabled { "disabled" } else { "enabled" });
+        v["tags"] = json!([fixed_tag.unwrap_or("")]);
+        v
+    }
+
+    /// A serving app (a long-running service from a node's services.yaml) in the app shape.
+    pub(crate) fn serving_app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let jobs_value = self.template_jobs(app, tag);
         let mut settings = app.spec.0.clone();
         if let Some(o) = settings.as_object_mut() {
             for key in ["kind", "namespace", "namespace_ref", "priority", "disabled", "tag"] {

@@ -48,7 +48,7 @@ fn batch_creation_with_user_token_leaves_namespace_to_verified_api_scope() {
         stream.read_exact(&mut request_body).unwrap();
         assert!(headers.starts_with("POST /batches HTTP/1.1"));
         assert!(headers.to_ascii_lowercase().contains("authorization: bearer owner-token"));
-        let body = r#"{"name":"training","namespace":"alice","type":"batch","persistent":false}"#;
+        let body = r#"{"type":"batch","kind":"batch","name":"training","namespace":"alice","batch":{"image":"python:3"}}"#;
         write!(stream, "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     let output = cli().args(["--json", "--url", &url, "--token-file"])
@@ -75,7 +75,8 @@ fn app_list() -> String {
          "resources":{"gpus":6,"cpus":48,"replicas":1,"nodes":["gpu-machine"]},
          "namespace_quota":{"gpus":0,"cpus":null},
          "jobs":{"total":4,"active":0,"succeeded":4,"failed":0,"last_at":2.0},
-         "proof":{"elf_id":"a".repeat(64),"class":"latency","anchor":"exclusive","mean_prove_ms":1200}},
+         "proof":{"elf_id":"a".repeat(64),"class":"latency","anchor":"exclusive","mean_prove_ms":1200,
+                  "image":"ghcr.io/projectzkm/ziren-gpu@sha256:d4b8"}},
     ]).to_string()
 }
 
@@ -115,11 +116,14 @@ fn app_list_shows_why_a_starting_app_is_not_running() {
     std::fs::remove_file(token).unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let table = String::from_utf8_lossy(&output.stdout);
+    let head = table.lines().next().unwrap();
+    assert!(head.ends_with("IMAGE") && head.contains("DETAIL"), "the image has its own last column, as in fleetctl batch: {table}");
     let row = table.lines().find(|l| l.contains("comfyui")).unwrap();
     assert!(row.contains("starting") && row.contains("waiting for capacity: needs 1 GPU and 2 CPU"), "{row}");
-    assert!(row.contains("image comfyui:latest"), "the reason comes first, other details stay: {row}");
+    assert!(row.ends_with("comfyui:latest") && !row.contains("image comfyui"), "the image is a column, not a detail: {row}");
     let row = table.lines().find(|l| l.contains("ethproofs")).unwrap();
     assert!(row.starts_with("proof") && row.contains("mean prove 1.2 s"), "{row}");
+    assert!(row.ends_with("ghcr.io/projectzkm/ziren-gpu@sha256:d4b8"), "a proof app shows its prover image: {row}");
 }
 
 #[test]
@@ -128,7 +132,7 @@ fn batch_creation_sends_namespace_selector() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = token_file("batch-add");
     let server = stub(listener, 1, |_, _| (201,
-        r#"{"priority":77,"name":"training","namespace":"11111111111111111111111111111111","image":"python:3","max_gpus":8,"allow":["/tmp"]}"#.into()));
+        r#"{"type":"batch","kind":"batch","name":"training","namespace":"11111111111111111111111111111111","priority":77,"batch":{"image":"python:3","max_gpus":8,"allow":["/tmp"]}}"#.into()));
     let output = cli().args(["--json", "batch", "add", "training", "--namespace", "alice", "--url", &url,
             "--image", "python:3", "--allow", "/tmp", "--priority", "77", "--token-file"])
         .arg(&token).output().unwrap();
@@ -241,39 +245,51 @@ fn app_delete_says_what_goes_until_confirmed() {
     assert!(seen[2].line.starts_with("DELETE /apps/ethproofs?namespace=alice"), "{}", seen[2].line);
 }
 
+/// Two batches as `GET /batches` returns them: the app record's shape, with the policy under `batch`.
+fn batch_list() -> String {
+    serde_json::json!([
+        {"type":"batch", "kind":"batch", "name":"training", "namespace":"alice", "tag":"scope=default", "tags":["scope=default"],
+         "state":"enabled", "priority":3, "disabled":false,
+         "jobs":{"total":2,"active":1,"succeeded":1,"failed":0,"last_at":1_800_000_100.0},
+         "batch":{"image":"python:3","max_gpus":2,"allow":["/tmp"],"workers":[]}},
+        {"type":"batch", "kind":"batch", "name":"idle", "namespace":"alice", "tag":null, "tags":[""],
+         "state":"disabled", "priority":0, "disabled":true,
+         "jobs":{"total":0,"active":0,"succeeded":0,"failed":0,"last_at":null},
+         "batch":{"image":"python:3","max_gpus":1,"workers":[]}},
+    ]).to_string()
+}
+
 #[test]
 fn plain_batch_lists_every_batch_like_app() {
     let token = token_file("batches");
-    // The batches, then each batch's active jobs and its recent ones to count and date them.
+    // One request: a batch record carries its own job counts and last job.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let server = stub(listener, 7, |line, _| {
-        let path = line.split_whitespace().nth(1).unwrap();
-        (200, if path.starts_with("/batches?") {
-            serde_json::json!([
-                {"name":"training","namespace":"alice","priority":3,"max_gpus":2,"image":"python:3"},
-                {"name":"idle","namespace":"alice","disabled":true,"image":"python:3"}]).to_string()
-        } else if path.starts_with("/batches/training/jobs?") {
-            serde_json::json!([
-                {"id":"a","batch":"training","state":"running","submitted_at":1_800_000_100.0},
-                {"id":"b","batch":"training","state":"succeeded","submitted_at":1_800_000_000.0}]).to_string()
-        } else if path.starts_with("/batches/idle/jobs?") {
-            "[]".to_string()
-        } else {
-            panic!("unexpected request {line}");
-        })
-    });
+    let server = stub(listener, 1, |_, _| (200, batch_list()));
     let output = cli().args(["--json", "batch", "--namespace", "alice", "--url", &url, "--token-file"])
         .arg(&token).output().unwrap();
-    let seen: Vec<String> = server.join().unwrap().into_iter().map(|s| s.line.split_whitespace().nth(1).unwrap().to_string()).collect();
+    let seen = server.join().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(seen[0].starts_with("/batches?"), "{seen:?}");
-    assert_eq!(seen.iter().filter(|p| p.starts_with("/batches/training/jobs?")).count(), 2, "{seen:?}");
+    assert!(seen[0].line.starts_with("GET /batches?namespace=alice"), "{}", seen[0].line);
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(rows[0]["name"], "training");
-    assert_eq!(rows[0]["active_jobs"], 1, "the running job, counted once although both lists return it");
-    assert_eq!(rows[0]["last_at"], 1_800_000_100.0);
-    assert_eq!((rows[1]["state"].as_str(), rows[1]["active_jobs"].as_u64()), (Some("disabled"), Some(0)));
-    assert!(rows[1]["last_at"].is_null());
+    assert_eq!((rows[0]["jobs"]["active"].as_u64(), rows[0]["batch"]["image"].as_str()), (Some(1), Some("python:3")));
+    assert_eq!((rows[1]["state"].as_str(), rows[1]["jobs"]["last_at"].is_null()), (Some("disabled"), true));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = stub(listener, 1, |_, _| (200, batch_list()));
+    let output = cli().args(["batch", "--namespace", "alice", "--url", &url, "--token-file"])
+        .arg(&token).output().unwrap();
+    server.join().unwrap();
     std::fs::remove_file(token).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let table = String::from_utf8_lossy(&output.stdout);
+    let head = table.lines().next().unwrap();
+    assert!(head.starts_with("NAME") && head.contains("MAX GPUS") && head.contains("ACTIVE") && head.ends_with("IMAGE"),
+        "the columns fleetctl app has, plus the batch's policy: {table}");
+    let row = table.lines().find(|l| l.starts_with("training")).unwrap();
+    assert!(row.contains("enabled") && row.contains(" 2 ") && row.contains(" UTC ") && row.ends_with("python:3"), "{row}");
+    let row = table.lines().find(|l| l.starts_with("idle")).unwrap();
+    assert!(row.contains("disabled") && row.ends_with("python:3"), "{row}");
 }

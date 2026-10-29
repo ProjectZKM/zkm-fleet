@@ -469,64 +469,6 @@ impl WorkloadController {
     fn has_jobs(&self, batch: &str) -> bool {
         self.inner.lock().jobs.values().any(|r| r.batch == batch && !r.purged)
     }
-    fn app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
-        let resources = app.persistent.then(|| self.app_resources(&app.namespace, &app.name, tag));
-        let i = self.inner.lock();
-        let jobs: Vec<_> = i
-            .jobs
-            .values()
-            .filter(|r| {
-                !r.purged && r.batch == app.name && r.namespace == app.namespace
-                && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag)
-            })
-            .collect();
-        let mut v = app.spec.0.clone();
-        if let Some(resources) = resources {
-            v.as_object_mut().unwrap().extend(resources.as_object().unwrap().clone());
-        }
-        v["tag"] = json!(app.tag.as_deref().or_else(|| app.spec["tag"].as_str()));
-        v["last_submitted_at"] = json!(jobs
-            .iter()
-            .filter_map(|r| r.status["submitted_at"].as_f64())
-            .max_by(f64::total_cmp));
-        if app.persistent {
-            v.as_object_mut().unwrap().remove("kind");
-            v["max_gpus"] = json!(
-                app.spec["gpus"].as_f64().unwrap_or(0.0)
-                    * app.spec["replicas"].as_f64().unwrap_or(1.0)
-            );
-        } else {
-            v["state"] = json!(if app.removed { "deleted" } else if app.spec["disabled"].as_bool() == Some(true) { "disabled" } else { "enabled" });
-        }
-
-        for (k, value) in [
-            ("name", json!(app.name)),
-            ("namespace", json!(app.namespace)),
-            ("type", json!(if app.persistent { "app" } else { "batch" })),
-            ("persistent", json!(app.persistent)),
-            ("removed", json!(app.removed)),
-            ("jobs", json!(jobs.len())),
-            (
-                "active",
-                json!(jobs.iter().filter(|r| !terminal(r.state())).count()),
-            ),
-            (
-                "succeeded",
-                json!(jobs.iter().filter(|r| r.state() == "succeeded").count()),
-            ),
-            (
-                "failed",
-                json!(jobs
-                    .iter()
-                    .filter(|r| matches!(r.state(), "failed" | "lost"))
-                    .count()),
-            ),
-            ("workers", json!(app.workers)),
-        ] {
-            v[k] = value;
-        }
-        v
-    }
     async fn submit(
         &self,
         batch: &str,
@@ -1844,7 +1786,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         };
         let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
         if batch {
-            return Ok(Json(templates.iter().map(|a| s.app_value(a, tag)).collect::<Vec<_>>()).into_response());
+            return Ok(Json(templates.iter().map(|a| s.batch_value(a, tag)).collect::<Vec<_>>()).into_response());
         }
         let mut apps: Vec<Value> = templates.iter().map(|a| s.serving_app_value(a, tag)).collect();
         apps.extend(s.proof_app_values(c, &q, tag).await?);
@@ -1936,7 +1878,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         };
         s.save("apps", &name, &app)?;
         s.inner.lock().apps.insert(name, app.clone());
-        return Ok((StatusCode::CREATED, Json(s.app_value(&app, app.tag.as_deref())),
+        return Ok((StatusCode::CREATED, Json(s.batch_value(&app, app.tag.as_deref())),
         ).into_response());
     }
     if parts.first() == Some(&"apps") && parts.len() >= 2 {
@@ -1956,7 +1898,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Err(fail(404, if batch { "unknown batch" } else { "unknown app" }));
         }
         let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
-        let view = |s: &WorkloadController, app: &WorkloadTemplate| if batch { s.app_value(app, tag) } else { s.serving_app_value(app, tag) };
+        let view = |s: &WorkloadController, app: &WorkloadTemplate| if batch { s.batch_value(app, tag) } else { s.serving_app_value(app, tag) };
         if method == Method::GET && parts.len() == 2 {
             return Ok(Json(view(&s, &app)).into_response());
         }
@@ -2014,7 +1956,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             s.inner.lock().apps.insert(name.into(), app.clone());
             // Jobs already accepted keep the settings they were submitted with.
             s.tell_nodes(&app.workers, json!({"batch":{"name":name}}), json!({"set": set}))?;
-            return Ok(Json(s.app_value(&app, tag)).into_response());
+            return Ok(Json(s.batch_value(&app, tag)).into_response());
         }
         if parts.len() == 3 && parts[2] == "priority" && method == Method::PUT {
             let p = priority_of(request).await?;

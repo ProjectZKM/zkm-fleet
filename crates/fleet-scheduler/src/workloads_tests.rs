@@ -118,17 +118,31 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
         assert_eq!(views["namespace_quota"],json!({"gpus":2.0,"cpus":8.0}));
         assert_eq!(views["tag_quota"],json!({"gpus":1.0,"cpus":null}));
         assert_eq!(views["tags"], json!(["scope=default"]));
+        assert_eq!(views["images"], json!(["runner:1"]));
         assert_eq!(views["state"], "disabled");
         let restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
         let restored = restarted.app_resources(&ns, &app, Some("scope=default"));
-        for field in ["resources", "namespace_quota", "tag_quota", "tags"] {
+        for field in ["resources", "namespace_quota", "tag_quota", "tags", "images"] {
             assert_eq!(restored[field], views[field]);
         }
         assert_eq!(restored["state"], "offline");
+        if proof { register(&c, &ns, PROOF, &proof_elf()).await; }
+        let app_view = |apps: &Value| apps.as_array().unwrap().iter().find(|a| a["name"] == app).cloned().unwrap_or_else(|| panic!("{app} is not listed: {apps}"));
+        let listed: Value = serde_json::from_slice(&axum::body::to_bytes(
+            scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let shown = app_view(&listed);
+        assert_eq!(shown[if proof { "proof" } else { "service" }]["image"], "runner:1", "an app shows the image it runs in: {shown}");
         let mut second = scale_inventory(&ns,proof,true);
         second.machine="second-machine".into();
+        second.services[0]["image"]=json!("runner:2");
         c.report("gpu-2","second-session",second).await.unwrap();
         assert_eq!(c.app_resources(&ns,&app,None)["resources"],json!({"gpus":4.0,"cpus":8.0,"replicas":4,"nodes":["gpu","gpu-2"]}));
+        assert_eq!(c.app_resources(&ns,&app,None)["images"],json!(["runner:1","runner:2"]));
+        if proof {
+            let listed: Value = serde_json::from_slice(&axum::body::to_bytes(
+                scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(app_view(&listed)["proof"]["image"], json!(["runner:1","runner:2"]), "while its services differ, each image");
+        }
         c.fleet.set_quota(&ns,Quota {gpus:None,cpus:Some(0.0),
                 },
             ).await.unwrap();
@@ -180,7 +194,7 @@ async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let rows: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), count, "{path}: {rows}");
-        if path.starts_with("/batches") { assert_eq!(rows[0]["jobs"], 1); }
+        if path.starts_with("/batches") { assert_eq!(rows[0]["jobs"]["total"], 1); }
     }
     let secret = "ab".repeat(32);
     c.fleet.add_user_token(&"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
@@ -191,7 +205,11 @@ async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
     ).await;
     assert_eq!(response.status(), StatusCode::OK);
     let batch: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
-    assert_eq!(batch["jobs"], 1);
+    assert_eq!((batch["type"].as_str(), batch["kind"].as_str(), batch["state"].as_str()), (Some("batch"), Some("batch"), Some("enabled")),
+        "a batch has the app record's shape: {batch}");
+    assert_eq!((batch["jobs"]["total"].as_u64(), batch["jobs"]["active"].as_u64()), (Some(1), Some(1)));
+    assert_eq!((batch["batch"]["image"].as_str(), batch["batch"]["max_gpus"].as_u64()), (Some("test"), Some(2)));
+    assert!(batch["batch"].get("name").is_none() && batch.get("persistent").is_none() && batch.get("removed").is_none(), "{batch}");
     assert_eq!(scale_call(c.clone(), &secret, "GET", "/apps/service", Value::Null).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(scale_call(c, "admin", "GET", &format!("/apps?namespace={ns}&tag=bare"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
 }
@@ -811,7 +829,7 @@ fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> NodeReport {
     let mut report = inventory(ns);
     report.services = vec![json!({"name":"service","kind":if proof {"ziren-gpu"}else{"app"},
         "namespace":ns,"tag":"scope=default","app":if proof {PROOF.to_string()}else{"service".into()},"elf_id":if proof {proof_elf()}else{String::new()},
-        "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled}).into()];
+        "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled,"image":"runner:1"}).into()];
     if !disabled { report.free_gpus=0.0;report.free_cpus=4.0; }
     report
 }
