@@ -9,7 +9,8 @@ cargo build --locked --release \
 ```
 
 For an execution agent alone, build `cargo build --locked --release -p fleet-node`.
-Generic Fleet builds and installations do not need the EthProofs submodule.
+Generic Fleet builds and installations do not need the app submodules under
+`third_party/`.
 
 | Machine | Required software |
 |---|---|

@@ -1,0 +1,37 @@
+{
+  "bundle_id": "REPLACE_WITH_64_HEX_BUNDLE_ID",
+  "zkm_circuit_version": "v2.0.0",
+  "imm_wrap_vk": true,
+  "programs": [
+    {
+      "name": "commit-chain",
+      "elf_sha256": "REPLACE_WITH_ELF_SHA256",
+      "program_id": "REPLACE_WITH_PROGRAM_ID",
+      "vk_hash": "0xREPLACE_WITH_VK_HASH"
+    },
+    {
+      "name": "header-chain",
+      "elf_sha256": "REPLACE_WITH_ELF_SHA256",
+      "program_id": "REPLACE_WITH_PROGRAM_ID",
+      "vk_hash": "0xREPLACE_WITH_VK_HASH"
+    },
+    {
+      "name": "operator",
+      "elf_sha256": "REPLACE_WITH_ELF_SHA256",
+      "program_id": "REPLACE_WITH_PROGRAM_ID",
+      "vk_hash": "0xREPLACE_WITH_OPERATOR_VK_HASH"
+    },
+    {
+      "name": "state-chain",
+      "elf_sha256": "REPLACE_WITH_ELF_SHA256",
+      "program_id": "REPLACE_WITH_PROGRAM_ID",
+      "vk_hash": "0xREPLACE_WITH_VK_HASH"
+    },
+    {
+      "name": "watchtower",
+      "elf_sha256": "REPLACE_WITH_ELF_SHA256",
+      "program_id": "REPLACE_WITH_PROGRAM_ID",
+      "vk_hash": "0xREPLACE_WITH_VK_HASH"
+    }
+  ]
+}

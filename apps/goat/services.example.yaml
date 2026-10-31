@@ -1,0 +1,46 @@
+# Merge this service into the selected machine's existing services.yaml.
+# Stage it disabled; enable it only after the cutover steps in README.md, while every
+# per-program GOAT SDK app stays disabled.
+services:
+  - name: goat-proof-builder-v1
+    kind: ziren-gpu
+    namespace: REPLACE_WITH_NAMESPACE_ID
+    app: goat-proof-builder-v1 # the namespace app (fleetctl app add goat-proof-builder-v1 --elf-id ...)
+    elf_id: REPLACE_WITH_FLEET_APP_ID # the package's fleet-app-id: the bundle id, not a member ELF
+    proof_storage_root: /srv/zkm-fleet/apps/goat
+    machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP
+    replicas: 1
+    disabled: true
+    # The Groth16 wrap runs on the worker's CPUs; size cpus for it as well as the GPUs.
+    gpus: 4
+    cpus: 48
+    shm_gb: 64
+    image: ghcr.io/projectzkm/ziren-gpu:latest
+    rust_log: info
+    worker_command:
+      - /opt/zkm-fleet/apps/goat/proof-builder-rpc
+      - --rpc-addr
+      - 127.0.0.1:7777
+      - --metrics-addr
+      - 127.0.0.1:9109
+      - --config
+      - proof-builder.toml
+      # Below worker_stop_timeout_s, so the worker exits before Fleet kills it.
+      - --drain-timeout-secs
+      - "540"
+    worker_env_file: /etc/zkm-fleet/goat-worker.env
+    # Relative ../circuits/data/... paths resolve inside the storage root.
+    worker_workdir: /srv/zkm-fleet/apps/goat/run
+    # At least the longest proof plus its publication; measure it in staging.
+    worker_stop_timeout_s: 600
+    env:
+      RUST_BACKTRACE: "1"
+      VERIFY_VK: "true"
+      SHARD_SIZE: "16777216"
+      ZIREN_LEAF_HOST_THREADS: "3"
+      ZIREN_PROCESS_PER_GPU: "1"
+      ZIREN_FUSE_LEAVES: "1"
+      ZIREN_REDUCE_OVERLAP: "1"
+      TMPDIR: /dev/shm
+      # Set only if a staging Groth16 proof reports a committed-values digest mismatch.
+      # ZKM_IMM_WRAP_VK: "1"

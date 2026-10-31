@@ -2,3 +2,7 @@
 	path = third_party/reth-processor
 	url = https://github.com/ProjectZKM/reth-processor.git
 	branch = chore/ziren-v2-stateless
+[submodule "third_party/bitvm-node"]
+	path = third_party/bitvm-node
+	url = https://github.com/blake-pro/bitvm-node.git
+	branch = feat/fetch-state-chain

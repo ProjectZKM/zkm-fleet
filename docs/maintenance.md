@@ -239,5 +239,7 @@ proof retention an explicit app policy.
 
 Pin validated GPU images by digest. Update EthProofs using its committed submodule
 revision with `git submodule update --init --recursive`; never deploy a moving
-submodule branch. See [data and ports](reference.md#data) for storage and
-network details.
+submodule branch. Package the GOAT worker from its committed
+`third_party/bitvm-node` revision with `apps/goat/build.sh`; a guest change is a
+new app identity (see the [GOAT guide](../apps/goat/README.md)). See
+[data and ports](reference.md#data) for storage and network details.

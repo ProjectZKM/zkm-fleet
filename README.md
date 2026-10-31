@@ -25,9 +25,10 @@ execution settings; owner changes remain subject to namespace and tag limits.
 
 EthProofs prepares witnesses, proves locally and reports from one integrated app
 worker. It resumes its saved cursor and proves every block in sequence.
-GOAT keeps `bitvm-node / proof-builder-rpc → zkm-sdk → Fleet gateway → proving`.
-TODO: evaluate moving GOAT preparation into an app worker after the EthProofs
-migration is validated.
+
+The GOAT proof builder runs as an integrated app worker: it serves Bitcoin node
+proof requests, proves its five circuits on its loopback GPU server and keeps its
+task database and proofs in app storage.
 
 ## Get started
 
@@ -44,3 +45,4 @@ migration is validated.
 | [Maintenance](docs/maintenance.md) | Pause/resume, Ray capacity changes, upgrades, runtime files and backups |
 | [Reference](docs/reference.md) | Protocols, namespaces, tokens, quotas, APIs, storage and ports |
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
+| [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
