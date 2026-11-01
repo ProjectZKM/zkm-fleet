@@ -933,7 +933,7 @@ struct JobListFilter<'a> {
 /// The proof apps the caller sees (only `app`, when given), by name.
 fn proof_app_names(a: &FleetClient, app: Option<&str>) -> anyhow::Result<Vec<String>> {
     Ok(a.get("/apps")?.as_array().into_iter().flatten()
-        .filter(|x| x["kind"] == "proof" && app.is_none_or(|name| x["name"].as_str() == Some(name)))
+        .filter(|x| x["kind"] == "app" && app.is_none_or(|name| x["name"].as_str() == Some(name)))
         .filter_map(|x| x["name"].as_str().map(str::to_owned))
         .collect())
 }
@@ -1023,10 +1023,10 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &ConnectionOptions, out: &
     let v = a.send(a.req(method, &format!("/apps/{name}/disabled")).timeout(Duration::from_secs(1800)))?;
     let served = v["resources"].is_object();
     let text = match (v["kind"].as_str(), disabled, served) {
-        (Some("proof"), true, true) => format!("{name} disabled: active proofs drained, its provers stopped"),
-        (Some("proof"), false, true) => format!("{name} enabled: its provers started"),
-        (Some("proof"), true, false) => format!("{name} disabled: it takes no new jobs; the queued and running ones finish"),
-        (Some("proof"), false, false) => format!("{name} enabled: it takes jobs again"),
+        (Some("app"), true, true) => format!("{name} disabled: active proofs drained, its provers stopped"),
+        (Some("app"), false, true) => format!("{name} enabled: its provers started"),
+        (Some("app"), true, false) => format!("{name} disabled: it takes no new jobs; the queued and running ones finish"),
+        (Some("app"), false, false) => format!("{name} enabled: it takes jobs again"),
         (_, true, _) => format!("{name} disabled: stopped; GPU reservations released"),
         (_, false, _) => format!("{name} enabled: service started"),
     };
@@ -1156,7 +1156,7 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
 /// One app's record, and a proof app's newest jobs.
 fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut rec = app_named(&FleetClient::new(conn)?, name)?;
-    let jobs = if rec["kind"] == "proof" {
+    let jobs = if rec["kind"] == "app" {
         fetch_rows(JobType::App, conn, &JobListFilter { limit: 5, active: false, app: Some(name) })?
     } else {
         vec![]
@@ -1179,7 +1179,7 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
     let a = FleetClient::new(conn)?;
     let app = app_named(&a, name)?;
     let (total, active) = (&app["jobs"]["total"], &app["jobs"]["active"]);
-    let proof = app["kind"] == "proof";
+    let proof = app["kind"] == "app";
     if !yes {
         if proof {
             bail!(

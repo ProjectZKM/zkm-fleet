@@ -709,7 +709,7 @@ Namespaces are the resource accounting and billing unit; namespace and optional 
 cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
 
 
-LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`, with `kind: proof` or `kind: service`. An app record carries `name`, `namespace`, `tag`, `tags`, `state`, `detail`, `priority`, `disabled`, `resources`, `namespace_quota`, `tag_quota`, `jobs` (`total`, `active`, `succeeded`, `failed`, `last_at`), and `proof` (`elf_id`, its placement policy, `mean_prove_ms`, `anchored_on`, `created_at`, and `image`: the container image of the services proving for it, a list while they differ) or `service` (container settings and workers). A batch record (`fleetctl batch`, `type: batch`, `kind: batch`) has the same envelope: its `state` is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and its policy sits under `batch` (`image`, `user`, `max_gpus`, `default_gpu_mem_gb`, `shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `workers`). Batch jobs appear only under `fleetctl batch` and `fleetctl job --type batch`.
+LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`. Proof and serving apps use `kind: app` or `kind: service` respectively, while `proof` remains the proof-program policy section on a proof app. An app record carries `name`, `namespace`, `tag`, `tags`, `state`, `detail`, `priority`, `disabled`, `resources`, `namespace_quota`, `tag_quota`, `jobs` (`total`, `active`, `succeeded`, `failed`, `last_at`), and `proof` (`elf_id`, its placement policy, `mean_prove_ms`, `anchored_on`, `created_at`, and `image`: the container image of the services proving for it, a list while they differ) or `service` (container settings and workers). A batch record (`fleetctl batch`, `type: batch`, `kind: batch`) has the same envelope: its `state` is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and its policy sits under `batch` (`image`, `user`, `max_gpus`, `default_gpu_mem_gb`, `shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `workers`). Batch jobs appear only under `fleetctl batch` and `fleetctl job --type batch`.
 `fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
 app has its own dedicated Ziren GPU server: disable blocks new submissions,
 drains its active proofs, then stops that server and releases its GPUs. Queued
@@ -779,18 +779,3 @@ dispatch from a database at a time. Fleet does not use SSH channels between mach
 MCP exposes only user-scoped tools through the existing HTTPS gateway. Users and operators both use `FLEET_TOKEN_FILE`
 (`--token-file`); without it `fleetctl` reads `admin.token` from `FLEET_ETC`,
 `~/.config/zkm-fleet` or `/etc/zkm-fleet`. Batch API handlers are part of the Rust scheduler; there is no separate Python HTTP listener.
-
-## Ports
-
-| port | bind | who |
-|---|---|---|
-| 8905 HTTPS gateway | public TLS ingress | user APIs, `/mcp`, proof RPCs and node-initiated gRPC |
-| 8906 MCP backend | 127.0.0.1 | gateway only; anonymous discovery, user token required for tool calls |
-| 51000 stage (gRPC) | gateway to private scheduler; server-authenticated TLS | SDK proof clients (user bearer token) |
-| 9191 scheduler HTTP | control-host loopback or HTTPS gateway | all `fleetctl` requests, batch/app API, public values and administration |
-| 51001 control (gRPC) | private backend behind HTTPS gateway | machine and proof heartbeats (cluster token) |
-| 51010 app SDK / 51011 app public values | execution-machine loopback; configurable | app clients; independent of GPU replicas |
-| 30100-30199 GPU server | 127.0.0.1 | its own node only |
-| app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
-| Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | execution machine only; block remote access | local placement groups, actors and tasks |
-| 172.28.250.0/24 | docker network on the control machine | scheduler (fixed at .10), Postgres, gateway; `install.sh --subnet` if it collides |

@@ -589,7 +589,7 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
     let app = registered_app(&h, b"elf-d");
-    assert_eq!((app["kind"].as_str(), app["jobs"]["total"].as_u64()), (Some("proof"), Some(1)));
+    assert_eq!((app["kind"].as_str(), app["jobs"]["total"].as_u64()), (Some("app"), Some(1)));
     let url = format!("{}/apps/{}?namespace={PROOFS}", h.http, app_of(b"elf-d"));
     let gone = admin_curl(&h, &["-X", "DELETE", &url]);
     let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
@@ -1458,7 +1458,7 @@ async fn namespace_owner_can_manage_every_app_only_in_its_namespace() {
     assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app_of(b"owner-managed-app"))).0, 200);
     assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app_of(b"another-app"))).0, 200);
     assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}?namespace=other-scope", app_of(b"owner-managed-app"))).0, 403);
-    assert!(admin_curl(&h, &[&format!("{}/apps/{}?namespace=other-scope", h.http, app_of(b"owner-managed-app"))]).contains("\"kind\":\"proof\""));
+    assert!(admin_curl(&h, &[&format!("{}/apps/{}?namespace=other-scope", h.http, app_of(b"owner-managed-app"))]).contains("\"kind\":\"app\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]

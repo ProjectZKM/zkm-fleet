@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v0.2.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build release components
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG='${{ inputs.tag }}'
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-release-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+
+      - name: Build release components
+        run: |
+          cargo build --locked --release \
+            -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
+
+      - name: Build release package
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIST="dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
+          mkdir -p "$DIST/bin" "$DIST/deploy" "$DIST/bridge" "dist"
+          install -m 755 target/release/fleet-scheduler "$DIST/bin/"
+          install -m 755 target/release/fleetctl "$DIST/bin/"
+          install -m 755 target/release/fleet-mcp "$DIST/bin/"
+          install -m 755 target/release/fleet-node "$DIST/bin/"
+          install -m 755 target/release/fleet-proof-app "$DIST/bin/"
+          cp -a deploy/docker-compose.yml deploy/gateway.yaml.in deploy/Dockerfile.scheduler \
+            deploy/install.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh "$DIST/deploy/"
+          cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
+          cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
+          printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
+          tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
+          sha256sum "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+
+      - name: Create GitHub release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --target "${GITHUB_SHA}" \
+              --title "ZKM Fleet $RELEASE_TAG" \
+              --generate-notes
+          gh release upload "$RELEASE_TAG" \
+            "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
+            "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
+            --clobber

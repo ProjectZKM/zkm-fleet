@@ -70,7 +70,7 @@ fn app_list() -> String {
          "resources":{"gpus":1,"cpus":2,"replicas":1,"nodes":["gpu-machine"]},
          "jobs":{"total":0,"active":0,"succeeded":0,"failed":0,"last_at":3.0},
          "service":{"image":"comfyui:latest"}},
-        {"type":"app", "kind":"proof", "name":"ethproofs", "namespace":"alice",
+        {"type":"app", "kind":"app", "name":"ethproofs", "namespace":"alice",
          "tags":["scope=default"], "state":"disabled", "priority":0, "disabled":true,
          "resources":{"gpus":6,"cpus":48,"replicas":1,"nodes":["gpu-machine"]},
          "namespace_quota":{"gpus":0,"cpus":null},
@@ -96,7 +96,7 @@ fn app_list_shows_every_app_from_one_request() {
     let apps: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let apps = apps.as_array().unwrap();
     assert_eq!((apps[0]["name"].as_str(), apps[0]["kind"].as_str()), (Some("comfyui"), Some("service")));
-    assert_eq!((apps[1]["name"].as_str(), apps[1]["kind"].as_str()), (Some("ethproofs"), Some("proof")));
+    assert_eq!((apps[1]["name"].as_str(), apps[1]["kind"].as_str()), (Some("ethproofs"), Some("app")));
     assert_eq!(apps[1]["proof"]["mean_prove_ms"], 1200);
     for app in apps {
         assert_eq!(app["type"], "app");
@@ -122,7 +122,7 @@ fn app_list_shows_why_a_starting_app_is_not_running() {
     assert!(row.contains("starting") && row.contains("waiting for capacity: needs 1 GPU and 2 CPU"), "{row}");
     assert!(row.ends_with("comfyui:latest") && !row.contains("image comfyui"), "the image is a column, not a detail: {row}");
     let row = table.lines().find(|l| l.contains("ethproofs")).unwrap();
-    assert!(row.starts_with("proof") && row.contains("mean prove 1.2 s"), "{row}");
+    assert!(row.starts_with("app") && row.contains("mean prove 1.2 s"), "{row}");
     assert!(row.ends_with("ghcr.io/projectzkm/ziren-gpu@sha256:d4b8"), "a proof app shows its prover image: {row}");
 }
 
@@ -179,7 +179,7 @@ fn app_commands_address_every_app_by_its_name() {
     for (args, method, leaf, body, reply) in [
         (vec!["priority", "ethproofs", "-5"], "PUT", "/priority", serde_json::json!({"priority":-5}), r#"{"priority":-5}"#),
         (vec!["disable", "ethproofs"], "PUT", "/disabled", serde_json::Value::Null,
-            r#"{"kind":"proof","name":"ethproofs","disabled":true,"resources":{"gpus":1}}"#),
+            r#"{"kind":"app","name":"ethproofs","disabled":true,"resources":{"gpus":1}}"#),
         (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"kind":"service","name":"comfyui","disabled":false}"#),
         (vec!["scale", "ethproofs", "--replicas", "2", "--node", "gpu-box"], "PUT", "/scale", serde_json::json!({"replicas":2,"node":"gpu-box"}),
             r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"node":"gpu-box"}"#),
@@ -227,7 +227,7 @@ fn app_logs_read_the_control_plane_route_and_print_the_raw_log_or_the_error() {
 
 #[test]
 fn app_delete_says_what_goes_until_confirmed() {
-    let app = r#"{"kind":"proof","name":"ethproofs","jobs":{"total":4,"active":0},"proof":{"elf_id":"aaaa"}}"#;
+    let app = r#"{"kind":"app","name":"ethproofs","jobs":{"total":4,"active":0},"proof":{"elf_id":"aaaa"}}"#;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = token_file("app-delete");
