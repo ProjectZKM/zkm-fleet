@@ -197,8 +197,10 @@ before following [verify and resume](#verify-and-resume).
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-box  # or ~/.config/zkm-fleet/ctl.env
 deploy/fleet-ctl.sh status                       # control services, health, nodes, apps and the node
 deploy/fleet-ctl.sh -n scheduler upgrade         # -n prints every step and changes nothing
-deploy/fleet-ctl.sh scheduler upgrade target/release   # scheduler, fleetctl and fleet-mcp
-deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # copied to the node over ssh
+deploy/fleet-ctl.sh scheduler upgrade v0.1.0           # download and verify the GitHub Release package
+deploy/fleet-ctl.sh node upgrade v0.1.0                 # download and verify the node package
+deploy/fleet-ctl.sh scheduler upgrade target/release   # legacy local scheduler binaries
+deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # legacy local node files over ssh
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
 deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start

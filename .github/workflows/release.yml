@@ -27,6 +27,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Resolve release tag
         shell: bash
@@ -64,6 +66,17 @@ jobs:
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 
+      - name: Build scheduler Docker image
+        run: |
+          docker build \
+            --tag "zkm-fleet-scheduler:${RELEASE_VERSION}" \
+            --tag zkm-fleet-scheduler:local \
+            -f deploy/Dockerfile.scheduler .
+          mkdir -p dist
+          docker save zkm-fleet-scheduler:local | gzip > "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz"
+          cd dist
+          sha256sum "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+
       - name: Build release package
         shell: bash
         run: |
@@ -76,23 +89,24 @@ jobs:
           install -m 755 target/release/fleet-node "$DIST/bin/"
           install -m 755 target/release/fleet-proof-app "$DIST/bin/"
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in deploy/Dockerfile.scheduler \
-            deploy/install.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh "$DIST/deploy/"
+            deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
           tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
-          sha256sum "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+          cd dist
+          sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
 
-      - name: Create GitHub release and upload assets
+      - name: Upload assets to existing GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --target "${GITHUB_SHA}" \
-              --title "ZKM Fleet $RELEASE_TAG" \
-              --generate-notes
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" >/dev/null
           gh release upload "$RELEASE_TAG" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
+            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
+            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
             --clobber
