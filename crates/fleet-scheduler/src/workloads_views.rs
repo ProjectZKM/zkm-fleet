@@ -174,7 +174,7 @@ impl WorkloadController {
     ) -> Value {
         let r = self.app_resources(namespace, name, tag);
         let state = if r["resources"].is_null() {
-            if disabled { "disabled" } else if kind == "proof" { "registered" } else { "configured" }
+            if disabled { "disabled" } else if kind == "app" { "registered" } else { "configured" }
         } else {
             r["state"].as_str().unwrap_or("configured")
         };
@@ -186,7 +186,7 @@ impl WorkloadController {
             "jobs": jobs,
         });
         v[detail.0] = detail.1;
-        if kind == "proof" {
+        if kind == "app" {
             // A proof app runs in its proving services' container: their image when they agree,
             // each distinct one while an update has moved some of them. A serving app's image is
             // already among its settings.
@@ -279,7 +279,7 @@ impl WorkloadController {
             "anchored_on": self.machine_name(anchored, None), "created_at": app.created_ms as f64 / 1000.0,
             "diagnostics": {"anchor_replica": anchored},
         });
-        Ok(self.app_view("proof", &app.namespace, &app.name, None, json!(app.priority), app.disabled, jobs, tag, ("proof", proof)))
+        Ok(self.app_view("app", &app.namespace, &app.name, None, json!(app.priority), app.disabled, jobs, tag, ("proof", proof)))
     }
 
     /// The registered proof apps the caller sees: a token's namespace's that it is granted, or

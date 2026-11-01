@@ -13,7 +13,7 @@ fn list_query_is_scoped(kind: &str) {
     let server = stub(listener, 4, move |line, _| {
         let path = line.split_whitespace().nth(1).unwrap();
         (200, if path.starts_with("/apps?") {
-            r#"[{"kind":"proof","name":"ethproofs"},{"kind":"service","name":"comfyui"}]"#.into()
+            r#"[{"kind":"app","name":"ethproofs"}]"#.into()
         } else if path.starts_with("/batches?") {
             r#"[{"name":"training"}]"#.into()
         } else if batch {
@@ -85,7 +85,7 @@ fn proof_fetch_downloads_both_files_through_the_scoped_control_plane() {
     let server = stub(listener, 4, |line, _| {
         let path = line.split_whitespace().nth(1).unwrap();
         (200, if path.starts_with("/apps?") {
-            r#"[{"kind":"proof","name":"ethproofs"}]"#.into()
+            r#"[{"kind":"app","name":"ethproofs"}]"#.into()
         } else if path.starts_with("/apps/ethproofs/jobs/proof-job/output/proof.json?") {
             "{\"proof\":1}".into()
         } else if path.starts_with("/apps/ethproofs/jobs/proof-job/output/public_values.bin?") {

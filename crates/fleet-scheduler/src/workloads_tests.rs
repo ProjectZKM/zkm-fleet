@@ -94,7 +94,7 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         for row in rows {
             if path.starts_with("/apps") {
                 assert_eq!(row["type"], "app", "{path}: {row}");
-                assert_eq!(row["kind"], "service", "{path}: {row}");
+                assert_eq!(row["kind"], "app", "{path}: {row}");
                 assert_eq!(row["name"], "service");
             } else {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
@@ -1124,7 +1124,7 @@ async fn app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
         assert_eq!(response.status(), StatusCode::OK);
         let app: Value = response.json().await.unwrap();
         assert_eq!(app["disabled"], disabled);
-        assert_eq!(app["kind"], "proof");
+        assert_eq!(app["kind"], "app");
         assert_eq!(c.fleet.app(&ns, PROOF).unwrap().priority, 31);
     }
     for selector in [String::new(), "?tag=scope=default".into()] {
@@ -1159,7 +1159,7 @@ fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body)
 async fn node_writes_config(c: &WorkloadController, mut report: NodeReport) {
     c.dispatch().await.unwrap();
     let command=c.inner.lock().commands.values().find(|v|!v.done&&v.operation==NodeOperation::App as i32).cloned().expect("configuration step");
-    report.results=vec![CommandResult{id:command.id,result:json!({"updated":["service"]}).into(),error:None}];
+    report.results=vec![CommandResult{id:command.id.clone(),result:json!({"updated":["service"]}).into(),error:None}];
     c.report("gpu","session",report).await.unwrap();
     c.dispatch().await.unwrap();
 }

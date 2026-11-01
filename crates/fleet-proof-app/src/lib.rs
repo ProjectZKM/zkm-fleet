@@ -206,7 +206,7 @@ impl ProofAppServer {
         }
         let apps = self.call(bearer, reqwest::Method::GET, "/apps", None).await?;
         let app = apps.as_array().into_iter().flatten()
-            .find(|a| a["kind"] == "proof" && a["namespace"].as_str() == Some(self.namespace.as_str())
+            .find(|a| a["kind"] == "app" && a["namespace"].as_str() == Some(self.namespace.as_str())
                 && a["proof"]["elf_id"].as_str() == Some(elf_id))
             .and_then(|a| a["name"].as_str())
             .ok_or_else(|| Status::permission_denied("the program is no app this token may use"))?
@@ -339,7 +339,7 @@ impl ProofAppServer {
                 request.receipt_inputs.clone()
             } else {
                 anyhow::ensure!(
-                    request.receipt_inputs.is_empty() || request.receipt_inputs == request.receipts,
+                    request.receipt_inputs.is_empty() || request.receipt.inputs == request.receipts,
                     "conflicting receipts fields"
                 );
                 request.receipts.clone()
