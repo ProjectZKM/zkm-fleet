@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ProjectZKM/zkm-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/ProjectZKM/zkm-fleet/actions/workflows/ci.yml)
 
-Fleet schedules apps and batch jobs on shared GPU/CPU machines.
+Fleet: A universal schedules apps and batch jobs on shared GPU/CPU machines.
 
 - **Apps** keep proof workers or serving containers running.
 - **Batches** run finite commands and release resources when cleanup finishes.
