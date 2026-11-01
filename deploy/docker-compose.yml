@@ -16,10 +16,7 @@ services:
       retries: 20
 
   scheduler:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.scheduler
-    image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
+    image: ${FLEET_SCHEDULER_IMAGE:?set FLEET_SCHEDULER_IMAGE in compose.env}
     restart: unless-stopped
     # The user that owns ${FLEET_ETC}: the secrets there are mode 600.
     user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
@@ -39,7 +36,7 @@ services:
 
   mcp:
     profiles: [mcp]
-    image: ${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
+    image: ${FLEET_SCHEDULER_IMAGE:?set FLEET_SCHEDULER_IMAGE in compose.env}
     restart: unless-stopped
     user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
     depends_on: [scheduler]

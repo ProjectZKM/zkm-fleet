@@ -68,14 +68,9 @@ PACKAGE_ROOT=$(find "$STAGE/root" -mindepth 1 -maxdepth 1 -type d | head -1)
 [ -x "$PACKAGE_ROOT/deploy/install.sh" ] || { echo "setup.sh: package is missing deploy/install.sh" >&2; exit 1; }
 
 if [ "$ROLE" = control ]; then
-  IMAGE="$STAGE/zkm-fleet-scheduler-${VERSION_NUMBER}-linux-x86_64.tar.gz"
-  IMAGE_CHECKSUM="$IMAGE.sha256"
-  curl -fsSL --retry 3 "$BASE/zkm-fleet-scheduler-${VERSION_NUMBER}-linux-x86_64.tar.gz" -o "$IMAGE"
-  curl -fsSL --retry 3 "$BASE/zkm-fleet-scheduler-${VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" -o "$IMAGE_CHECKSUM"
-  sed 's#  dist/#  #g' "$IMAGE_CHECKSUM" > "$STAGE/image.sha256"
-  (cd "$STAGE" && sha256sum -c image.sha256) || { echo "setup.sh: scheduler image checksum mismatch" >&2; exit 1; }
   command -v docker >/dev/null || { echo "setup.sh: docker is required for control installation" >&2; exit 1; }
-  docker load -i "$IMAGE" >/dev/null
+  export FLEET_SCHEDULER_IMAGE="ghcr.io/${REPO,,}-scheduler:${VERSION_NUMBER}"
+  docker pull "$FLEET_SCHEDULER_IMAGE" >/dev/null || { echo "setup.sh: cannot pull $FLEET_SCHEDULER_IMAGE" >&2; exit 1; }
 fi
 
 FORWARD=("${ARGS[@]:1}" "--bin" "$PACKAGE_ROOT/bin")

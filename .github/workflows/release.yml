@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -66,16 +67,21 @@ jobs:
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 
-      - name: Build scheduler Docker image
+      - name: Publish scheduler image to GHCR
+        shell: bash
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-scheduler"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker build \
-            --tag "zkm-fleet-scheduler:${RELEASE_VERSION}" \
-            --tag zkm-fleet-scheduler:local \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${RELEASE_VERSION}" \
+            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+            --tag "$IMAGE:${RELEASE_VERSION}" \
             -f deploy/Dockerfile.scheduler .
-          mkdir -p dist
-          docker save zkm-fleet-scheduler:local | gzip > "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz"
-          cd dist
-          sha256sum "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+          docker push "$IMAGE:${RELEASE_VERSION}"
 
       - name: Build release package
         shell: bash
@@ -88,7 +94,7 @@ jobs:
           install -m 755 target/release/fleet-mcp "$DIST/bin/"
           install -m 755 target/release/fleet-node "$DIST/bin/"
           install -m 755 target/release/fleet-proof-app "$DIST/bin/"
-          cp -a deploy/docker-compose.yml deploy/gateway.yaml.in deploy/Dockerfile.scheduler \
+          cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
             deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
@@ -107,6 +113,4 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
-            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
-            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
             --clobber

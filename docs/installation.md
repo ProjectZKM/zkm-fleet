@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/se
   --tls-names stage,fleet.example --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc"
 ```
 
-This loads the scheduler image and starts the scheduler, Postgres, the HTTPS
+This pulls the release's scheduler image from GHCR and starts the scheduler, Postgres, the HTTPS
 gateway and MCP with Docker Compose. Add `--no-mcp` to leave MCP out. The
 installer creates the cluster token, a private TLS CA and the first
 administrator token in `etc/admin.token`, and puts `fleetctl` on the PATH.

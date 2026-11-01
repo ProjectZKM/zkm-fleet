@@ -56,7 +56,7 @@ fi
 # Copy execution code only to execution machines. The control plane has no Ray dependency.
 mkdir -p "$PREFIX/deploy"
 if [ "$ROLE" = control ]; then
-  cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in,Dockerfile.scheduler} "$PREFIX/deploy/"
+  cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in} "$PREFIX/deploy/"
   FLEETCTL="$PREFIX/bin/fleetctl"
   [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" >/dev/null
   [ -f "$ETC/pg_password" ] || (umask 077; openssl rand -hex 24 > "$ETC/pg_password")
@@ -81,6 +81,7 @@ EOF
   mkdir -p "$PREFIX/data" "$HOME/.config/zkm-fleet" "$HOME/.local/bin"
   ln -sf "$ETC/admin.token" "$HOME/.config/zkm-fleet/admin.token"
   ln -sf "$FLEETCTL" "$HOME/.local/bin/fleetctl"
+  IMG=${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
   cat > "$PREFIX/compose.env" <<EOF
 FLEET_ETC=$ETC
 FLEET_DATA=$PREFIX/data
@@ -90,11 +91,15 @@ FLEET_SUBNET=$SUBNET
 FLEET_SCHEDULER_IP=$SCHED_IP
 FLEET_MCP_ALLOWED_HOSTS=$MCP_AUTHORITY,localhost:8906,127.0.0.1:8906
 COMPOSE_PROFILES=$([ "$MCP" = 1 ] && echo mcp || true)
+FLEET_SCHEDULER_IMAGE=$IMG
 EOF
-  IMG=${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
   if ! docker image inspect "$IMG" >/dev/null 2>&1; then
-    [ -d "$SRC/crates" ] || die "load the scheduler image or install from a full checkout"
-    docker build -f "$SRC/deploy/Dockerfile.scheduler" -t "$IMG" "$SRC"
+    if [ -n "${FLEET_SCHEDULER_IMAGE:-}" ]; then
+      docker pull "$IMG" || die "cannot pull $IMG"
+    else # a source checkout builds its own image
+      [ -d "$SRC/crates" ] || die "set FLEET_SCHEDULER_IMAGE or install from a full checkout"
+      docker build -f "$SRC/deploy/Dockerfile.scheduler" -t "$IMG" "$SRC"
+    fi
   fi
   docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d
   for _ in $(seq 1 30); do curl -sf http://127.0.0.1:9191/healthz >/dev/null && break; sleep 2; done

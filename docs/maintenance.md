@@ -127,34 +127,17 @@ redistribute scoped credentials before resuming clients.
 
 ### Control host
 
-For the default Docker Compose installation, rebuild the image from the checkout
-and recreate the scheduler. Set `FLEET_PREFIX` to the installed directory:
+The scheduler and MCP run from the release's GHCR image
+(`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`) in Docker Compose; only
+`fleetctl` is a host binary. Upgrade with:
 
 ```bash
-FLEET_PREFIX="$HOME/app/fleet"
-docker build -f deploy/Dockerfile.scheduler -t zkm-fleet-scheduler:local .
-install -m 755 target/release/fleetctl "$FLEET_PREFIX/bin/fleetctl"
-docker compose --env-file "$FLEET_PREFIX/compose.env" -p zkm-fleet \
-  -f "$FLEET_PREFIX/deploy/docker-compose.yml" up -d --no-deps --force-recreate scheduler
+FLEET_PREFIX="$HOME/app/fleet" deploy/fleet-ctl.sh scheduler upgrade v0.1.1
 ```
 
-If MCP is enabled, repeat the Compose command with `mcp` instead of `scheduler`.
-Use the image tag already configured by the installation if it differs from
-`zkm-fleet-scheduler:local`. Replace installed Compose/gateway templates when
-their configuration changes; rebuilding an image alone does not replace them.
-
-Existing native systemd installations keep their supervisor. For the deployed
-control host, run from the build checkout and select the installed runtime path
-explicitly; a separate worktree does not contain that installation:
-
-```bash
-FLEET_PREFIX="/data/stephen/zkm-fleet/.fleet"
-FLEET_BIN_DIR="${CARGO_TARGET_DIR:-target}/release"
-sudo systemctl stop zkm-fleet-mcp.service zkm-scheduler.service
-install -m 755 "$FLEET_BIN_DIR/fleet-scheduler" "$FLEET_BIN_DIR/fleetctl" \
-  "$FLEET_BIN_DIR/fleet-mcp" "$FLEET_PREFIX/bin/"
-sudo systemctl start zkm-scheduler.service zkm-fleet-mcp.service
-```
+It pulls the image, backs up `fleetctl`, the Compose files and `compose.env`,
+records the new image in `compose.env`, recreates the services and waits for
+`/healthz`. `scheduler rollback` restores that backup and recreates them.
 
 Verify the gateway's `/healthz`, `fleetctl namespace` and `fleetctl node`.
 When enabled, also check MCP initialization and an authenticated tool call.
