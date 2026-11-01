@@ -127,34 +127,17 @@ redistribute scoped credentials before resuming clients.
 
 ### Control host
 
-For the default Docker Compose installation, rebuild the image from the checkout
-and recreate the scheduler. Set `FLEET_PREFIX` to the installed directory:
+The scheduler and MCP run from the release's GHCR image
+(`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`) in Docker Compose; only
+`fleetctl` is a host binary. Upgrade with:
 
 ```bash
-FLEET_PREFIX="$HOME/app/fleet"
-docker build -f deploy/Dockerfile.scheduler -t zkm-fleet-scheduler:local .
-install -m 755 target/release/fleetctl "$FLEET_PREFIX/bin/fleetctl"
-docker compose --env-file "$FLEET_PREFIX/compose.env" -p zkm-fleet \
-  -f "$FLEET_PREFIX/deploy/docker-compose.yml" up -d --no-deps --force-recreate scheduler
+FLEET_PREFIX="$HOME/app/fleet" deploy/fleet-ctl.sh scheduler upgrade v0.1.2
 ```
 
-If MCP is enabled, repeat the Compose command with `mcp` instead of `scheduler`.
-Use the image tag already configured by the installation if it differs from
-`zkm-fleet-scheduler:local`. Replace installed Compose/gateway templates when
-their configuration changes; rebuilding an image alone does not replace them.
-
-Existing native systemd installations keep their supervisor. For the deployed
-control host, run from the build checkout and select the installed runtime path
-explicitly; a separate worktree does not contain that installation:
-
-```bash
-FLEET_PREFIX="/data/stephen/zkm-fleet/.fleet"
-FLEET_BIN_DIR="${CARGO_TARGET_DIR:-target}/release"
-sudo systemctl stop zkm-fleet-mcp.service zkm-scheduler.service
-install -m 755 "$FLEET_BIN_DIR/fleet-scheduler" "$FLEET_BIN_DIR/fleetctl" \
-  "$FLEET_BIN_DIR/fleet-mcp" "$FLEET_PREFIX/bin/"
-sudo systemctl start zkm-scheduler.service zkm-fleet-mcp.service
-```
+It pulls the image, backs up `fleetctl`, the Compose files and `compose.env`,
+records the new image in `compose.env`, recreates the services and waits for
+`/healthz`. `scheduler rollback` restores that backup and recreates them.
 
 Verify the gateway's `/healthz`, `fleetctl namespace` and `fleetctl node`.
 When enabled, also check MCP initialization and an authenticated tool call.
@@ -197,10 +180,9 @@ before following [verify and resume](#verify-and-resume).
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-box  # or ~/.config/zkm-fleet/ctl.env
 deploy/fleet-ctl.sh status                       # control services, health, nodes, apps and the node
 deploy/fleet-ctl.sh -n scheduler upgrade         # -n prints every step and changes nothing
-deploy/fleet-ctl.sh scheduler upgrade v0.1.0           # download and verify the GitHub Release package
-deploy/fleet-ctl.sh node upgrade v0.1.0                 # download and verify the node package
-deploy/fleet-ctl.sh scheduler upgrade target/release   # legacy local scheduler binaries
-deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # legacy local node files over ssh
+deploy/fleet-ctl.sh scheduler upgrade v0.1.2     # pull the GHCR image, install the release's fleetctl
+deploy/fleet-ctl.sh node upgrade v0.1.2          # download and verify the node package
+deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # local node files over ssh
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
 deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start
@@ -208,8 +190,8 @@ deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app sta
 
 An upgrade copies what it replaces to `backup/` first, then waits for the scheduler's
 health check or the node's reconnection. Upgrade the scheduler and nodes together when a
-release changes the protocol. The script uses `sudo systemctl` with the unit names in this
-guide; set `FLEET_SCHEDULER_UNIT`, `FLEET_MCP_UNIT` or `FLEET_NODE_UNIT` for others.
+release changes the protocol. The scheduler and MCP are managed with Docker Compose; the
+node uses `sudo systemctl`, and `FLEET_NODE_UNIT` names a non-default unit.
 A third `node upgrade` argument also installs `fleet-proof-app` and restarts the app
 endpoint units listed in `FLEET_PROOF_APP_UNITS`.
 

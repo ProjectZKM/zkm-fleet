@@ -2,9 +2,9 @@
 # Upgrade, roll back and inspect Fleet: fleet-ctl.sh [-n] COMMAND
 #
 #   status                        control services, health, nodes and apps (and the node, if configured)
-#   scheduler upgrade [TAG]       load the release's scheduler image, recreate it with Docker Compose
-#                                 and install its fleetctl (default: latest release)
-#   scheduler rollback            restore the image, fleetctl and compose files the last upgrade replaced
+#   scheduler upgrade [TAG]       pull the release's scheduler image from GHCR, recreate it with Docker
+#                                 Compose and install its fleetctl (default: latest release)
+#   scheduler rollback            restore the image setting, fleetctl and compose files the last upgrade replaced
 #   node upgrade [TAG]            install a release's fleet-node, bridge and fleet-proof-app
 #   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   the same from local files
 #   node rollback                 restore what the last node upgrade replaced
@@ -92,28 +92,25 @@ scheduler_healthy() {
   for _ in $(seq 30); do curl -fs -o /dev/null http://127.0.0.1:9191/healthz && return 0; sleep 2; done
   return 1
 }
+set_scheduler_image() { # compose.env names the image both services run
+  [ "$DRY" = 1 ] && { echo "+ set FLEET_SCHEDULER_IMAGE=$1 in $PREFIX/compose.env"; return; }
+  { grep -v '^FLEET_SCHEDULER_IMAGE=' "$PREFIX/compose.env" || true; echo "FLEET_SCHEDULER_IMAGE=$1"; } > "$PREFIX/compose.env.new"
+  mv "$PREFIX/compose.env.new" "$PREFIX/compose.env"
+}
 # The scheduler and MCP run from the image in Docker Compose; only fleetctl is a host binary.
 scheduler_upgrade() {
   local source=${1:-$RELEASE_VERSION} b; b=$PREFIX/backup/control-$(stamp)
   local stage; stage=$(mktemp -d)
   prepare_release "$source" "$stage"
-  local image="$stage/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
-  local base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
-  if [ "$DRY" = 1 ]; then
-    echo "+ curl --fail --location --retry 3 --output $image $base/$(basename "$image")"
-  else
-    curl -fsSL --retry 3 -o "$image" "$base/$(basename "$image")" || die "release has no scheduler image"
-    curl -fsSL --retry 3 -o "$image.sha256" "$base/$(basename "$image").sha256" || die "failed to download scheduler image checksum"
-    sed 's#  dist/#  #g' "$image.sha256" > "$image.sha256.normalized"
-    (cd "$stage" && sha256sum -c "$(basename "$image").sha256.normalized") || die "scheduler image checksum mismatch"
-    [ -x "$RELEASE_ROOT/bin/fleetctl" ] || die "release package has no fleetctl"
-  fi
+  local image="ghcr.io/${RELEASE_REPO,,}-scheduler:${RELEASE_VERSION_NUMBER}"
+  [ "$DRY" = 1 ] || [ -x "$RELEASE_ROOT/bin/fleetctl" ] || die "release package has no fleetctl"
+  # Pull first so a missing image changes nothing.
+  run docker pull "$image"
   run mkdir -p "$b"
-  run cp -a "$PREFIX/bin/fleetctl" "$PREFIX/deploy/docker-compose.yml" "$PREFIX/deploy/gateway.yaml.in" "$b/"
-  run docker tag zkm-fleet-scheduler:local zkm-fleet-scheduler:rollback
-  run docker load -i "$image"
+  run cp -a "$PREFIX/bin/fleetctl" "$PREFIX/deploy/docker-compose.yml" "$PREFIX/deploy/gateway.yaml.in" "$PREFIX/compose.env" "$b/"
   run install -m 755 "$RELEASE_ROOT/bin/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$RELEASE_ROOT/deploy/docker-compose.yml" "$RELEASE_ROOT/deploy/gateway.yaml.in" "$PREFIX/deploy/"
+  set_scheduler_image "$image"
   # The scheduler finishes in-flight calls before it exits, so recreating can take ~90s.
   compose up -d --no-deps --force-recreate $(control_services)
   scheduler_healthy || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
@@ -121,9 +118,9 @@ scheduler_upgrade() {
 }
 scheduler_rollback() {
   local b; b=$(latest_backup control); [ -n "$b" ] || die "no backup in $PREFIX/backup"
-  run docker tag zkm-fleet-scheduler:rollback zkm-fleet-scheduler:local
   run install -m 755 "$b/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$b/docker-compose.yml" "$b/gateway.yaml.in" "$PREFIX/deploy/"
+  run cp "$b/compose.env" "$PREFIX/compose.env"
   compose up -d --no-deps --force-recreate $(control_services)
   scheduler_healthy || die "scheduler is not healthy after rollback"
   echo "restored $b"
