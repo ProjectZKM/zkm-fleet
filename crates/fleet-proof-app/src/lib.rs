@@ -336,10 +336,10 @@ impl ProofAppServer {
             elf: vec![],
             stdin_buffer,
             receipts: if request.receipts.is_empty() {
-                request.receipt.inputs
+                request.receipt_inputs.clone()
             } else {
                 anyhow::ensure!(
-                    request.receipt.inputs == request.receipts,
+                    request.receipt_inputs.is_empty() || request.receipt_inputs == request.receipts,
                     "conflicting receipts fields"
                 );
                 request.receipts.clone()

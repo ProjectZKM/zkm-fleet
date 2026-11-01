@@ -94,7 +94,7 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         for row in rows {
             if path.starts_with("/apps") {
                 assert_eq!(row["type"], "app", "{path}: {row}");
-                assert_eq!(row["kind"], "app", "{path}: {row}");
+                assert_eq!(row["kind"], "service", "{path}: {row}");
                 assert_eq!(row["name"], "service");
             } else {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
