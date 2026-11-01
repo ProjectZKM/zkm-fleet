@@ -2,26 +2,26 @@
 # Upgrade, roll back and inspect Fleet: fleet-ctl.sh [-n] COMMAND
 #
 #   status                        control services, health, nodes and apps (and the node, if configured)
-#   scheduler upgrade [TAG|BIN_DIR] install from GitHub Release tag (default latest), or local binaries
-#   scheduler rollback            restore the binaries the last upgrade replaced
-#   node upgrade [TAG]              install agent, bridge and proof app from GitHub Release
-#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   legacy local-file upgrade
+#   scheduler upgrade [TAG]       load the release's scheduler image, recreate it with Docker Compose
+#                                 and install its fleetctl (default: latest release)
+#   scheduler rollback            restore the image, fleetctl and compose files the last upgrade replaced
+#   node upgrade [TAG]            install a release's fleet-node, bridge and fleet-proof-app
+#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   the same from local files
 #   node rollback                 restore what the last node upgrade replaced
 #   app cleanup SERVICE-0         remove the placement group and container a failed app start left
 #
 # -n prints what would change and changes nothing. Settings come from the environment or
 # ${FLEET_CTL_ENV:-~/.config/zkm-fleet/ctl.env}: FLEET_PREFIX (install dir), FLEET_NODE_SSH
-# (ssh host of the node; node commands then run there) and FLEET_NODE_PREFIX (its install
-# dir, default ~/app/fleet). Units follow docs/maintenance.md; FLEET_*_UNIT renames them, and
-# FLEET_PROOF_APP_UNITS names the node's app endpoint units a fleet-proof-app upgrade restarts.
-# Every upgrade copies what it replaces to PREFIX/backup first.
+# (ssh host of the node; node commands then run there), FLEET_NODE_PREFIX (its install
+# dir, default ~/app/fleet) and FLEET_RELEASE_REPO (default ProjectZKM/zkm-fleet).
+# FLEET_NODE_UNIT names the node's systemd unit; FLEET_PROOF_APP_UNITS the app endpoint
+# units a fleet-proof-app upgrade restarts. Every upgrade backs up what it replaces first.
 set -euo pipefail
 SELF=$(readlink -f "$0")
 ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
 [ ! -f "$ENV_FILE" ] || . "$ENV_FILE"
 PREFIX=${FLEET_PREFIX:-$(dirname "$(dirname "$SELF")")}
 NODE_SSH=${FLEET_NODE_SSH:-}; NODE_PREFIX=${FLEET_NODE_PREFIX:-\$HOME/app/fleet}
-SCHEDULER_UNIT=${FLEET_SCHEDULER_UNIT:-zkm-scheduler.service}; MCP_UNIT=${FLEET_MCP_UNIT:-zkm-fleet-mcp.service}
 NODE_UNIT=${FLEET_NODE_UNIT:-zkm-fleet-node.service}
 PROOF_APP_UNITS=${FLEET_PROOF_APP_UNITS:-}
 [ -n "${FLEET_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_TOKEN_FILE=$PREFIX/etc/admin.token
@@ -84,55 +84,48 @@ on_node() { # this script, run on the node over ssh
   ssh "$NODE_SSH" "FLEET_CTL_ON_NODE=1 FLEET_PREFIX=$NODE_PREFIX bash -s -- $flag $(printf '%q ' "$@")" < "$SELF"
 }
 
+compose() { run docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" "$@"; }
+# Naming a profiled service starts it, so recreate MCP only where install.sh enabled it.
+control_services() { echo scheduler; grep -q '^COMPOSE_PROFILES=.*mcp' "$PREFIX/compose.env" 2>/dev/null && echo mcp || true; }
+scheduler_healthy() {
+  [ "$DRY" = 1 ] && return 0
+  for _ in $(seq 30); do curl -fs -o /dev/null http://127.0.0.1:9191/healthz && return 0; sleep 2; done
+  return 1
+}
+# The scheduler and MCP run from the image in Docker Compose; only fleetctl is a host binary.
 scheduler_upgrade() {
-  local source=${1:-$RELEASE_VERSION} bin b; b=$PREFIX/backup/bin-$(stamp)
-  local package_image=""
-  if [ -d "$source" ]; then
-    bin=$source
+  local source=${1:-$RELEASE_VERSION} b; b=$PREFIX/backup/control-$(stamp)
+  local stage; stage=$(mktemp -d)
+  prepare_release "$source" "$stage"
+  local image="$stage/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
+  local base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
+  if [ "$DRY" = 1 ]; then
+    echo "+ curl --fail --location --retry 3 --output $image $base/$(basename "$image")"
   else
-    local stage; stage=$(mktemp -d)
-    prepare_release "$source" "$stage"
-    bin=$RELEASE_ROOT/bin
-    package_image="$stage/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
-    local image_base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
-    if [ "$DRY" = 1 ]; then
-      echo "+ curl --fail --location --retry 3 --output $package_image $image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
-    else
-      curl -fsSL --retry 3 -o "$package_image" "$image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz" || die "release has no scheduler image package"
-      local image_checksum="$package_image.sha256"
-      curl -fsSL --retry 3 -o "$image_checksum" "$image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" || die "failed to download scheduler image checksum"
-      sed 's#  dist/#  #g' "$image_checksum" > "$image_checksum.normalized"
-      (cd "$(dirname "$package_image")" && sha256sum -c "$(basename "$image_checksum.normalized")") || die "scheduler image checksum mismatch"
-    fi
-  fi
-  if [ "$DRY" != 1 ]; then
-    for f in fleet-scheduler fleetctl fleet-mcp; do [ -x "$bin/$f" ] || die "$bin/$f is not built or packaged"; done
+    curl -fsSL --retry 3 -o "$image" "$base/$(basename "$image")" || die "release has no scheduler image"
+    curl -fsSL --retry 3 -o "$image.sha256" "$base/$(basename "$image").sha256" || die "failed to download scheduler image checksum"
+    sed 's#  dist/#  #g' "$image.sha256" > "$image.sha256.normalized"
+    (cd "$stage" && sha256sum -c "$(basename "$image").sha256.normalized") || die "scheduler image checksum mismatch"
+    [ -x "$RELEASE_ROOT/bin/fleetctl" ] || die "release package has no fleetctl"
   fi
   run mkdir -p "$b"
-  run cp -a "$PREFIX"/bin/{fleet-scheduler,fleetctl,fleet-mcp} "$b/"
-  if [ -n "$package_image" ] && [ "$DRY" != 1 ]; then
-    run docker save zkm-fleet-scheduler:local -o "$b/scheduler-image.tar.gz"
-  fi
-  run sudo systemctl stop "$MCP_UNIT" "$SCHEDULER_UNIT"
-  if [ -n "$package_image" ] && [ "$DRY" != 1 ]; then
-    run docker load -i "$package_image"
-    run docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d --no-deps --force-recreate scheduler mcp
-  else
-    run install -m 755 "$bin"/fleet-scheduler "$bin"/fleetctl "$bin"/fleet-mcp "$PREFIX/bin/"
-  fi
-  run sudo systemctl start "$SCHEDULER_UNIT" "$MCP_UNIT"
-  [ "$DRY" = 1 ] || for _ in $(seq 30); do curl -fs -o /dev/null http://127.0.0.1:9191/healthz && break; sleep 2; done
-  [ "$DRY" = 1 ] || curl -fs -o /dev/null http://127.0.0.1:9191/healthz || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
-  echo "scheduler upgraded to ${RELEASE_TAG:-local binaries}; previous binaries in $b"
+  run cp -a "$PREFIX/bin/fleetctl" "$PREFIX/deploy/docker-compose.yml" "$PREFIX/deploy/gateway.yaml.in" "$b/"
+  run docker tag zkm-fleet-scheduler:local zkm-fleet-scheduler:rollback
+  run docker load -i "$image"
+  run install -m 755 "$RELEASE_ROOT/bin/fleetctl" "$PREFIX/bin/fleetctl"
+  run cp "$RELEASE_ROOT/deploy/docker-compose.yml" "$RELEASE_ROOT/deploy/gateway.yaml.in" "$PREFIX/deploy/"
+  # The scheduler finishes in-flight calls before it exits, so recreating can take ~90s.
+  compose up -d --no-deps --force-recreate $(control_services)
+  scheduler_healthy || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
+  echo "control plane upgraded to $RELEASE_TAG; previous fleetctl and compose files in $b"
 }
 scheduler_rollback() {
-  local b; b=$(latest_backup bin); [ -n "$b" ] || die "no backup in $PREFIX/backup"
-  run sudo systemctl stop "$MCP_UNIT" "$SCHEDULER_UNIT"
-  if [ -f "$b/scheduler-image.tar.gz" ] && [ "$DRY" != 1 ]; then
-    run docker load -i "$b/scheduler-image.tar.gz"
-  fi
-  run install -m 755 "$b"/{fleet-scheduler,fleetctl,fleet-mcp} "$PREFIX/bin/"
-  run sudo systemctl start "$SCHEDULER_UNIT" "$MCP_UNIT"
+  local b; b=$(latest_backup control); [ -n "$b" ] || die "no backup in $PREFIX/backup"
+  run docker tag zkm-fleet-scheduler:rollback zkm-fleet-scheduler:local
+  run install -m 755 "$b/fleetctl" "$PREFIX/bin/fleetctl"
+  run cp "$b/docker-compose.yml" "$b/gateway.yaml.in" "$PREFIX/deploy/"
+  compose up -d --no-deps --force-recreate $(control_services)
+  scheduler_healthy || die "scheduler is not healthy after rollback"
   echo "restored $b"
 }
 
@@ -237,7 +230,8 @@ status() {
     docker ps --format '{{.Names}} {{.Status}}' | grep -E '^fleet-(gpu|app|job)-' || true
     return
   fi
-  echo "== control host: scheduler $(systemctl is-active "$SCHEDULER_UNIT" || true), mcp $(systemctl is-active "$MCP_UNIT" || true), healthz $(curl -fs http://127.0.0.1:9191/healthz || echo FAILING)"
+  echo "== control host: healthz $(curl -fs http://127.0.0.1:9191/healthz || echo FAILING)"
+  docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" ps || true
   "$PREFIX/bin/fleetctl" node || true
   "$PREFIX/bin/fleetctl" app || true
   if [ -n "$NODE_SSH" ]; then on_node status; fi
