@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -95,18 +95,13 @@ jobs:
           cd dist
           sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
 
-      - name: Create GitHub release and upload assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --target "${GITHUB_SHA}" \
-              --title "ZKM Fleet $RELEASE_TAG" \
-              --generate-notes
-          gh release upload "$RELEASE_TAG" \
-            "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
-            "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
-            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
-            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
-            --clobber
+      - name: Publish release build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zkm-fleet-${{ env.RELEASE_TAG }}-linux-x86_64
+          path: |
+            dist/zkm-fleet-${{ env.RELEASE_VERSION }}-linux-x86_64.tar.gz
+            dist/zkm-fleet-${{ env.RELEASE_VERSION }}-linux-x86_64.tar.gz.sha256
+            dist/zkm-fleet-scheduler-${{ env.RELEASE_VERSION }}-linux-x86_64.tar.gz
+            dist/zkm-fleet-scheduler-${{ env.RELEASE_VERSION }}-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
