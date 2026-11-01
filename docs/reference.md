@@ -779,18 +779,3 @@ dispatch from a database at a time. Fleet does not use SSH channels between mach
 MCP exposes only user-scoped tools through the existing HTTPS gateway. Users and operators both use `FLEET_TOKEN_FILE`
 (`--token-file`); without it `fleetctl` reads `admin.token` from `FLEET_ETC`,
 `~/.config/zkm-fleet` or `/etc/zkm-fleet`. Batch API handlers are part of the Rust scheduler; there is no separate Python HTTP listener.
-
-## Ports
-
-| port | bind | who |
-|---|---|---|
-| 8905 HTTPS gateway | public TLS ingress | user APIs, `/mcp`, proof RPCs and node-initiated gRPC |
-| 8906 MCP backend | 127.0.0.1 | gateway only; anonymous discovery, user token required for tool calls |
-| 51000 stage (gRPC) | gateway to private scheduler; server-authenticated TLS | SDK proof clients (user bearer token) |
-| 9191 scheduler HTTP | control-host loopback or HTTPS gateway | all `fleetctl` requests, batch/app API, public values and administration |
-| 51001 control (gRPC) | private backend behind HTTPS gateway | machine and proof heartbeats (cluster token) |
-| 51010 app SDK / 51011 app public values | execution-machine loopback; configurable | app clients; independent of GPU replicas |
-| 30100-30199 GPU server | 127.0.0.1 | its own node only |
-| app `port_base` + replica | where the app binds (ComfyUI: 127.0.0.1) | the app's own clients |
-| Ray 6379, 6380, 6381, 8080, 52365, 10002-19999 | execution machine only; block remote access | local placement groups, actors and tasks |
-| 172.28.250.0/24 | docker network on the control machine | scheduler (fixed at .10), Postgres, gateway; `install.sh --subnet` if it collides |
