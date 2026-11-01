@@ -46,6 +46,12 @@ jobs:
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
+      # Fail before publishing an image for a tag that has no Release to attach assets to.
+      - name: Require an existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" >/dev/null
+
       - name: Install protobuf compiler
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
@@ -109,7 +115,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" >/dev/null
           gh release upload "$RELEASE_TAG" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \

@@ -132,7 +132,7 @@ The scheduler and MCP run from the release's GHCR image
 `fleetctl` is a host binary. Upgrade with:
 
 ```bash
-FLEET_PREFIX="$HOME/app/fleet" deploy/fleet-ctl.sh scheduler upgrade v0.1.1
+FLEET_PREFIX="$HOME/app/fleet" deploy/fleet-ctl.sh scheduler upgrade v0.1.2
 ```
 
 It pulls the image, backs up `fleetctl`, the Compose files and `compose.env`,
@@ -180,10 +180,9 @@ before following [verify and resume](#verify-and-resume).
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-box  # or ~/.config/zkm-fleet/ctl.env
 deploy/fleet-ctl.sh status                       # control services, health, nodes, apps and the node
 deploy/fleet-ctl.sh -n scheduler upgrade         # -n prints every step and changes nothing
-deploy/fleet-ctl.sh scheduler upgrade v0.1.0           # download and verify the GitHub Release package
-deploy/fleet-ctl.sh node upgrade v0.1.0                 # download and verify the node package
-deploy/fleet-ctl.sh scheduler upgrade target/release   # legacy local scheduler binaries
-deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # legacy local node files over ssh
+deploy/fleet-ctl.sh scheduler upgrade v0.1.2     # pull the GHCR image, install the release's fleetctl
+deploy/fleet-ctl.sh node upgrade v0.1.2          # download and verify the node package
+deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # local node files over ssh
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
 deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start
@@ -191,8 +190,8 @@ deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app sta
 
 An upgrade copies what it replaces to `backup/` first, then waits for the scheduler's
 health check or the node's reconnection. Upgrade the scheduler and nodes together when a
-release changes the protocol. The script uses `sudo systemctl` with the unit names in this
-guide; set `FLEET_SCHEDULER_UNIT`, `FLEET_MCP_UNIT` or `FLEET_NODE_UNIT` for others.
+release changes the protocol. The scheduler and MCP are managed with Docker Compose; the
+node uses `sudo systemctl`, and `FLEET_NODE_UNIT` names a non-default unit.
 A third `node upgrade` argument also installs `fleet-proof-app` and restarts the app
 endpoint units listed in `FLEET_PROOF_APP_UNITS`.
 

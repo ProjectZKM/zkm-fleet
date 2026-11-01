@@ -1,9 +1,9 @@
 #!/bin/bash
 # Bootstrap Fleet from a published GitHub Release package.
 #
-# setup.sh --version v0.1.0 node --name gpu-1 \
+# setup.sh --version v0.1.2 node --name gpu-1 \
 #   --scheduler https://fleet.example:8905 --cluster-token FILE
-# setup.sh --version v0.1.0 control --public-url https://fleet.example:8905
+# setup.sh --version v0.1.2 control --public-url https://fleet.example:8905
 set -euo pipefail
 
 REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}

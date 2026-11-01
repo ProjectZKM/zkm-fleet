@@ -13,7 +13,7 @@ checksums and runs `deploy/install.sh` with the packaged binaries.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/setup.sh | bash -s -- \
-  --version v0.1.0 control --public-url https://fleet.example:8905 \
+  --version v0.1.2 control --public-url https://fleet.example:8905 \
   --tls-names stage,fleet.example --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc"
 ```
 
@@ -31,7 +31,7 @@ Copy the control host's `etc/cluster.token` to the node (mode 600), and its
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/setup.sh | bash -s -- \
-  --version v0.1.0 node --name gpu-1 --scheduler https://fleet.example:8905 \
+  --version v0.1.2 node --name gpu-1 --scheduler https://fleet.example:8905 \
   --cluster-token "$HOME/cluster.token" --scheduler-ca "$HOME/ca.pem" \
   --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc" --cuda 0,1,2,3 --cpus 32
 ```
