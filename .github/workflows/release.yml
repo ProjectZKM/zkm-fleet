@@ -64,6 +64,17 @@ jobs:
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 
+      - name: Build scheduler Docker image
+        run: |
+          docker build \
+            --tag "zkm-fleet-scheduler:${RELEASE_VERSION}" \
+            --tag zkm-fleet-scheduler:local \
+            -f deploy/Dockerfile.scheduler .
+          mkdir -p dist
+          docker save zkm-fleet-scheduler:local | gzip > "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz"
+          cd dist
+          sha256sum "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+
       - name: Build release package
         shell: bash
         run: |
@@ -81,7 +92,8 @@ jobs:
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
           tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
-          sha256sum "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
+          cd dist
+          sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
 
       - name: Create GitHub release and upload assets
         env:
@@ -95,4 +107,6 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
             "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
+            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz" \
+            "dist/zkm-fleet-scheduler-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256" \
             --clobber

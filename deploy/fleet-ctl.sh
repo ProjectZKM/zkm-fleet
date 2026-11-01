@@ -2,10 +2,10 @@
 # Upgrade, roll back and inspect Fleet: fleet-ctl.sh [-n] COMMAND
 #
 #   status                        control services, health, nodes and apps (and the node, if configured)
-#   scheduler upgrade [BIN_DIR]   install fleet-scheduler, fleetctl and fleet-mcp (default target/release)
+#   scheduler upgrade [TAG|BIN_DIR] install from GitHub Release tag (default latest), or local binaries
 #   scheduler rollback            restore the binaries the last upgrade replaced
-#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   install a fleet-node binary and
-#                                 bridge/fleet_bridge, and a fleet-proof-app binary when given
+#   node upgrade [TAG]              install agent, bridge and proof app from GitHub Release
+#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   legacy local-file upgrade
 #   node rollback                 restore what the last node upgrade replaced
 #   app cleanup SERVICE-0         remove the placement group and container a failed app start left
 #
@@ -29,6 +29,52 @@ DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }
 run() { if [ "$DRY" = 1 ]; then echo "+ $*"; else "$@"; fi; }
 stamp() { date -u +%Y%m%dT%H%M%SZ; }
+RELEASE_REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}
+RELEASE_VERSION=${FLEET_RELEASE_VERSION:-latest}
+
+resolve_release_tag() {
+  local requested=${1:-$RELEASE_VERSION}
+  if [ "$requested" = latest ]; then
+    python3 - "$RELEASE_REPO" <<'PY'
+import json, sys, urllib.request
+repo = sys.argv[1]
+with urllib.request.urlopen(f"https://api.github.com/repos/{repo}/releases/latest", timeout=30) as response:
+    print(json.load(response)["tag_name"])
+PY
+  else
+    case "$requested" in
+      v*) printf '%s\n' "$requested" ;;
+      *) printf 'v%s\n' "$requested" ;;
+    esac
+  fi
+}
+
+prepare_release() {
+  local requested=${1:-$RELEASE_VERSION} stage=${2:-}
+  RELEASE_TAG=$(resolve_release_tag "$requested") || die "could not resolve release $requested"
+  RELEASE_TAG=${RELEASE_TAG//$'\r'/}
+  RELEASE_TAG=${RELEASE_TAG//$'\n'/}
+  RELEASE_VERSION_NUMBER=${RELEASE_TAG#v}
+  if [ -z "$stage" ]; then stage=$(mktemp -d); fi
+  RELEASE_PACKAGE="$stage/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
+  RELEASE_CHECKSUM="$RELEASE_PACKAGE.sha256"
+  local base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
+  if [ "$DRY" = 1 ]; then
+    echo "+ curl --fail --location --retry 3 --output $RELEASE_PACKAGE $base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
+    echo "+ curl --fail --location --retry 3 --output $RELEASE_CHECKSUM $base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz.sha256"
+    RELEASE_ROOT=$stage
+    return
+  fi
+  curl -fsSL --retry 3 -o "$RELEASE_PACKAGE" "$base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz" || die "failed to download $RELEASE_TAG package"
+  curl -fsSL --retry 3 -o "$RELEASE_CHECKSUM" "$base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" || die "failed to download package checksum"
+  sed 's#  dist/#  #g' "$RELEASE_CHECKSUM" > "$RELEASE_CHECKSUM.normalized"
+  (cd "$stage" && sha256sum -c "$(basename "$RELEASE_CHECKSUM.normalized")") || die "package checksum mismatch"
+  mkdir -p "$stage/root"
+  tar -xzf "$RELEASE_PACKAGE" -C "$stage/root" || die "invalid release package"
+  RELEASE_ROOT=$(find "$stage/root" -mindepth 1 -maxdepth 1 -type d | head -1)
+  [ -n "$RELEASE_ROOT" ] || die "release package has no component directory"
+  [ -f "$RELEASE_ROOT/VERSION" ] || die "release package has no VERSION file"
+}
 latest_backup() { # the newest backup this script made: KIND-YYYYmmddTHHMMSSZ
   find "$PREFIX/backup" -maxdepth 1 -type d -name "$1-[0-9]*T[0-9]*Z" 2>/dev/null | sort | tail -1
 }
@@ -39,30 +85,69 @@ on_node() { # this script, run on the node over ssh
 }
 
 scheduler_upgrade() {
-  local bin=${1:-target/release} b; b=$PREFIX/backup/bin-$(stamp)
-  for f in fleet-scheduler fleetctl fleet-mcp; do [ -x "$bin/$f" ] || die "$bin/$f is not built"; done
-  run mkdir -p "$b"; run cp -a "$PREFIX"/bin/{fleet-scheduler,fleetctl,fleet-mcp} "$b/"
-  # The scheduler finishes in-flight calls before it exits, so stopping can take ~90s.
+  local source=${1:-$RELEASE_VERSION} bin b; b=$PREFIX/backup/bin-$(stamp)
+  local package_image=""
+  if [ -d "$source" ]; then
+    bin=$source
+  else
+    local stage; stage=$(mktemp -d)
+    prepare_release "$source" "$stage"
+    bin=$RELEASE_ROOT/bin
+    package_image="$stage/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
+    local image_base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
+    if [ "$DRY" = 1 ]; then
+      echo "+ curl --fail --location --retry 3 --output $package_image $image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
+    else
+      curl -fsSL --retry 3 -o "$package_image" "$image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz" || die "release has no scheduler image package"
+      local image_checksum="$package_image.sha256"
+      curl -fsSL --retry 3 -o "$image_checksum" "$image_base/zkm-fleet-scheduler-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" || die "failed to download scheduler image checksum"
+      sed 's#  dist/#  #g' "$image_checksum" > "$image_checksum.normalized"
+      (cd "$(dirname "$package_image")" && sha256sum -c "$(basename "$image_checksum.normalized")") || die "scheduler image checksum mismatch"
+    fi
+  fi
+  if [ "$DRY" != 1 ]; then
+    for f in fleet-scheduler fleetctl fleet-mcp; do [ -x "$bin/$f" ] || die "$bin/$f is not built or packaged"; done
+  fi
+  run mkdir -p "$b"
+  run cp -a "$PREFIX"/bin/{fleet-scheduler,fleetctl,fleet-mcp} "$b/"
+  if [ -n "$package_image" ] && [ "$DRY" != 1 ]; then
+    run docker save zkm-fleet-scheduler:local -o "$b/scheduler-image.tar.gz"
+  fi
   run sudo systemctl stop "$MCP_UNIT" "$SCHEDULER_UNIT"
-  run install -m 755 "$bin"/fleet-scheduler "$bin"/fleetctl "$bin"/fleet-mcp "$PREFIX/bin/"
+  if [ -n "$package_image" ] && [ "$DRY" != 1 ]; then
+    run docker load -i "$package_image"
+    run docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d --no-deps --force-recreate scheduler mcp
+  else
+    run install -m 755 "$bin"/fleet-scheduler "$bin"/fleetctl "$bin"/fleet-mcp "$PREFIX/bin/"
+  fi
   run sudo systemctl start "$SCHEDULER_UNIT" "$MCP_UNIT"
   [ "$DRY" = 1 ] || for _ in $(seq 30); do curl -fs -o /dev/null http://127.0.0.1:9191/healthz && break; sleep 2; done
   [ "$DRY" = 1 ] || curl -fs -o /dev/null http://127.0.0.1:9191/healthz || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
-  echo "scheduler upgraded; previous binaries in $b"
+  echo "scheduler upgraded to ${RELEASE_TAG:-local binaries}; previous binaries in $b"
 }
 scheduler_rollback() {
   local b; b=$(latest_backup bin); [ -n "$b" ] || die "no backup in $PREFIX/backup"
   run sudo systemctl stop "$MCP_UNIT" "$SCHEDULER_UNIT"
+  if [ -f "$b/scheduler-image.tar.gz" ] && [ "$DRY" != 1 ]; then
+    run docker load -i "$b/scheduler-image.tar.gz"
+  fi
   run install -m 755 "$b"/{fleet-scheduler,fleetctl,fleet-mcp} "$PREFIX/bin/"
   run sudo systemctl start "$SCHEDULER_UNIT" "$MCP_UNIT"
   echo "restored $b"
 }
 
-node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], all local to where this runs
-  local bin=$1 bridge=$2 proof_app=${3:-}
-  # A dry run never ships the files, so on the node there is nothing to check.
-  if ! { [ "$DRY" = 1 ] && [ "${FLEET_CTL_ON_NODE:-0}" = 1 ]; }; then
-    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge [FLEET_PROOF_APP_BINARY]"
+node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], or node upgrade RELEASE_TAG
+  local bin=${1:-} bridge=${2:-} proof_app=${3:-}
+  if [ -n "$bin" ] && [ ! -f "$bin" ]; then
+    local stage; stage=$(mktemp -d)
+    prepare_release "$bin" "$stage"
+    bin=$RELEASE_ROOT/bin/fleet-node
+    bridge=$RELEASE_ROOT/bridge
+    proof_app=$RELEASE_ROOT/bin/fleet-proof-app
+  fi
+  # A dry run never ships or validates downloaded files.
+  if [ "$DRY" != 1 ]; then
+    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge [FLEET_PROOF_APP_BINARY] or node upgrade RELEASE_TAG"
     [ -z "$proof_app" ] || [ -f "$proof_app" ] || die "no fleet-proof-app binary $proof_app"
   fi
   if remote; then # ship them, then upgrade on the node
