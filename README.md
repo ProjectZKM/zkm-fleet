@@ -4,7 +4,7 @@
 
 Fleet: A universal schedules apps and batch jobs on shared GPU/CPU machines.
 
-- **Apps** keep proof workers or serving containers running.
+- **Apps** keep containers running: a model server, or a Ziren prover with its program.
 - **Batches** run finite commands and release resources when cleanup finishes.
 
 ## Architecture
@@ -18,9 +18,10 @@ quotas, placement and lifecycle; workers own their application data and pipeline
 The [code model](docs/reference.md#code-names) uses jobs, app deployments and a
 workload controller. Shared records come from protobuf; Kubernetes is not required.
 
-App owners manage workload metadata, priority, enable/disable and
-scaling with namespace tokens holding the `manage` permission. Administrators
-manage namespace quotas, access, batch mount roots and runtime users, and service
+App owners create apps and manage workload metadata, priority, enable/disable and
+scaling with namespace tokens holding the `manage` permission; the scheduler picks
+each app's node. Administrators
+manage namespace quotas, access, batch mount roots and runtime users, and app
 execution settings; owner changes remain subject to namespace and tag limits.
 
 EthProofs prepares witnesses, proves locally and reports from one integrated app

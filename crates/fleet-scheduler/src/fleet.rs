@@ -18,7 +18,7 @@ use crate::config::SchedulerConfig;
 use crate::placement::{self, AnchorPolicy, AppPolicy, PlacementDecision, PlacementCandidate, SchedulingClass};
 use crate::quota::{Allocation, Quota, Usage};
 use crate::store::{normalize_address, App, ProofJob, ProofJobState, Namespace, Store, Token};
-use fleet_proto::model::v1::RegisterAppRequest;
+use fleet_proto::model::v1::AppProof;
 
 
 /// How an attempt failed, which decides whether it counts and what it says about the node.
@@ -249,18 +249,19 @@ impl Scheduler {
         Ok(serde_json::json!({"namespace":namespace,"name":name,"priority":priority}))
     }
 
-    /// Registers a program as an app of the namespace: from then on its jobs are accepted (the
-    /// ELF itself arrives with the first one). Its policy says where they are placed.
-    pub async fn add_app(&self, reference: &str, r: &RegisterAppRequest) -> anyhow::Result<App> {
+    /// Records the program app `name` of the namespace proves: from then on its jobs are
+    /// accepted, and wait for its prover (the ELF itself arrives with the first one). Its policy
+    /// says where they are placed.
+    pub async fn add_app(&self, reference: &str, name: &str, priority: i32, r: &AppProof) -> anyhow::Result<App> {
         let _ops = self.app_ops.write().await;
         let namespace = self.namespace(reference).ok_or_else(|| {
             refuse(404, "unknown namespace; an administrator must create it first".into())
         })?;
         if namespace.suspended_ms.is_some() { return Err(refuse(403, "namespace is suspended".into())); }
-        if !valid_app_name(&r.name) {
+        if !valid_app_name(name) {
             return Err(refuse(400, "name: letters, digits, _ . -, at most 63".into()));
         }
-        let elf_id = r.elf_id.as_deref().unwrap_or("").trim().trim_start_matches("0x").to_ascii_lowercase();
+        let elf_id = r.elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
         if !valid_elf_id(&elf_id) {
             return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into()));
         }
@@ -277,19 +278,19 @@ impl Scheduler {
         }
         let max_queued = r.max_queued.unwrap_or(64);
         if max_queued == 0 { return Err(refuse(400, "max_queued must be at least 1".into())); }
-        if self.app_known(&namespace.id, &r.name) {
-            return Err(refuse(409, format!("app {} exists", r.name)));
+        if self.app_known(&namespace.id, name) {
+            return Err(refuse(409, format!("app {name} exists")));
         }
         if let Some(other) = self.app_for_elf(&namespace.id, &elf_id) {
             return Err(refuse(409, format!("program {elf_id} is app {} of this namespace already", other.name)));
         }
         let app = App {
-            namespace: namespace.id.clone(), name: r.name.clone(), elf_id, priority: r.priority.unwrap_or(0),
+            namespace: namespace.id.clone(), name: name.into(), elf_id, priority,
             disabled: false, created_ms: now_ms(), class, anchor, backends: r.backends.clone(),
             zkm_version: r.zkm_version.clone().filter(|v| !v.is_empty()), max_queued, ..Default::default()
         };
         if !self.store.add_app(&app).await? {
-            return Err(refuse(409, format!("app {} or its program exists", r.name)));
+            return Err(refuse(409, format!("app {name} or its program exists")));
         }
         self.apps.lock().insert((app.namespace.clone(), app.name.clone()), app.clone());
         tracing::info!(app = %app.name, elf = %app.elf_id, "app registered");
@@ -508,10 +509,10 @@ impl Scheduler {
     pub async fn reserve_job(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64, restore: bool,
     ) -> anyhow::Result<Allocation> {
         let _ops = self.quota_ops.lock().await;
-        let service_id = id.strip_prefix("service:");
-        anyhow::ensure!(service_id.map_or_else(|| blobs::is_safe_id(id), blobs::is_safe_id), "invalid job/app id");
+        let deployment = id.strip_prefix("deployment:");
+        anyhow::ensure!(deployment.map_or_else(|| blobs::is_safe_id(id), blobs::is_safe_id), "invalid job/app id");
         let n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
-        let prefix = if service_id.is_some() { "" } else { "job:" };
+        let prefix = if deployment.is_some() { "" } else { "job:" };
         let a = Allocation { id: format!("{prefix}{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus,
         };
         let previous = self.allocations.lock().get(&a.id).cloned();
@@ -526,7 +527,7 @@ impl Scheduler {
 
     pub async fn release_job(&self, namespace: &str, id: &str) -> anyhow::Result<()> {
         let _ops = self.quota_ops.lock().await;
-        let key = if id.starts_with("service:") { id.to_string() } else { format!("job:{id}") };
+        let key = if id.starts_with("deployment:") { id.to_string() } else { format!("job:{id}") };
         anyhow::ensure!(self.allocations.lock().get(&key).is_none_or(|a| a.namespace == namespace), "allocation belongs to another namespace or tag");
         self.release_quota(&key).await
     }

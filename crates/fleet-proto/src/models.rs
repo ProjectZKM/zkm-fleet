@@ -287,55 +287,63 @@ impl PreemptionPlan {
 }
 
 impl RegisterAppRequest {
-    /// The settings of an app's services.yaml entry it may be registered with. The scheduler
-    /// adds its name, kind, namespace, tag and priority, and registers it disabled.
-    pub const SPEC_SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
-        "port_base", "health_path", "workdir", "volumes", "env", "user"];
+    /// Settings every app's spec may give; the scheduler adds its name, namespace, tag,
+    /// priority and program, and creates it disabled.
+    pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
+        "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
+    /// Settings only a container app's spec (`kind: app`) may give.
+    pub const CONTAINER_SETTINGS: [&'static str; 5] = ["command", "port_base", "health_path", "workdir", "user"];
+    /// Settings only a prover's spec (`kind: ziren-gpu` or `ziren-cpu`) may give.
+    pub const PROVER_SETTINGS: [&'static str; 3] = ["proof_storage_root", "backend", "rust_log"];
 
-    /// The app is registered by its container, which the scheduler places, rather than by the
-    /// program its node-configured provers prove.
-    pub fn has_spec(&self) -> bool {
-        self.spec.is_some()
+    /// The runtime of the app's container: `app` unless it proves a program, which a Ziren GPU
+    /// prover does unless the spec asks for a CPU one.
+    pub fn kind(&self) -> &str {
+        self.spec.get("kind").and_then(Value::as_str)
+            .unwrap_or(if self.proof.is_some() { "ziren-gpu" } else { "app" })
     }
 
-    /// That the request names the app's container or its program, not both. The program and
-    /// its policy are checked where the app is registered; the container's settings here,
-    /// before the app is recorded, since a setting the node refuses later would leave an app
-    /// record with no service behind it.
+    /// That the spec is an object of known, well-typed settings for its kind, and that a
+    /// prover, and only a prover, has a program. The program and its policy are checked where
+    /// the app is registered; the settings here, before the app is recorded, since a setting the
+    /// node refuses later would leave an app record with nothing behind it.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.has_spec() {
-            anyhow::ensure!(
-                self.elf_id.as_deref().is_some_and(|e| !e.is_empty()),
-                "an app needs its container (spec) or the program its provers prove (elf_id)"
-            );
-            return Ok(());
-        }
-        // A prover's container needs the node's prover configuration, so it is still
-        // configured on its node.
-        anyhow::ensure!(
-            self.elf_id.is_none() && self.class.is_none() && self.anchor.is_none() && self.backends.is_empty()
-                && self.zkm_version.is_none() && self.max_queued.is_none(),
-            "an app's spec takes no proof program or policy (elf_id, class, anchor, backends, zkm_version, max_queued)"
-        );
         anyhow::ensure!(
             !self.name.is_empty() && self.name.len() <= 63
                 && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
             "invalid app name: letters, digits, _ . -, at most 63"
         );
-        let spec = self.spec.as_deref().and_then(Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("spec must be a JSON object of settings"))?;
-        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str())) {
-            anyhow::bail!("unknown app setting {key}; an app's spec takes {}", Self::SPEC_SETTINGS.join(", "));
+        let spec = self.spec.as_object().ok_or_else(|| anyhow::anyhow!("spec must be a JSON object of settings"))?;
+        let kind = self.kind();
+        let own: &[&str] = match kind {
+            "app" => &Self::CONTAINER_SETTINGS,
+            "ziren-gpu" | "ziren-cpu" => &Self::PROVER_SETTINGS,
+            _ => anyhow::bail!("kind must be app, ziren-gpu or ziren-cpu"),
+        };
+        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str()) && !own.contains(&k.as_str())) {
+            anyhow::bail!("unknown setting {key} for a {kind} app; it takes {}, {}", Self::SPEC_SETTINGS.join(", "), own.join(", "));
+        }
+        anyhow::ensure!(
+            (kind != "app") == self.proof.is_some(),
+            "a prover (kind ziren-gpu or ziren-cpu) proves a program: give proof with its elf_id, and only for a prover"
+        );
+        if let Some(proof) = &self.proof {
+            anyhow::ensure!(!proof.elf_id.trim().is_empty(), "proof.elf_id is required: the program's id");
         }
         let set = |key: &str| spec.get(key).filter(|v| !v.is_null());
         anyhow::ensure!(
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
+        if kind == "app" {
+            anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
+        }
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
-        let invalid = ["user", "health_path", "workdir"].into_iter().find(|k| set(k).is_some_and(|v| !v.is_string()))
-            .or_else(|| ["cpus", "shm_gb", "port_base"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
+        let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
+        let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()
+                .find(|k| set(k).is_some_and(|v| !v.is_string()))
+            .or_else(|| ["cpus", "shm_gb", "port_base", "stop_timeout_s"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
+            .or_else(|| ["memory_gb", "ready_timeout_s"].into_iter().find(|k| set(k).is_some_and(positive)))
             .or_else(|| ["command", "volumes"].into_iter().find(|k| set(k).is_some_and(strings)))
             .or_else(|| set("replicas").is_some_and(|r| r.as_u64().is_none_or(|r| !(1..=64).contains(&r))).then_some("replicas"))
             .or_else(|| set("gpus").is_some_and(|g| g.as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())).then_some("gpus"))
@@ -353,33 +361,34 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn an_app_registers_its_container_or_its_program() {
-        let app = |spec: Value| -> RegisterAppRequest {
-            serde_json::from_value(json!({"name":"model","spec":spec})).unwrap()
+    fn an_app_is_its_container_and_a_prover_also_its_program() {
+        let app = |body: Value| -> anyhow::Result<()> {
+            serde_json::from_value::<RegisterAppRequest>(body)?.validate()
         };
-        let valid = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
-        assert!(app(valid.clone()).has_spec() && app(valid.clone()).validate().is_ok());
+        let container = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
+        app(json!({"name":"model","spec":container})).unwrap();
         for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
-            ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("app"))] {
-            let mut spec = valid.clone();
+            ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("vm")),
+            ("proof_storage_root", json!("/proofs")), ("name", json!("x"))] {
+            let mut spec = container.clone();
             spec[key] = value;
-            assert!(app(spec).validate().is_err(), "{key}");
+            assert!(app(json!({"name":"model","spec":spec})).is_err(), "{key}");
         }
-        let program: RegisterAppRequest = serde_json::from_value(json!({"name":"eth","elf_id":"ab".repeat(32)})).unwrap();
-        assert!(!program.has_spec() && program.validate().is_ok(), "a program's registration is unchanged");
-        let neither: RegisterAppRequest = serde_json::from_value(json!({"name":"eth"})).unwrap();
-        assert!(neither.validate().is_err(), "an app needs its container or its program");
-        let both: RegisterAppRequest = serde_json::from_value(json!({"name":"model","spec":valid,"elf_id":"ab".repeat(32)})).unwrap();
-        assert!(both.validate().is_err(), "a prover's container is configured on its node");
-        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","image":"serve:1"})).is_err(),
-            "settings belong under spec");
-        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","node":"gpu","spec":{}})).is_err(),
-            "the scheduler picks the node");
+        let proof = json!({"elf_id":"ab".repeat(32),"class":"latency"});
+        let prover = json!({"image":"ziren-gpu:1","gpus":1,"proof_storage_root":"/proofs"});
+        app(json!({"name":"eth","spec":prover,"proof":proof})).unwrap();
+        app(json!({"name":"eth","spec":{"kind":"ziren-cpu","image":"ziren-cpu:1","gpus":0},"proof":proof})).unwrap();
+        assert!(app(json!({"name":"eth","spec":prover})).is_err(), "a prover proves a program");
+        assert!(app(json!({"name":"model","spec":container,"proof":proof})).is_err(), "a container app proves none");
+        assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","port_base":1},"proof":proof})).is_err(),
+            "a prover takes no container settings");
+        assert!(app(json!({"name":"eth","elf_id":"ab".repeat(32)})).is_err(), "an app is created from its spec");
+        assert!(app(json!({"name":"model","node":"gpu","spec":container})).is_err(), "the scheduler picks the node");
     }
 
     #[test]
     fn node_reports_share_the_json_and_protobuf_contract() {
-        let source = json!({"version":2,"machine":"gpu","ready":true,
+        let source = json!({"version":3,"machine":"gpu","ready":true,
             "total_gpus":8,"total_cpus":64,"free_gpus":6,"free_cpus":32,
             "batches":{"training":{"image":"app","counter":u64::MAX}},
             "jobs":[{"id":"job","lease":"attempt","status":{"state":"running"},
@@ -388,7 +397,7 @@ mod tests {
         let decoded = NodeReport::decode(report.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, report);
         assert_eq!(decoded.batches["training"]["counter"], json!(u64::MAX));
-        assert!(serde_json::from_value::<NodeReport>(json!({"version":2,"unknown":true})).is_err());
+        assert!(serde_json::from_value::<NodeReport>(json!({"version":3,"unknown":true})).is_err());
     }
 
     #[test]

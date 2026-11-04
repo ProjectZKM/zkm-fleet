@@ -128,15 +128,15 @@ else
     python3 -m venv "$PREFIX/venv"
   fi
   "$PREFIX/venv/bin/pip" install --timeout 120 --retries 10 "$SRC/bridge"
-  [ -f "$ETC/services.yaml" ] || cat > "$ETC/services.yaml" <<EOF
+  [ -f "$ETC/apps.yaml" ] || cat > "$ETC/apps.yaml" <<EOF
 scheduler: $SCHEDULER
 cluster_token_file: $ETC/cluster.token
 node_binary: $PREFIX/bin/fleet-ziren-node
 log_dir: $WORKDIR/logs
-services: [] # configured proof servers and persistent apps for this machine
+apps: [] # configured proof servers and persistent apps for this machine
 EOF
-  if [ -n "$CA" ] && ! grep -q '^scheduler_ca_file:' "$ETC/services.yaml"; then
-    printf '\nscheduler_ca_file: %s\n' "$CA" >> "$ETC/services.yaml"
+  if [ -n "$CA" ] && ! grep -q '^scheduler_ca_file:' "$ETC/apps.yaml"; then
+    printf '\nscheduler_ca_file: %s\n' "$CA" >> "$ETC/apps.yaml"
   fi
   [ -f "$ETC/batches.yaml" ] || echo 'batches: {} # initial operator-managed batches' > "$ETC/batches.yaml"
   mkdir -p "$JOBS_DIR"

@@ -177,8 +177,15 @@ const TEST_ELFS: &[&[u8]] =
 ];
 
 /// The name the tests give the app of a program: `app-<elf id prefix>`.
+/// The tests' name for the app of program `elf_id` in `namespace`: app names are unique across
+/// the fleet.
+fn app_in(namespace: &str, elf_id: &str) -> String {
+    format!("{namespace}-{}", &elf_id[..8])
+}
+
+/// The tests' name for the app of program `elf_id` in the default namespace.
 fn app_named(elf_id: &str) -> String {
-    format!("app-{}", &elf_id[..8])
+    app_in(PROOFS, elf_id)
 }
 
 fn app_of(elf: &[u8]) -> String {
@@ -197,13 +204,14 @@ fn create_namespace(h: &Harness, name: &str, quota: Option<serde_json::Value>) -
 /// tests' provers expect: the biggest prover first, the program kept on its prover.
 fn register(h: &Harness, namespace: &str, elf: &[u8]) -> String {
     let id = fleet_scheduler::blobs::elf_id_of(elf);
-    assert_eq!(register_id(h, namespace, &id), "201", "registering {}", app_named(&id));
+    assert_eq!(register_id(h, namespace, &id), "201", "registering {}", app_in(namespace, &id));
     id
 }
 
 /// Registers program `elf_id` as an app of the namespace; the HTTP status.
 fn register_id(h: &Harness, namespace: &str, elf_id: &str) -> String {
-    let body = serde_json::json!({"name": app_named(elf_id), "elf_id": elf_id, "class": "latency", "anchor": "exclusive"});
+    let body = serde_json::json!({"name": app_in(namespace, elf_id), "spec": {"image": "ziren-gpu:test"},
+        "proof": {"elf_id": elf_id, "class": "latency", "anchor": "exclusive"}});
     admin_curl(h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "content-type: application/json",
         "-d", &body.to_string(), &format!("{}/apps?namespace={namespace}", h.http)])
 }
@@ -274,8 +282,9 @@ async fn add_node_app_session(h: &Harness, name: &str, gpus: u32, fail_first: bo
     };
     let mut ctl = ControlServiceClient::with_interceptor(channel.clone(), auth);
     let body = admin_curl(h, &[&format!("{}/namespaces/{namespace}", h.http)]);
-    let namespace = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
     let elf_id = fleet_scheduler::blobs::elf_id_of(elf);
+    let app = app_in(namespace, &elf_id);
+    let namespace = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
     let id = ctl
         .register(RegisterRequest {
             node: Some(NodeInfo {
@@ -288,7 +297,7 @@ async fn add_node_app_session(h: &Harness, name: &str, gpus: u32, fail_first: bo
                 machine: "test".into(),
                 control_version: 1,
                 app_namespace: namespace,
-                app: app_named(&elf_id),
+                app,
                 app_elf_id: elf_id,
             }),
         })
@@ -589,7 +598,7 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     h.stage.generate_proof(request("job-d", b"elf-d")).await.unwrap();
     assert_eq!(wait_done(&mut h, "job-d").await.status, S::Success as i32);
     let app = registered_app(&h, b"elf-d");
-    assert_eq!((app["kind"].as_str(), app["jobs"]["total"].as_u64()), (Some("app"), Some(1)));
+    assert_eq!((app["proof"].is_object(), app["jobs"]["total"].as_u64()), (true, Some(1)));
     let url = format!("{}/apps/{}?namespace={PROOFS}", h.http, app_of(b"elf-d"));
     let gone = admin_curl(&h, &["-X", "DELETE", &url]);
     let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
@@ -637,11 +646,12 @@ async fn a_job_runs_only_for_a_registered_app() {
         admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", "-H", "content-type: application/json",
             "-d", &body.to_string(), &format!("{}/apps?namespace={PROOFS}", h.http)])
     };
-    assert_eq!(post(serde_json::json!({"name": app_named(&id), "elf_id": "f".repeat(64)})), "409", "a name is registered once");
-    assert_eq!(post(serde_json::json!({"name": "again", "elf_id": id})), "409", "a program is one app of the namespace");
-    assert_eq!(post(serde_json::json!({"name": "slow", "elf_id": "f".repeat(64), "class": "slow"})), "400", "no such class");
-    assert_eq!(post(serde_json::json!({"name": "short", "elf_id": "abc"})), "400", "not a program id");
-    assert_eq!(post(serde_json::json!({"name": "a/b", "elf_id": "f".repeat(64)})), "400", "not a name");
+    let prover = |name: &str, proof: serde_json::Value| serde_json::json!({"name": name, "spec": {"image": "ziren-gpu:test"}, "proof": proof});
+    assert_eq!(post(prover(&app_named(&id), serde_json::json!({"elf_id": "f".repeat(64)}))), "409", "a name is registered once");
+    assert_eq!(post(prover("again", serde_json::json!({"elf_id": id}))), "409", "a program is one app of the namespace");
+    assert_eq!(post(prover("slow", serde_json::json!({"elf_id": "f".repeat(64), "class": "slow"}))), "400", "no such class");
+    assert_eq!(post(prover("short", serde_json::json!({"elf_id": "abc"}))), "400", "not a program id");
+    assert_eq!(post(prover("a/b", serde_json::json!({"elf_id": "f".repeat(64)}))), "400", "not a name");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -726,7 +736,6 @@ async fn user_tokens_scope_apps_jobs_and_revocation() {
     let mut h = start().await;
     // Namespace-specific nodes are registered after their namespaces are created below.
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
-    let app = app_named(&elf);
     let keys: Vec<_> = [11u8, 12].iter().map(|v| k256::ecdsa::SigningKey::from_slice(&[*v; 32]).unwrap()).collect();
     let addresses: Vec<_> = keys.iter().map(|k| {
             format!("{:x}", alloy_primitives::Address::from_public_key(k.verifying_key()))
@@ -738,7 +747,7 @@ async fn user_tokens_scope_apps_jobs_and_revocation() {
         register(&h, &ns, b"elf");
         let token_id = format!("{:02x}", i + 1).repeat(16);
         let body = serde_json::json!({"id": token_id, "namespace": ns, "address": addresses[i], "label": format!("user-{i}"),
-            "apps": [app, "training"], "token_hash": hex::encode(sha2::Sha256::digest(tokens[i].as_bytes()))});
+            "apps": [app_in(&ns, &elf), "training"], "token_hash": hex::encode(sha2::Sha256::digest(tokens[i].as_bytes()))});
         let created = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body.to_string(),
             &format!("{}/tokens", h.http),
             ],
@@ -782,15 +791,15 @@ async fn user_tokens_scope_apps_jobs_and_revocation() {
             }, &tokens[0],
         )).await.unwrap().into_inner();
     assert_eq!(rejection.status, S::InvalidParameter as i32);
-    let job = format!("/apps/{app}/jobs/user-0");
+    let job = format!("/apps/{}/jobs/user-0", app_in("user-0", &elf));
     assert_eq!(user_http(&h, &tokens[0], "GET", &job).0, 200);
     assert_eq!(user_http(&h, &tokens[1], "GET", &job).0, 404);
-    assert_eq!(user_http(&h, &tokens[0], "GET", &format!("/apps/{}/jobs/user-0", app_of(b"elf-r"))).0, 403, "not granted");
+    assert_eq!(user_http(&h, &tokens[0], "GET", &format!("/apps/{}/jobs/user-0", app_in("user-0", &fleet_scheduler::blobs::elf_id_of(b"elf-r")))).0, 403, "not granted");
     assert_eq!(user_http(&h, &tokens[0], "GET", "/tokens").0, 403);
     assert_eq!(user_http(&h, &tokens[0], "GET", "/status").0, 403);
     assert_eq!(user_http(&h, &tokens[0], "POST", "/apps").0, 403);
-    assert_eq!(user_http(&h, &tokens[0], "PUT", &format!("/apps/{app}/priority")).0, 403);
-    let (_, body) = user_http(&h, &tokens[1], "GET", &format!("/apps/{app}/jobs?limit=1"));
+    assert_eq!(user_http(&h, &tokens[0], "PUT", &format!("/apps/{}/priority", app_in("user-0", &elf))).0, 403);
+    let (_, body) = user_http(&h, &tokens[1], "GET", &format!("/apps/{}/jobs?limit=1", app_in("user-1", &elf)));
     let jobs: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(jobs.as_array().unwrap().len(), 1);
     assert_eq!(jobs[0]["owner"], addresses[1]);
@@ -850,11 +859,11 @@ async fn bearer_tokens_authorize_proof_submission_and_status_without_client_cert
     )).await.unwrap().into_inner();
     assert_eq!(foreign.status, S::Unspecified as i32);
 
-    let proof_path = format!("/apps/{}/jobs/bearer-proof/output/proof.json", app_named(&elf));
+    let proof_path = format!("/apps/{}/jobs/bearer-proof/output/proof.json", app_in("alice", &elf));
     let proof_path = proof_path.as_str();
     assert_eq!(user_http(&h,&alice_token,"GET",proof_path).0,200);
     assert_eq!(user_http(&h,&bob_token,"GET",proof_path).0,404);
-    assert_eq!(user_http(&h,&alice_token,"GET",&format!("/apps/{}/jobs/bearer-proof/output/stdin.bin", app_named(&elf))).0,404);
+    assert_eq!(user_http(&h,&alice_token,"GET",&format!("/apps/{}/jobs/bearer-proof/output/stdin.bin", app_in("alice", &elf))).0,404);
     std::fs::remove_dir_all(h._dir.path().join("data/proofs")).unwrap();
     let missing = user_http(&h,&alice_token,"GET",proof_path);
     assert_eq!(missing.0,404);
@@ -892,7 +901,7 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
                 worker_id: "storage-agent".into(), session: "storage-session".into(), proof_fetch_ready: true,
                 report: Some(
                     serde_json::from_value(
-                        serde_json::json!({"version":2,"machine":"test","ready":true,
+                        serde_json::json!({"version":3,"machine":"test","ready":true,
                     "total_gpus":8,"total_cpus":48,"free_gpus":8,"free_cpus":48}),
                     ).unwrap(),
                 ),
@@ -922,7 +931,7 @@ async fn app_endpoint_reads_local_outputs_without_machine_fetch_heartbeats() {
     let h = start().await;
     create_namespace(&h, "alice", None);
     let elf=fleet_scheduler::blobs::elf_id_of(b"elf");
-    let app_name=app_named(&elf);
+    let app_name=app_in("alice",&elf);
     let (key,_,token)=tag_token(&h,"alice",Some("scope=research"),81,&elf);
     let (_,_,foreign)=tag_token(&h,"alice",Some("scope=production"),82,&elf);
     let (_, _, proof_node) = add_node_app_session(&h,"app-prover",2,false,150,tonic::Code::Internal,"alice", b"elf",
@@ -1042,10 +1051,11 @@ fn namespace_token(h: &Harness, namespace: &str, seed: u8, elf_id: &str,
 async fn apps_require_admin_created_namespaces_and_mutations_are_namespace_local() {
     let mut h = start().await;
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
-    let app = app_named(&elf);
+    let app = app_in("alice", &elf);
     for (selector, expected) in [("", "400"), ("?namespace=missing", "404")] {
         let code = admin_curl(&h, &["-X", "POST", "-o", "/dev/null", "-w", "%{http_code}", "-H", "content-type: application/json",
-            "-d", &serde_json::json!({"name": app, "elf_id": elf}).to_string(), &format!("{}/apps{selector}", h.http)]);
+            "-d", &serde_json::json!({"name": app, "spec": {"image": "ziren-gpu:test"}, "proof": {"elf_id": elf}}).to_string(),
+            &format!("{}/apps{selector}", h.http)]);
         assert_eq!(code, expected);
     }
     for name in ["alice", "bob"] {
@@ -1092,7 +1102,7 @@ fn tag_token(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id: &str
     let address = format!("{:x}", alloy_primitives::Address::from_public_key(key.verifying_key()));
     let token = format!("{seed:02x}").repeat(48);
     let body = serde_json::json!({"id": format!("{seed:02x}").repeat(16), "namespace": namespace, "tag":tag, "address": address,
-        "apps": [app_named(elf_id), "training"], "label": namespace,
+        "apps": [app_in(namespace, elf_id), "training"], "label": namespace,
         "token_hash": hex::encode(sha2::Sha256::digest(token.as_bytes()))});
     let created = admin_curl(h, &["-X", "POST", "-H", "content-type: application/json", "-d", &body.to_string(),
         &format!("{}/tokens", h.http),
@@ -1107,7 +1117,7 @@ fn tag_token(h: &Harness,namespace: &str,tag: Option<&str>,seed: u8,elf_id: &str
 async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
     let mut h = start().await;
     let elf = fleet_scheduler::blobs::elf_id_of(b"elf");
-    let app = app_named(&elf);
+    let (app, bob_app) = (app_in("alice", &elf), app_in("bob", &elf));
     for name in ["alice", "bob"] {
         assert!(create_namespace(&h, name, None)["id"].is_string());
     }
@@ -1144,12 +1154,12 @@ async fn namespace_rotation_preserves_jobs_and_suspension_blocks_every_key() {
     assert_eq!(jobs.len(), 2);
     assert_ne!(jobs[0], jobs[1], "nodes use distinct internal ids");
     let (_, a_json) = user_http(&h, &old_token, "GET", &format!("/apps/{app}/jobs/same-id"));
-    let (_, b_json) = user_http(&h, &bob_token, "GET", &format!("/apps/{app}/jobs/same-id"));
+    let (_, b_json) = user_http(&h, &bob_token, "GET", &format!("/apps/{bob_app}/jobs/same-id"));
     let a: serde_json::Value = serde_json::from_str(&a_json).unwrap();
     let b: serde_json::Value = serde_json::from_str(&b_json).unwrap();
     assert_ne!(a["id"], b["id"]);
     assert_ne!(a["namespace"], b["namespace"]);
-    assert_eq!(user_http(&h, &bob_token, "GET", &format!("/apps/{app}/jobs/{}", a["id"].as_str().unwrap())).0, 404);
+    assert_eq!(user_http(&h, &bob_token, "GET", &format!("/apps/{bob_app}/jobs/{}", a["id"].as_str().unwrap())).0, 404);
     assert_eq!(user_http(&h, &bob_token, "GET", &format!("/apps/{app}/jobs/same-id?namespace=alice")).0, 403);
     let (new_key, _, new_token) = namespace_token(&h, "alice", 23, &elf);
     let repeated = h.stage.generate_proof(with_bearer(signed_request("same-id", b"elf", &new_key), &new_token,
@@ -1222,7 +1232,7 @@ async fn namespace_resource_quota_is_shared_by_proofs_batches_and_rotated_keys()
     assert_eq!(r.status, S::Computing as i32);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0, "a run reservation leaves no quota for a proof");
-    let (_, record) = user_http(&h, &token, "GET", &format!("/apps/{}/jobs/proof-quota", app_named(&elf)));
+    let (_, record) = user_http(&h, &token, "GET", &format!("/apps/{}/jobs/proof-quota", app_in("alice", &elf)));
     assert_eq!(serde_json::from_str::<serde_json::Value>(&record).unwrap()["state"], "queued");
     let (_, access) = user_http(&h, &replacement_token, "GET", "/access");
     let access: serde_json::Value = serde_json::from_str(&access).unwrap();
@@ -1323,7 +1333,7 @@ async fn tags_isolate_proofs_and_enforce_both_resource_caps() {
     let mut h=start().await;
     create_namespace(&h, "billing", Some(serde_json::json!({"gpus":2,"cpus":16})));
     let elf=fleet_scheduler::blobs::elf_id_of(b"elf");
-    let jobs=format!("/apps/{}/jobs", app_named(&elf));
+    let jobs=format!("/apps/{}/jobs", app_in("billing", &elf));
     let (ka,_,ta)=tag_token(&h,"billing",Some("scope=research"),51,&elf);
     let (kb,_,tb)=tag_token(&h,"billing",Some("scope=production"),52,&elf);
     let (_,_,replacement)=tag_token(&h,"billing",Some("scope=research"),53,&elf);
@@ -1455,24 +1465,26 @@ async fn namespace_owner_can_manage_every_app_only_in_its_namespace() {
         &format!("{}/tokens", h.http),
         ],
     );
-    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app_of(b"owner-managed-app"))).0, 200);
-    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app_of(b"another-app"))).0, 200);
-    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}?namespace=other-scope", app_of(b"owner-managed-app"))).0, 403);
-    assert!(admin_curl(&h, &[&format!("{}/apps/{}?namespace=other-scope", h.http, app_of(b"owner-managed-app"))]).contains("\"kind\":\"app\""));
+    let app = |namespace: &str, elf: &[u8]| app_in(namespace, &fleet_scheduler::blobs::elf_id_of(elf));
+    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app("owner-scope", b"owner-managed-app"))).0, 200);
+    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{}", app("owner-scope", b"another-app"))).0, 200);
+    let other = app("other-scope", b"owner-managed-app");
+    assert_eq!(user_http(&h, &bearer, "DELETE", &format!("/apps/{other}?namespace=other-scope")).0, 403);
+    assert!(admin_curl(&h, &[&format!("{}/apps/{other}?namespace=other-scope", h.http)]).contains("\"proof\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn persistent_service_reservations_count_against_namespace_quota() {
+async fn app_reservations_count_against_namespace_quota() {
     let h = start().await;
-    let ns = create_namespace(&h, "service-budget", None);
+    let ns = create_namespace(&h, "app-budget", None);
     let id = ns["id"].as_str().unwrap();
     let quota = serde_json::json!({"gpus": 2.0, "cpus": 8.0}).to_string();
     admin_curl(&h, &["-X", "PUT", "-H", "content-type: application/json", "-d", &quota,
         &format!("{}/namespaces/{id}/quota", h.http),
         ],
     );
-    let service = serde_json::json!({"id":"service:ethproofs-gpu-0", "tag":"scope=default", "gpus":1.0, "cpus":4.0});
-    let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &service.to_string(),
+    let deployment = serde_json::json!({"id":"deployment:ethproofs-gpu-0", "tag":"scope=default", "gpus":1.0, "cpus":4.0});
+    let status = admin_curl(&h, &["-X", "POST", "-H", "content-type: application/json", "-d", &deployment.to_string(),
         "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/namespaces/{id}/allocations", h.http),
         ],
     );
@@ -1482,9 +1494,9 @@ async fn persistent_service_reservations_count_against_namespace_quota() {
         "-o", "/dev/null", "-w", "%{http_code}", &format!("{}/namespaces/{id}/allocations", h.http),
         ],
     );
-    assert_eq!(status, "429", "persistent service capacity must reduce available quota");
+    assert_eq!(status, "429", "an app's reserved capacity must reduce available quota");
     let status = admin_curl(&h, &["-X", "DELETE", "-o", "/dev/null", "-w", "%{http_code}",
-        &format!("{}/allocations/service:ethproofs-gpu-0", h.http),
+        &format!("{}/allocations/deployment:ethproofs-gpu-0", h.http),
         ],
     );
     assert_eq!(status, "204");
@@ -1504,7 +1516,7 @@ async fn machine_heartbeat_requires_cluster_token_and_populates_control_plane_no
     let h = start().await;
     let mut worker = WorkerServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port)).await.unwrap();
     let report = serde_json::from_value::<fleet_proto::model::v1::NodeReport>(serde_json::json!({
-        "version": 2, "machine": "gpu-machine", "ready": true,
+        "version": 3, "machine": "gpu-machine", "ready": true,
         "total_gpus": 8, "total_cpus": 48, "free_gpus": 8, "free_cpus": 48,
     })).unwrap();
     let heartbeat = || WorkerHeartbeatRequest { worker_id: "gpu-1".into(), session: "agent-session".into(),
@@ -1533,10 +1545,10 @@ async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
     let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port)).unwrap().connect().await.unwrap();
     let mut agent = WorkerServiceClient::with_interceptor(channel, fleet_scheduler::token::BearerTokenInterceptor::new(TOKEN).unwrap(),
     );
-    let report = serde_json::json!({"version":2,"machine":"test","ready":true,
+    let report = serde_json::json!({"version":3,"machine":"test","ready":true,
         "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"batches":{},
-        "services":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
-            "app":app_named(&elf),"elf_id":elf,"worker_command":["/opt/eth-proofs"],
+        "apps":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
+            "app":app_in("alice", &elf),"elf_id":elf,"worker_command":["/opt/eth-proofs"],
             "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});
     agent.heartbeat(WorkerHeartbeatRequest {worker_id:"integrated-worker".into(),session:"session".into(),
             report: Some(serde_json::from_value(report).unwrap()),proof_fetch_ready:false,

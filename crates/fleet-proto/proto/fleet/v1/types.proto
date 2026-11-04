@@ -40,10 +40,10 @@ message ProofFetch {
   ArtifactRef reference = 7;
 }
 
-// Asks a node for the last `lines` lines of one app service's log.
+// Asks a node for the last `lines` lines of the log of one of its apps.yaml entries.
 message LogRequest {
   string ticket = 1;
-  string service = 2;
+  string entry = 2;
   uint32 lines = 3;
 }
 
@@ -52,15 +52,15 @@ enum NodeOperation {
   NODE_OPERATION_LAUNCH_JOB = 1;
   NODE_OPERATION_CANCEL_JOB = 2;
   NODE_OPERATION_PREEMPT_JOB = 3;
-  // Start or stop a service's replicas as the node's services.yaml configures them
+  // Start or stop an app's replicas as the node's apps.yaml entry configures them
   // (runtime only; NODE_OPERATION_APP writes that configuration).
-  NODE_OPERATION_SET_SERVICE = 4;
+  NODE_OPERATION_SET_APP = 4;
   NODE_OPERATION_PURGE_JOB = 5;
   reserved 6;
   reserved "NODE_OPERATION_STAGE_MODEL";
   // An app-level change for what the node configures: remove an app or a batch, or set its
   // configuration (enabled state, resources, settings). Parameters: {"app": {namespace,
   // namespace_name, name}} or {"batch": {name}} with {"remove": true} or {"set": {...}}, or
-  // {"service": {name}} with {"set": {...}} for the one service a change of an app stops.
+  // {"entry": {name}} with {"set": {...}} for the one apps.yaml entry a change of an app stops.
   NODE_OPERATION_APP = 7;
 }

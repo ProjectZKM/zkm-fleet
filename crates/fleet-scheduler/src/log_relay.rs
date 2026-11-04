@@ -1,4 +1,4 @@
-//! Client-triggered reads of an app service's log, delivered through ordinary machine
+//! Client-triggered reads of an app's log, delivered through ordinary machine
 //! heartbeats. A request lives only as long as the client's call; nothing is stored here.
 use axum::{
     body::to_bytes,
@@ -87,7 +87,7 @@ impl LogRelay {
     pub async fn request(
         &self,
         worker: &str,
-        service: &str,
+        entry: &str,
         lines: u32,
     ) -> Result<Vec<u8>, Status> {
         let _slot = self
@@ -118,7 +118,7 @@ impl LogRelay {
                     session,
                     request: LogRequest {
                         ticket,
-                        service: service.into(),
+                        entry: entry.into(),
                         lines: lines.clamp(1, MAX_LOG_LINES),
                     },
                     delivered: false,
@@ -190,8 +190,8 @@ async fn receive(
     };
     if !error.is_empty() {
         let status = match error.as_str() {
-            "missing" => Status::not_found("this service has no log yet"),
-            "unconfigured" => Status::not_found("this service reports no log file"),
+            "missing" => Status::not_found("this app has no log yet"),
+            "unconfigured" => Status::not_found("this app reports no log file"),
             _ => Status::unavailable("the node could not read the log"),
         };
         let _ = reply.send(Err(status));
@@ -233,7 +233,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        assert_eq!((request.service.as_str(), request.lines), ("svc", MAX_LOG_LINES));
+        assert_eq!((request.entry.as_str(), request.lines), ("svc", MAX_LOG_LINES));
         assert!(relay.heartbeat("gpu", "s1").is_empty(), "delivered once");
         assert_eq!(relay.claim(&request.ticket, "other", "s1").unwrap_err(), StatusCode::FORBIDDEN);
         assert_eq!(relay.claim(&request.ticket, "gpu", "old").unwrap_err(), StatusCode::FORBIDDEN);

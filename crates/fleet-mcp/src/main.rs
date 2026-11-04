@@ -206,21 +206,36 @@ struct AppLogs {
     name: String,
     #[serde(default = "default_log_lines")]
     lines: usize,
-    /// The machine, when the app has services on more than one.
+    /// The machine, when the app runs on more than one.
     node: Option<String>,
 }
 
-/// An app's `RegisterAppRequest` (model.proto) by its container: its name and spec. Its
-/// namespace is the token's; the scheduler picks its node.
+/// An app's `RegisterAppRequest` (model.proto): its name, container spec and, for a prover,
+/// its program and proof policy. Its namespace is the token's; the scheduler picks its node.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CreateApp {
     name: String,
-    /// The app's container settings, the keys of its services.yaml entry: image, command,
-    /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
-    /// image and port_base are required; user and volumes require administrator credentials.
+    /// The app's container settings, the keys of its apps.yaml entry: kind (app, the default,
+    /// or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus, shm_gb, memory_gb, env,
+    /// volumes, ready_timeout_s, stop_timeout_s; for an app also command, port_base, health_path,
+    /// workdir, user; for a prover proof_storage_root, backend, rust_log. image is required, and
+    /// port_base for an app; user, volumes and proof_storage_root require administrator credentials.
     spec: serde_json::Map<String, Value>,
-    /// Priority inherited by the app's replicas (default 0; higher values run first).
+    /// Priority inherited by the app's replicas and jobs (default 0; higher values run first).
     priority: Option<i32>,
+    /// A prover's program: its full ELF SHA-256.
+    elf_id: Option<String>,
+    /// latency: the biggest free prover first; batch (default): the smallest.
+    class: Option<String>,
+    /// none (default), shared or exclusive: keep the program on the prover it first ran on.
+    anchor: Option<String>,
+    /// Node backends that may prove it: cuda, cpu, mock; default any.
+    #[serde(default)]
+    backends: Vec<String>,
+    /// Only provers of this circuit version prove it.
+    zkm_version: Option<String>,
+    /// Jobs queued or running at most (default 64).
+    max_queued: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -306,7 +321,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_app_create",
-        description = "Create an app (a long-running container with its own port, such as a model server) in the authenticated namespace; the scheduler validates its settings and picks the node. It starts disabled; enabling it admits it against the namespace's quota. A namespace token with manage permission may create one; user and volumes require administrator credentials.",
+        description = "Create an app (a long-running container, such as a model server, or with elf_id a prover of that program) in the authenticated namespace; the scheduler validates its settings. It starts disabled; enabling it places it on a node and admits it against the namespace's quota. A namespace token with manage permission may create one; user, volumes and proof_storage_root require administrator credentials.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn app_create(
@@ -329,8 +344,21 @@ impl FleetMcp {
             "--spec".into(),
             spec.path().display().to_string(),
         ];
-        if let Some(priority) = input.priority {
-            args.extend(["--priority".into(), priority.to_string()]);
+        let optional = [
+            ("--priority", input.priority.map(|v| v.to_string())),
+            ("--elf-id", input.elf_id),
+            ("--class", input.class),
+            ("--anchor", input.anchor),
+            ("--zkm-version", input.zkm_version),
+            ("--max-queued", input.max_queued.map(|v| v.to_string())),
+        ];
+        for (flag, value) in optional {
+            if let Some(value) = value {
+                args.extend([flag.into(), value]);
+            }
+        }
+        for backend in input.backends {
+            args.extend(["--backend".into(), backend]);
         }
         self.call(parts, args).await
     }

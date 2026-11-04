@@ -91,14 +91,14 @@ fleetctl node ant-5090-2
 
 Scaling requires the `manage` permission and an online, ready node.
 The token must cover the app's namespace, tag and app grant; for a proof app its
-tag must cover every service running it. Namespace and tag quotas remain
+tag must cover every node entry running it. Namespace and tag quotas remain
 administrator-managed. Requests are asynchronous; inspect until
 the state is `complete` or `failed`. Omitted resource flags retain their current
 values. Disabled apps stay disabled. Use `--node` to
 select a machine when the app has multiple deployments.
 
-Integrated EthProofs uses exactly one replica. SDK-driven apps and serving
-apps may use multiple replicas; resources are per replica. The current
+Integrated EthProofs uses exactly one replica. Other apps may use multiple
+replicas; resources are per replica. The current
 `ant-5090-2` pool is 8 GPUs and 128 CPUs. With only EthProofs enabled at 5 GPUs
 and 96 CPUs, 3 GPUs and 32 CPUs remain for other allocations. Inspect current
 allocations with `fleetctl app scale`; these resource settings can change.
@@ -111,20 +111,20 @@ increase node capacity. Follow the [node maintenance procedure](maintenance.md).
 
 ## Apps and batches
 
-Apps and jobs show `TAG` and `STATE`. App state reports service readiness;
+Apps and jobs show `TAG` and `STATE`. App state reports replica readiness;
 job state reports an execution's progress. App details retain replica settings
 and job counts. Tags use `key=value`, for example `scope=default` or `team=research`.
 The same namespace/tag selectors work for apps, batches and jobs.
 
-Owner tokens can register and remove workloads, set priority, enable/disable them
+Owner tokens can create and remove workloads, set priority, enable/disable them
 and scale apps within their grants. Batch owners set image, environment, resource
 policy when registering a batch. Administrators set batch mount roots and runtime
-users. Service image, environment, command, user, workdir and volume changes also
+users. App image, environment, command, user, workdir and volume changes also
 require an administrator; owners can change resource sizes and timeouts. Batch disabling
 blocks new submissions; accepted batch jobs continue. App disabling drains the
-configured services before releasing their reservations.
+app's replicas before releasing their reservations.
 
-When upgrading from owner-controlled runtime settings, review existing service
+When upgrading from owner-controlled runtime settings, review existing app
 configuration, batch mount roots and runtime users, and queued jobs before
 restoring untrusted owner access. The new authorization checks do not rewrite
 configuration or cancel jobs accepted by an earlier scheduler.
@@ -142,6 +142,24 @@ fleetctl --namespace zkm job
 fleetctl --token-file zkm-owner.token --namespace zkm app disable ethproofs-z4
 fleetctl --token-file zkm-owner.token --namespace zkm app enable ethproofs-z4
 ```
+
+Create an app from a JSON file of its container settings, the keys of its
+`apps.yaml` entry (`image`, `replicas`, `gpus`, `cpus`, `env`, and for a container app
+`command` and `port_base`). A proof app is an app whose container is a Ziren prover: give
+its program and proof policy too, and its spec's `kind` defaults to `ziren-gpu`
+(`ziren-cpu` for a CPU prover):
+
+```bash
+fleetctl --token-file zkm-owner.token --namespace zkm app add model --spec model.json
+fleetctl --token-file zkm-owner.token --namespace zkm app add eth --spec prover.json \
+  --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda
+fleetctl --token-file zkm-owner.token --namespace zkm app enable model
+```
+
+An app starts disabled and on no node. Its first `app enable` places it: the scheduler
+picks a ready node big enough for all its replicas, preferring one where they fit now,
+has that node write the entry into its `apps.yaml`, then starts it. Users do not choose the node. App names are unique across
+the fleet. The [reference](reference.md) lists every setting.
 
 Disabling releases the app's execution resources after cleanup. Durable app data
 remains. An interrupted EthProofs block is retried from its saved cursor;
@@ -171,8 +189,8 @@ for namespace creation, token issuance and quotas. Use `fleetctl --help` and
 subcommand `--help` for the complete command list. SDK clients use their app's
 endpoint; Fleet CLI and MCP use the control-plane URL.
 
-Batches are configured in node `etc/batches.yaml`; app deployments
-are configured in `etc/services.yaml`. Both share namespace, tag, priority,
+Batches are configured in node `etc/batches.yaml`; apps are configured in
+`etc/apps.yaml`, where the scheduler also writes the apps it places. Both share namespace, tag, priority,
 image and resource policy. Each batch job gets a workspace under
 `FLEET_JOBS_DIR/JOB_ID/`, normally `~/app/fleet/work/jobs/JOB_ID/`.
 The command's output directory is exposed as `FLEET_OUT`; retrieve artifacts
@@ -192,7 +210,8 @@ fleetctl app logs APP --node NODE             # when the app runs on several mac
 It needs the same access as `fleetctl app scale APP` without changing anything: the app
 must be granted to the token and within its tag. An offline node, or one that is busy for
 longer than 15 seconds, answers with an error. Each reply carries at most
-256 KiB, from the first replica's `<service>-0.node.log` file in the node's log directory.
+256 KiB, from the first replica's `<entry>-0.node.log` file in the node's log directory,
+named after the app's `apps.yaml` entry.
 MCP clients use `fleet_app_logs`. A node must run this release for the command to work.
 
 When `fleetctl app` shows an app as `starting`, DETAIL says why: `waiting for capacity`

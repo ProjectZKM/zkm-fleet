@@ -45,7 +45,7 @@ key.
 `BITCOIN_NETWORK` is compiled into the host and the guests, so each network has its own
 bundle id. Any guest change produces a new app identity. For a new identity:
 
-- register a new app name, and use a new service name and storage root;
+- create a new app name, and use a new `apps.yaml` entry name and storage root;
 - follow the cutover below;
 - keep the previous package until the new one has been verified.
 
@@ -59,7 +59,7 @@ precedence over the TOML; the procedure backs it up before resetting only header
 The earlier `[header_chain_bootstrap]` patch and `--check-storage` command are not part of
 the current pinned source.
 
-Fleet reserves the GPU server for exactly the app named by the service's `app` and `elf_id`.
+Fleet reserves the GPU server for exactly the app named by the entry's `app` and `elf_id`.
 No SDK submission reaches that app, because the bundle id is not the digest of any ELF.
 Fleet does not know which ELFs the bundle contains, so it still accepts SDK submissions to
 separate per-program apps registered with a member ELF's `elf_id`. While the bundle worker is
@@ -133,7 +133,7 @@ The script:
    The working directory is `run/`. Relative `../circuits/data/...` paths in the database,
    the config and state-chain snapshots therefore resolve inside the root. The worker
    refuses to start when its working directory or database is outside the root.
-4. Adapt [`services.example.yaml`](services.example.yaml) to the node's `services.yaml`. Fill
+4. Adapt [`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`. Fill
    in the namespace, the app name, `elf_id`, the machine and the resources. `elf_id` is the
    content of the package's `fleet-app-id`; YAML does not expand `$(cat ...)`. Size `cpus` for the
    Groth16 wrap as well as the GPUs. Keep `--drain-timeout-secs` below
@@ -157,7 +157,7 @@ The example follows the selected `ghcr.io/projectzkm/ziren-gpu:latest` image. Pu
 GPU node before restarting this app and record its resolved digest for recovery. The tag
 can move; this configuration does not establish compatibility with the current `3cf393cd`
 SDK pin. Verify Groth16 proofs against the deployed host and guests before resuming all
-tasks. In Fleet mode the service's `image` field selects the GPU image; SDK Docker image
+tasks. In Fleet mode the entry's `image` field selects the GPU image; SDK Docker image
 environment variables do not select this external server.
 
 ## Cutover
@@ -166,16 +166,19 @@ Stop the old path before starting the new one, so the GPUs and quota are free an
 runs twice.
 
 1. Build the package and confirm it against the baseline. Install it and the Groth16
-   artifacts. Register the bundle under a new app name:
+   artifacts. Create the bundle's app under a new name, with a spec file holding the GPU
+   image (`{"image": "ghcr.io/projectzkm/ziren-gpu:latest"}`):
 
    ```bash
-   fleetctl --namespace NAMESPACE app add goat-proof-builder-v1 \
+   fleetctl --namespace NAMESPACE app add goat-proof-builder-v1 --spec goat.json \
      --elf-id "$(cat /opt/zkm-fleet/apps/goat/fleet-app-id)"
    ```
 
    Use `--elf-id`, not `--elf`: the bundle id is not the digest of a single ELF. Then add the
-   service to `services.yaml` disabled, with `app` set to that name and `elf_id` to the
-   bundle id, and wait for the node heartbeat to advertise it.
+   entry to `apps.yaml` disabled, with `app` set to that name and `elf_id` to the
+   bundle id, and wait for the node heartbeat to advertise it. Enable the app only after
+   that: enabling an app no node reports yet places a plain prover, without the worker,
+   on a node the scheduler picks.
 
 2. Stop every submission source: stop the old proof builder, and archive its database
    read-only.

@@ -84,14 +84,14 @@ struct AppArgs {
 
 #[derive(Subcommand)]
 enum AppCmd {
-    /// Create an app of the namespace: NAME --spec FILE.json, a container the scheduler places
-    /// on a node, which `app enable` starts. Or register the program a node's provers prove:
-    /// NAME --elf-id ID, or NAME --elf FILE.
+    /// Create an app of the namespace from its container: NAME --spec FILE.json. It starts
+    /// disabled; `app enable` places it on a node and starts it. A prover also takes its program,
+    /// --elf-id ID or --elf FILE, and proof policy.
     Add {
         #[command(flatten)]
         add: AddApp,
     },
-    /// Disable an app: its services drain and stop, releasing their GPUs.
+    /// Disable an app: its replicas drain and stop, releasing their GPUs.
     Disable { name: String },
     /// Set the priority inherited by new jobs (higher values run first).
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
@@ -107,11 +107,11 @@ enum AppCmd {
         #[arg(long)] cpus: Option<u32>,
         /// Replicas on the selected node (positive; use app disable to stop all).
         #[arg(long)] replicas: Option<u32>,
-        /// Select a machine agent when the app has services on multiple nodes.
+        /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
     },
     /// Change a proof or persistent app's settings. Image and environment changes require
-    /// administrator credentials. Its service drains, stops,
+    /// administrator credentials. The app drains, stops,
     /// takes the new settings on its node and starts again, like a scale.
     Update {
         name: String,
@@ -121,7 +121,7 @@ enum AppCmd {
         #[arg(long)] env: Vec<String>,
         /// /dev/shm size in GiB.
         #[arg(long)] shm_gb: Option<u32>,
-        /// Select a machine agent when the app has services on multiple nodes.
+        /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
     },
     /// Show the last lines of an app's log, read from the node that runs it.
@@ -129,12 +129,12 @@ enum AppCmd {
         name: String,
         /// How many of the last lines to show (at most 2000).
         #[arg(short = 'n', long, default_value_t = 100)] lines: u32,
-        /// Select a machine agent when the app has services on multiple nodes.
+        /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
     },
     /// Delete an app, refused while any of its jobs is queued or running. A proof app goes
     /// with its jobs' records, inputs and proofs, its anchor, and its ELF when no other app
-    /// uses it; serving deployments must be disabled first.
+    /// uses it; a running app must be disabled first.
     /// Without --yes it only says what it would delete.
     Delete {
         name: String,
@@ -440,7 +440,7 @@ enum BatchJobCmd {
     },
     /// Stop a batch job (SIGTERM, SIGKILL its batch's stop_timeout_s later; its cards freed).
     Cancel { id: String, #[arg(long)] batch: Option<String> },
-    /// Stop a batch job as a service needing its cards would: it queues again (same id and
+    /// Stop a batch job as an app needing its cards would: it queues again (same id and
     /// out/, FLEET_ATTEMPT counting on) and spends no --retry.
     Preempt { id: String, #[arg(long)] batch: Option<String> },
     /// Delete a finished batch job's record (out/ included), or every finished batch job older than --older-than days.
@@ -464,51 +464,44 @@ enum JobCmd {
     },
 }
 
-/// A proof app to register. The command line and the request body are this one struct (its
-/// field names are the API's); unset flags take the server's defaults.
-#[derive(Args, Serialize)]
+/// An app to create: its container settings, and a prover's program and proof policy.
+#[derive(Args)]
 struct AddApp {
-    /// The app's name in the namespace: letters, digits, _ . -.
+    /// The app's name: letters, digits, _ . -; unique across the fleet.
     name: String,
-    /// The program's full ELF SHA-256.
+    /// A JSON file with the app's container settings, the keys of its apps.yaml entry: kind
+    /// (app, the default, or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus,
+    /// shm_gb, memory_gb, env, volumes, ready_timeout_s, stop_timeout_s; for an app also command,
+    /// port_base, health_path, workdir, user; for a prover proof_storage_root, backend, rust_log.
+    /// image is required, and port_base for an app; user, volumes and proof_storage_root need
+    /// administrator credentials.
     #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: PathBuf,
+    /// A prover's program: its full ELF SHA-256.
+    #[arg(long)]
     elf_id: Option<String>,
-    /// The ELF itself, to take its id from.
+    /// A prover's program: the ELF itself, to take its id from.
     #[arg(long)]
-    #[serde(skip)]
     elf: Option<PathBuf>,
     /// latency: the biggest free prover first; batch (default): the smallest.
     #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     class: Option<String>,
     /// none (default); shared: keep the program on the prover it first ran on while healthy;
     /// exclusive: as shared, and that prover serves this app only.
     #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     anchor: Option<String>,
     /// A node backend that may prove it (repeat): cuda, cpu, mock; default any.
     #[arg(long = "backend")]
-    #[serde(rename = "backends", skip_serializing_if = "Vec::is_empty")]
     backends: Vec<String>,
     /// Only provers of this circuit version prove it.
     #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     zkm_version: Option<String>,
     /// Jobs queued or running at most (default 64).
     #[arg(long)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     max_queued: Option<u32>,
     /// Priority inherited by new jobs (default 0; higher values run first).
     #[arg(long, allow_hyphen_values = true)]
-    #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
-    /// A JSON file with the app's container settings, the keys of its services.yaml entry
-    /// (image, command, replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes,
-    /// env, user). image and port_base are required; user and volumes need administrator credentials.
-    #[arg(long)]
-    #[serde(skip)]
-    spec: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -940,7 +933,7 @@ struct JobListFilter<'a> {
 /// The proof apps the caller sees (only `app`, when given), by name.
 fn proof_app_names(a: &FleetClient, app: Option<&str>) -> anyhow::Result<Vec<String>> {
     Ok(a.get("/apps")?.as_array().into_iter().flatten()
-        .filter(|x| x["kind"] == "app" && app.is_none_or(|name| x["name"].as_str() == Some(name)))
+        .filter(|x| x["proof"].is_object() && app.is_none_or(|name| x["name"].as_str() == Some(name)))
         .filter_map(|x| x["name"].as_str().map(str::to_owned))
         .collect())
 }
@@ -1004,7 +997,6 @@ fn list(p: &ListArgs, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::R
 }
 
 const APP_COLS: &[out::TableColumn] = &[
-    col("TYPE", "type"),
     col("NAME", "name"),
     col("NAMESPACE", "namespace"),
     col("PRIORITY", "priority"),
@@ -1029,13 +1021,13 @@ fn set_app_disabled(name: &str, disabled: bool, conn: &ConnectionOptions, out: &
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(method, &format!("/apps/{name}/disabled")).timeout(Duration::from_secs(1800)))?;
     let served = v["resources"].is_object();
-    let text = match (v["kind"].as_str(), disabled, served) {
-        (Some("app"), true, true) => format!("{name} disabled: active proofs drained, its provers stopped"),
-        (Some("app"), false, true) => format!("{name} enabled: its provers started"),
-        (Some("app"), true, false) => format!("{name} disabled: it takes no new jobs; the queued and running ones finish"),
-        (Some("app"), false, false) => format!("{name} enabled: it takes jobs again"),
-        (_, true, _) => format!("{name} disabled: stopped; GPU reservations released"),
-        (_, false, _) => format!("{name} enabled: service started"),
+    let text = match (v["proof"].is_object(), disabled, served) {
+        (true, true, true) => format!("{name} disabled: active proofs drained, its provers stopped"),
+        (true, false, true) => format!("{name} enabled: its provers started"),
+        (true, true, false) => format!("{name} disabled: it takes no new jobs; the queued and running ones finish"),
+        (true, false, false) => format!("{name} enabled: it takes jobs again"),
+        (false, true, _) => format!("{name} disabled: stopped; GPU reservations released"),
+        (false, false, _) => format!("{name} enabled: started"),
     };
     out.done(&text, v);
     Ok(())
@@ -1087,14 +1079,14 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     Ok(())
 }
 
-/// Changes an app's settings; the scheduler drains and restarts its service with them.
+/// Changes an app's settings; the scheduler drains and restarts it with them.
 fn update_app(name: &str, set: Value, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
     let a = FleetClient::new(conn)?;
     let mut request = a.req(reqwest::Method::PUT, &format!("/apps/{name}/settings"));
     if let Some(node) = node { request = request.query(&[("node", node)]); }
     let v = a.send(request.json(&set))?;
-    out.done(&format!("{name}: {} — its service drains and restarts with the new settings on {}",
+    out.done(&format!("{name}: {} — it drains and restarts with the new settings on {}",
         v["state"].as_str().unwrap_or("requested"), v["node"].as_str().unwrap_or("?")), v);
     Ok(())
 }
@@ -1109,58 +1101,54 @@ fn env_map(pairs: &[String]) -> anyhow::Result<Value> {
     Ok(Value::Object(env))
 }
 
-/// Creates an app of the namespace from its --spec, or registers the program its provers prove.
+/// Creates an app of the namespace from its --spec, disabled; a prover with its program.
 fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
-        bail!("app registration requires --namespace NAME; an administrator must create the namespace first");
+        bail!("app creation requires --namespace NAME; an administrator must create the namespace first");
     }
-    if add.spec.is_some() {
-        return add_app_from_spec(add, conn, out);
-    }
-    let mut body = serde_json::to_value(add)?;
-    body["elf_id"] = json!(match (&add.elf, &add.elf_id) {
-        (Some(file), None) => {
-            use sha2::Digest;
-            let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-            hex::encode(sha2::Sha256::digest(&bytes))
-        }
-        (None, Some(id)) => id.trim_start_matches("0x").to_ascii_lowercase(),
-        (Some(_), Some(_)) => bail!("give --elf-id or --elf FILE, not both"),
-        (None, None) => bail!("give the app's container, --spec FILE.json, or its program, --elf-id ID or --elf FILE"),
-    });
-    let a = FleetClient::new(conn)?;
-    let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
-    out.done(
-        &format!("added app {}: program {} (its jobs are accepted from now on)", add.name, body["elf_id"].as_str().unwrap_or("")),
-        v,
-    );
-    Ok(())
-}
-
-fn add_app_from_spec(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
-    if add.elf.is_some() || add.elf_id.is_some() || add.class.is_some() || add.anchor.is_some()
-        || !add.backends.is_empty() || add.zkm_version.is_some() || add.max_queued.is_some()
-    {
-        bail!("--spec takes no proof program (--elf, --elf-id) or proof policy: a prover's container is configured on its node");
-    }
-    let path = add.spec.as_ref().context("--spec FILE: the app's settings as JSON")?;
+    let path = &add.spec;
     let spec: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
         .with_context(|| format!("{}: JSON settings", path.display()))?;
     if !spec.is_object() {
         bail!("--spec: a JSON object of settings");
     }
-    // The app's RegisterAppRequest (model.proto); the scheduler picks its node.
+    // The app's RegisterAppRequest (model.proto); the scheduler places it when it is enabled.
     let mut body = json!({"name": add.name, "spec": spec});
     if let Some(priority) = add.priority {
         body["priority"] = json!(priority);
     }
+    let elf_id = match (&add.elf, &add.elf_id) {
+        (Some(file), None) => {
+            use sha2::Digest;
+            let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+            Some(hex::encode(sha2::Sha256::digest(&bytes)))
+        }
+        (None, Some(id)) => Some(id.trim_start_matches("0x").to_ascii_lowercase()),
+        (Some(_), Some(_)) => bail!("give --elf-id or --elf FILE, not both"),
+        (None, None) => None,
+    };
+    let policy = add.class.is_some() || add.anchor.is_some() || !add.backends.is_empty()
+        || add.zkm_version.is_some() || add.max_queued.is_some();
+    match elf_id {
+        Some(elf_id) => {
+            let mut proof = json!({"elf_id": elf_id});
+            for (key, value) in [("class", json!(add.class)), ("anchor", json!(add.anchor)), ("zkm_version", json!(add.zkm_version)),
+                ("max_queued", json!(add.max_queued))] {
+                if !value.is_null() {
+                    proof[key] = value;
+                }
+            }
+            if !add.backends.is_empty() {
+                proof["backends"] = json!(add.backends);
+            }
+            body["proof"] = proof;
+        }
+        None if policy => bail!("proof policy is a prover's: give its program, --elf-id ID or --elf FILE"),
+        None => {}
+    }
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
-    let node = v["service"]["workers"].as_array().and_then(|w| w.first()).and_then(Value::as_str).unwrap_or("?").to_owned();
-    out.done(
-        &format!("added app {} on {node}: disabled until `fleetctl app enable {}`", add.name, add.name),
-        v,
-    );
+    out.done(&format!("added app {}: disabled until `fleetctl app enable {}` places and starts it", add.name, add.name), v);
     Ok(())
 }
 
@@ -1193,7 +1181,7 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
 /// One app's record, and a proof app's newest jobs.
 fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut rec = app_named(&FleetClient::new(conn)?, name)?;
-    let jobs = if rec["kind"] == "app" {
+    let jobs = if rec["proof"].is_object() {
         fetch_rows(JobType::App, conn, &JobListFilter { limit: 5, active: false, app: Some(name) })?
     } else {
         vec![]
@@ -1216,7 +1204,7 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
     let a = FleetClient::new(conn)?;
     let app = app_named(&a, name)?;
     let (total, active) = (&app["jobs"]["total"], &app["jobs"]["active"]);
-    let proof = app["kind"] == "app";
+    let proof = app["proof"].is_object();
     if !yes {
         if proof {
             bail!(
@@ -1226,7 +1214,7 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
             );
         }
         bail!(
-            "would remove serving app {name}; its {total} past execution record(s) \
+            "would remove app {name}; its {total} past execution record(s) \
              stay ({active} queued or running: refused while any is). Pass --yes to delete"
         );
     }
@@ -1235,13 +1223,13 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
         format!("deleted app {name}: {} job(s), ELF {}", v["jobs_deleted"],
             if v["elf_removed"].as_bool() == Some(true) { "removed" } else { "kept (in use or absent)" })
     } else {
-        format!("deleted serving app {name}; its {total} past execution record(s) stay")
+        format!("deleted app {name}; its {total} past execution record(s) stay")
     };
     out.done(&text, v);
     Ok(())
 }
 
-/// Every app, proof and serving alike, most recently used first.
+/// Every app, most recently used first.
 fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
     match &p.cmd {
         Some(AppCmd::Delete { name, yes }) => return delete_app(name, *yes, &p.conn, out),
@@ -1270,10 +1258,10 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         // Why a starting app is not running yet comes first.
         let why = a["detail"].as_str().filter(|d| !d.is_empty()).map(str::to_owned);
         let detail: Vec<String> = [why, anchored, mean].into_iter().flatten().collect();
-        // A serving app's image is among its settings, a proof app's is its provers'.
-        let image = [&a["service"]["image"], &a["proof"]["image"]].into_iter().find(|i| !i.is_null());
+        // A proof app runs its provers' image; another app's is among its settings.
+        let image = [&a["proof"]["image"], &a["spec"]["image"]].into_iter().find(|i| !i.is_null());
         json!({
-            "type": a["kind"], "name": a["name"], "namespace": a["namespace"],
+            "name": a["name"], "namespace": a["namespace"],
             "tag": a.get("tags").filter(|v| v.as_array().is_some_and(|tags| !tags.is_empty())).unwrap_or(&a["tag"]),
             "state": a["state"], "priority": a["priority"], "resources": a["resources"],
             "last_at": a["jobs"]["last_at"], "detail": detail.join(", "), "image": image,

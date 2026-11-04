@@ -98,10 +98,18 @@ for log locations and the distinction between node capacity and app allocation.
 
 Deploy a tested Git revision. Changes to shared models or execution protocols
 require updating the control host and nodes together: the scheduler, agent and
-Python bridge must agree on machine report version 2. A compatible change limited
+Python bridge must agree on machine report version 3. A compatible change limited
 to scheduler permissions, CLI or MCP needs only a control-host update. Use the
 pause procedure above before replacing node programs. A program update does not
 require restarting Ray or changing its pool.
+
+Upgrading from report version 2 changes all three at once. Rename each node's
+`etc/services.yaml` to `etc/apps.yaml` and its top-level `services:` key to `apps:`;
+`node-start.sh` from the same revision passes it as `--apps`. The scheduler keeps its
+app deployment records in `data_dir/workloads/deployments` and its reservations under
+`deployment:` ids; it does not read the old `workloads/services` records or release
+`service:` reservations, so disable apps and confirm their cleanup before the update,
+and enable them again afterward.
 
 Build the generic programs from that revision:
 
@@ -117,7 +125,7 @@ transaction: each app takes a name (its tenant's when that tenant had one app in
 the namespace, else `TENANT-<first 8 hex of the ELF id>`) and the default
 placement policy, jobs name their app, `TENANT/ELF` grants become app names, and
 namespace-less tenant signer tokens are removed. Update each prover's
-`services.yaml` entry to `app: NAME` plus `elf_id`. Remove `tenants`,
+`apps.yaml` entry to `app: NAME` plus `elf_id`. Remove `tenants`,
 `default_tenant`, `require_signature` and `admin_token_file` from `fleet.yaml`
 first; the scheduler refuses to start with them. Issue an administrator token with
 `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`, since the old
@@ -167,7 +175,7 @@ sudo systemctl start zkm-fleet-node.service
 The offline wheel command assumes Ray and PyYAML are already installed at the
 versions required by the package. For cron installations, pause and restore the
 watchdog as described above. Preserve `etc/watchdog.env`, including node capacity
-and `FLEET_NODE_SUPERVISED`, along with `services.yaml`, `batches.yaml` and credentials.
+and `FLEET_NODE_SUPERVISED`, along with `apps.yaml`, `batches.yaml` and credentials.
 Keep independent app endpoints running when their programs are unchanged.
 Verify the fresh heartbeat, total/free resources, app states and saved progress
 before following [verify and resume](#verify-and-resume).
@@ -185,7 +193,7 @@ deploy/fleet-ctl.sh node upgrade v0.1.2          # download and verify the node 
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # local node files over ssh
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
-deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start
+deploy/fleet-ctl.sh app cleanup APP-0            # leftovers of a failed app start
 ```
 
 An upgrade copies what it replaces to `backup/` first, then waits for the scheduler's

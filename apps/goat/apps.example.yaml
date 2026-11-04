@@ -1,11 +1,11 @@
-# Merge this service into the selected machine's existing services.yaml.
+# Merge this entry into the selected machine's existing apps.yaml.
 # Stage it disabled; enable it only after the cutover steps in README.md, while every
 # per-program GOAT SDK app stays disabled.
-services:
+apps:
   - name: goat-proof-builder-v1
     kind: ziren-gpu
     namespace: REPLACE_WITH_NAMESPACE_ID
-    app: goat-proof-builder-v1 # the namespace app (fleetctl app add goat-proof-builder-v1 --elf-id ...)
+    app: goat-proof-builder-v1 # the namespace app (fleetctl app add goat-proof-builder-v1 --spec ... --elf-id ...)
     elf_id: REPLACE_WITH_FLEET_APP_ID # the package's fleet-app-id: the bundle id, not a member ELF
     proof_storage_root: /srv/zkm-fleet/apps/goat
     machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP

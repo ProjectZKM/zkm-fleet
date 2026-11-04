@@ -1,4 +1,4 @@
-"""Local service inventory, placement and actor/container lifecycle.
+"""Local app inventory, placement and actor/container lifecycle.
 
 fleet-node invokes these operations for commands admitted by the Rust scheduler.
 Namespace validation, quotas, draining and preemption stay in the control plane.
@@ -27,7 +27,7 @@ ACTORS: dict[AppRuntime, Any] = {AppRuntime.ZIREN_GPU: ZirenGpuProver, AppRuntim
 _SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "proof_output_dir", "gpu_port_range")
 
 
-def load_services(data: Mapping[str, Any]) -> AppsConfig:
+def load_apps(data: Mapping[str, Any]) -> AppsConfig:
     return AppsConfig.parse(data)
 
 
@@ -35,40 +35,40 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
     """One AppReplicaSpec per replica, in file order. `config` is the replica's mapping as
     the file gives it (shared keys, the entry, its name and index), which the hash
     covers."""
-    raw_services = {s["name"]: s for s in file.raw.get("services", [])}
+    raw_apps = {a["name"]: a for a in file.raw.get("apps", [])}
     shared = {k: file.raw[k] for k in _SHARED_KEYS if k in file.raw}
     from .jobs import is_job_actor
 
     out: dict[str, AppReplicaSpec] = {}
-    for svc in file.services:
-        if svc.disabled:
+    for app in file.apps:
+        if app.disabled:
             continue
-        if is_job_actor(svc.name):
-            raise ValueError(f"service {svc.name}: the job- prefix is reserved for batch job actors")
-        for i in range(svc.replicas):
-            name = f"{svc.name}-{i}"
-            config = {**shared, **raw_services[svc.name], "name": name, "kind": svc.kind.value}
-            if svc.kind is AppRuntime.APP:
+        if is_job_actor(app.name):
+            raise ValueError(f"app {app.name}: the job- prefix is reserved for batch job actors")
+        for i in range(app.replicas):
+            name = f"{app.name}-{i}"
+            config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
+            if app.kind is AppRuntime.APP:
                 config["index"] = i
-            out[name] = AppReplicaSpec(name=name, index=i, service=svc, cluster=file.cluster, config=config)
+            out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=file.cluster, config=config)
     return out
 
 
 def bundle(spec: AppReplicaSpec) -> ResourceRequest:
-    svc = spec.service
+    app = spec.app
     pin = None
-    if svc.machine:
+    if app.machine:
         # Ray's per-node resource: the replica can only be placed on that machine.
         from .jobs import _machine_resource
 
-        pin = _machine_resource(svc.machine)
-    return ResourceRequest(cpu=float(svc.cpus), gpu=float(svc.gpus) if svc.kind.takes_gpus else 0,
-                  memory=svc.memory_gb * 2**30 if svc.memory_gb else None, pin=pin)
+        pin = _machine_resource(app.machine)
+    return ResourceRequest(cpu=float(app.cpus), gpu=float(app.gpus) if app.kind.takes_gpus else 0,
+                  memory=app.memory_gb * 2**30 if app.memory_gb else None, pin=pin)
 
 
 def running() -> dict[str, ActorHandle[Any]]:
-    """The services' actors: every named actor in the namespace except batch jobs'
-    (those belong to their jobs, not to the services file)."""
+    """The apps' actors: every named actor in the namespace except batch jobs'
+    (those belong to their jobs, not to the apps file)."""
     from .jobs import is_job_actor
 
     names = [a["name"] for a in ray.util.list_named_actors(all_namespaces=True)
@@ -89,7 +89,7 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
 
 def _pg_name(actor: str) -> str:
     # Ray keeps named placement-group records after removal. Reusing the same
-    # name on a later service restart is rejected by the GCS even when the old
+    # name on a later app restart is rejected by the GCS even when the old
     # group is REMOVED, so each actor start needs a fresh name.
     return f"pg-{actor}-{uuid.uuid4().hex}"
 

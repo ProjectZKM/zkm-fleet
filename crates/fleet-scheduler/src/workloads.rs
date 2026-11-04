@@ -78,7 +78,7 @@ struct WorkloadState {
     jobs: BTreeMap<String, Job>,
     commands: BTreeMap<String, CommandRecord>,
     workers: BTreeMap<String, NodeSession>,
-    services: BTreeMap<String, AppDeployment>,
+    deployments: BTreeMap<String, AppDeployment>,
 }
 
 pub struct WorkloadController {
@@ -89,23 +89,23 @@ pub struct WorkloadController {
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
 }
-pub(crate) fn integrated_worker(service: &Value) -> bool {
-    text(service, "kind") == "ziren-gpu"
-        && service["worker_command"].as_array().is_some_and(|command| !command.is_empty())
+pub(crate) fn integrated_worker(entry: &Value) -> bool {
+    text(entry, "kind") == "ziren-gpu"
+        && entry["worker_command"].as_array().is_some_and(|command| !command.is_empty())
 }
 
 /// The proof apps an enabled integrated worker feeds: (namespace, app).
 fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
-    inner.services.values()
-        .filter(|s| integrated_worker(&s.service) && !s.disabled)
-        .map(|s| (text(&s.service, "namespace").to_owned(), text(&s.service, "app").to_owned()))
+    inner.deployments.values()
+        .filter(|s| integrated_worker(&s.spec) && !s.disabled)
+        .map(|s| (text(&s.spec, "namespace").to_owned(), text(&s.spec, "app").to_owned()))
         .collect()
 }
 
 impl WorkloadController {
     pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
-        for name in ["apps", "jobs", "commands", "artifacts", "services"] {
+        for name in ["apps", "jobs", "commands", "artifacts", "deployments"] {
             fs::create_dir_all(dir.join(name))?;
         }
         let mut inner = WorkloadState::default();
@@ -118,10 +118,10 @@ impl WorkloadController {
         for v in load::<CommandRecord>(&dir.join("commands"))? {
             inner.commands.insert(v.id.clone(), v);
         }
-        for v in load::<AppDeployment>(&dir.join("services"))? {
+        for v in load::<AppDeployment>(&dir.join("deployments"))? {
             inner
-                .services
-                .insert(format!("{}-{}", v.worker, text(&v.service, "name")), v);
+                .deployments
+                .insert(format!("{}-{}", v.worker, text(&v.spec, "name")), v);
         }
         fleet.set_worker_owned_apps(worker_owned(&inner));
         Ok(Self {
@@ -146,57 +146,57 @@ impl WorkloadController {
     /// Mirrors a prover's state onto its proof app. A prover whose app is not registered has
     /// nothing to mirror: that must not fail the heartbeat or scale pass carrying it, or every
     /// later node result is rejected with it.
-    pub(super) async fn sync_app_record(&self, service: &Value, disabled: bool) -> anyhow::Result<()> {
-        let (namespace, app) = (text(service, "namespace"), text(service, "app"));
+    pub(super) async fn sync_app_record(&self, entry: &Value, disabled: bool) -> anyhow::Result<()> {
+        let (namespace, app) = (text(entry, "namespace"), text(entry, "app"));
         if !self.fleet.app_known(namespace, app) {
-            if text(service, "kind").starts_with("ziren-") {
-                tracing::warn!(service = text(service, "name"), app, "prover's proof app is not registered");
+            if text(entry, "kind").starts_with("ziren-") {
+                tracing::warn!(entry = text(entry, "name"), app, "prover's proof app is not registered");
             }
             return Ok(());
         }
         self.fleet.set_app_disabled(namespace, app, disabled).await.map(drop)
     }
 
-    /// Drops a service record, its allocation already released. Nothing else removes one, and a
-    /// stale record can restart its service or claim its app's worker slot.
-    fn forget_service(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.lock().services.remove(key);
-        match std::fs::remove_file(self.dir.join("services").join(format!("{key}.json"))) {
+    /// Drops a deployment record, its allocation already released. Nothing else removes one, and a
+    /// stale record can restart its app or claim its app's worker slot.
+    fn forget_deployment(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.lock().deployments.remove(key);
+        match std::fs::remove_file(self.dir.join("deployments").join(format!("{key}.json"))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
         }
-        tracing::info!(service = key, "service record removed: its node no longer configures it");
+        tracing::info!(deployment = key, "deployment record removed: its node no longer configures it");
         Ok(())
     }
 
-    /// The node reports every service its configuration has, so one it stopped reporting was
+    /// The node reports every app its configuration has, so one it stopped reporting was
     /// removed from it. Its record goes once nothing about it is still open.
-    fn forget_unreported_services(&self, worker: &str, reported: &[String]) -> anyhow::Result<()> {
+    fn forget_unreported_deployments(&self, worker: &str, reported: &[String]) -> anyhow::Result<()> {
         let candidates: Vec<(String, String)> = {
             let i = self.inner.lock();
-            i.services.iter()
+            i.deployments.iter()
                 .filter(|(_, intent)| {
-                    let name = text(&intent.service, "name");
+                    let name = text(&intent.spec, "name");
                     intent.worker == worker && intent.disabled
                         && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
                         && !reported.iter().any(|r| r == name)
                         && !i.commands.values().any(|c| !c.done && c.worker == worker
-                            && c.operation == NodeOperation::SetService as i32
-                            && text(&c.parameters["service"], "name") == name)
+                            && c.operation == NodeOperation::SetApp as i32
+                            && text(&c.parameters["app"], "name") == name)
                 })
-                .map(|(key, intent)| (key.clone(), text(&intent.service, "namespace").to_owned()))
+                .map(|(key, intent)| (key.clone(), text(&intent.spec, "namespace").to_owned()))
                 .collect()
         };
         for (key, namespace) in candidates {
-            if !self.fleet.allocations(&namespace).iter().any(|a| a.id == format!("service:{key}")) {
-                self.forget_service(&key)?;
+            if !self.fleet.allocations(&namespace).iter().any(|a| a.id == format!("deployment:{key}")) {
+                self.forget_deployment(&key)?;
             }
         }
         Ok(())
     }
 
     /// An app-level node message's address for `app` in `namespace`. A node's configuration may name the namespace by id
-    /// or by name, so both go along; the node finds the services that run the app.
+    /// or by name, so both go along; the node finds the entries that run the app.
     pub(super) fn app_message(&self, namespace: &str, app: &str) -> Value {
         let name = self.fleet.namespace(namespace).map(|n| n.name).unwrap_or_default();
         json!({"app":{"namespace":namespace,"namespace_name":name,"name":app}})
@@ -211,7 +211,7 @@ impl WorkloadController {
         workers.into_iter().map(|worker| self.command(worker, NodeOperation::App, message.clone())).collect()
     }
 
-    /// Tells every node that `app` was deleted from `namespace`; each removes the services it
+    /// Tells every node that `app` was deleted from `namespace`; each removes the entries it
     /// configures for it.
     pub(crate) fn remove_app(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
         let workers: Vec<String> = self.inner.lock().workers.keys().cloned().collect();
@@ -219,17 +219,17 @@ impl WorkloadController {
         Ok(())
     }
 
-    fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, service: &Value,
+    fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, entry: &Value,
     ) -> anyhow::Result<()> {
-        if !integrated_worker(service) { return Ok(()); }
-        let namespace = text(service, "namespace");
+        if !integrated_worker(entry) { return Ok(()); }
+        let namespace = text(entry, "namespace");
         let allocations = self.fleet.allocations(namespace);
-        let key = format!("{}-{}", worker, text(service, "name"));
-        let owner = inner.services.iter().find(|(other_key, intent)| {
-            *other_key != &key && integrated_worker(&intent.service)
-                && text(&intent.service, "namespace") == namespace
-                && text(&intent.service, "app") == text(service, "app")
-                && (!intent.disabled || allocations.iter().any(|a| a.id == format!("service:{other_key}")))
+        let key = format!("{}-{}", worker, text(entry, "name"));
+        let owner = inner.deployments.iter().find(|(other_key, intent)| {
+            *other_key != &key && integrated_worker(&intent.spec)
+                && text(&intent.spec, "namespace") == namespace
+                && text(&intent.spec, "app") == text(entry, "app")
+                && (!intent.disabled || allocations.iter().any(|a| a.id == format!("deployment:{other_key}")))
         });
         if owner.is_some() {
             return Err(fail(409, "this app already has an integrated worker; clean up its owner before moving it",
@@ -259,48 +259,48 @@ impl WorkloadController {
         }) {
             return Ok(c.id.clone());
         }
-        if operation == NodeOperation::SetService {
+        if operation == NodeOperation::SetApp {
             if parameters["disabled"].as_bool() == Some(false) {
-                self.check_worker_owner(&inner, worker, &parameters["service"])?;
+                self.check_worker_owner(&inner, worker, &parameters["app"])?;
             }
-            if inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
+            if inner.deployments.get(&format!("{}-{}", worker, text(&parameters["app"], "name")))
                 .and_then(|s| s.scale.as_ref()).is_some_and(|s|
                     s.pending() && parameters["scale_id"].as_str() != Some(s.id())) {
                 return Err(fail(409, "app scaling is already pending"));
             }
-            let same_service = |c: &CommandRecord| {
+            let same_entry = |c: &CommandRecord| {
                 !c.done
                     && c.worker == worker
                     && c.operation == operation as i32
-                    && text(&c.parameters["service"], "name") == text(&parameters["service"], "name")
+                    && text(&c.parameters["app"], "name") == text(&parameters["app"], "name")
             };
             // An operation still waiting for capacity was never sent to the node, so a newer one
             // replaces it. Without this an app that cannot be placed could not be disabled or scaled.
-            let waiting: Vec<_> = inner.commands.values().filter(|c| same_service(c) && !c.admitted).map(|c| c.id.clone()).collect();
+            let waiting: Vec<_> = inner.commands.values().filter(|c| same_entry(c) && !c.admitted).map(|c| c.id.clone()).collect();
             for id in waiting {
                 if let Some(c) = inner.commands.get_mut(&id) {
                     c.done = true;
-                    c.error = Some("replaced by a newer service operation before it was sent to the node".into());
+                    c.error = Some("replaced by a newer app operation before it was sent to the node".into());
                     self.save("commands", &id, &*c)?;
                 }
             }
-            if inner.commands.values().any(same_service) {
-                return Err(fail(409, "a service operation is already pending"));
+            if inner.commands.values().any(same_entry) {
+                return Err(fail(409, "an app operation is already pending"));
             }
             let intent = AppDeployment {
                 worker: worker.into(),
-                service: parameters["service"].clone().into(),
+                spec: parameters["app"].clone().into(),
                 disabled: parameters["disabled"].as_bool().unwrap_or(true),
-                scale: inner.services.get(&format!("{}-{}", worker, text(&parameters["service"], "name")))
+                scale: inner.deployments.get(&format!("{}-{}", worker, text(&parameters["app"], "name")))
                     .and_then(|s| {
                         s.scale.as_ref().filter(|_| {
                                 parameters["scale_id"].is_string() || parameters["scale_cleanup"].as_bool() == Some(true)
                             }).cloned()
                     }),
             };
-            let key = format!("{}-{}", worker, text(&intent.service, "name"));
-            self.save("services", &key, &intent)?;
-            inner.services.insert(key, intent);
+            let key = format!("{}-{}", worker, text(&intent.spec, "name"));
+            self.save("deployments", &key, &intent)?;
+            inner.deployments.insert(key, intent);
             self.update_worker_owned_apps(&inner);
         }
         let c = CommandRecord {
@@ -311,7 +311,7 @@ impl WorkloadController {
             done: false,
             result: Value::Null.into(),
             error: None,
-            admitted: operation != NodeOperation::SetService,
+            admitted: operation != NodeOperation::SetApp,
         };
         self.save("commands", &c.id, &c)?;
         let id = c.id.clone();
@@ -329,7 +329,7 @@ impl WorkloadController {
                 .chain(proofs.iter().filter(|n| n.machine == w.report.machine).filter_map(|n| n.busy.clone()),
                     )
                 .collect::<Vec<_>>();
-            let apps = w.report.services.iter().map(|s| {
+            let apps = w.report.apps.iter().map(|s| {
                 text(s, "app")
             }).collect::<Vec<_>>();
             json!({"id":id,"name":id,"backend":"ray-local",
@@ -430,11 +430,11 @@ impl WorkloadController {
         }
         Ok(())
     }
-    fn require_service_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
+    fn require_deployment_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(c) = c {
-            let (_, deployment) = self.scale_service(namespace, app, node)?;
-            if deployment.service["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
+            let (_, deployment) = self.app_deployment(namespace, app, node)?;
+            if deployment.spec["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
                 return Err(fail(403, "another tag cannot be selected"));
             }
         }
@@ -459,10 +459,10 @@ impl WorkloadController {
         }
         Ok(r)
     }
-    /// The services among `keys` whose node is connected.
+    /// The deployments among `keys` whose node is connected.
     fn online(&self, keys: &[String]) -> Vec<String> {
         let i = self.inner.lock();
-        keys.iter().filter(|k| i.services.get(*k).and_then(|d| i.workers.get(&d.worker)).is_some_and(|w| now() - w.seen < 30.0)).cloned().collect()
+        keys.iter().filter(|k| i.deployments.get(*k).and_then(|d| i.workers.get(&d.worker)).is_some_and(|w| now() - w.seen < 30.0)).cloned().collect()
     }
 
     /// Whether a batch still has job records (not purged).
@@ -660,7 +660,7 @@ impl WorkloadController {
             || worker_id.len() > 63
             || session.len() > 80
             || session.is_empty()
-            || report.version != 2
+            || report.version != 3
         {
             return Err(fail(400, "invalid worker contract"));
         }
@@ -678,30 +678,30 @@ impl WorkloadController {
             return Err(fail(400, "invalid capacity"));
         }
         let mut report = report;
-        for service in &mut report.services {
-            let reference = service["namespace_ref"]
+        for entry in &mut report.apps {
+            let reference = entry["namespace_ref"]
                 .as_str()
-                .or_else(|| service["namespace"].as_str())
+                .or_else(|| entry["namespace"].as_str())
                 .unwrap_or(crate::store::SYSTEM_NAMESPACE)
                 .to_owned();
-            service["namespace_ref"] = json!(reference);
+            entry["namespace_ref"] = json!(reference);
             if let Some(n) = self.fleet.namespace(&reference) {
-                service["namespace"] = json!(n.id);
+                entry["namespace"] = json!(n.id);
             }
         }
-        for spec in report.batches.values().chain(report.services.iter()) {
+        for spec in report.batches.values().chain(report.apps.iter()) {
             if let Some(tag) = spec["tag"].as_str() {
                 crate::fleet::Scheduler::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
             }
         }
         let mut worker_streams = HashSet::new();
-        for service in &report.services {
-            if integrated_worker(service) {
-                if service["replicas"].as_u64().unwrap_or(1) != 1 {
+        for entry in &report.apps {
+            if integrated_worker(entry) {
+                if entry["replicas"].as_u64().unwrap_or(1) != 1 {
                     return Err(fail(409, "integrated workers require exactly one replica"));
                 }
-                if service["disabled"].as_bool() != Some(true)
-                    && !worker_streams.insert((text(service, "namespace"), text(service, "app"))) {
+                if entry["disabled"].as_bool() != Some(true)
+                    && !worker_streams.insert((text(entry, "namespace"), text(entry, "app"))) {
                     return Err(fail(409, "duplicate integrated worker stream in node report",
                     ));
                 }
@@ -716,9 +716,9 @@ impl WorkloadController {
             {
                 return Err(fail(409, "another agent session is active for this worker"));
             }
-            for service in &report.services {
-                if service["disabled"].as_bool() != Some(true) && service["cleaned"].as_bool() != Some(true) {
-                    self.check_worker_owner(&i, worker_id, service)?;
+            for entry in &report.apps {
+                if entry["disabled"].as_bool() != Some(true) && entry["cleaned"].as_bool() != Some(true) {
+                    self.check_worker_owner(&i, worker_id, entry)?;
                 }
             }
             let draining = i.workers.get(worker_id).is_some_and(|w| w.draining);
@@ -734,7 +734,7 @@ impl WorkloadController {
         }
         for (name, mut spec) in report.batches.clone().into_iter().chain(
             report
-                .services
+                .apps
                 .iter()
                 .filter(|s| text(s, "kind") == "app")
                 .map(|s| (text(s, "name").into(), s.clone())),
@@ -754,7 +754,7 @@ impl WorkloadController {
             }
             let persistent = text(&spec, "kind") == "app";
             let existing = self.inner.lock().apps.get(&name).cloned();
-            // Apps and batches share one name space: a node's batch and serving app of the same
+            // Apps and batches share one name space: a node's batch and app of the same
             // name would otherwise merge into one record. The one already known keeps the name.
             if existing.as_ref().is_some_and(|a| !a.removed && a.persistent != persistent) {
                 tracing::warn!(app = %name, "node reports an app and a batch with the same name; ignoring the one that is not registered");
@@ -778,7 +778,7 @@ impl WorkloadController {
             self.save("apps", &name, &app)?;
             self.inner.lock().apps.insert(name, app);
         }
-        for observed in &report.services {
+        for observed in &report.apps {
             let name = text(observed, "name");
             if !is_safe_id(name)
                 || !matches!(text(observed, "kind"), "app" | "ziren-gpu" | "ziren-cpu")
@@ -790,38 +790,38 @@ impl WorkloadController {
                 continue;
             };
             let key = format!("{worker_id}-{name}");
-            let existing = { self.inner.lock().services.get(&key).cloned() };
+            let existing = { self.inner.lock().deployments.get(&key).cloned() };
             let intent = if let Some(mut intent) = existing {
-                // The app a service runs, its program and its launch settings are the node's own
+                // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
                 for field in ["app", "elf_id", "worker_command", "worker_env_file", "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root",
                 ] {
-                    if observed.get(field).is_some() || intent.service.get(field).is_some() {
-                        intent.service[field] = observed[field].clone();
+                    if observed.get(field).is_some() || intent.spec.get(field).is_some() {
+                        intent.spec[field] = observed[field].clone();
                     }
                 }
-                self.save("services", &key, &intent)?;
-                self.inner.lock().services.insert(key.clone(), intent.clone());
+                self.save("deployments", &key, &intent)?;
+                self.inner.lock().deployments.insert(key.clone(), intent.clone());
                 intent
             } else {
-                let mut service = observed.clone();
-                service["namespace_ref"] = observed["namespace_ref"].clone();
-                service["namespace"] = json!(namespace.id);
+                let mut spec = observed.clone();
+                spec["namespace_ref"] = observed["namespace_ref"].clone();
+                spec["namespace"] = json!(namespace.id);
                 let intent = AppDeployment {
                     worker: worker_id.into(),
-                    service,
+                    spec,
                     disabled: observed["disabled"].as_bool().unwrap_or(false),
                     scale: None,
                 };
-                self.save("services", &key, &intent)?;
+                self.save("deployments", &key, &intent)?;
                 self.inner
                     .lock()
-                    .services
+                    .deployments
                     .insert(key.clone(), intent.clone());
                 intent
             };
             if text(observed, "kind") == "app" || integrated_worker(observed) {
-                let id = format!("service:{key}");
+                let id = format!("deployment:{key}");
                 let replicas = observed["replicas"].as_f64().unwrap_or(1.0);
                 if observed["cleaned"].as_bool() == Some(true) && intent.disabled {
                     self.fleet.release_job(&namespace.id, &id).await?;
@@ -848,46 +848,46 @@ impl WorkloadController {
                 self.inner.lock().commands.values().any(|c| {
                     !c.done
                         && c.worker == worker_id
-                        && (c.operation == NodeOperation::SetService as i32 && text(&c.parameters["service"], "name") == name
-                            || c.operation == NodeOperation::App as i32 && text(&c.parameters["service"], "name") == name)
+                        && (c.operation == NodeOperation::SetApp as i32 && text(&c.parameters["app"], "name") == name
+                            || c.operation == NodeOperation::App as i32 && text(&c.parameters["entry"], "name") == name)
                 })
             };
             if !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
                 && !intent.scale.as_ref().is_some_and(ScaleStatus::failed)
-                && !scaling::same_resources(observed, &intent.service)
+                && !scaling::same_resources(observed, &intent.spec)
             {
                 // A node restart or local edit cannot replace the control plane's
                 // desired allocation. Repair drift with the same drain/cleanup fences.
                 let mut repaired = intent.clone();
-                repaired.scale = Some(scaling::new_scale(self.with_priority(intent.service.clone()), intent.disabled));
-                self.save("services", &key, &repaired)?;
-                self.inner.lock().services.insert(key.clone(), repaired);
+                repaired.scale = Some(scaling::new_scale(self.with_priority(intent.spec.clone()), intent.disabled));
+                self.save("deployments", &key, &repaired)?;
+                self.inner.lock().deployments.insert(key.clone(), repaired);
                 continue;
             }
             if mismatch && !pending && !intent.scale.as_ref().is_some_and(ScaleStatus::pending) {
                 if intent.scale.as_ref().is_some_and(ScaleStatus::failed) {
-                    // After a failed change the service stays down, its failure still shown.
+                    // After a failed change the app stays down, its failure still shown.
                     if observed["disabled"].as_bool() != Some(true) {
-                        self.tell_nodes([&worker_id.to_owned()], json!({"service":{"name":name}}), json!({"set":{"disabled":true}}))?;
+                        self.tell_nodes([&worker_id.to_owned()], json!({"entry":{"name":name}}), json!({"set":{"disabled":true}}))?;
                     }
                     if observed["cleaned"].as_bool() != Some(true) {
-                        self.command(worker_id, NodeOperation::SetService,
-                            json!({"service":intent.service,"disabled":true,"scale_cleanup":true}))?;
+                        self.command(worker_id, NodeOperation::SetApp,
+                            json!({"app":intent.spec,"disabled":true,"scale_cleanup":true}))?;
                     }
                 } else if observed["disabled"].as_bool().unwrap_or(false) != intent.disabled {
                     // The node's configuration drifted from the desired one: write it back like a scale.
                     let mut repaired = intent.clone();
-                    repaired.scale = Some(scaling::new_scale(self.with_priority(intent.service.clone()), intent.disabled));
-                    self.save("services", &key, &repaired)?;
-                    self.inner.lock().services.insert(key.clone(), repaired);
+                    repaired.scale = Some(scaling::new_scale(self.with_priority(intent.spec.clone()), intent.disabled));
+                    self.save("deployments", &key, &repaired)?;
+                    self.inner.lock().deployments.insert(key.clone(), repaired);
                 } else {
                     // Configured as desired but not running as desired: start or stop it.
-                    self.command(worker_id, NodeOperation::SetService,
-                        json!({"service":self.with_priority(intent.service.clone()),"disabled":intent.disabled}))?;
+                    self.command(worker_id, NodeOperation::SetApp,
+                        json!({"app":self.with_priority(intent.spec.clone()),"disabled":intent.disabled}))?;
                 }
             }
         }
-        self.forget_unreported_services(worker_id, &report.services.iter().map(|s| text(s, "name").to_owned()).collect::<Vec<_>>())?;
+        self.forget_unreported_deployments(worker_id, &report.apps.iter().map(|s| text(s, "name").to_owned()).collect::<Vec<_>>())?;
         self.refresh_worker_owned_apps();
         for incoming in &report.jobs {
             if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
@@ -1052,24 +1052,24 @@ impl WorkloadController {
                         }
                     }
                 }
-                if c.operation == NodeOperation::SetService as i32 && c.error.is_none() {
-                    let service = &c.parameters["service"];
-                    if (text(service, "kind") == "app" || integrated_worker(service))
+                if c.operation == NodeOperation::SetApp as i32 && c.error.is_none() {
+                    let entry = &c.parameters["app"];
+                    if (text(entry, "kind") == "app" || integrated_worker(entry))
                         && c.parameters["disabled"].as_bool() == Some(true)
                         && c.result["cleaned"].as_bool() == Some(true)
                     {
                         self.fleet
                             .release_job(
-                                text(service, "namespace"),
-                                &format!("service:{}-{}", worker_id, text(service, "name")),
+                                text(entry, "namespace"),
+                                &format!("deployment:{}-{}", worker_id, text(entry, "name")),
                             )
                             .await?;
                     }
-                    if text(service, "kind") == "ziren-gpu"
+                    if text(entry, "kind") == "ziren-gpu"
                         && c.parameters["disabled"].as_bool() == Some(false)
                         && c.parameters["scale_id"].is_null()
                     {
-                        self.sync_app_record(service, false).await?;
+                        self.sync_app_record(entry, false).await?;
                     }
                 }
                 self.save("commands", &c.id, &c)?;
@@ -1100,18 +1100,18 @@ impl WorkloadController {
                     })
             })
             .fold((0.0, 0.0), |(g, c), r| (g + r.gpus(), c + r.cpus()));
-        let services = i
+        let starting = i
             .commands
             .values()
             .filter(|c| {
                 c.worker == worker
                     && !c.done
                     && c.admitted
-                    && c.operation == NodeOperation::SetService as i32
+                    && c.operation == NodeOperation::SetApp as i32
                     && c.parameters["disabled"].as_bool() == Some(false)
             })
             .fold((0.0, 0.0), |(g, c), cmd| {
-                let s = &cmd.parameters["service"];
+                let s = &cmd.parameters["app"];
                 let n = s["replicas"].as_f64().unwrap_or(1.0);
                 (
                     g + s["gpus"].as_f64().unwrap_or(0.0) * n,
@@ -1119,8 +1119,8 @@ impl WorkloadController {
                 )
             });
         Some((
-            (w.report.free_gpus - pending.0 - services.0).max(0.0),
-            (w.report.free_cpus - pending.1 - services.1).max(0.0),
+            (w.report.free_gpus - pending.0 - starting.0).max(0.0),
+            (w.report.free_cpus - pending.1 - starting.1).max(0.0),
         ))
     }
     fn purge(&self, mut r: Job) -> anyhow::Result<Value> {
@@ -1293,19 +1293,19 @@ impl WorkloadController {
                 self.command(r.worker.as_deref().unwrap(), operation, parameters)?;
             }
         }
-        let services = {
+        let waiting = {
             self.inner
                 .lock()
                 .commands
                 .values()
                 .filter(|c| {
-                    !c.done && !c.admitted && c.operation == NodeOperation::SetService as i32
+                    !c.done && !c.admitted && c.operation == NodeOperation::SetApp as i32
                 })
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        for mut c in services {
-            let s = &c.parameters["service"];
+        for mut c in waiting {
+            let s = &c.parameters["app"];
             let disabled = c.parameters["disabled"].as_bool() == Some(true);
             if disabled && text(s, "kind") == "ziren-gpu" {
                 let names = (0..s["replicas"].as_u64().unwrap_or(1))
@@ -1345,7 +1345,7 @@ impl WorkloadController {
                 let already_ready = {
                     let i = self.inner.lock();
                     i.workers.get(&c.worker).is_some_and(|w| {
-                        w.report.services.iter().any(|v| {
+                        w.report.apps.iter().any(|v| {
                             text(v, "name") == text(s, "name") && v["ready"].as_bool() == Some(true)
                                 && v["disabled"].as_bool() != Some(true)
                                 && scaling::same_resources(v, s)
@@ -1378,7 +1378,7 @@ impl WorkloadController {
                         .reserve_job(
                             text(s, "namespace"),
                             s["tag"].as_str(),
-                            &format!("service:{}-{}", c.worker, text(s, "name")),
+                            &format!("deployment:{}-{}", c.worker, text(s, "name")),
                             g,
                             cpu,
                             false,
@@ -1762,7 +1762,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         }
     }
     // /batches/{name}/jobs[/{id}] are one batch's jobs; the other /batches routes are batch
-    // definitions, which share the serving app template routes.
+    // definitions, which share the app template routes.
     let batch_jobs = parts.first() == Some(&"batches") && parts.get(2) == Some(&"jobs");
     let batch = parts.first() == Some(&"batches") && !batch_jobs;
     if batch { parts[0] = "apps"; }
@@ -1781,7 +1781,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
             )); }
         WorkloadController::require_grant(c, &app.name)?;
-        return s.service_action(c, &q, &namespace, &app.name, action, &method, request).await;
+        return s.app_action(c, &q, &namespace, &app.name, action, &method, request).await;
     }
     if method == Method::GET && parts == ["apps"] {
         if q.contains_key("tag") { s.scope(c, &q, None)?; }
@@ -1793,6 +1793,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 .filter(|a| {
                     (!a.removed || batch && with_jobs.contains(a.name.as_str()))
                         && a.persistent != batch
+                        // A proof app is listed with its proof record.
+                        && !s.fleet.app_known(&a.namespace, &a.name)
                         && s.app_visible(a, c, &q)
                         && WorkloadController::require_grant(c, &a.name).is_ok()
                 })
@@ -1803,7 +1805,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if batch {
             return Ok(Json(templates.iter().map(|a| s.batch_value(a, tag)).collect::<Vec<_>>()).into_response());
         }
-        let mut apps: Vec<Value> = templates.iter().map(|a| s.serving_app_value(a, tag)).collect();
+        let mut apps: Vec<Value> = templates.iter().map(|a| s.app_value(a, tag)).collect();
         apps.extend(s.proof_app_values(c, &q, tag).await?);
         let last = |a: &Value| a["jobs"]["last_at"].as_f64().unwrap_or(0.0);
         apps.sort_by(|a, b| last(b).total_cmp(&last(a)));
@@ -1815,18 +1817,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)
                     .map_err(|e| fail(400, format!("invalid app registration: {e}")))?;
             body.validate().map_err(|e| fail(400, e.to_string()))?;
-            if body.has_spec() {
-                return s.create_app(c, &q, body).await;
-            }
-            let (namespace, tag) = s.scope(c, &q, body.namespace.as_deref())?;
-            WorkloadController::require_grant(c, &body.name)?;
-            let _ops = s.ops.lock().await;
-            if s.inner.lock().apps.get(&body.name).is_some_and(|a| !a.removed) {
-                return Err(fail(409, format!("an app or batch named {} exists", body.name)));
-            }
-            let app = s.fleet.add_app(&namespace, &body).await?;
-            drop(_ops);
-            return Ok((StatusCode::CREATED, Json(s.proof_app_value(&app, None, tag.as_deref()).await?)).into_response());
+            return s.create_app(c, &q, body).await;
         }
         let mut body: Value =
             serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
@@ -1918,7 +1909,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Err(fail(404, if batch { "unknown batch" } else { "unknown app" }));
         }
         let tag = c.map(|c| c.tag.as_deref().unwrap_or("")).or_else(|| q.get("tag").map(String::as_str));
-        let view = |s: &WorkloadController, app: &WorkloadTemplate| if batch { s.batch_value(app, tag) } else { s.serving_app_value(app, tag) };
+        let view = |s: &WorkloadController, app: &WorkloadTemplate| if batch { s.batch_value(app, tag) } else { s.app_value(app, tag) };
         if method == Method::GET && parts.len() == 2 {
             return Ok(Json(view(&s, &app)).into_response());
         }
@@ -1930,7 +1921,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     && app.workers.iter().all(|id| {
                         s.inner.lock().workers.get(id).is_some_and(|w| {
                             now() - w.seen < 30.0
-                                && w.report.services.iter().any(|v| {
+                                && w.report.apps.iter().any(|v| {
                                     text(v, "name") == name && v["cleaned"].as_bool() == Some(true)
                                 })
                         })
@@ -1944,7 +1935,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             {
                 return Err(fail(
                     409,
-                    "disable persistent services or finish/cancel jobs before deleting",
+                    "disable the app or finish/cancel jobs before deleting",
                 ));
             }
             app.removed = true;
@@ -1999,6 +1990,9 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             && matches!(method, Method::PUT | Method::DELETE)
         {
             let disabled = method == Method::PUT;
+            if app.persistent && !disabled {
+                s.deploy(&app.namespace, name).await?;
+            }
             let ids = {
                 let _ops = s.ops.lock().await;
                 app = s
@@ -2014,7 +2008,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 s.inner.lock().apps.insert(name.into(), app.clone());
                 if app.persistent {
                     // Every deployment changes; an offline node's waits until it reconnects.
-                    let keys = s.app_services(&app.namespace, name);
+                    let keys = s.app_deployments(&app.namespace, name);
                     s.begin_toggle(&keys, disabled)?;
                     s.online(&keys)
                 } else {
@@ -2141,10 +2135,10 @@ async fn priority_of(request: Request) -> anyhow::Result<i32> {
 }
 
 impl WorkloadController {
-    /// The keys of `app`'s service records in `namespace`.
-    pub(crate) fn app_services(&self, namespace: &str, app: &str) -> Vec<String> {
-        self.inner.lock().services.iter()
-            .filter(|(_, d)| text(&d.service, "app") == app && text(&d.service, "namespace") == namespace)
+    /// The keys of `app`'s deployment records in `namespace`.
+    pub(crate) fn app_deployments(&self, namespace: &str, app: &str) -> Vec<String> {
+        self.inner.lock().deployments.iter()
+            .filter(|(_, d)| text(&d.spec, "app") == app && text(&d.spec, "namespace") == namespace)
             .map(|(k, _)| k.clone())
             .collect()
     }
@@ -2171,9 +2165,9 @@ impl WorkloadController {
         self.proof_app_value(&app, anchored.as_deref(), tag).await
     }
 
-    /// A scale, logs or settings request for `app`'s services.
+    /// A scale, logs or settings request for `app`'s deployments.
     #[allow(clippy::too_many_arguments)]
-    async fn service_action(&self, c: Option<&Token>, q: &BTreeMap<String, String>, namespace: &str, app: &str,
+    async fn app_action(&self, c: Option<&Token>, q: &BTreeMap<String, String>, namespace: &str, app: &str,
         action: &str, method: &Method, request: Request,
     ) -> anyhow::Result<Response> {
         if action == "logs" {
@@ -2187,20 +2181,20 @@ impl WorkloadController {
                 return Err(fail(405, "PUT required"));
             }
             let node = q.get("node").map(String::as_str);
-            self.require_service_scope(c, namespace, app, node)?;
+            self.require_deployment_scope(c, namespace, app, node)?;
             let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
             if let Some(settings) = set.as_object() {
-                Self::require_admin_settings(c, settings, &Self::ADMIN_SERVICE_SETTINGS)?;
+                Self::require_admin_settings(c, settings, &Self::ADMIN_APP_SETTINGS)?;
             }
             return Ok((StatusCode::ACCEPTED, Json(self.request_update(namespace, app, node, set).await?)).into_response());
         }
         if method == Method::GET {
-            self.require_service_scope(c, namespace, app, q.get("node").map(String::as_str))?;
+            self.require_deployment_scope(c, namespace, app, q.get("node").map(String::as_str))?;
             return Ok(Json(self.scale_status(namespace, app, q.get("node").map(String::as_str))?).into_response());
         }
         if method == Method::PUT {
             let body: fleet_proto::model::v1::ScaleRequest = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)?;
-            self.require_service_scope(c, namespace, app, body.node.as_deref())?;
+            self.require_deployment_scope(c, namespace, app, body.node.as_deref())?;
             return Ok((StatusCode::ACCEPTED, Json(self.request_scale(namespace, app, body).await?)).into_response());
         }
         Err(fail(405, "GET or PUT required"))
@@ -2216,14 +2210,14 @@ impl WorkloadController {
             return Err(fail(404, "unknown app"));
         }
         let (namespace, name) = (app.namespace.clone(), app.name.clone());
-        // Changing the app changes every service that runs it: a token's tag must cover them.
+        // Changing the app changes every deployment of it: a token's tag must cover them.
         let changes = !matches!((method, rest), (&Method::GET, _) | (&Method::POST, ["jobs"]) | (_, ["scale" | "logs" | "settings"]));
         if changes {
             if let Some(c) = c {
                 let i = self.inner.lock();
-                if i.services.values().any(|d| text(&d.service, "namespace") == namespace && text(&d.service, "app") == name
-                    && d.service["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag))) {
-                    return Err(fail(403, "another tag's services run this app"));
+                if i.deployments.values().any(|d| text(&d.spec, "namespace") == namespace && text(&d.spec, "app") == name
+                    && d.spec["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag))) {
+                    return Err(fail(403, "another tag's deployments run this app"));
                 }
             }
         }
@@ -2232,6 +2226,12 @@ impl WorkloadController {
             (&Method::DELETE, []) => {
                 let _guard = self.app_lifecycle_guard(&namespace, &name).await?;
                 let deleted = self.fleet.delete_app(&namespace, &name).await?;
+                let template = self.inner.lock().apps.get(&name).filter(|a| a.namespace == namespace).cloned();
+                if let Some(mut template) = template {
+                    template.removed = true;
+                    self.save("apps", &name, &template)?;
+                    self.inner.lock().apps.insert(name.clone(), template);
+                }
                 self.remove_app(&namespace, &name)?;
                 Ok(Json(deleted).into_response())
             }
@@ -2241,8 +2241,11 @@ impl WorkloadController {
             }
             (&Method::PUT | &Method::DELETE, ["disabled"]) => {
                 let disabled = method == Method::PUT;
+                if !disabled {
+                    self.deploy(&namespace, &name).await?;
+                }
                 // Every deployment changes; an offline node's waits until it reconnects.
-                let keys = self.app_services(&namespace, &name);
+                let keys = self.app_deployments(&namespace, &name);
                 {
                     let _ops = self.ops.lock().await;
                     // Refused while another change is under way, before anything changes.
@@ -2254,7 +2257,7 @@ impl WorkloadController {
                 Ok(Json(self.stored_proof_app(&namespace, &name, tag.as_deref()).await?).into_response())
             }
             (_, [action]) if matches!(*action, "scale" | "logs" | "settings") => {
-                self.service_action(c, q, &namespace, &name, action, method, request).await
+                self.app_action(c, q, &namespace, &name, action, method, request).await
             }
             (_, ["jobs", jobs @ ..]) => {
                 crate::proof_api::app_jobs(self, c, q, &app, tag.as_deref(), method, jobs, request).await

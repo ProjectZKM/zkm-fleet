@@ -207,7 +207,7 @@ class JobState(str, enum.Enum):
     WAITING_VRAM = "waiting_vram"
     RUNNING = "running"
     RETRYING = "retrying"
-    PREEMPTED = "preempted"  # being stopped so a service gets its cards; it queues again
+    PREEMPTED = "preempted"  # being stopped so an app gets its cards; it queues again
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -226,7 +226,7 @@ class FailureCause(str, enum.Enum):
     EXIT_CODE = "exit-code"
     DOCKER_RUN = "docker-run"
     RANK_LOST = "rank-lost"
-    PREEMPTED = "preempted"  # a service took the cards; spends no --retry
+    PREEMPTED = "preempted"  # an app took the cards; spends no --retry
 
     @property
     def oom(self) -> bool:
@@ -432,7 +432,7 @@ class JobStatus(Record):
                          container=self.container or "")]
 
 
-# ── services ─────────────────────────────────────────────────────────────────
+# ── apps ─────────────────────────────────────────────────────────────────────
 
 class AppRuntime(str, enum.Enum):
     ZIREN_GPU = "ziren-gpu"
@@ -446,7 +446,7 @@ class AppRuntime(str, enum.Enum):
 
 @dataclass(kw_only=True)
 class ControlPlaneConfig(Record):
-    """The top of services.yaml: what every replica shares."""
+    """The top of apps.yaml: what every replica shares."""
 
     scheduler: str | None = None
     scheduler_ca_file: str | None = None
@@ -459,7 +459,7 @@ class ControlPlaneConfig(Record):
 
 @dataclass(kw_only=True)
 class AppSpec(Record):
-    """One entry of `services:`."""
+    """One entry of `apps:`."""
 
     name: str
     namespace: str = "00000000000000000000000000000000"
@@ -468,7 +468,7 @@ class AppSpec(Record):
     kind: AppRuntime = AppRuntime.ZIREN_GPU
     replicas: int = 1
     disabled: bool = False  # release resources until enabled
-    # The app this service runs, by its name in the service's namespace; the service's own
+    # The app this entry runs, by its name in the entry's namespace; the entry's own
     # name by default. A Ziren prover's is a proof app.
     app: str = ""
     # The program a dedicated Ziren prover proves (its app's full ELF SHA-256): required for a
@@ -505,7 +505,7 @@ class AppSpec(Record):
         if self.worker_command:
             if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):
-                raise ModelError("integrated worker requires a machine-pinned ziren-gpu service with one replica and persistent proof_storage_root")
+                raise ModelError("integrated worker requires a machine-pinned ziren-gpu app with one replica and persistent proof_storage_root")
             if not os.path.isabs(self.worker_command[0]) or self.worker_stop_timeout_s <= 0:
                 raise ModelError("worker executable must be absolute and stop timeout positive")
         elif self.worker_env_file or self.worker_workdir:
@@ -517,50 +517,50 @@ class AppSpec(Record):
             if self.elf_id and not re.fullmatch(r"[0-9a-fA-F]{64}", self.elf_id):
                 raise ModelError(f"{self.name}: elf_id must be the program's full ELF SHA-256")
             if self.kind is AppRuntime.ZIREN_GPU and not self.elf_id:
-                raise ModelError(f"{self.name}: a ziren-gpu service proves one program: set its elf_id")
+                raise ModelError(f"{self.name}: a ziren-gpu app proves one program: set its elf_id")
             self.elf_id = self.elf_id.lower()
         else:
             if self.app != self.name:
-                raise ModelError(f"{self.name}: a {self.kind.value} service is its own app")
+                raise ModelError(f"{self.name}: a {self.kind.value} entry is its own app")
             if self.elf_id:
                 raise ModelError(f"{self.name}: only a Ziren prover proves a program (elf_id)")
 
 
 @dataclass(kw_only=True)
 class AppsConfig(Record):
-    """services.yaml as a whole."""
+    """apps.yaml as a whole."""
 
     cluster: ControlPlaneConfig
-    services: list[AppSpec]
+    apps: list[AppSpec]
     raw: dict[str, Any] = field(default_factory=dict)  # the file's own mapping, for the spec hash
 
     @classmethod
     def parse(cls, data: Mapping[str, Any]) -> AppsConfig:
-        cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "services"})
-        services = [from_dict(AppSpec, s, where=f"service {s.get('name', '?')}") for s in data.get("services", [])]
-        return cls(cluster=cluster, services=services, raw=dict(data))
+        cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
+        apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
+        return cls(cluster=cluster, apps=apps, raw=dict(data))
 
 
 @dataclass(kw_only=True)
 class AppReplicaSpec(Record):
-    """One actor: a service's replica `index`, named `<service>-<index>`, with the
+    """One actor: an app's replica `index`, named `<app>-<index>`, with the
     cluster settings it needs. `config` is the file's own mapping for this replica,
     which the spec hash is taken from: a change in the bridge's code never counts as
-    a change of the service, only an edit of the file does."""
+    a change of the app, only an edit of the file does."""
 
     name: str
     index: int
-    service: AppSpec
+    app: AppSpec
     cluster: ControlPlaneConfig
     config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def kind(self) -> AppRuntime:
-        return self.service.kind
+        return self.app.kind
 
     @property
     def machine(self) -> str | None:
-        return self.service.machine
+        return self.app.machine
 
     def node_log_path(self) -> str:
         return os.path.join(self.cluster.log_dir, f"{self.name}.node.log")

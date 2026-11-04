@@ -60,12 +60,12 @@ the existing ELF to the upstream host build. A new guest requires the Ziren MIPS
 toolchain and the locked guest dependencies, including PR #23's precompile pins.
 
 For an image update, pull `ghcr.io/projectzkm/ziren-gpu:latest`, validate it with
-the host and guest, then pin its resolved digest in the service config. The current
+the host and guest, then pin its resolved digest in the app's `apps.yaml` entry. The current
 validated image is `sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655`.
 Its Ziren revision label matches the locked host and guest revision.
 
 Install the package at `/opt/zkm-fleet/apps/ethproofs`. Adapt
-[`services.example.yaml`](services.example.yaml) to the existing node config,
+[`apps.example.yaml`](apps.example.yaml) to the existing node config,
 using the node's Ray hostname/IP, namespace, actual ELF digest, validated GPU
 image, and durable storage path. The example starts disabled. Put API credentials
 and RPC URLs in the private file described by
@@ -75,19 +75,22 @@ worker reads its app name from `FLEET_APP`. Its checkpoint identity names the ap
 a version-1 checkpoint naming a tenant is upgraded in place when the rest of its
 identity matches.
 
-A new guest has a new app identity. Register it under a new NAME with
-`fleetctl --token-file zkm-owner.token --namespace zkm app add NAME --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda`,
-then stage its service disabled with `app: NAME` and the guest's `elf_id`, and
-wait for the node heartbeat to advertise it.
-Use a new service name and state directory. Keep a temporary rollback package
+A new guest has a new app identity. Create it under a new NAME with
+`fleetctl --token-file zkm-owner.token --namespace zkm app add NAME --spec prover.json --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda`,
+where `prover.json` holds the validated image (`{"image": "ghcr.io/projectzkm/ziren-gpu@sha256:..."}`).
+Then stage its `apps.yaml` entry disabled with `app: NAME` and the guest's `elf_id`,
+and wait for the node heartbeat to advertise it before enabling the app: enabling an
+app no node reports yet places a plain prover, without the worker, on a node the
+scheduler picks.
+Use a new entry name and state directory. Keep a temporary rollback package
 until proving and reporting are verified, then remove retired deployment records
-according to the app's retention policy. Keep GOAT's service and image unchanged.
+according to the app's retention policy. Keep GOAT's entry and image unchanged.
 
 Before enabling a new worker, validate local proving and API reporting with test
 credentials. For an existing stream, preserve its next unproved block and stop
 the previous worker before starting the replacement. Bootstrap a new state
 directory with `--start-block N`; a checkpoint takes precedence on subsequent
-restarts. Run only one worker for the stream and preserve GOAT's service.
+restarts. Run only one worker for the stream and preserve GOAT's entry.
 
 ## Production deployment
 

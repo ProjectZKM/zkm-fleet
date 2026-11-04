@@ -24,7 +24,7 @@ batches:
       - /tmp/train_jobs
     env:
       HOME: /home/ubuntu
-    # A higher-priority job/service in this namespace may preempt this batch job after
+    # A higher-priority job/app in this namespace may preempt this batch job after
     # min_runtime_s: SIGTERM, SIGKILL stop_timeout_s later (also on cancel), then the
     # job queues again with the same id and out/, FLEET_ATTEMPT counting on, no --retry spent.
     preemptible: true
