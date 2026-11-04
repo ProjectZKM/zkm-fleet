@@ -184,6 +184,9 @@ impl WorkloadController {
     // Services can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
     pub(super) const ADMIN_SERVICE_SETTINGS: [&'static str; 6] = ["image", "env", "command", "user", "workdir", "volumes"];
+    // A namespace's owner creates its own serving apps, as it does its batches: the host's
+    // filesystem and user ids stay administrator settings.
+    const ADMIN_CREATE_SETTINGS: [&'static str; 2] = ["user", "volumes"];
 
     /// Changes `app`'s service settings like a scale does: drain, stop, have the node write the
     /// settings (NODE_OPERATION_APP), start it again with them.
@@ -622,6 +625,9 @@ impl WorkloadController {
         if !body["image"].as_str().is_some_and(|i| !i.is_empty() && !i.starts_with('-')) {
             return Err(fail(400, "image is required"));
         }
+        if body["port_base"].is_null() {
+            return Err(fail(400, "port_base is required: replica i serves on port_base + i"));
+        }
         // Checked here, not only by the node: a setting the node refuses would leave an app
         // record with no service behind it.
         let set = |key: &str| !body[key].is_null();
@@ -633,7 +639,7 @@ impl WorkloadController {
         }
         let (namespace, tag) = self.scope(c, q, body["namespace"].as_str())?;
         WorkloadController::require_grant(c, &name)?;
-        WorkloadController::require_admin_settings(c, body.as_object().unwrap(), &Self::ADMIN_SERVICE_SETTINGS)?;
+        WorkloadController::require_admin_settings(c, fields, &Self::ADMIN_CREATE_SETTINGS)?;
         let replicas = body["replicas"].as_u64().unwrap_or(1);
         if !(1..=64).contains(&replicas) {
             return Err(fail(400, "replicas must be between 1 and 64"));

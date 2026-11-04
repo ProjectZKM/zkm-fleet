@@ -1930,9 +1930,9 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu"})).await.status(),
         StatusCode::BAD_REQUEST);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","image":"x"})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","image":"x","port_base":1})).await.status(),
         StatusCode::CONFLICT, "a batch's name is taken");
-    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x"})).await.status(),
+    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x","port_base":1})).await.status(),
         StatusCode::NOT_FOUND);
 }
 
@@ -1940,10 +1940,32 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
 async fn a_serving_app_with_a_mistyped_setting_is_refused_before_its_node_sees_it() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("workdir", json!(1)), ("kind", json!("app"))] {
-        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1"});
+    for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("port_base", Value::Null),
+        ("workdir", json!(1)), ("kind", json!("app"))] {
+        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","port_base":50100});
         body[key] = value;
         assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::BAD_REQUEST, "{key}");
     }
     assert!(remove_commands(&c, NodeOperation::App).is_empty() && !c.inner.lock().apps.contains_key("model"));
+}
+
+#[tokio::test]
+async fn a_namespace_owner_creates_its_serving_app_but_not_host_mounts_or_users() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let owner = user_token(&c, &ns, 7, "scope=default", None, true).await;
+    let reader = user_token(&c, &ns, 8, "scope=default", Some(vec!["model".into()]), false).await;
+    let body = json!({"name":"model","node":"gpu","image":"serve:1","port_base":50100,"command":["serve","{port}"],
+        "env":{"A":"1"},"workdir":"/srv"});
+    for (key, value) in [("volumes", json!(["/models:ro"])), ("user", json!("0:0"))] {
+        let mut admin_only = body.clone();
+        admin_only[key] = value;
+        assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", admin_only).await.status(), StatusCode::FORBIDDEN, "{key}");
+    }
+    assert_eq!(scale_call(c.clone(), &reader, "POST", "/apps", body.clone()).await.status(), StatusCode::FORBIDDEN, "creation needs manage");
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    let app = c.inner.lock().apps["model"].clone();
+    assert_eq!((app.namespace.as_str(), app.tag.as_deref()), (ns.as_str(), Some("scope=default")), "in the token's namespace and tag");
+    let (_, message) = remove_commands(&c, NodeOperation::App).remove(0);
+    assert_eq!(message["create"]["tag"], "scope=default");
 }

@@ -217,7 +217,7 @@ struct CreateServingApp {
     node: String,
     /// The app's settings, the keys of its services.yaml entry: image (required), command,
     /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
-    /// Image, command, env, user, workdir and volumes require administrator credentials.
+    /// image and port_base are required; user and volumes require administrator credentials.
     settings: serde_json::Map<String, Value>,
 }
 
@@ -304,7 +304,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_app_create_serving",
-        description = "Create a serving app (a long-running container with its own port, such as a model server) on a node in the authenticated namespace. It starts disabled; enabling it admits it against the namespace's quota. Image, command, env, user, workdir and volumes require administrator credentials. The scheduler validates the settings.",
+        description = "Create a serving app (a long-running container with its own port, such as a model server) on a node in the authenticated namespace. It starts disabled; enabling it admits it against the namespace's quota. A namespace token with manage permission may create one; user and volumes require administrator credentials. The scheduler validates the settings.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn app_create_serving(

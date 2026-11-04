@@ -509,7 +509,7 @@ struct AddApp {
     node: Option<String>,
     /// Serving app: a JSON file with the app's settings, the keys of its services.yaml entry
     /// (image, command, replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes,
-    /// env, user). Image, command, env, user, workdir and volumes need administrator credentials.
+    /// env, user). image and port_base are required; user and volumes need administrator credentials.
     #[arg(long)]
     #[serde(skip)]
     spec: Option<PathBuf>,
