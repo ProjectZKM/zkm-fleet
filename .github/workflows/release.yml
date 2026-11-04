@@ -45,6 +45,7 @@ jobs:
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+          echo "FLEET_VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
       # Fail before publishing an image for a tag that has no Release to attach assets to.
       - name: Require an existing GitHub Release

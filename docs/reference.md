@@ -113,7 +113,10 @@ and execution details use lossless JSON extension fields; the local Python adapt
 needs no protobuf package. Rust owns runtime handles and scheduling behavior.
 The report (`NodeReport`) carries the node's `apps.yaml` entries, each with its observed
 state, in `apps` (field 9). Machine report version 3 requires updating the scheduler,
-agent and adapter together; version 2 named that field `services`.
+agent and adapter together; version 2 named that field `services`. The agent reports the
+release version it was built for in `agent_version` (field 12, optional): the build sets
+`FLEET_VERSION`, for example `0.1.5`. Builds that name no version, like agents that
+predate the field, omit it, and `fleetctl node` shows `-` there.
 
 Further simplification should move batch and app command persistence behind
 the same store interface as proof records, and separate retained artifact fetching

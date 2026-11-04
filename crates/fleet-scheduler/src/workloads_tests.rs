@@ -573,9 +573,11 @@ async fn heartbeat_fences_duplicate_sessions_and_registers_local_node_capacity()
     let mut report = inventory(&ns);
     report.free_gpus = 0.5;
     report.free_cpus = 0.0;
+    report.agent_version = Some("v0.1.6".into());
     c.report("gpu", "first", report).await.unwrap();
     assert!(c.report("gpu", "second", inventory(&ns)).await.is_err());
     assert_eq!(c.worker_status()[0]["backend"], "ray-local");
+    assert_eq!(c.worker_status()[0]["agent_version"], "v0.1.6");
     assert_eq!(c.worker_status()[0]["gpus"].as_f64(), Some(2.0));
     assert_eq!(c.worker_status()[0]["cpus"].as_f64(), Some(8.0));
     assert_eq!(c.worker_status()[0]["free_gpus"].as_f64(), Some(0.5));
