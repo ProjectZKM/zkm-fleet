@@ -210,7 +210,10 @@ deploy/fleet-ctl.sh app cleanup APP-0            # leftovers of a failed app sta
 An upgrade copies what it replaces to `backup/` first, then waits for the scheduler's
 health check or the node's reconnection. Upgrade the scheduler and nodes together when a
 release changes the protocol. The scheduler and MCP are managed with Docker Compose; the
-node uses `sudo systemctl`, and `FLEET_NODE_UNIT` names a non-default unit.
+node uses `sudo systemctl`, and `FLEET_NODE_UNIT` names a non-default unit. Keep a site's
+changes to the release's compose file, such as another gateway or an existing Postgres
+volume, in `deploy/docker-compose.override.yml`: an upgrade replaces only
+`docker-compose.yml`, and every compose call applies the override after it.
 A third `node upgrade` argument also installs `fleet-proof-app` and restarts the app
 endpoint units listed in `FLEET_PROOF_APP_UNITS`.
 
