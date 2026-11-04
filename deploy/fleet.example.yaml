@@ -1,5 +1,5 @@
 # fleet-scheduler configuration (inside the compose container: paths under /etc/zkm-fleet).
-stage_addr: 0.0.0.0:51000          # SDK proof API (server TLS; authorize with the user bearer token)
+stage_addr: 0.0.0.0:51000          # deprecated SDK proof API, kept for existing clients; new ones use fleet-proof-app
 control_addr: 0.0.0.0:51001        # node-initiated gRPC; TLS uses the certificate below
 http_addr: 0.0.0.0:9191            # public values for the SDK, /healthz, the API (each route needs a token permission)
 public_url: https://fleet.example.com:8905

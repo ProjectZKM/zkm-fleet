@@ -229,6 +229,23 @@ must preserve it (for example, through `take_prove_ms()`); an SDK that only logs
 it needs a timing accessor. Integrated EthProofs takes execution timing directly
 from its GPU response and excludes preparation, queueing and reporting.
 
+### Scheduler stage API (deprecated)
+
+The scheduler still serves the SDK's gRPC stage API (`GenerateProof`, `GetStatus`)
+on `stage_addr` (default `0.0.0.0:51000`, behind the HTTPS gateway on `8905`) for
+`ZKM_PROVER=network` clients whose `ENDPOINT` points at Fleet. Its remaining client
+is reth-processor's `eth-proofs` and `host`. Such a request carries the program and
+its inputs to the control host's blob storage, and outputs come back through the
+control-host fetch relay.
+
+This endpoint is deprecated. It keeps working and takes no new features. Point new
+SDK clients at an [app-owned proof endpoint](#app-owned-proof-endpoint) instead:
+the same SDK and token, with `ENDPOINT` set to that endpoint's stage port, and
+payloads kept in app storage. The scheduler logs a `deprecated` warning the first
+time each token calls the stage API after a start, naming the token and its
+namespace, so the remaining clients can be found before the API is removed. The
+HTTP proof job routes (`/apps/NAME/jobs`) that app endpoints use are not deprecated.
+
 ## Namespaces, access and quotas
 
 A namespace is a resource and the accounting and billing unit. A token names

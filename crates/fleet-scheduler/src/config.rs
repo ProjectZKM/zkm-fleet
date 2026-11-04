@@ -4,7 +4,8 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
-    /// External stage API (SDK network prover). TLS when `tls` is set.
+    /// External stage API (SDK network prover), deprecated for `fleet-proof-app`. TLS when
+    /// `tls` is set.
     #[serde(default = "default_stage_addr")]
     pub stage_addr: String,
     /// Cluster-internal control API (node registration and heartbeats).

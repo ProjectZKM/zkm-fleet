@@ -38,7 +38,7 @@ pub(crate) async fn app_jobs(w: &WorkloadController, c: Option<&Token>, q: &BTre
                 return Err(fail(403, "an administrator's token submits no proofs: use a namespace token"));
             };
             let body: SubmitProofRequest = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-            let api = ProofStageService { fleet: fleet.clone() };
+            let api = ProofStageService::new(fleet.clone());
             let response = api.generate(
                 GenerateProofRequest {
                     proof_id: body.proof_id,

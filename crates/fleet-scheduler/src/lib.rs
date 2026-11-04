@@ -85,12 +85,11 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     } else {
         tracing::warn!("stage API without TLS: keep it off untrusted networks");
     }
-    let stage = StageServiceServer::new(stage::ProofStageService {
-        fleet: fleet.clone(),
-    })
+    let stage = StageServiceServer::new(stage::ProofStageService::new(fleet.clone()))
     .max_decoding_message_size(1 << 30)
     .max_encoding_message_size(1 << 30);
     let stage_addr = cfg.stage_addr.parse()?;
+    tracing::info!(%stage_addr, "serving the deprecated gRPC stage API for SDK network clients; new clients use fleet-proof-app");
     let (stop_tx, stop_rx) = watch::channel(false);
     let stopping = move || {
         let mut rx = stop_rx.clone();
