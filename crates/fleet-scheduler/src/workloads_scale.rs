@@ -808,6 +808,8 @@ impl WorkloadController {
 
     /// The new node reports the moved app's entry: the start on the old node is not sent, the
     /// old deployment is done and its node removes the entry, and the app starts on `target`.
+    /// Removing the entry stops what is left of the app there; its data stays where the app
+    /// keeps it, which may be storage the new node shares.
     fn finish_move(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));

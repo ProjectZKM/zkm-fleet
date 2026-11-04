@@ -303,6 +303,23 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     assert list(yaml.safe_load((executor.apps_file.parent/"batches.yaml").read_text())["batches"])==["kept"]
 
 
+def test_removing_an_app_keeps_its_data(executor,monkeypatch,tmp_path):
+    """A moved app's old node removes its entry; the app's storage is the app's own."""
+    monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
+    monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:True)
+    data={name:tmp_path/"data"/name for name in ("storage","workdir","models")}
+    for d in data.values():
+        d.mkdir(parents=True);(d/"cursor").write_text("42")
+    env=tmp_path/"data"/"worker.env";env.write_text("RPC=x\n")
+    apps=yaml.safe_load(executor.apps_file.read_text())
+    apps["apps"]=[{"name":"eth-worker","kind":"ziren-gpu","namespace":"a"*32,"app":"eth","elf_id":"b"*64,"image":"ziren-gpu:1",
+        "machine":"m1","worker_command":["/opt/eth-proofs"],"worker_env_file":str(env),"worker_workdir":str(data["workdir"]),
+        "proof_storage_root":str(data["storage"]),"volumes":[f"{data['models']}:ro"]}]
+    executor.apps_file.write_text(yaml.safe_dump(apps))
+    assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["eth-worker"]},None)
+    assert all((d/"cursor").read_text()=="42" for d in data.values()) and env.read_text()=="RPC=x\n"
+
+
 def test_an_app_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
