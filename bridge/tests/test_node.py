@@ -10,11 +10,11 @@ from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
 @pytest.fixture
 def executor(tmp_path, monkeypatch):
     (tmp_path / "batches.yaml").write_text("batches: {}\n")
-    (tmp_path / "services.yaml").write_text(yaml.safe_dump({"services": [{
+    (tmp_path / "apps.yaml").write_text(yaml.safe_dump({"apps": [{
         "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
         "app": "eth", "elf_id": "b"*64, "disabled": True, "replicas": 2,
     }]}))
-    e=node.NodeExecutor(str(tmp_path/"services.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
+    e=node.NodeExecutor(str(tmp_path/"apps.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
     e.pool=Mock()
     monkeypatch.setattr(node.ray,"nodes",lambda:[{"Alive":True}])
@@ -58,37 +58,37 @@ def test_cancel_before_local_record_confirms_absence_without_launch(executor,mon
 
 
 def test_stop_removes_every_replica_and_writes_nothing(executor,monkeypatch):
-    cfg=yaml.safe_load(executor.services.read_text())
-    before=executor.services.read_bytes()
+    cfg=yaml.safe_load(executor.apps_file.read_text())
+    before=executor.apps_file.read_bytes()
     stop=Mock();clean=Mock();monkeypatch.setattr(reconcile,"stop",stop)
-    monkeypatch.setattr(reconcile,"running",lambda:{"proof-2":"left over","other-0":"another service"})
+    monkeypatch.setattr(reconcile,"running",lambda:{"proof-2":"left over","other-0":"another app"})
     monkeypatch.setattr(actors,"clean_after",clean);monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
-    result=executor.service({"service":cfg["services"][0],"disabled":True})
+    result=executor.set_app({"app":cfg["apps"][0],"disabled":True})
     assert result["cleaned"]
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1","proof-2"]
     assert clean.remote.call_count==3
-    assert executor.services.read_bytes()==before
+    assert executor.apps_file.read_bytes()==before
 
 
 def test_stop_failure_does_not_confirm_cleanup(executor,monkeypatch):
-    service=yaml.safe_load(executor.services.read_text())["services"][0]
+    app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
     monkeypatch.setattr(reconcile,"stop",lambda _:None);monkeypatch.setattr(reconcile,"running",lambda:{})
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:False)
     with pytest.raises(ValueError,match="uncertain"):
-        executor.service({"service":service,"disabled":True})
-    assert yaml.safe_load(executor.services.read_text())["services"][0]["disabled"]
+        executor.set_app({"app":app,"disabled":True})
+    assert yaml.safe_load(executor.apps_file.read_text())["apps"][0]["disabled"]
 
 
 def test_start_uses_local_executor_and_no_admin_token(executor,monkeypatch):
-    service=yaml.safe_load(executor.services.read_text())["services"][0]
+    app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
     monkeypatch.setattr(reconcile,"running",lambda:{})
     start=Mock();monkeypatch.setattr(reconcile,"start",start)
-    with pytest.raises(ValueError,match="disabled in services.yaml"):
-        executor.service({"service":service,"disabled":False})
-    node.set_fields(executor.services,"services","proof",{"disabled":False})
-    assert executor.service({"service":service,"disabled":False})["ready"]
+    with pytest.raises(ValueError,match="disabled in apps.yaml"):
+        executor.set_app({"app":app,"disabled":False})
+    node.set_fields(executor.apps_file,"apps","proof",{"disabled":False})
+    assert executor.set_app({"app":app,"disabled":False})["ready"]
     assert start.call_count==2
     assert all(not c.kwargs for c in start.call_args_list)
 
@@ -104,7 +104,7 @@ def test_purge_refuses_an_old_execution_lease(executor):
 def test_local_ray_must_contain_only_this_machine(executor,monkeypatch):
     monkeypatch.setattr(node.ray,"nodes",lambda:[{"Alive":True},{"Alive":True}])
     with pytest.raises(ValueError,match="only this machine"):
-        executor.service({"service":{},"disabled":False})
+        executor.set_app({"app":{},"disabled":False})
 
 
 def test_pending_launch_cannot_recover_into_a_shared_ray_cluster(executor, monkeypatch):
@@ -159,20 +159,20 @@ def test_finished_job_reports_log_completion_without_archiving_outputs(executor,
     assert executor.report()["jobs"][0]["logs_ready"]
 
 
-def test_healthy_proof_service_is_ready_and_enable_preserves_actors(executor, monkeypatch):
+def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkeypatch):
     from fleet_bridge.model import ReplicaHealth
-    cfg=yaml.safe_load(executor.services.read_text())
-    cfg['services'][0]['disabled']=False
-    executor.services.write_text(yaml.safe_dump(cfg))
-    specs=reconcile.replica_specs(reconcile.load_services(cfg))
+    cfg=yaml.safe_load(executor.apps_file.read_text())
+    cfg['apps'][0]['disabled']=False
+    executor.apps_file.write_text(yaml.safe_dump(cfg))
+    specs=reconcile.replica_specs(reconcile.load_apps(cfg))
     monkeypatch.setattr(reconcile,'running',lambda:{name:name for name in specs})
     monkeypatch.setattr(reconcile,'health_of',lambda name, **kwargs:ReplicaHealth(name=name,spec=actors.spec_hash(specs[name]),gpu_ready=True))
     start,stop=Mock(),Mock()
     monkeypatch.setattr(reconcile,'start',start);monkeypatch.setattr(reconcile,'stop',stop)
     monkeypatch.setattr(node.ray,'cluster_resources',lambda:{'GPU':8,'CPU':48})
     monkeypatch.setattr(node.ray,'available_resources',lambda:{'GPU':4,'CPU':16})
-    assert executor.report()['services'][0]['ready'] is True
-    assert executor.service({'service':cfg['services'][0],'disabled':False})['ready']
+    assert executor.report()['apps'][0]['ready'] is True
+    assert executor.set_app({'app':cfg['apps'][0],'disabled':False})['ready']
     start.assert_not_called();stop.assert_not_called()
     assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=False).is_ready
     assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=True,stopping=True).is_ready
@@ -191,49 +191,49 @@ def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(execut
                                                      'done': True, 'result': {'cleaned': True}, 'error': None})
     report = executor.report()
     assert report['ready'] and report['total_gpus'] == 8
-    assert not report['services'][0]['ready']
+    assert not report['apps'][0]['ready']
     assert report['results'][0]['result']['cleaned']
     assert all(call.kwargs == {'timeout_s': 5} for call in health.call_args_list)
 
 
-def test_start_takes_resources_from_services_yaml_and_stops_extra_replicas(executor,monkeypatch):
-    service=yaml.safe_load(executor.services.read_text())["services"][0]
-    node.set_fields(executor.services,"services","proof",{"disabled":False,"gpus":2,"cpus":8,"replicas":1})
+def test_start_takes_resources_from_apps_yaml_and_stops_extra_replicas(executor,monkeypatch):
+    app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
+    node.set_fields(executor.apps_file,"apps","proof",{"disabled":False,"gpus":2,"cpus":8,"replicas":1})
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
     monkeypatch.setattr(reconcile,"running",lambda:{"proof-1":"outside the new count"})
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
     start=Mock();monkeypatch.setattr(reconcile,"start",start)
-    assert executor.service({"service":service,"disabled":False,"scale_id":"resize"})["ready"]
+    assert executor.set_app({"app":app,"disabled":False,"scale_id":"resize"})["ready"]
     assert [c.args[0] for c in stop.call_args_list]==["proof-1"]
     replica=start.call_args.args[0]
-    assert (start.call_count,replica.name,replica.service.gpus,replica.service.cpus)==(1,"proof-0",2,8)
+    assert (start.call_count,replica.name,replica.app.gpus,replica.app.cpus)==(1,"proof-0",2,8)
 
 
 @pytest.mark.parametrize("field,value",[("namespace","another"),("app","other-app"),("elf_id","c"*64),("tag","other"),("kind","app")])
-def test_scale_cannot_change_machine_service_scope(executor,field,value):
-    before=executor.services.read_bytes()
-    service=yaml.safe_load(before)["services"][0];service[field]=value
+def test_scale_cannot_change_machine_app_scope(executor,field,value):
+    before=executor.apps_file.read_bytes()
+    app=yaml.safe_load(before)["apps"][0];app[field]=value
     with pytest.raises(ValueError,match="scope"):
-        executor.service({"service":service,"disabled":True})
-    assert executor.services.read_bytes()==before
+        executor.set_app({"app":app,"disabled":True})
+    assert executor.apps_file.read_bytes()==before
 
 
 def test_resource_update_preserves_comments_and_handles_flow_yaml(tmp_path):
-    for text in ["# machine config\nservices:\n- name: app # owner label\n  kind: app\n  image: image:latest\n",
-                 "# machine config\nservices: [{name: app, kind: app, image: 'image:latest'}]\n"]:
-        p=tmp_path/"services.yaml";p.write_text(text)
-        node.set_fields(p,"services","app",{"disabled":True,"gpus":2,"cpus":8,"replicas":3})
-        data=yaml.safe_load(p.read_text())["services"][0]
+    for text in ["# machine config\napps:\n- name: app # owner label\n  kind: app\n  image: image:latest\n",
+                 "# machine config\napps: [{name: app, kind: app, image: 'image:latest'}]\n"]:
+        p=tmp_path/"apps.yaml";p.write_text(text)
+        node.set_fields(p,"apps","app",{"disabled":True,"gpus":2,"cpus":8,"replicas":3})
+        data=yaml.safe_load(p.read_text())["apps"][0]
         assert (data["gpus"],data["cpus"],data["replicas"],data["disabled"])==(2,8,3,True)
         assert data["image"]=="image:latest" and "# machine config" in p.read_text()
 
 
 
 
-SERVICES = """# machine config
+APPS = """# machine config
 cluster: {log_dir: /tmp}
-services:
+apps:
 # the GOAT worker
 - name: goat
   kind: ziren-gpu
@@ -249,18 +249,18 @@ services:
 
 
 def test_remove_entry_keeps_every_other_line(tmp_path):
-    p=tmp_path/"services.yaml";p.write_text(SERVICES)
-    assert node.remove_entry(p,"services","eth")
+    p=tmp_path/"apps.yaml";p.write_text(APPS)
+    assert node.remove_entry(p,"apps","eth")
     text=p.read_text()
-    assert [s["name"] for s in yaml.safe_load(text)["services"]]==["goat","flow"]
+    assert [s["name"] for s in yaml.safe_load(text)["apps"]]==["goat","flow"]
     assert "ethproofs: retired" not in text and "owner label" not in text
     assert "# machine config" in text and "# the GOAT worker" in text and "# trailing note" in text
-    assert len(list(tmp_path.glob("services.yaml.removed-*")))==1
-    assert node.remove_entry(p,"services","flow")
-    assert node.remove_entry(p,"services","goat")
-    assert yaml.safe_load(p.read_text())["services"]==[]
+    assert len(list(tmp_path.glob("apps.yaml.removed-*")))==1
+    assert node.remove_entry(p,"apps","flow")
+    assert node.remove_entry(p,"apps","goat")
+    assert yaml.safe_load(p.read_text())["apps"]==[]
     assert "# trailing note" in p.read_text()
-    assert not node.remove_entry(p,"services","goat")
+    assert not node.remove_entry(p,"apps","goat")
 
 
 def test_remove_entry_drops_one_batch(tmp_path):
@@ -273,8 +273,8 @@ def test_remove_entry_drops_one_batch(tmp_path):
 
 
 def test_remove_entry_leaves_flow_sections_and_unknown_names_alone(tmp_path):
-    p=tmp_path/"services.yaml";text="services: [{name: a, kind: app}]\n";p.write_text(text)
-    assert not node.remove_entry(p,"services","a") and p.read_text()==text
+    p=tmp_path/"apps.yaml";text="apps: [{name: a, kind: app}]\n";p.write_text(text)
+    assert not node.remove_entry(p,"apps","a") and p.read_text()==text
     assert not node.remove_entry(p,"batches","a")
 
 
@@ -289,30 +289,30 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
     monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
     monkeypatch.setattr(node,"container_gone",lambda _:True)
-    services=yaml.safe_load(executor.services.read_text())
-    services["services"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth","elf_id":"b"*64},
+    apps=yaml.safe_load(executor.apps_file.read_text())
+    apps["apps"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth","elf_id":"b"*64},
                            {"name":"web","kind":"app","namespace":"zkm"}]
-    executor.services.write_text(yaml.safe_dump(services))
+    executor.apps_file.write_text(yaml.safe_dump(apps))
     assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["proof"]},None)
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
     assert app_message(executor,"remove-2",{"remove":True},app="eth")==({"removed":[]},None)
     assert app_message(executor,"remove-3",{"remove":True},app="web",ns="1"*32,ns_name="zkm")==({"removed":["web"]},None)
-    assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["other-ns"]
-    (executor.services.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
+    assert [s["name"] for s in yaml.safe_load(executor.apps_file.read_text())["apps"]]==["other-ns"]
+    (executor.apps_file.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
     assert app_message(executor,"remove-4",{"remove":True},batch="old")==({"removed":["old"]},None)
-    assert list(yaml.safe_load((executor.services.parent/"batches.yaml").read_text())["batches"])==["kept"]
+    assert list(yaml.safe_load((executor.apps_file.parent/"batches.yaml").read_text())["batches"])==["kept"]
 
 
-def test_a_service_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
+def test_an_app_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
     result,error=app_message(executor,"remove-1",{"remove":True},app="eth")
     assert "uncertain" in error
-    assert [s["name"] for s in yaml.safe_load(executor.services.read_text())["services"]]==["proof"]
+    assert [s["name"] for s in yaml.safe_load(executor.apps_file.read_text())["apps"]]==["proof"]
 
 
 SETTINGS = """# machine config
-services:
+apps:
 # the web app
 - name: web # owner label
   kind: app
@@ -327,11 +327,11 @@ services:
 
 
 def test_app_settings_are_written_without_touching_other_lines(executor):
-    executor.services.write_text(SETTINGS)
+    executor.apps_file.write_text(SETTINGS)
     change={"set":{"image":"web:2","env":{"A":"3"},"shm_gb":8}}
     assert app_message(executor,"set-1",change,app="web",ns="1"*32,ns_name="zkm")==({"updated":["web"]},None)
-    text=executor.services.read_text()
-    web,other=yaml.safe_load(text)["services"]
+    text=executor.apps_file.read_text()
+    web,other=yaml.safe_load(text)["apps"]
     assert (web["image"],web["env"],web["shm_gb"],web["replicas"])==("web:2",{"A":"3"},8,1)
     assert other=={"name":"other","kind":"app","namespace":"zkm","image":"other:1"}
     assert "# machine config" in text and "# the web app" in text and "owner label" in text
@@ -339,13 +339,13 @@ def test_app_settings_are_written_without_touching_other_lines(executor):
 
 
 def test_invalid_app_settings_leave_the_configuration_alone(executor):
-    executor.services.write_text(SETTINGS)
+    executor.apps_file.write_text(SETTINGS)
     result,error=app_message(executor,"set-1",{"set":{"replicas":"many"}},app="web",ns="zkm")
-    assert error and executor.services.read_text()==SETTINGS
+    assert error and executor.apps_file.read_text()==SETTINGS
 
 
 def test_batch_settings_are_written_and_validated(executor):
-    path=executor.services.parent/"batches.yaml"
+    path=executor.apps_file.parent/"batches.yaml"
     path.write_text("batches:\n  # trainer\n  train:\n    image: t:1\n    allow: [/srv]\n  other: {image: o:1}\n")
     assert app_message(executor,"set-1",{"set":{"image":"t:2","allow":["/srv","/data"]}},batch="train")==({"updated":["train"]},None)
     batches=yaml.safe_load(path.read_text())["batches"]
@@ -357,14 +357,14 @@ def test_batch_settings_are_written_and_validated(executor):
     assert app_message(executor,"set-3",{"set":{"image":"x"}},batch="missing")==({"updated":[]},None)
 
 
-def test_a_stopped_service_gets_its_configuration_by_name(executor):
-    executor.services.write_text(SETTINGS)
-    executor.execute({"id":"set-1","operation":7,"parameters":{"service":{"name":"web"},"set":{"disabled":True,"replicas":2,"image":"web:3"}}})
+def test_a_stopped_entry_gets_its_configuration_by_name(executor):
+    executor.apps_file.write_text(SETTINGS)
+    executor.execute({"id":"set-1","operation":7,"parameters":{"entry":{"name":"web"},"set":{"disabled":True,"replicas":2,"image":"web:3"}}})
     done=node.read_json(executor.journal/"set-1.json")
     assert (done["result"],done["error"])==({"updated":["web"]},None)
-    web=yaml.safe_load(executor.services.read_text())["services"][0]
+    web=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
     assert (web["disabled"],web["replicas"],web["image"])==(True,2,"web:3")
-    executor.execute({"id":"set-2","operation":7,"parameters":{"service":{"name":"missing"},"set":{"disabled":True}}})
+    executor.execute({"id":"set-2","operation":7,"parameters":{"entry":{"name":"missing"},"set":{"disabled":True}}})
     assert node.read_json(executor.journal/"set-2.json")["result"]=={"updated":[]}
 
 
@@ -415,3 +415,35 @@ def test_batch_launch_keeps_approved_regular_storage_usable(executor, monkeypatc
     monkeypatch.setattr(jobs, "launch", launch)
     executor.launch(p)
     assert launch.call_args.args[0].mounts[0].path == str(path)
+
+
+@pytest.mark.parametrize("text", [
+    APPS,
+    "# machine config\napps:\n- name: only\n  kind: app\n  image: a:1\n# trailing note\n",
+    "# machine config\napps: []\n",
+])
+def test_append_entry_keeps_every_other_line(tmp_path, text):
+    p=tmp_path/"apps.yaml";p.write_text(text)
+    node.append_entry(p,"apps",{"name":"new","kind":"app","namespace":"zkm","disabled":True,"image":"web:1"})
+    apps=yaml.safe_load(p.read_text())["apps"]
+    assert apps[-1]=={"name":"new","kind":"app","namespace":"zkm","disabled":True,"image":"web:1"}
+    assert [s["name"] for s in apps[:-1]]==[s["name"] for s in yaml.safe_load(text)["apps"] or []]
+    for line in text.splitlines():
+        if line.startswith("#"):
+            assert line in p.read_text()
+
+
+def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
+    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
+    assert app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)
+    assert yaml.safe_load(executor.apps_file.read_text())["apps"][-1]==entry
+    result,error=app_message(executor,"create-2",{"create":entry},app="web",ns="a"*32)
+    assert error and "already configured" in str(error)
+
+
+def test_create_adds_a_prover_and_refuses_an_invalid_entry(executor):
+    prover={"name":"proofs","kind":"ziren-gpu","namespace":"a"*32,"disabled":True,"image":"ziren-gpu:1","elf_id":"b"*64}
+    assert app_message(executor,"create-1",{"create":prover},app="proofs",ns="a"*32)==({"created":["proofs"]},None)
+    before=executor.apps_file.read_text()
+    result,error=app_message(executor,"create-2",{"create":{**prover,"name":"other","elf_id":""}},app="other",ns="a"*32)
+    assert error and "elf_id" in str(error) and executor.apps_file.read_text()==before

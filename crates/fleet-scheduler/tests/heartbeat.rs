@@ -1,7 +1,6 @@
-//! Outbound-only control: durable leases, node-owned output and retry safety.
-use fleet_proto::fleet::v1::{Assignment, Completion, HeartbeatRequest, NodeInfo, ProofKind};
+//! Outbound-only control: durable leases, output in app storage and retry safety.
+use fleet_proto::fleet::v1::{ArtifactRef, Assignment, Completion, HeartbeatRequest, NodeInfo, ProofInputs, ProofKind, ProofOutputs};
 use fleet_scheduler::{
-    blobs::{self, BlobStore},
     config::SchedulerConfig,
     fleet::Scheduler,
     quota::Quota,
@@ -10,18 +9,11 @@ use fleet_scheduler::{
 use std::{sync::Arc, time::Duration};
 
 fn config(dir: &std::path::Path) -> SchedulerConfig {
-    serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\nheartbeat_secs: 1\n", dir.display())).unwrap()
+    serde_yaml::from_str(&format!("data_dir: {}\ncluster_token_file: unused\nheartbeat_secs: 1\n", dir.display())).unwrap()
 }
 
 async fn fresh(cfg: SchedulerConfig, store: Arc<MemoryStore>) -> Arc<Scheduler> {
-    let f = Scheduler::new(
-        cfg.clone(),
-        store,
-        BlobStore::new(&cfg.data_dir).unwrap().with_proof_output(
-            cfg.proof_output_dir.clone().unwrap_or_else(|| cfg.data_dir.join("proofs")),
-        ),
-        "a".repeat(48),
-    );
+    let f = Scheduler::new(cfg, store, "a".repeat(48));
     f.load_tokens().await.unwrap();
     f.load_apps().await.unwrap();
     f.recover().await.unwrap();
@@ -49,6 +41,31 @@ fn info(name: &str, namespace: &str, elf_id: &str) -> NodeInfo {
         app_elf_id: elf_id.into(),
         ..Default::default()
     }
+}
+
+/// A queued job of the tests' app, its inputs in app storage.
+fn job(id: &str, namespace: &str, elf_id: &str) -> ProofJob {
+    let artifact = |path: &str, sha256: String| Some(ArtifactRef { uri: format!("file:///app/{path}"), sha256, size: 3 });
+    ProofJob {
+        inputs: Some(ProofInputs { input: artifact("inputs/hash", "a".repeat(64)), elf: artifact("elf/hash", elf_id.into()),
+            output_root: "file:///app/outputs".into() }),
+        outputs: None, id: id.into(), client_id: id.into(), namespace: namespace.into(), owner: "ab".repeat(20),
+        tag: String::new(), app: "proof".into(), elf_id: elf_id.into(), priority: 0, kind: ProofKind::Compressed as i32,
+        state: ProofJobState::Queued as i32, fail_status: None, error: String::new(), node: None, attempts: 0,
+        failed_on: vec![], cycles: 0, prove_ms: 0, created_ms: 1, started_ms: None, finished_ms: None,
+    }
+}
+
+/// What a node writes under the job's output root for `assignment`.
+fn outputs(assignment: &Assignment) -> ProofOutputs {
+    let artifact = |name: &str, bytes: &[u8]| Some(ArtifactRef {
+        uri: format!("file:///app/outputs/{}/{}/{name}", assignment.job_id, assignment.lease),
+        sha256: fleet_proto::artifacts::hash(bytes), size: bytes.len() as u64 });
+    ProofOutputs { machine: "gpu-host".into(), proof: artifact("proof.json", b"proof"), public_values: artifact("public_values.bin", b"values") }
+}
+
+fn completion(assignment: &Assignment) -> Completion {
+    Completion { assignment: Some(assignment.clone()), cycles: 42, prove_ms: 9, outputs: Some(outputs(assignment)), ..Default::default() }
 }
 
 async fn assigned(f: &Scheduler, node: &str) -> Assignment {
@@ -86,45 +103,12 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         )
         .await
         .unwrap();
-    let elf_id = f.blobs.put_elf(b"elf").unwrap();
+    let elf_id = fleet_proto::artifacts::hash(b"elf");
     store.add_app(&app(&namespace.id, &elf_id)).await.unwrap();
     f.load_apps().await.unwrap();
     let apps = f.apps().await.unwrap();
     assert_eq!((apps[0].0.name.as_str(), apps[0].0.elf_id.as_str()), ("proof", elf_id.as_str()));
-    for name in [blobs::STDIN, blobs::RECEIPTS] {
-        f.blobs
-            .put(
-                "job",
-                name,
-                &bincode::serialize(&Vec::<Vec<u8>>::new()).unwrap(),
-            )
-            .unwrap();
-    }
-    f.submit(ProofJob {
-                inputs: None, outputs: None,
-        id: "job".into(),
-        client_id: "job".into(),
-        namespace: namespace.id.clone(),
-        owner: "ab".repeat(20),
-        tag: String::new(),
-        app: "proof".into(),
-        elf_id: elf_id.clone(),
-        priority: 0,
-        kind: ProofKind::Compressed as i32,
-        state: ProofJobState::Queued as i32,
-        fail_status: None,
-        error: String::new(),
-        node: None,
-        attempts: 0,
-        failed_on: vec![],
-        cycles: 0,
-        prove_ms: 0,
-        created_ms: 1,
-        started_ms: None,
-        finished_ms: None,
-    })
-    .await
-    .unwrap();
+    f.submit(job("job", &namespace.id, &elf_id)).await.unwrap();
     assert!(f
         .register(NodeInfo {
             control_version: 0,
@@ -141,25 +125,9 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
     assert_eq!(assigned(&f, &original).await, assignment);
     assert_eq!(f.job("job").await.unwrap().unwrap().attempts, 1);
     assert_eq!(f.usage(&namespace.id).gpus, 2.0);
-    let other = f.register(info("other", &namespace.id, &elf_id)).unwrap();
-    assert_eq!(
-        f.fetch_inputs(&other, &assignment, true)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
     let mut stale = assignment.clone();
     stale.lease.push('0');
-    assert_eq!(
-        f.fetch_inputs(&original, &stale, true)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::FailedPrecondition
-    );
-    // The scheduler has no proof output and still tracks the active reservation.
-    assert!(f.blobs.get("job", blobs::PROOF).is_err());
+    // The scheduler still tracks the active reservation.
     assert_eq!(
         f.job("job").await.unwrap().unwrap().state(),
         ProofJobState::Running
@@ -185,30 +153,17 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         resumed, assignment,
         "restart cannot create a second execution attempt"
     );
-    let result = fleet_proto::fleet::v1::ProveResponse {
-        proof_json: b"proof".to_vec(), public_values: vec![1,2], cycles:42, prove_ms:9,
-        ..Default::default()
-    };
     let foreign = recovered.register(info("other", &namespace.id, &elf_id)).unwrap();
-    for (node,a) in [(&foreign,&assignment),(&session,&stale)] {
-        assert_eq!(recovered.publish_output(node,a,result.clone()).await.unwrap_err().code(),tonic::Code::FailedPrecondition);
-    }
-    for _ in 0..2 { recovered.publish_output(&session,&assignment,result.clone()).await.unwrap(); }
-    assert_eq!(recovered.usage(&namespace.id).gpus,2.0,"upload must not release an active execution");
-    assert_eq!(recovered.blobs.sdk_output(&recovered.job("job").await.unwrap().unwrap(),blobs::PROOF).await.unwrap(),b"proof");
-    let mut changed=result.clone(); changed.proof_json=b"different".to_vec();
-    assert!(recovered.publish_output(&session,&assignment,changed).await.is_err());
+    let foreign_completion = HeartbeatRequest { node_id: foreign, completion: Some(completion(&assignment)), ..Default::default() };
+    recovered.exchange(foreign_completion).await.unwrap();
+    assert_eq!(recovered.job("job").await.unwrap().unwrap().state(), ProofJobState::Running, "another node's report is ignored");
+    assert_eq!(recovered.usage(&namespace.id).gpus, 2.0, "another node's report must not release an active execution");
     let request = HeartbeatRequest {
         node_id: session.clone(),
         ready: true,
         busy: true,
         running_job: "job".into(),
-        completion: Some(Completion {
-            assignment: Some(assignment.clone()),
-            cycles: 42,
-            prove_ms: 9,
-            ..Default::default()
-        }),
+        completion: Some(completion(&assignment)),
         ..Default::default()
     };
     for _ in 0..2 {
@@ -221,12 +176,7 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
     assert_eq!(saved.state(), ProofJobState::Succeeded);
     assert_eq!(saved.attempts, 1);
     assert_eq!(saved.cycles, 42);
-    recovered.publish_output(&session,&assignment,result).await.unwrap();
     assert_eq!(recovered.usage(&namespace.id).gpus, 0.0);
-    assert!(
-        recovered.blobs.get("job", blobs::PROOF).is_err(),
-        "completion must not require scheduler-held output"
-    );
     let before = recovered.job("job").await.unwrap().unwrap();
     let reply = recovered
         .exchange(HeartbeatRequest {
@@ -247,25 +197,7 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
         recovered.job("job").await.unwrap().unwrap().finished_ms,
         before.finished_ms
     );
-    let mut next = saved.clone();
-    next.id = "next-job".into();
-    next.client_id = "next-job".into();
-    next.state = ProofJobState::Queued as i32;
-    next.node = None;
-    next.attempts = 0;
-    next.started_ms = None;
-    next.finished_ms = None;
-    for name in [blobs::STDIN, blobs::RECEIPTS] {
-        recovered
-            .blobs
-            .put(
-                &next.id,
-                name,
-                &bincode::serialize(&Vec::<Vec<u8>>::new()).unwrap(),
-            )
-            .unwrap();
-    }
-    recovered.submit(next).await.unwrap();
+    recovered.submit(job("next-job", &namespace.id, &elf_id)).await.unwrap();
     let next = assigned(&recovered, &request.node_id).await;
     let delayed = recovered.exchange(request).await.unwrap();
     assert_eq!(
@@ -279,7 +211,6 @@ async fn restart_keeps_attempt_quota_and_accepts_retried_completion_once() {
 
 #[tokio::test]
 async fn metadata_completion_is_lease_fenced_and_survives_scheduler_restart() {
-    use fleet_proto::fleet::v1::{ArtifactRef, ProofInputs, ProofOutputs, ProveResponse};
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(dir.path());
     let store = Arc::new(MemoryStore::default());
@@ -290,36 +221,19 @@ async fn metadata_completion_is_lease_fenced_and_survives_scheduler_restart() {
     let elf_id = fleet_proto::artifacts::hash(b"elf");
     store.add_app(&app(&namespace.id, &elf_id)).await.unwrap();
     f.load_apps().await.unwrap();
-    let input = ArtifactRef {uri:"file:///app/inputs/hash".into(),sha256:"a".repeat(64),size:3,
-    };
-    f.submit(ProofJob {
-        inputs:Some(ProofInputs {input:Some(input),elf:Some(ArtifactRef {uri:"file:///app/elf/hash".into(),sha256:elf_id.clone(),size:3,
-            }),output_root:"file:///app/outputs".into(),
-        }),
-        outputs:None,id:"metadata-job".into(),client_id:"metadata-job".into(),namespace:namespace.id.clone(),owner:"ab".repeat(20),tag:String::new(),app:"proof".into(),elf_id:elf_id.clone(),priority:0,kind:ProofKind::Compressed as i32,
-        state:ProofJobState::Queued as i32,
-        fail_status: None,error:String::new(),node:None,attempts:0,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:None,finished_ms:None,
-    }).await.unwrap();
+    f.submit(job("metadata-job", &namespace.id, &elf_id)).await.unwrap();
     let session = f.register(info("worker",&namespace.id,&elf_id)).unwrap();
     let dispatch = tokio::spawn(f.clone().dispatch_loop());
     let assignment = assigned(&f,&session).await;
     assert!(assignment.inputs.is_some());
     assert_eq!(assignment.kind,ProofKind::Compressed as i32);
-    assert!(f.fetch_inputs(&session,&assignment,true).await.is_err());
-    assert!(f.publish_output(&session,&assignment,ProveResponse {proof_json:b"proof".to_vec(),..Default::default()}).await.is_err());
     dispatch.abort();
     let recovered = fresh(cfg,store.clone()).await;
     let session = recovered.register(info("worker",&namespace.id,&elf_id)).unwrap();
     let dispatch = tokio::spawn(recovered.clone().dispatch_loop());
     assert_eq!(assigned(&recovered,&session).await,assignment);
-    let outputs = ProofOutputs {
-        machine: "gpu-host".into(),
-        proof:Some(ArtifactRef {uri:format!("file:///app/outputs/metadata-job/{}/proof.json",assignment.lease),sha256:fleet_proto::artifacts::hash(b"proof"),size:5,
-        }),
-        public_values:Some(ArtifactRef {uri:format!("file:///app/outputs/metadata-job/{}/public_values.bin",assignment.lease),sha256:fleet_proto::artifacts::hash(b"values"),size:6,
-        }),
-    };
-    let heartbeat = HeartbeatRequest {node_id:session,ready:true,busy:true,running_job:"metadata-job".into(),completion:Some(Completion {assignment:Some(assignment.clone()),cycles:42,prove_ms:9,outputs:Some(outputs.clone()),..Default::default()}),..Default::default()};
+    let outputs = outputs(&assignment);
+    let heartbeat = HeartbeatRequest {node_id:session,ready:true,busy:true,running_job:"metadata-job".into(),completion:Some(completion(&assignment)),..Default::default()};
     let mut missing = heartbeat.clone();missing.completion.as_mut().unwrap().outputs=None;
     assert_eq!(recovered.exchange(missing).await.unwrap_err().code(),tonic::Code::InvalidArgument);
     let mut wrong = heartbeat.clone();wrong.completion.as_mut().unwrap().outputs.as_mut().unwrap().proof.as_mut().unwrap().uri="file:///app/outputs/other/proof.json".into();
@@ -340,16 +254,9 @@ async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completi
     let store = Arc::new(MemoryStore::default());
     let f = fresh(config(dir.path()), store.clone()).await;
     let ns = f.create_namespace("app", Quota::default()).await.unwrap();
-    let elf = f.blobs.put_elf(b"elf").unwrap();
-    f.add_app(&ns.id, &fleet_proto::model::v1::RegisterAppRequest { name: "proof".into(), elf_id: elf.clone(), ..Default::default() }).await.unwrap();
-    let job = ProofJob {
-        inputs: None, outputs: None, id: "active".into(), client_id: "active".into(),
-        namespace: ns.id.clone(), owner: "ab".repeat(20), tag: String::new(),
-        app: "proof".into(), elf_id: elf.clone(), priority: 0, kind: ProofKind::Compressed as i32,
-        state: ProofJobState::Queued as i32,
-        fail_status: None, error: String::new(), node: None, attempts: 0,
-        failed_on: vec![], cycles: 0, prove_ms: 0, created_ms: 1, started_ms: None, finished_ms: None,
-    };
+    let elf = fleet_proto::artifacts::hash(b"elf");
+    f.add_app(&ns.id, "proof", 0, &fleet_proto::model::v1::AppProof { elf_id: elf.clone(), ..Default::default() }).await.unwrap();
+    let job = job("active", &ns.id, &elf);
     f.submit(job.clone()).await.unwrap();
     let session = f.register(info("proof-0", &ns.id, &elf)).unwrap();
     let dispatcher = tokio::spawn(f.clone().dispatch_loop());
@@ -361,8 +268,7 @@ async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completi
         busy: true, running_job: "active".into(), ..Default::default()}).await.unwrap();
     assert_eq!(running.assignment, Some(assignment.clone()));
     let completed = f.exchange(HeartbeatRequest {node_id: session.clone(), ready: true,
-        completion: Some(Completion {assignment: Some(assignment.clone()), cycles: 42, prove_ms: 9, ..Default::default()}),
-        ..Default::default()}).await.unwrap();
+        completion: Some(completion(&assignment)), ..Default::default()}).await.unwrap();
     assert_eq!(completed.completed_lease, assignment.lease);
     assert_eq!(f.job("active").await.unwrap().unwrap().state(), ProofJobState::Succeeded);
     // Allow multiple dispatcher passes with both current and newly registered replicas ready.
@@ -377,4 +283,22 @@ async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completi
     f.set_machine_drain("gpu-host", false);
     assert_eq!(assigned(&f, &session).await.job_id, "next");
     dispatcher.abort();
+}
+
+#[tokio::test]
+async fn a_job_left_from_the_retired_stage_api_fails_when_the_scheduler_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let f = fresh(config(dir.path()), store.clone()).await;
+    let ns = f.create_namespace("app", Quota::default()).await.unwrap();
+    let elf = fleet_proto::artifacts::hash(b"elf");
+    let payload = ProofJob { inputs: None, ..job("payload", &ns.id, &elf) };
+    assert!(f.submit(payload.clone()).await.is_err(), "a new job's inputs are in app storage");
+    store.upsert(&payload).await.unwrap();
+    store.upsert(&job("stored", &ns.id, &elf)).await.unwrap();
+    assert_eq!(fresh(config(dir.path()), store.clone()).await.queued_for(&ns.id, "proof"), 1);
+    let failed = store.get("payload").await.unwrap().unwrap();
+    assert_eq!(failed.state(), ProofJobState::Failed);
+    assert!(failed.error.contains("retired stage API") && failed.finished_ms.is_some(), "{}", failed.error);
+    assert_eq!(store.get("stored").await.unwrap().unwrap().state(), ProofJobState::Queued);
 }

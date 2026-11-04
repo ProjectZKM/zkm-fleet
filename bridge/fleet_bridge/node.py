@@ -51,7 +51,7 @@ def container_gone(name: str) -> bool:
 
 
 def _entry(root: Any, section: str, name: str) -> Any:
-    """The `services` entry named `name`, or the `batches` value under key `name`."""
+    """The `apps` entry named `name`, or the `batches` value under key `name`."""
     node = next((v for k, v in root.value if k.value == section), None) if root else None
     if isinstance(node, yaml.SequenceNode):
         return next((e for e in node.value if any(k.value == "name" and v.value == name for k, v in e.value)), None)
@@ -61,7 +61,7 @@ def _entry(root: Any, section: str, name: str) -> Any:
 
 
 def set_fields(path: Path, section: str, name: str, fields: dict[str, Any]) -> None:
-    """Writes `fields` into one `services` entry or `batches` value, keeping every other line
+    """Writes `fields` into one `apps` entry or `batches` value, keeping every other line
     as written. A value is written in YAML flow style (JSON), so maps and lists fit on its line."""
     text = path.read_text()
     for key, setting in fields.items():
@@ -107,7 +107,7 @@ def _is_content(line: str) -> bool:
 
 
 def remove_entry(path: Path, section: str, name: str) -> bool:
-    """Removes one `services` entry or `batches` key from a configuration file and keeps
+    """Removes one `apps` entry or `batches` key from a configuration file and keeps
     every other line as written, with the comment lines directly above the entry. The
     previous file stays as <file>.removed-<UTC time>. False when there is no such entry."""
     text = path.read_text()
@@ -150,9 +150,35 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
     return True
 
 
+def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
+    """Appends one entry to an `apps` list, keeping every other line as written. The entry
+    goes on one line in YAML flow style, under a block list, an empty list or a missing key."""
+    text = path.read_text()
+    root = yaml.compose(text)
+    node = next((v for k, v in root.value if k.value == section), None) if root else None
+    item = f"- {json.dumps(entry)}\n"
+    if isinstance(node, yaml.SequenceNode) and node.value and not node.flow_style:
+        last = node.value[-1]
+        end = offset = last.start_mark.index
+        for line in text[offset:last.end_mark.index].splitlines(keepends=True):
+            offset += len(line)
+            if _is_content(line):
+                end = offset
+        if not text[:end].endswith("\n"):
+            text, end = text + "\n", len(text) + 1
+        text = text[:end] + " " * (last.start_mark.column - 2) + item + text[end:]
+    elif isinstance(node, yaml.SequenceNode) and not node.value:
+        text = text[:node.start_mark.index].rstrip(" ") + "\n  " + item + text[node.end_mark.index:]
+    elif node is None and root is not None:
+        text = text if text.endswith("\n") or not text else text + "\n"
+        text += f"{section}:\n  " + item
+    else:
+        raise ValueError(f"{section}: must be a list to add an entry to")
+    _replace(path, text)
+
 class NodeExecutor:
-    def __init__(self, services: str, batches: str, jobs_dir: str) -> None:
-        self.services, self.batches, self.jobs_dir = Path(services), batches, Path(jobs_dir)
+    def __init__(self, apps: str, batches: str, jobs_dir: str) -> None:
+        self.apps_file, self.batches, self.jobs_dir = Path(apps), batches, Path(jobs_dir)
         self.journal = self.jobs_dir / ".node" / "commands"
         self.journal.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
@@ -160,7 +186,7 @@ class NodeExecutor:
         self.resource_locks: dict[str, threading.Lock] = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self.output_lock = threading.Lock()
-        self.services_lock = threading.Lock()
+        self.apps_lock = threading.Lock()
 
     def resource_lock(self, key: str) -> threading.Lock:
         with self.lock:
@@ -193,7 +219,7 @@ class NodeExecutor:
 
     def execute(self, command: dict[str, Any]) -> None:
         params = command["parameters"]
-        key = params.get("id") or params.get("service", {}).get("name") or (params.get("app") or params.get("batch") or {}).get("name") or command["id"]
+        key = params.get("id") or (params.get("app") or params.get("entry") or params.get("batch") or {}).get("name") or command["id"]
         result: Any = {"cleaned": False}
         error = None
         try:
@@ -204,8 +230,8 @@ class NodeExecutor:
                 elif operation in (2, 3):
                     result = self.stop(params, preempt=operation == 3)
                 elif operation == 4:
-                    with self.services_lock:
-                        result = self.service(params)
+                    with self.apps_lock:
+                        result = self.set_app(params)
                 elif operation == 5:
                     directory = self.jobs_dir / params["id"]
                     if directory.exists():
@@ -218,7 +244,7 @@ class NodeExecutor:
                         shutil.rmtree(job.path)
                     result = {"cleaned": True}
                 elif operation == 7:
-                    with self.services_lock:
+                    with self.apps_lock:
                         result = self.app(params)
                 else:
                     raise ValueError("unsupported node operation")
@@ -273,7 +299,7 @@ class NodeExecutor:
         # Batch policy is supplied by the scheduler, but these host resources are
         # never batch storage, even in a previously accepted or stale launch.
         protected = [os.path.realpath(root) for root in (
-            self.jobs_dir, self.services.parent, "/dev", "/proc", "/sys", "/run",
+            self.jobs_dir, self.apps_file.parent, "/dev", "/proc", "/sys", "/run",
             "/var/run", "/var/lib/docker", "/var/lib/containerd",
         )]
         for mount in mounts:
@@ -333,31 +359,31 @@ class NodeExecutor:
             subprocess.run(["docker", "stop", "--time", str(job.spec().policy.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().policy.stop_timeout_s + 30)
         return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 
-    def service(self, p: dict[str, Any]) -> dict[str, Any]:
-        """Starts or stops a service's replicas as services.yaml configures them; the scheduler
+    def set_app(self, p: dict[str, Any]) -> dict[str, Any]:
+        """Starts or stops an app's replicas as apps.yaml configures them; the scheduler
         writes that configuration (enabled state, resources, settings) with NODE_OPERATION_APP
-        first. A stop removes every replica of the service, also one beyond its configured
+        first. A stop removes every replica of the app, also one beyond its configured
         count, and confirms its containers are gone."""
         if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
-        service = p["service"]
-        cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        configured = next((s for s in cfg.services if s.name == service["name"]), None)
+        app = p["app"]
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        configured = next((a for a in cfg.apps if a.name == app["name"]), None)
         if configured is None:
-            raise ValueError(f"{service['name']} is not configured on this node")
-        if (configured.namespace != service.get("namespace_ref", service["namespace"]) or configured.app != service.get("app")
-                or configured.elf_id != (service.get("elf_id") or "").lower()):
-            raise ValueError("service scope differs from configured scope")
-        if service.get("kind") != configured.kind.value or service.get("tag") != configured.tag:
-            raise ValueError("service kind or tag differs from configured scope")
+            raise ValueError(f"{app['name']} is not configured on this node")
+        if (configured.namespace != app.get("namespace_ref", app["namespace"]) or configured.app != app.get("app")
+                or configured.elf_id != (app.get("elf_id") or "").lower()):
+            raise ValueError("app scope differs from configured scope")
+        if app.get("kind") != configured.kind.value or app.get("tag") != configured.tag:
+            raise ValueError("app kind or tag differs from configured scope")
         running = [n for n in reconcile.running()
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
         if p["disabled"]:
             self._remove_replicas(sorted(set(running) | {f"{configured.name}-{i}" for i in range(configured.replicas)}))
             return {"cleaned": True, "disabled": True}
         if configured.disabled:
-            raise ValueError(f"{configured.name} is disabled in services.yaml")
-        replicas = [s for s in reconcile.replica_specs(cfg).values() if s.service.name == configured.name]
+            raise ValueError(f"{configured.name} is disabled in apps.yaml")
+        replicas = [s for s in reconcile.replica_specs(cfg).values() if s.app.name == configured.name]
         self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
         for spec in replicas:
@@ -375,16 +401,25 @@ class NodeExecutor:
             reconcile.stop(name)
             ray.get(actors.clean_after.remote(name), timeout=120)
             if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
-                raise ValueError(f"{name}: service container cleanup is uncertain")
+                raise ValueError(f"{name}: app container cleanup is uncertain")
 
     def app(self, p: dict[str, Any]) -> dict[str, Any]:
-        """An app-level change from the scheduler, for an app (`p["app"]`: the services that
-        run the app of that name, in a namespace given by id and by name), a batch (`p["batch"]`, by name), or the one service a change of an app stopped
-        (`p["service"]`, by name, set only): `remove` it, or `set` some of its configuration.
-        A removed service has what is left of its replicas cleaned up the way disabling does;
+        """An app-level change from the scheduler, for an app (`p["app"]`: the entries that
+        run the app of that name, in a namespace given by id and by name), a batch (`p["batch"]`, by name), or the one entry a change of an app stopped
+        (`p["entry"]`, by name, set only): `remove` it, or `set` some of its configuration.
+        A removed entry has what is left of its replicas cleaned up the way disabling does;
         app data stays (storage roots, workdirs, env files and images belong to the operator).
-        Settings are written to the configuration only: the scheduler drains and stops a
-        service first and starts it again afterwards."""
+        Settings are written to the configuration only: the scheduler drains and stops an
+        app first and starts it again afterwards. `p["create"]` adds a new app's
+        entry to the configuration, disabled until the app is enabled."""
+        if "create" in p:
+            entry = p["create"]
+            AppSpec.load(entry)
+            entries = (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []
+            if any(e.get("name") == entry["name"] for e in entries):
+                raise ValueError(f"{entry['name']} is already configured on this node")
+            append_entry(self.apps_file, "apps", entry)
+            return {"created": [entry["name"]]}
         if "batch" in p:
             name, path = p["batch"]["name"], Path(self.batches)
             if p.get("remove"):
@@ -395,32 +430,32 @@ class NodeExecutor:
             Batch.load({**entry, **p["set"]})
             set_fields(path, "batches", name, p["set"])
             return {"updated": [name]}
-        if "service" in p:
-            # The one service a change of an app stopped: its configuration only.
-            name = p["service"]["name"]
-            entries = {e["name"]: e for e in (yaml.safe_load(self.services.read_text()) or {}).get("services", [])}
+        if "entry" in p:
+            # The one entry a change of an app stopped: its configuration only.
+            name = p["entry"]["name"]
+            entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
             if p.get("remove") or name not in entries:
                 return {"updated": []}
             AppSpec.load({**entries[name], **p["set"]})
-            set_fields(self.services, "services", name, p["set"])
+            set_fields(self.apps_file, "apps", name, p["set"])
             return {"updated": [name]}
         target = p["app"]
         namespaces = {target["namespace"], target.get("namespace_name") or target["namespace"]}
-        entries = {e["name"]: e for e in (yaml.safe_load(self.services.read_text()) or {}).get("services", [])}
-        cfg = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        services = [s for s in cfg.services if s.namespace in namespaces
-                    and s.app == target["name"]]
+        entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        apps = [a for a in cfg.apps if a.namespace in namespaces
+                and a.app == target["name"]]
         if not p.get("remove"):
-            for service in services:
-                AppSpec.load({**entries[service.name], **p["set"]})
-            for service in services:
-                set_fields(self.services, "services", service.name, p["set"])
-            return {"updated": [s.name for s in services]}
+            for app in apps:
+                AppSpec.load({**entries[app.name], **p["set"]})
+            for app in apps:
+                set_fields(self.apps_file, "apps", app.name, p["set"])
+            return {"updated": [a.name for a in apps]}
         removed = []
-        for service in services:
-            self._remove_replicas([f"{service.name}-{index}" for index in range(service.replicas)])
-            if remove_entry(self.services, "services", service.name):
-                removed.append(service.name)
+        for app in apps:
+            self._remove_replicas([f"{app.name}-{index}" for index in range(app.replicas)])
+            if remove_entry(self.apps_file, "apps", app.name):
+                removed.append(app.name)
         return {"removed": removed}
 
     def report(self) -> dict[str, Any]:
@@ -428,19 +463,19 @@ class NodeExecutor:
         ready = len(nodes) == 1
         total, free = resources()
         config = jobs.load_config(self.batches)
-        apps = reconcile.load_services(yaml.safe_load(self.services.read_text()))
-        services = apps.raw.get("services", [])
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        apps = cfg.raw.get("apps", [])
         running = reconcile.running()
-        for service in services:
-            names = [f"{service['name']}-{i}" for i in range(service.get("replicas", 1))]
-            service.setdefault("namespace", "0" * 32)
-            service.setdefault("app", service["name"])
-            service.setdefault("priority", 0)
-            service.setdefault("cpus", 1)
-            service["gpus"] = 0 if service["kind"] == "ziren-cpu" else service.get("gpus", 1)
-            service["ready"] = True
+        for app in apps:
+            names = [f"{app['name']}-{i}" for i in range(app.get("replicas", 1))]
+            app.setdefault("namespace", "0" * 32)
+            app.setdefault("app", app["name"])
+            app.setdefault("priority", 0)
+            app.setdefault("cpus", 1)
+            app["gpus"] = 0 if app["kind"] == "ziren-cpu" else app.get("gpus", 1)
+            app["ready"] = True
             # Where `fleetctl app logs` reads from: one node log per replica.
-            service["logs"] = [os.path.join(apps.cluster.log_dir, f"{name}.node.log") for name in names]
+            app["logs"] = [os.path.join(cfg.cluster.log_dir, f"{name}.node.log") for name in names]
             for name in names:
                 try:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
@@ -448,10 +483,10 @@ class NodeExecutor:
                 except Exception as error:
                     # Starting or restarting one actor must not suppress the
                     # machine heartbeat or another command's cleanup acknowledgment.
-                    log.warning("service health unavailable for %s: %s", name, type(error).__name__)
+                    log.warning("app health unavailable for %s: %s", name, type(error).__name__)
                     healthy = False
-                service["ready"] &= healthy
-            service["cleaned"] = not any(name in running for name in names) and all(container_gone(actors.gpu_container(name)) and container_gone(actors.app_container(name)) for name in names)
+                app["ready"] &= healthy
+            app["cleaned"] = not any(name in running for name in names) and all(container_gone(actors.gpu_container(name)) and container_gone(actors.app_container(name)) for name in names)
         job_reports = []
         for entry in self.jobs_dir.iterdir():
             if entry.name.startswith(".") or not entry.is_dir() or not (entry / "spec.json").is_file():
@@ -477,11 +512,11 @@ class NodeExecutor:
         with self.lock:
             results = [{"id": p.stem, "result": v["result"], "error": v["error"]}
                 for p in self.journal.glob("*.json") if (v := read_json(p)).get("done")]
-        return {"version": 2, "machine": socket.gethostname(), "ready": ready,
+        return {"version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
             "batches": {k: v.dump() for k, v in config.batches.items()},
-            "services": services, "jobs": job_reports, "results": results}
+            "apps": apps, "jobs": job_reports, "results": results}
 
     def publish(self) -> None:
         while True:
@@ -496,7 +531,7 @@ class NodeExecutor:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    for name in ["services", "batches", "jobs-dir"]:
+    for name in ["apps", "batches", "jobs-dir"]:
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--address", default="127.0.0.1:6379")
     args = parser.parse_args()
@@ -504,7 +539,7 @@ def main() -> None:
     if not args.address.startswith(("127.0.0.1:", "localhost:")):
         raise SystemExit("Ray must be local")
     ray.init(address=args.address, namespace=reconcile.NAMESPACE, log_to_driver=False)
-    executor = NodeExecutor(args.services, args.batches, args.jobs_dir)
+    executor = NodeExecutor(args.apps, args.batches, args.jobs_dir)
     for path in executor.journal.glob("*.json"):
         entry = read_json(path)
         if not entry.get("done"):

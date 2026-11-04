@@ -1,5 +1,5 @@
 # Userland for a ComfyUI tree that lives on the host: the tree, its venv and its data
-# are mounted at their own paths (services.yaml `volumes`), so the image only has to
+# are mounted at their own paths (apps.yaml `volumes`), so the image only has to
 # match what the venv was built against: Ubuntu 22.04, /usr/bin/python3.10, and the
 # shared libraries its native modules load.
 #

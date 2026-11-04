@@ -36,19 +36,6 @@ static_resources:
                   cluster: control
                   timeout: 0s
               - match:
-                  prefix: /stage.v1.StageService/
-                per_request_buffer_limit_bytes: 268435456
-                route:
-                  cluster: stage
-                  timeout: 0s
-                  retry_policy:
-                    retry_on: connect-failure,refused-stream,reset,unavailable
-                    num_retries: 120
-                    per_try_timeout: 600s
-                    retry_back_off:
-                      base_interval: 0.25s
-                      max_interval: 1s
-              - match:
                   prefix: /
                 route:
                   cluster: http
@@ -71,23 +58,6 @@ static_resources:
               private_key:
                 filename: /etc/zkm-fleet/tls/server.key
   clusters:
-  - name: stage
-    type: STATIC
-    connect_timeout: 2s
-    load_assignment:
-      cluster_name: stage
-      endpoints:
-      - lb_endpoints:
-        - endpoint:
-            address:
-              socket_address:
-                address: '@SCHEDULER_IP@'
-                port_value: 51000
-    typed_extension_protocol_options:
-      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
-        '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
-        explicit_http_config:
-          http2_protocol_options: {}
   - name: control
     type: STATIC
     connect_timeout: 2s

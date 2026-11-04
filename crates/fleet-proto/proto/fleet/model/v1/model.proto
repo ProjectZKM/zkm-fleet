@@ -121,18 +121,27 @@ message App {
   optional double mean_prove_ms = 17;
 }
 
-// Registers a proof app (POST /apps). Unset policy fields take the defaults: class batch,
-// anchor none, any backend and circuit version, 64 queued jobs, priority 0.
+// The program an app proves and how its proof jobs are placed. Unset fields take the
+// defaults: class batch, anchor none, any backend and circuit version, 64 queued jobs.
+message AppProof {
+  // The program, the SHA-256 of its ELF.
+  required string elf_id = 1;
+  optional string class = 2;
+  optional string anchor = 3;
+  repeated string backends = 4;
+  optional string zkm_version = 5;
+  optional uint32 max_queued = 6;
+}
+
+// Creates an app (POST /apps), disabled, from its container `spec` (validated in models.rs):
+// the settings of its apps.yaml entry, which the scheduler writes on the node it picks when the
+// app is first enabled. An app with `proof` proves that program: its container is a Ziren prover.
 message RegisterAppRequest {
   required string name = 1;
-  required string elf_id = 2;
-  optional string class = 3;
-  optional string anchor = 4;
-  repeated string backends = 5;
-  optional string zkm_version = 6;
-  optional uint32 max_queued = 7;
-  optional int32 priority = 8;
-  optional string namespace = 9;
+  optional string namespace = 2;
+  optional int32 priority = 3;
+  required Json spec = 4;
+  optional AppProof proof = 5;
 }
 
 message WorkloadTemplate {
@@ -182,7 +191,8 @@ message NodeReport {
   required double free_gpus = 6;
   required double free_cpus = 7;
   map<string, Json> batches = 8;
-  repeated Json services = 9;
+  // The node's apps.yaml entries, each with its observed state.
+  repeated Json apps = 9;
   repeated JobReport jobs = 10;
   repeated CommandResult results = 11;
 }
@@ -219,14 +229,15 @@ message ScaleStatus {
   optional string error = 7;
   optional double ready_since = 8;
   // An update also changes these settings: the node writes them with the rest of the target
-  // configuration (NODE_OPERATION_APP, command `update`) while the service is stopped.
+  // configuration (NODE_OPERATION_APP, command `update`) while the app is stopped.
   optional Json set = 9;
   optional string update = 10;
 }
 
+// An app's entry on one node (`worker`): its apps.yaml settings as the scheduler wants them.
 message AppDeployment {
   required string worker = 1;
-  required Json service = 2;
+  required Json spec = 2;
   required bool disabled = 3;
   optional ScaleStatus scale = 4;
 }
@@ -272,11 +283,6 @@ message ProofJobsQuery {
   optional string tag = 2;
   required bool active = 3;
   required uint64 limit = 4;
-}
-
-message PublicValuesQuery {
-  optional string key = 1;
-  optional string token_id = 2;
 }
 
 message SubmitProofRequest {

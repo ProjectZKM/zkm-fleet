@@ -1,4 +1,4 @@
-# Local execution services advertised by fleet-node to the Rust scheduler.
+# Local apps advertised by fleet-node to the Rust scheduler.
 scheduler: https://scheduler.example.com:8905
 # Copy the public CA certificate to every Ray worker at this path when using a
 # private CA; the cluster token remains the node's bearer credential.
@@ -8,15 +8,14 @@ node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
-proof_output_dir: /var/lib/zkm-fleet/proofs # legacy proof jobs only
-services:
+apps:
   # Resources not reserved by enabled apps remain available to batch jobs.
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user
     tag: scope=default
     app: ethproofs # the namespace's proof app this server proves for, alone
-    elf_id: FULL_ELF_SHA256 # its program (fleetctl app add ethproofs --elf-id FULL_ELF_SHA256)
+    elf_id: FULL_ELF_SHA256 # its program (fleetctl app add ethproofs --spec SPEC.json --elf-id FULL_ELF_SHA256)
     proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1
     gpus: 2

@@ -1,4 +1,4 @@
-"""Which jobs a service preempts, what a preempted run keeps, and its record's rules."""
+"""Which jobs an app preempts, what a preempted run keeps, and its record's rules."""
 
 from __future__ import annotations
 

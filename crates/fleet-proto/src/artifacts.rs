@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_INPUT: u64 = 1 << 30;
 pub const MAX_OUTPUT: u64 = 64 << 20;
+/// A proof's output files, under its output root.
+pub const PROOF: &str = "proof.json";
+pub const PUBLIC_VALUES: &str = "public_values.bin";
 
 /// Execution identifiers are also filesystem components on the control host and nodes.
 pub fn is_safe_id(id: &str) -> bool {

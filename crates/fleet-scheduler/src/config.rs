@@ -4,33 +4,20 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SchedulerConfig {
-    /// External stage API (SDK network prover). TLS when `tls` is set.
-    #[serde(default = "default_stage_addr")]
-    pub stage_addr: String,
     /// Cluster-internal control API (node registration and heartbeats).
     #[serde(default = "default_control_addr")]
     pub control_addr: String,
-    /// HTTP: public values for the SDK, health, operator status.
+    /// HTTP: health, the API and the nodes' relays.
     #[serde(default = "default_http_addr")]
     pub http_addr: String,
-    /// Base URL clients reach `http_addr` at; public values are served under it.
-    pub public_url: String,
     /// Postgres; the in-memory store is used when absent (tests, local jobs).
     #[serde(default)]
     pub database_url: Option<String>,
     /// File holding the Postgres URL (keeps the password out of this file); wins over `database_url`.
     #[serde(default)]
     pub database_url_file: Option<PathBuf>,
-    /// ELFs and job inputs; previously stored SDK results remain readable.
+    /// The apps', batches' and their jobs' records (`workloads/`).
     pub data_dir: PathBuf,
-    /// Control-host proof output received from nodes; the SDK adapter reads it,
-    /// and app deletion removes completed jobs' output directories. Defaults to
-    /// data_dir/proofs.
-    #[serde(default)]
-    pub proof_output_dir: Option<PathBuf>,
-    /// How long `GetStatus` holds a request open waiting for the job to finish.
-    #[serde(default = "default_long_poll_ms")]
-    pub long_poll_ms: u64,
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u32,
     /// A node that has not sent a heartbeat for this long is dropped.
@@ -39,8 +26,6 @@ pub struct SchedulerConfig {
     /// Attempts per job, the first one included; a retry avoids the nodes that failed it.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
-    #[serde(default)]
-    pub tls: Option<TlsConfig>,
     /// TLS for node-initiated control gRPC, independent of gateway TLS termination.
     #[serde(default)]
     pub control_tls: Option<TlsConfig>,
@@ -52,11 +37,16 @@ pub struct SchedulerConfig {
 
 /// Settings this configuration no longer has, with what replaced them: starting with one is
 /// refused rather than silently ignoring it.
-const REMOVED: [(&str, &str); 4] = [
+const REMOVED: [(&str, &str); 9] = [
     ("tenants", "a proof app's placement policy is set when it is registered (fleetctl app add NAME --elf-id ID --class --anchor --backend)"),
     ("default_tenant", "every proof job comes from a namespace token"),
     ("require_signature", "every proof job is signed by its namespace token's key"),
     ("admin_token_file", "administrator tokens are in the database: fleet-scheduler issue-admin --label NAME --out FILE"),
+    ("stage_addr", "the stage API is retired: SDK clients use their app's endpoint (fleet-proof-app)"),
+    ("tls", "the stage API is retired; control_tls secures the control API"),
+    ("public_url", "the stage API's public values are retired: an app's endpoint serves them"),
+    ("proof_output_dir", "proofs stay in app storage"),
+    ("long_poll_ms", "the stage API is retired: an app's endpoint holds GetStatus open"),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,17 +55,11 @@ pub struct TlsConfig {
     pub key_path: PathBuf,
 }
 
-fn default_stage_addr() -> String {
-    "0.0.0.0:51000".into()
-}
 fn default_control_addr() -> String {
     "0.0.0.0:51001".into()
 }
 fn default_http_addr() -> String {
     "0.0.0.0:9191".into()
-}
-fn default_long_poll_ms() -> u64 {
-    2_000
 }
 fn default_heartbeat_secs() -> u32 {
     5
@@ -118,7 +102,7 @@ impl SchedulerConfig {
 mod tests {
     use super::*;
     fn cfg(control: &str, tls: &str) -> SchedulerConfig {
-        serde_yaml::from_str(&format!("public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: {control}\n{tls}")).unwrap()
+        serde_yaml::from_str(&format!("data_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: {control}\n{tls}")).unwrap()
     }
     #[test]
     fn control_listener_requires_tls_outside_loopback() {
@@ -134,11 +118,20 @@ mod tests {
     fn a_removed_setting_is_refused_with_what_replaced_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fleet.yaml");
-        let base = "public_url: http://localhost:9191\ndata_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: 127.0.0.1:51001\n";
+        let base = "data_dir: /tmp/fleet\ncluster_token_file: /tmp/cluster\ncontrol_addr: 127.0.0.1:51001\n";
         std::fs::write(&path, base).unwrap();
         assert!(SchedulerConfig::load(&path).is_ok());
         std::fs::write(&path, format!("{base}admin_token_file: /tmp/admin\n")).unwrap();
         let e = SchedulerConfig::load(&path).unwrap_err().to_string();
         assert!(e.contains("admin_token_file was removed") && e.contains("fleet-scheduler issue-admin"), "{e}");
+    }
+
+    #[test]
+    fn the_example_configuration_loads() {
+        let raw: serde_yaml::Value = serde_yaml::from_str(include_str!("../../../deploy/fleet.example.yaml")).unwrap();
+        for (key, _) in REMOVED {
+            assert!(raw.get(key).is_none(), "the example sets removed {key}");
+        }
+        serde_yaml::from_value::<SchedulerConfig>(raw).unwrap().validate().unwrap();
     }
 }

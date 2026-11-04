@@ -6,8 +6,8 @@ See [installation](installation.md), [operations](operations.md) and
 ## Code names
 
 Fleet follows Kubernetes workload terminology while keeping its own small API:
-a `Job` finishes a command, an `AppDeployment` holds desired app replica state,
-and `WorkloadController` reconciles that state with node reports.
+a `Job` finishes a command, an `AppDeployment` holds the desired state of one app
+entry on one node, and `WorkloadController` reconciles that state with node reports.
 `JobSpec` describes execution; `JobStatus` records what happened. `ProofJob`
 is the proof-specific record. Shared records and requests are generated from
 [model.proto](../crates/fleet-proto/proto/fleet/model/v1/model.proto).
@@ -23,9 +23,8 @@ is the proof-specific record. Shared records and requests are generated from
 These names follow Kubernetes' [workload](https://kubernetes.io/docs/concepts/workloads/controllers/)
 and [controller](https://kubernetes.io/docs/concepts/architecture/controller/) concepts.
 Fleet keeps `fleetctl app` and `fleetctl batch`; it needs no Kubernetes runtime.
-Node execution configuration is currently `services.yaml`; its entries describe
-apps, whereas a Kubernetes [Service](https://kubernetes.io/docs/concepts/services-networking/service/)
-is a network endpoint. Batches use `batches.yaml`, and local job records use
+Node execution configuration is `apps.yaml`; each entry runs an app's replicas
+on that node. Batches use `batches.yaml`, and local job records use
 `FLEET_JOBS_DIR`. This release replaces the previous execution names and paths
 without compatibility aliases.
 
@@ -33,7 +32,7 @@ without compatibility aliases.
 
 Each execution machine runs an **independent local Ray instance** and `fleet-node`.
 It initiates authenticated HTTPS gRPC heartbeats to the control plane. Responses
-carry typed launch, stop and service commands; later heartbeats acknowledge commands
+carry typed launch, stop and app commands; later heartbeats acknowledge commands
 and report capacity and job state. Proof actors use their existing outbound proof
 heartbeat. The scheduler makes admission, quota, priority and preemption decisions;
 a small Python adapter performs local Ray/container operations. The control host
@@ -112,9 +111,11 @@ the Rust types for jobs, apps, namespaces, tokens, resources, scaling and node r
 The scheduler and machine agent exchange a typed protobuf report. App-owned settings
 and execution details use lossless JSON extension fields; the local Python adapter
 needs no protobuf package. Rust owns runtime handles and scheduling behavior.
-Machine report version 2 requires updating the scheduler, agent and adapter together.
+The report (`NodeReport`) carries the node's `apps.yaml` entries, each with its observed
+state, in `apps` (field 9). Machine report version 3 requires updating the scheduler,
+agent and adapter together; version 2 named that field `services`.
 
-Further simplification should move batch and service command persistence behind
+Further simplification should move batch and app command persistence behind
 the same store interface as proof records, and separate retained artifact fetching
 from the native prover package. Both require recovery and compatibility checks;
 the current storage formats and GOAT execution path are preserved.
@@ -124,26 +125,28 @@ the current storage formats and GOAT execution path are preserved.
 | Resource | Purpose |
 |---|---|
 | **Namespace** | Administrator-created ownership and billing boundary. |
-| **App** | Long-running workload in one namespace: a named proof program or a serving deployment. |
+| **App** | Long-running container in one namespace; a proof app's container is a Ziren prover of its named program. |
 | **Batch** | Reusable finite workload configuration in one namespace; each run is a batch job. |
 | **Job** | Execution record for a proof request or batch command, with namespace and tag ownership. |
 | **Token** | Belongs to one namespace, with permissions, an optional tag and app grants; an administrator's token has none. |
 
-Nodes are infrastructure; allocations are internal reservation records. Proof app registrations set proof scheduling, quotas configure namespace limits, and tags are optional attributes for isolating work and applying additional limits. There is no Group resource. See [namespaces, access and quotas](#namespaces-access-and-quotas) for details.
+Nodes are infrastructure; allocations are internal reservation records. A proof app's `proof` settings set proof scheduling, quotas configure namespace limits, and tags are optional attributes for isolating work and applying additional limits. There is no Group resource. See [namespaces, access and quotas](#namespaces-access-and-quotas) for details.
 
-**Apps, batches and jobs.** `fleetctl app` lists all long-running workloads together. `fleetctl --json app` returns one array of app records, each with `type: app`. Inspect and manage an app by name, without a kind selector. A proof app is a namespace's named program, registered once per namespace with `fleetctl --namespace NS app add NAME --elf-id ID` (or `--elf FILE`). Registration sets its placement policy: `--class latency` places it on the biggest free prover first, `batch` (the default) on the smallest; `--anchor` is `none` (default), `shared` or `exclusive`; repeat `--backend` (`cuda`, `cpu`, `mock`; default any); `--zkm-version`, `--max-queued` (default 64) and `--priority` (default 0) are optional. A proof runs only on a prover bound to its app. Operators initially configure container deployments in node `services.yaml`; the control plane then manages their enable/disable, priority and scaling. Node service configuration still selects the execution backend internally.
+**Apps, batches and jobs.** `fleetctl app` lists all long-running workloads together. `fleetctl --json app` returns one array of app records, each with `type: app`. Inspect and manage an app by name, without a kind selector. An app is a container; a proof app is an app whose container is a Ziren prover of a named program. Create either with `fleetctl --namespace NS app add NAME --spec FILE.json`, which posts a `RegisterAppRequest` (`model.proto`) to `POST /apps`: `name`, optional `namespace` and `priority` (default 0), the file as `spec`, and a prover's `proof`. The spec holds the keys of the app's `apps.yaml` entry: `kind` (`app` by default, `ziren-gpu` by default for a prover, or `ziren-cpu`), `image` (required), `replicas`, `gpus`, `cpus`, `shm_gb`, `memory_gb`, `env`, `volumes`, `ready_timeout_s` and `stop_timeout_s`; a `kind: app` container also `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir` and `user`; a prover also `proof_storage_root`, `backend` and `rust_log`. Unknown or mistyped settings are refused. A prover also takes its program, `--elf-id ID` or `--elf FILE`, and its placement policy, sent as `proof` (`elf_id`, `class`, `anchor`, `backends`, `zkm_version`, `max_queued`): `--class latency` places its jobs on the biggest free prover first, `batch` (the default) on the smallest; `--anchor` is `none` (default), `shared` or `exclusive`; repeat `--backend` (`cuda`, `cpu`, `mock`; default any); `--zkm-version` and `--max-queued` (default 64) are optional. Only a prover takes a program, and proof policy without one is refused. A proof runs only on a prover bound to its app.
 
-App and job tables both show `TAG` and `STATE`. An app's state describes its service:
+An app is created disabled and on no node; the first `app enable` places it, and users never choose the node. Candidates are live, ready nodes that are not draining and whose total capacity holds the GPUs and CPUs of all its replicas. The scheduler prefers a node where they are free now and, among those, the one with the fewest free GPUs; otherwise the one with the most free GPUs, where the app waits for room. With no node big enough, enabling answers 503. The scheduler sends that node a `create` (`NODE_OPERATION_APP`), which writes the entry into its `apps.yaml` disabled, waits up to 120 seconds for the node to report it, then enables it and admits it against the namespace's quota; the control plane then manages enable/disable, priority and scaling. A failed create clears the placement, so the next enable places the app again; if the node has not reported the entry within the wait, enabling answers 503, and enabling again waits for the same create. An app that a node's `apps.yaml` already runs, such as an integrated worker's prover bound with `app: NAME`, is not placed again. A namespace token with manage permission creates the namespace's apps; `user`, `volumes` and `proof_storage_root` (the host's user ids and filesystem) require administrator credentials, as `user` and `allow` do for batches. App names are unique across the fleet and shared with batches (409 when taken): a node's entry named like a batch is ignored.
+
+App and job tables both show `TAG` and `STATE`. An app's state describes its replicas:
 `configured`, `starting`, `running`, `draining`, `disabled`, `offline` or `failed`;
 a proof app without provers is `registered`.
 The app table shows total configured GPUs and CPUs without a replica column;
-replica settings and job counts remain in app details. An app with services using
+replica settings and job counts remain in app details. An app with node entries using
 multiple tags shows their tags together. Batches show `enabled` or
 `disabled`; their execution states appear in the job table.
 
-`fleetctl batch` lists the batches, as `fleetctl app` lists apps, with each batch's active jobs and last job; `fleetctl batch NAME` shows one batch and its newest jobs, and `fleetctl job --type batch` lists the finite executions themselves. Register a reusable image and resource policy with `fleetctl --namespace NAMESPACE batch add NAME --image IMAGE`, and submit commands with `fleetctl batch submit NAME --gpus N --cpus N -- COMMAND`. Job actions take the job ID: `fleetctl batch logs`, `cancel`, `preempt` and `purge` find its batch, and `--batch NAME` skips that lookup. Batches can also be initially advertised from node `batches.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from a serving app.
+`fleetctl batch` lists the batches, as `fleetctl app` lists apps, with each batch's active jobs and last job; `fleetctl batch NAME` shows one batch and its newest jobs, and `fleetctl job --type batch` lists the finite executions themselves. Register a reusable image and resource policy with `fleetctl --namespace NAMESPACE batch add NAME --image IMAGE`, and submit commands with `fleetctl batch submit NAME --gpus N --cpus N -- COMMAND`. Job actions take the job ID: `fleetctl batch logs`, `cancel`, `preempt` and `purge` find its batch, and `--batch NAME` skips that lookup. Batches can also be initially advertised from node `batches.yaml`. A batch may run for hours or days; its finite command lifecycle distinguishes it from an app.
 
-Serving apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch is that reusable configuration; each submission creates a batch job. Serving apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
+Apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch is that reusable configuration; each submission creates a batch job. Apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
 Every app and batch belongs to an administrator-created namespace. Proof requests require a registered proof app, which the scheduler finds by the job's namespace and ELF ID; batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching; `--app NAME` selects one app's or batch's jobs and `--type app|batch` one kind.
 
@@ -151,7 +154,7 @@ App listings contain registered workloads. Rejected proof requests remain job
 records and do not create an app entry.
 
 Restarting the scheduler preserves proof jobs, namespaces and quota reservations
-in Postgres. Batch records, service intents and commands are durable files in
+in Postgres. Batch records, app deployment records and commands are durable files in
 the control host's `data_dir`; back up that directory together with Postgres.
 Nodes continue locally, reconnect through heartbeats, and retry
 completion metadata until acknowledged. App endpoints and the machine storage handler remain independent of
@@ -160,7 +163,7 @@ proofs remain fetchable through the machine agent.
 App owners control retention of their input and output files.
 
 `fleetctl job fetch JOB_ID --out DIR` downloads proof JSON and public values (the
-destination must not exist). For reference jobs, Fleet authorizes the request,
+destination must not exist). Fleet authorizes the request,
 delivers a short-lived fetch ticket in the machine's next ordinary heartbeat,
 and relays the node's HTTPS response in bounded memory. `fleet-ziren-node fetch-artifact`
 verifies committed files against the job, execution lease and
@@ -182,8 +185,8 @@ fleet-proof-app --scheduler https://scheduler.example.com:8905 \
   --stage-addr 127.0.0.1:51012 --http-addr 127.0.0.1:51013
 ```
 
-Set `proof_storage_root: /srv/goat` on each matching `ziren-gpu` service in
-`services.yaml`. Point the SDK's `ENDPOINT` to `http://127.0.0.1:51012` for a local
+Set `proof_storage_root: /srv/goat` on each matching `ziren-gpu` prover, in its app's
+spec or its `apps.yaml` entry. Point the SDK's `ENDPOINT` to `http://127.0.0.1:51012` for a local
 client. Keep its signing key; older SDKs without bearer headers can use the
 endpoint's configured namespace user `--token-file`. The endpoint reads that file
 on each request, so token rotation and revocation still apply. Supplied authorization
@@ -196,7 +199,7 @@ GOAT uses its app-owned SDK endpoint on loopback ports `51012`/`51013`.
 Integrated EthProofs calls its local GPU server directly and requires no SDK endpoint.
 For other SDK-driven apps, use a separate storage root, scoped token and pair of
 loopback ports for each endpoint. Set the pipeline’s SDK `ENDPOINT` to its local
-stage port and its service’s `proof_storage_root` to the matching directory.
+stage port and its prover's `proof_storage_root` to the matching directory.
 Changing the endpoint does not enable a disabled Fleet app.
 Successful SDK status calls read the proof directly from this app's local output
 storage using Fleet's authenticated completion references. Public values use the
@@ -214,9 +217,8 @@ file with one absolute root per line; `deploy/install.sh node --proof-storage-ro
 installs this configuration. Keep these roots configured when GPU actors stop.
 The machine agent executes storage-only fetches separately from its heartbeats and Ray operations.
 
-Reference jobs avoid control-host input uploads and proactive output publication.
-A remote fetch through Fleet still transfers its requested bytes through the
-control host. The app endpoint logs input storage and metadata admission time
+Fleet stores no proof inputs or outputs. A remote fetch through Fleet transfers its
+requested bytes through the control host. The app endpoint logs input storage and metadata admission time
 separately from the node's `prove_ms`.
 
 **Proving time is execution time.** For GPU proofs, `prove_ms` comes from the
@@ -279,20 +281,19 @@ GPU/CPU quota, described below.
 
 Every app belongs to an existing namespace. An administrator creates the namespace
 and issues its owner token for the built-in `scope=default` tag. The owner can then
-register apps and batches, manage their metadata and submit jobs
+create apps and batches, manage their metadata and submit jobs
 inside that namespace and tag:
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl --token-file alice.token --namespace alice --tag scope=default batch add training --image IMAGE
-fleetctl --token-file alice.token --namespace alice --tag scope=default app add eth --elf-id FULL_ELF_SHA256
+fleetctl --token-file alice.token --namespace alice --tag scope=default app add eth --spec prover.json --elf-id FULL_ELF_SHA256
 ```
 
 Owner tokens hold `read`, `submit` and `manage`. Metadata changes still enforce
 the token's namespace, tag and any explicit app grants; changing a proof app also
-needs the token's tag to cover every service running it. Tokens without `manage`
+needs the token's tag to cover every node entry running it. Tokens without `manage`
 can submit and inspect permitted jobs and read granted scaling status; they
 cannot change workload metadata.
 
@@ -300,10 +301,11 @@ cannot change workload metadata.
 |---|---|
 | Namespace creation, token issuance, namespace/tag quotas and node administration | `admin` |
 | Namespace listing and quota/usage inspection | `read` for its own namespace and tag; administrators can inspect all |
-| App registration, removal, priority and enable/disable | `manage` in the namespace, with any explicit app grants |
+| App creation, removal, priority and enable/disable | `manage` in the namespace, with any explicit app grants |
 | Batch creation, priority, enable/disable and removal | `manage` for the namespace, tag and batch |
 | Batch host mount roots and runtime user | `admin` |
-| Service image, environment, command, user, workdir and volumes | `admin` |
+| App `user`, `volumes` and `proof_storage_root` at creation | `admin` |
+| App image, environment, command, user, workdir and volumes changes | `admin` |
 | App GPU/CPU and replica changes | `manage` for the app; namespace/tag quotas and node capacity still apply |
 | Job and log inspection | `read` within its scope |
 | Job submission and batch job cancellation | `submit` within its scope |
@@ -315,13 +317,13 @@ registering a batch and changed with `fleetctl batch update NAME --image ...`
 submitted with; new jobs use the new ones. Only administrators may set batch
 `allow` roots or `user`, at creation or on update. Owner-created batches start
 without host mounts and use the image's default user until an administrator
-configures one. Serving deployments start from node
-`services.yaml`; owners manage their lifecycle, priority, allocation and
+configures one. Apps start from their creation spec or a node's
+`apps.yaml`; owners manage their lifecycle, priority, allocation and
 settings through the control plane. `fleetctl app update NAME --image ... --env K=V`
 (`PUT /apps/NAME/settings`) changes an app's server or prover image,
 environment, command, user, workdir, volumes, shm/memory size, health path or
 timeouts. Changing image, environment, command, user, workdir or volumes requires
-administrator credentials because services can reach host networking, storage
+administrator credentials because apps can reach host networking, storage
 and prover credentials. Scoped managers retain resource-size, health-path and
 timeout updates. Mixed updates containing an administrator-only field are
 rejected without applying any fields.
@@ -333,16 +335,22 @@ Administrators must approve storage dedicated to the namespace; an approved
 directory grants access to its contents.
 
 The scheduler is the source of truth for an app's configuration and tells each
-node with one app-level node operation, `NODE_OPERATION_APP`: it addresses an app
-(its namespace by id and name, plus the app's name; the node finds its services
-that run it) or a batch by name, and either
-removes it (`remove`) or writes its configuration into `services.yaml` or
-`batches.yaml` (`set`): enabled state, resources and settings. Enabling,
-disabling, scaling and updating an app all run the same way: the service drains
-and stops, its node writes the new configuration, and it starts again unless it
-is now disabled. `NODE_OPERATION_SET_SERVICE` only starts or stops a service's
+node with one app-level node operation, `NODE_OPERATION_APP` (7): it addresses an app
+(`{"app": {namespace, namespace_name, name}}`: its namespace by id and name, plus the
+app's name; the node finds its `apps.yaml` entries that run it), a batch
+(`{"batch": {name}}`) or the one entry a change of an app stopped (`{"entry": {name}}`),
+and either removes it (`remove`), writes its configuration into `apps.yaml` or
+`batches.yaml` (`set`): enabled state, resources and settings, or, for an app being
+placed, adds its entry disabled (`create`, with the entry). Enabling,
+disabling, scaling and updating an app all run the same way: its replicas drain
+and stop, its node writes the new configuration, and they start again unless the app
+is now disabled. `NODE_OPERATION_SET_APP` (4), with `{"app": entry, "disabled",
+"scale_id", "scale_phase"}` (or `"scale_cleanup"`), only starts or stops an entry's
 replicas as configured, for that sequence and when a node's replicas stop
-matching it. Priority is a scheduling parameter within the namespace and stays in
+matching it. The scheduler records each entry on each node as an `AppDeployment`
+keyed `{node}-{entry name}`; its reservation's allocation id is `deployment:{key}`.
+`fleetctl app logs` asks the node for an entry's log with a `LogRequest` naming that
+`entry`. Priority is a scheduling parameter within the namespace and stays in
 the scheduler.
 
 Owner metadata routes use the same authenticated API as the CLI. Every app has
@@ -350,7 +358,7 @@ the same routes:
 
 | Workload | Routes |
 |---|---|
-| Apps | `GET /apps` (proof and serving apps together), `POST /apps` (register a proof app), `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs` |
+| Apps | `GET /apps`, `POST /apps` (create an app from its container `spec`, a prover also with its `proof`), `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs` |
 | Allocation and status | `PUT` / `GET /apps/NAME/scale` |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
@@ -359,7 +367,7 @@ the same routes:
 Every API route needs a token permission. `GET /namespaces[/NAME]` (own
 namespace), `GET /apps...` and `GET /batches...` need `read`. `POST /apps/NAME/jobs`,
 `POST /batches/NAME/jobs` and `POST /batches/NAME/jobs/ID/cancel` need `submit`;
-`.../preempt` needs `admin`. Any other `/apps` or `/batches` change (register,
+`.../preempt` needs `admin`. Any other `/apps` or `/batches` change (create,
 delete, priority, disabled, scale, settings, purge) needs `manage`; the settings
 handler additionally requires `admin` for the execution fields listed above. Everything
 else (status, namespace creation, quotas and suspension, allocations, the
@@ -367,23 +375,25 @@ preemption plan, tokens and node drain) needs `admin`. `/healthz` and
 `/{proof_id}/wrap/public_values.bin` need no token, `/access` takes any valid
 token and `/internal/*` the cluster token. An administrator selects a namespace
 with `?namespace=`. Disabling a batch blocks new submissions and lets
-accepted jobs continue; disabling an app drains its services before releasing
+accepted jobs continue; disabling an app drains its replicas before releasing
 their reservations. A deleted batch stays listed with state `deleted`, and readable,
 while it still has job records; its jobs keep their own lifecycle until purged.
 
 App and batch creation infer the namespace from a verified user token;
 administrator requests must supply it. An unknown namespace is not automatically
-created. App registrations use `(namespace, name)`, each program
-once per namespace, so namespaces can register the same program independently. Disabling or deleting one
-registration leaves the others and their jobs intact. Batch names remain unique within the control plane; each workload has one namespace.
+created. App names are unique across the fleet; each program has one proof app
+per namespace, so namespaces can prove the same program independently. Disabling or deleting one
+app leaves the others and their jobs intact. Batch names remain unique within the control plane; each workload has one namespace.
 App and batch grants are explicit; a grant from another namespace cannot authorize submission. Admin batch submissions
 also inherit the app's namespace and participate in its quota.
 
-The app registration API uses `POST /apps?namespace=alice` with `{"name":"eth","elf_id":"FULL_ELF_SHA256"}`
-and optional `class`, `anchor`, `backends`, `zkm_version`, `max_queued` and `priority`.
+The app creation API uses `POST /apps?namespace=alice` with
+`{"name":"eth","spec":{"image":"IMAGE","gpus":1},"proof":{"elf_id":"FULL_ELF_SHA256"}}`,
+optional `priority`, and in `proof` optional `class`, `anchor`, `backends`, `zkm_version`
+and `max_queued`; a container app has no `proof` and a `spec` with `port_base`.
 The control-plane batch API accepts `POST /batches?namespace=alice` with the batch JSON, or a
 `namespace` field in the JSON. Names and immutable namespace IDs are accepted;
-registrations persist the ID. A configured batch or persistent `kind: app`
+registrations persist the ID. A configured batch or `apps.yaml`
 entry can also specify `namespace: alice`; its namespace is verified before launch.
 The owner token is bound to `scope=default`; jobs inherit that tag. Batch owners
 prepare inputs in storage and include the code and storage client in their image.
@@ -396,17 +406,16 @@ gpu_mem, mounts, env and nodes. Listings leave it out.
 ### GPU and CPU quotas
 
 A namespace quota caps **concurrent GPU/CPU units** held by proof jobs, one-shot
-batch jobs and persistent service replicas assigned to that namespace. Reservations from
+batch jobs and app replicas assigned to that namespace. Reservations from
 all tags and tokens share this cap. An optional tag can cap its own reservations.
 Admission must fit both caps; tag caps do not
 reserve a guaranteed share of fleet capacity. Neither quota has a duration, expiry,
-hourly budget or periodic reset. Jobs and enabled services can keep their reservations
+hourly budget or periodic reset. Jobs and enabled apps can keep their reservations
 indefinitely; normal job lifecycle rules and existing application timeouts still apply.
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl namespace quota alice --gpus 4 --cpus 32
 fleetctl namespace get alice       # quota and currently reserved units
 fleetctl namespace quota alice     # clear both caps: unlimited (a write operation)
@@ -450,7 +459,7 @@ out or disconnected proof keeps its reservation and rejoins its original prover;
 it cannot fail over to another prover while the original execution is uncertain.
 The replica's entire allocation must fit; an active proof keeps its allocation.
 App owners can use `fleetctl app scale` to adjust the app's GPU/CPU units
-between proofs to fit user quotas. Persistent service replicas reserve their configured GPU/CPU units
+between proofs to fit user quotas. App replicas reserve their configured GPU/CPU units
 against the namespace and tag they are assigned to. Shared infrastructure
 configured in the `system` namespace is accounted there.
 
@@ -488,10 +497,10 @@ quota before stopping any batch job. The Rust scheduler makes this plan from Ray
 capacity and batch candidates; the Python adapter executes the selected stop, and
 the Rust scheduler requeues the job after confirmed cleanup. Equal or higher priority batch jobs, batch jobs in another
 namespace and active proofs are protected. Proof priority orders queued proofs;
-it does not resize active proofs or evict running prover services. Persistent apps
+it does not resize active proofs or evict running provers. Persistent apps
 are also protected from automatic eviction. Their app priority controls which batch jobs they may displace when starting;
-changing priority alone does not recreate actors. Node service configuration provides
-the initial execution settings.
+changing priority alone does not recreate actors. An app's creation spec or
+`apps.yaml` entry provides the initial execution settings.
 
 Stopping uses SIGTERM followed by SIGKILL after `stop_timeout_s`. Placement and
 quota reservations remain until every container is confirmed stopped or absent.
@@ -509,14 +518,13 @@ control namespace, while Fleet namespace IDs scope policy and accounting.
 
 ```bash
 fleetctl namespace create team --gpus 8 --cpus 64 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out team.env
+  --endpoint http://127.0.0.1:51012 --out team.env
 fleetctl namespace quota team --tag scope=research --gpus 2 --cpus 16
 fleetctl namespace quota team --tag scope=production --gpus 6 --cpus 48
 fleetctl namespace get team                  # namespace quota, usage and tags
 fleetctl namespace get team --tag scope=research   # namespace totals and tag quota/usage
 fleetctl token issue --namespace team --tag scope=research \
-  --app training --endpoint https://fleet.example:8905 --out alice.env
+  --app training --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl --namespace team --tag scope=research job
 ```
 
@@ -538,8 +546,7 @@ Users cannot select another tag or spoof it in a submission body.
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://stage.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl namespace list
 fleetctl namespace get alice
 # Give alice.env, alice.token, and alice.ca.pem (if generated) to the owner securely.
@@ -548,7 +555,7 @@ FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=scope=default \
 
 # Copies the namespace, optional tag, permissions, app grants and label to a new key/token.
 fleetctl token refresh OLD_TOKEN_ID \
-  --endpoint https://stage.example:8905 --out alice-next.env
+  --endpoint http://127.0.0.1:51012 --out alice-next.env
 # After the user verifies the replacement:
 fleetctl token revoke OLD_TOKEN_ID
 
@@ -556,8 +563,8 @@ fleetctl namespace suspend alice
 fleetctl namespace resume alice
 ```
 
-Namespace creation requires the HTTPS stage gateway details so the owner bundle
-can submit proofs. `refresh` does not revoke
+Namespace creation takes the SDK endpoint the owner's clients use, their
+[app-owned proof endpoint](#app-owned-proof-endpoint), for the bundle's `ENDPOINT`. `refresh` does not revoke
 the old key automatically or overwrite an existing bundle.
 
 Issuance requires an existing, active namespace. A typo cannot silently create a
@@ -597,7 +604,7 @@ token's address. The scheduler finds the job's app by namespace and ELF ID.
 `GetStatus` needs a token of that namespace with `read` or `submit`.
 The SDK signs and receives its original proof ID. The scheduler resolves
 `(namespace_id, optional_tag, client_proof_id)` to a unique internal ID, derived from their
-SHA-256 hash for new jobs. Nodes, blob keys, retries and deduplication use that
+SHA-256 hash for new jobs. Nodes, retries and deduplication use that
 internal ID. Different tags can submit the same client proof ID independently.
 Resubmission within a tag returns the existing job without replacing input. Reference submissions with conflicting inputs or proof parameters are rejected.
 
@@ -655,7 +662,7 @@ cannot be issued in `system`.
 Configured batches and persistent app entries default to `system`.
 Administrators assign a user app's namespace explicitly; API registrations require
 an existing namespace. Namespace quotas govern proof and batch jobs as well as
-configured service replica reservations. Disabling a service releases its reservation
+app replica reservations. Disabling an app releases its reservation
 after the actor stops.
 
 ### MCP clients
@@ -679,7 +686,10 @@ administrator token. Clients must support remote
 Streamable HTTP and allow the Bearer header to be configured. Clients that only
 support local `stdio` servers cannot connect directly to this endpoint.
 
-The server lists long-running apps with `fleet_apps_list` and `fleet_app_get`.
+The server lists long-running apps with `fleet_apps_list` and `fleet_app_get`, and
+`fleet_app_create` creates one as `fleetctl app add` does: a `spec` object and optional
+`priority`, plus a prover's `elf_id`, `class`, `anchor`, `backends`, `zkm_version` and
+`max_queued`.
 Batch tools are `fleet_batch_create`, `fleet_batches_list`,
 `fleet_batch_get`, `fleet_batch_jobs_list`, `fleet_batch_job_get`,
 `fleet_batch_job_submit`, `fleet_batch_job_logs` and `fleet_batch_job_cancel`. `fleet_app_logs` reads a visible app's log from its node. Batch job submission
@@ -689,42 +699,43 @@ workload-management grant. Its `priority` is owner-managed; nonempty `allow`
 roots require an administrator.
 `fleet_batches_list` and `fleet_batch_get` use `fleetctl batch` and `fleetctl batch NAME`; `fleet_batch_jobs_list` and `fleet_batch_job_get` use `fleetctl job --type batch` and `fleetctl job ID`.
 `fleet_batch_job_submit` accepts a `mounts` array such as `["/data/models:ro"]`;
-each path must be inside the batch's allowed roots. Existing metadata changes
-and app scaling use the CLI or HTTP API; MCP currently exposes batch creation
-and job operations. Proof jobs remain submitted through the Ziren network SDK;
+each path must be inside the batch's allowed roots. Existing metadata changes,
+enabling and app scaling use the CLI or HTTP API; MCP currently exposes app and batch
+creation and job operations. Proof jobs remain submitted through the Ziren network SDK;
 MCP can list and inspect their records.
 
 Tokens with `manage` manage app and batch
 metadata within their namespace, tag and app grants:
-registration, priority, enable/disable and removal. Owners can
+creation, priority, enable/disable and removal. Owners can
 scale their apps within namespace and tag quotas, and submit
 batch jobs in their tag. SDK proof submissions are signed by the token's key.
 Tokens without `manage` can use their granted apps but cannot change their metadata.
 Administrators manage namespace and tag quotas, namespace access, token issuance,
-batch host storage and runtime users, and service execution settings.
+batch host storage and runtime users, and app execution settings.
 App removal refuses while any proof is queued or running and deletes that app's
 terminal proof records and control-host artifacts. App-owned storage retention remains with the app owner. Administrators can also issue tokens limited
 to approved apps and a selected namespace/tag. Token refresh preserves access to jobs.
 Namespaces are the resource accounting and billing unit; namespace and optional tag quotas
-cap concurrent GPU/CPU units across proofs, batch jobs, and persistent service replicas, with no quota time limit. A service replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
+cap concurrent GPU/CPU units across proofs, batch jobs, and app replicas, with no quota time limit. An app replica reserves its configured resources for as long as it is enabled; disabling or removing it releases that reservation after the actor stops.
 
 
-LLM serving, ComfyUI and proving programs all appear as `type: app` in `fleetctl app`. Proof and serving apps use `kind: app` or `kind: service` respectively, while `proof` remains the proof-program policy section on a proof app. An app record carries `name`, `namespace`, `tag`, `tags`, `state`, `detail`, `priority`, `disabled`, `resources`, `namespace_quota`, `tag_quota`, `jobs` (`total`, `active`, `succeeded`, `failed`, `last_at`), and `proof` (`elf_id`, its placement policy, `mean_prove_ms`, `anchored_on`, `created_at`, and `image`: the container image of the services proving for it, a list while they differ) or `service` (container settings and workers). A batch record (`fleetctl batch`, `type: batch`, `kind: batch`) has the same envelope: its `state` is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and its policy sits under `batch` (`image`, `user`, `max_gpus`, `default_gpu_mem_gb`, `shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `workers`). Batch jobs appear only under `fleetctl batch` and `fleetctl job --type batch`.
+Model servers, ComfyUI and provers all appear as `type: app` in `fleetctl app`; a record has no `kind`. An app record carries `name`, `namespace`, `tag`, `tags`, `state`, `detail`, `priority`, `disabled`, `resources`, `namespace_quota`, `tag_quota`, `jobs` (`total`, `active`, `succeeded`, `failed`, `last_at`), `spec` (its container settings, including `kind`, and `workers`: the nodes it runs on), and for a proof app `proof` (`elf_id`, its placement policy, `mean_prove_ms`, `anchored_on`, `created_at`, and `image`: the container image of the provers proving for it, a list while they differ). A proof app created before `spec` existed, proved by provers its nodes configure, has only `proof`. A batch record (`fleetctl batch`, `type: batch`) has the same envelope: its `state` is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and its policy sits under `batch` (`image`, `user`, `max_gpus`, `default_gpu_mem_gb`, `shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `workers`). Batch jobs appear only under `fleetctl batch` and `fleetctl job --type batch`.
 `fleetctl app disable NAME` stops a persistent app and releases its GPUs. A proof
 app has its own dedicated Ziren GPU server: disable blocks new submissions,
 drains its active proofs, then stops that server and releases its GPUs. Queued
 proofs wait until the app is enabled again. Enabling an app starts its
-service before accepting work. Disabling a batch only blocks new
+replicas before accepting work. Disabling a batch only blocks new
 batch jobs; accepted batch jobs finish.
 
-Every service in `services.yaml` has an `app`. Each `ziren-gpu` entry must bind
+Every entry in `apps.yaml` has an `app`. Each `ziren-gpu` entry must bind
 its server to the one app it is dedicated to using `namespace`, `app: NAME` and
 `elf_id: FULL_ELF_SHA256`; a `ziren-cpu` entry names its app the same way, with
-`elf_id` optional. Any other service is its own app, takes no `elf_id`, and its
-`app` defaults to the service name. Do not configure a Ziren server for multiple
+`elf_id` optional. An entry the scheduler creates for an app takes the app's name.
+Any other entry (`kind: app`) is its own app, takes no `elf_id`, and its
+`app` defaults to the entry name. Do not configure a Ziren server for multiple
 apps. Provers and workers receive `FLEET_APP`, `FLEET_APP_NAMESPACE` and
 `FLEET_APP_ELF_ID`; `fleet-ziren-node` takes `--app` / `FLEET_APP`.
-`services.yaml` supplies initial resource settings; app owners then manage
+The spec or `apps.yaml` entry supplies initial resource settings; app owners then manage
 allocations through the control plane with `fleetctl app scale`. Batch jobs request resources with
 `fleetctl batch submit NAME --gpus N --cpus N`. Active proofs cannot resize
 their GPU allocation. Resizing a proof already in progress is tracked in
@@ -738,7 +749,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 | SDK proof ELFs and inputs | App-owned `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`. Fleet stores references, hashes and parameters. |
 | SDK proof output | App-owned `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest. The local app endpoint reads them directly; remote Fleet fetches use an authorized heartbeat ticket and HTTPS relay. Disabling the GPU actor preserves fetching. |
 | Integrated EthProofs data | Its app-owned storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`; the app manages their format and recovery. |
-| serving apps, batches, jobs and command intents | `data_dir/workloads/{apps,jobs,commands,services}` on the control host; durable JSON records, including lease and cleanup fences |
+| apps, app deployments, batches, jobs and command intents | `data_dir/workloads/{apps,deployments,jobs,commands}` on the control host; durable JSON records, including lease and cleanup fences |
 | batch inputs, outputs and checkpoints | owner-managed shared or object storage, read and written directly by the batch command |
 | batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes retain execution files in `FLEET_JOBS_DIR/<job-id>/` (normally `work/jobs/`) |
 
@@ -748,7 +759,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 |---|---|---|
 | user token (`FLEET_TOKEN_FILE`) | the namespace owner/client | namespace/token issuance; authorizes proof RPCs and HTTP APIs within its scope; revocable |
 | SDK signing key (`ZKM_PRIVATE_KEY`) | the client | generated in the token bundle and bound internally to its token |
-| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` when supplied | `install.sh` (`fleetctl init tls`) |
+| server certificate + CA | gateway and control API; clients get `CA_CERT_PATH` when supplied | `install.sh` (`fleetctl init tls`) |
 | cluster token | scheduler and every node; authenticates node-initiated requests | `install.sh` (`fleetctl init token`) |
 | admin token | operators | `install.sh` (`fleet-scheduler issue-admin`); more with `fleetctl token admin` |
 
@@ -765,12 +776,12 @@ any of them and names what replaced it.
 
 Proof clients use bundled SDK signing material and bearer authorization at their
 app endpoint. Loopback clients use local HTTP; external clients require an authenticated HTTPS app gateway. The token API exposes only opaque IDs and access
-scopes. Tokens with `manage` can register apps and manage their metadata;
+scopes. Tokens with `manage` can create apps and manage their metadata;
 tokens without it can use only granted apps and batches. Revocation applies to both proofs and
 batch jobs.
 
 The scheduler’s backend listeners stay private behind the HTTPS gateway. Node control gRPC uses TLS with the scheduler
-certificate and cluster bearer token; use an HTTPS `scheduler` URL in `services.yaml`.
+certificate and cluster bearer token; use an HTTPS `scheduler` URL in `apps.yaml`.
 For a private certificate authority, set `scheduler_ca_file` so prover containers trust it.
 The installer sets this to its generated public CA certificate; distribute that CA to
 each execution machine.

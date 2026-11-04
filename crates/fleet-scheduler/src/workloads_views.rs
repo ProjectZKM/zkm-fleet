@@ -27,13 +27,13 @@ impl WorkloadController {
         }
         replica.and_then(|replica| {
             let workers: std::collections::BTreeSet<_> = i
-                .services
+                .deployments
                 .values()
                 .filter(|intent| {
-                    let service = &intent.service;
-                    text(service, "kind").starts_with("ziren-")
+                    let entry = &intent.spec;
+                    text(entry, "kind").starts_with("ziren-")
                         && replica
-                            .strip_prefix(&format!("{}-", text(service, "name")))
+                            .strip_prefix(&format!("{}-", text(entry, "name")))
                             .is_some_and(|index| index.parse::<u32>().is_ok())
                 })
                 .map(|intent| intent.worker.clone())
@@ -57,15 +57,15 @@ impl WorkloadController {
         v
     }
 
-    /// Configured totals across all services/replicas; disabled apps keep their settings.
+    /// Configured totals across all deployments and replicas; disabled apps keep their settings.
     /// Quotas are shared namespace limits, not independent limits for each app.
     pub(crate) fn app_resources(&self, namespace: &str, app: &str, tag: Option<&str>) -> Value {
         let i = self.inner.lock();
-        let services: Vec<_> = i
-            .services
+        let deployments: Vec<_> = i
+            .deployments
             .values()
             .filter(|intent| {
-                let s = &intent.service;
+                let s = &intent.spec;
                 text(s, "namespace") == namespace
                     && text(s, "app") == app
             })
@@ -78,13 +78,13 @@ impl WorkloadController {
         let mut images = std::collections::BTreeSet::new();
         let mut states = std::collections::BTreeSet::new();
         let mut reasons = Vec::new();
-        for intent in &services {
+        for intent in &deployments {
             let s = intent
                 .scale
                 .as_ref()
                 .filter(|s| s.pending())
                 .map(|s| s.target())
-                .unwrap_or(&intent.service);
+                .unwrap_or(&intent.spec);
             let count = s["replicas"].as_u64().unwrap_or(1);
             replicas += count;
             gpus += s["gpus"]
@@ -103,8 +103,8 @@ impl WorkloadController {
             }
             let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
             let observed = worker.and_then(|w| {
-                w.report.services.iter()
-                .find(|s| text(s, "name") == text(&intent.service, "name"))
+                w.report.apps.iter()
+                .find(|s| text(s, "name") == text(&intent.spec, "name"))
             });
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
                 "failed"
@@ -132,7 +132,7 @@ impl WorkloadController {
             .into_iter().find(|s| states.contains(s)).unwrap_or("configured");
         let n = self.fleet.namespace(namespace);
         json!({
-            "resources":(!services.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
+            "resources":(!deployments.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
             "tags":tags, "images":images, "state":state,
             "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
@@ -140,18 +140,18 @@ impl WorkloadController {
         })
     }
 
-    /// Why an enabled service is not running yet, for `fleetctl app`'s DETAIL column.
+    /// Why an enabled app is not running yet, for `fleetctl app`'s DETAIL column.
     fn starting_reason(commands: &BTreeMap<String, CommandRecord>, intent: &AppDeployment, worker: Option<&NodeSession>) -> String {
-        let name = text(&intent.service, "name");
+        let name = text(&intent.spec, "name");
         let pending = commands.values().find(|c| {
             !c.done
                 && c.worker == intent.worker
-                && c.operation == NodeOperation::SetService as i32
-                && text(&c.parameters["service"], "name") == name
+                && c.operation == NodeOperation::SetApp as i32
+                && text(&c.parameters["app"], "name") == name
         });
         match pending {
             Some(c) if !c.admitted => {
-                let s = &c.parameters["service"];
+                let s = &c.parameters["app"];
                 let n = s["replicas"].as_f64().unwrap_or(1.0);
                 let (g, cpu) = (s["gpus"].as_f64().unwrap_or(0.0) * n, s["cpus"].as_f64().unwrap_or(1.0) * n);
                 match worker {
@@ -165,31 +165,34 @@ impl WorkloadController {
         }
     }
 
-    /// An app as every listing shows one, whichever kind it is: what it is, where it runs, its
-    /// state and jobs. A proof app adds its program and placement policy under `proof`, a
-    /// serving app its container settings under `service`, a batch its policy under `batch`.
+    /// An app or batch as every listing shows one: what it is, where it runs, its state and
+    /// jobs. `sections` add an app's container settings under `spec` and, when it proves a
+    /// program, that program and its placement policy under `proof`; a batch's policy under
+    /// `batch`.
     #[allow(clippy::too_many_arguments)]
-    fn app_view(&self, kind: &str, namespace: &str, name: &str, fixed_tag: Option<&str>, priority: Value, disabled: bool,
-        jobs: Value, tag: Option<&str>, detail: (&str, Value),
+    fn app_view(&self, namespace: &str, name: &str, fixed_tag: Option<&str>, priority: Value, disabled: bool,
+        jobs: Value, tag: Option<&str>, sections: Vec<(&str, Value)>,
     ) -> Value {
         let r = self.app_resources(namespace, name, tag);
+        let proves = sections.iter().any(|(key, _)| *key == "proof");
         let state = if r["resources"].is_null() {
-            if disabled { "disabled" } else if kind == "app" { "registered" } else { "configured" }
+            if disabled { "disabled" } else if proves { "registered" } else { "configured" }
         } else {
             r["state"].as_str().unwrap_or("configured")
         };
         let mut v = json!({
-            "type": "app", "kind": kind, "name": name, "namespace": namespace,
+            "type": "app", "name": name, "namespace": namespace,
             "tag": fixed_tag, "tags": r["tags"], "state": state, "detail": r["detail"],
             "priority": priority, "disabled": disabled, "resources": r["resources"],
             "namespace_quota": r["namespace_quota"], "tag_quota": r["tag_quota"],
             "jobs": jobs,
         });
-        v[detail.0] = detail.1;
-        if kind == "app" {
-            // A proof app runs in its proving services' container: their image when they agree,
-            // each distinct one while an update has moved some of them. A serving app's image is
-            // already among its settings.
+        for (key, value) in sections {
+            v[key] = value;
+        }
+        if proves {
+            // A proof app runs in its provers' container: their image when they agree, each
+            // distinct one while an update has moved some of them.
             v["proof"]["image"] = match r["images"].as_array().map(Vec::as_slice) {
                 Some([one]) => one.clone(),
                 Some([]) | None => Value::Null,
@@ -217,7 +220,7 @@ impl WorkloadController {
         })
     }
 
-    /// A batch in the app shape: `kind: batch`, `state` enabled, disabled or deleted, its job
+    /// A batch in the app shape: `type: batch`, `state` enabled, disabled or deleted, its job
     /// counts under `jobs`, and its image, user, resource policy, mount roots, environment and
     /// workers under `batch`.
     pub(crate) fn batch_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
@@ -231,9 +234,9 @@ impl WorkloadController {
         }
         let disabled = app.spec["disabled"].as_bool() == Some(true);
         let fixed_tag = app.tag.as_deref().or_else(|| app.spec["tag"].as_str());
-        let mut v = self.app_view("batch", &app.namespace, &app.name, fixed_tag, app.spec["priority"].clone(), disabled,
-            jobs, tag, ("batch", settings));
-        // A batch runs no service of its own: its state is whether it takes jobs, and its tag
+        let mut v = self.app_view(&app.namespace, &app.name, fixed_tag, app.spec["priority"].clone(), disabled,
+            jobs, tag, vec![("batch", settings)]);
+        // A batch runs no app of its own: its state is whether it takes jobs, and its tag
         // is the one it was registered with.
         v["type"] = json!("batch");
         v["state"] = json!(if app.removed { "deleted" } else if disabled { "disabled" } else { "enabled" });
@@ -241,21 +244,28 @@ impl WorkloadController {
         v
     }
 
-    /// A serving app (a long-running service from a node's services.yaml) in the app shape.
-    pub(crate) fn serving_app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
-        let jobs_value = self.template_jobs(app, tag);
+    /// An app's container settings as its record shows them, with the nodes it runs on.
+    fn spec_value(app: &WorkloadTemplate) -> Value {
         let mut settings = app.spec.0.clone();
         if let Some(o) = settings.as_object_mut() {
-            for key in ["kind", "namespace", "namespace_ref", "priority", "disabled", "tag"] {
+            for key in ["name", "namespace", "namespace_ref", "priority", "disabled", "tag", "app", "elf_id"] {
                 o.remove(key);
             }
             o.insert("workers".into(), json!(app.workers));
         }
-        self.app_view("service", &app.namespace, &app.name, app.tag.as_deref().or_else(|| app.spec["tag"].as_str()),
-            app.spec["priority"].clone(), app.spec["disabled"].as_bool() == Some(true), jobs_value, tag, ("service", settings))
+        settings
     }
 
-    /// A registered proof app in the app shape; its job counts are the selected tag's.
+    /// An app that proves no program, in the app shape.
+    pub(crate) fn app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
+        let jobs = self.template_jobs(app, tag);
+        self.app_view(&app.namespace, &app.name, app.tag.as_deref().or_else(|| app.spec["tag"].as_str()),
+            app.spec["priority"].clone(), app.spec["disabled"].as_bool() == Some(true), jobs, tag,
+            vec![("spec", Self::spec_value(app))])
+    }
+
+    /// An app that proves a program, in the app shape: its proof record, and its container
+    /// settings when the scheduler created it; its job counts are the selected tag's.
     pub(crate) async fn proof_app_value(&self, app: &crate::store::App, anchored: Option<&str>, tag: Option<&str>) -> anyhow::Result<Value> {
         let (mut total, mut active, mut succeeded, mut failed, mut last) = (app.jobs, app.active, app.succeeded, app.failed, app.last_created_ms);
         if let Some(tag) = tag {
@@ -279,10 +289,15 @@ impl WorkloadController {
             "anchored_on": self.machine_name(anchored, None), "created_at": app.created_ms as f64 / 1000.0,
             "diagnostics": {"anchor_replica": anchored},
         });
-        Ok(self.app_view("app", &app.namespace, &app.name, None, json!(app.priority), app.disabled, jobs, tag, ("proof", proof)))
+        let mut sections = vec![("proof", proof)];
+        let template = self.inner.lock().apps.get(&app.name).filter(|t| t.persistent && !t.removed && t.namespace == app.namespace).cloned();
+        if let Some(template) = template {
+            sections.push(("spec", Self::spec_value(&template)));
+        }
+        Ok(self.app_view(&app.namespace, &app.name, None, json!(app.priority), app.disabled, jobs, tag, sections))
     }
 
-    /// The registered proof apps the caller sees: a token's namespace's that it is granted, or
+    /// The proof apps the caller sees: a token's namespace's that it is granted, or
     /// an administrator's selected namespace's (every namespace's without one).
     pub(crate) async fn proof_app_values(&self, c: Option<&Token>, q: &BTreeMap<String, String>, tag: Option<&str>) -> anyhow::Result<Vec<Value>> {
         let namespace = match (c, q.get("namespace")) {

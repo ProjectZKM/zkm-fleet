@@ -48,7 +48,7 @@ fn batch_creation_with_user_token_leaves_namespace_to_verified_api_scope() {
         stream.read_exact(&mut request_body).unwrap();
         assert!(headers.starts_with("POST /batches HTTP/1.1"));
         assert!(headers.to_ascii_lowercase().contains("authorization: bearer owner-token"));
-        let body = r#"{"type":"batch","kind":"batch","name":"training","namespace":"alice","batch":{"image":"python:3"}}"#;
+        let body = r#"{"type":"batch","name":"training","namespace":"alice","batch":{"image":"python:3"}}"#;
         write!(stream, "HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
     let output = cli().args(["--json", "--url", &url, "--token-file"])
@@ -61,16 +61,16 @@ fn batch_creation_with_user_token_leaves_namespace_to_verified_api_scope() {
     assert_eq!(batch["type"], "batch");
 }
 
-/// The unified app list: a registered proof app and a serving app, as `GET /apps` returns them.
+/// The app list, as `GET /apps` returns it: a model server and a proof app.
 fn app_list() -> String {
     serde_json::json!([
-        {"type":"app", "kind":"service", "name":"comfyui", "namespace":"alice",
+        {"type":"app", "name":"comfyui", "namespace":"alice",
          "tags":["scope=default"], "state":"starting", "priority":0, "disabled":false,
          "detail":"waiting for capacity: needs 1 GPU and 2 CPU, gpu-machine has 0 GPU and 8 CPU free",
          "resources":{"gpus":1,"cpus":2,"replicas":1,"nodes":["gpu-machine"]},
          "jobs":{"total":0,"active":0,"succeeded":0,"failed":0,"last_at":3.0},
-         "service":{"image":"comfyui:latest"}},
-        {"type":"app", "kind":"app", "name":"ethproofs", "namespace":"alice",
+         "spec":{"image":"comfyui:latest"}},
+        {"type":"app", "name":"ethproofs", "namespace":"alice",
          "tags":["scope=default"], "state":"disabled", "priority":0, "disabled":true,
          "resources":{"gpus":6,"cpus":48,"replicas":1,"nodes":["gpu-machine"]},
          "namespace_quota":{"gpus":0,"cpus":null},
@@ -95,8 +95,8 @@ fn app_list_shows_every_app_from_one_request() {
     assert!(seen[0].headers.contains("authorization: bearer test-admin"));
     let apps: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let apps = apps.as_array().unwrap();
-    assert_eq!((apps[0]["name"].as_str(), apps[0]["kind"].as_str()), (Some("comfyui"), Some("service")));
-    assert_eq!((apps[1]["name"].as_str(), apps[1]["kind"].as_str()), (Some("ethproofs"), Some("app")));
+    assert_eq!((apps[0]["name"].as_str(), apps[0]["spec"]["image"].as_str()), (Some("comfyui"), Some("comfyui:latest")));
+    assert_eq!(apps[1]["name"], "ethproofs");
     assert_eq!(apps[1]["proof"]["mean_prove_ms"], 1200);
     for app in apps {
         assert_eq!(app["type"], "app");
@@ -122,7 +122,7 @@ fn app_list_shows_why_a_starting_app_is_not_running() {
     assert!(row.contains("starting") && row.contains("waiting for capacity: needs 1 GPU and 2 CPU"), "{row}");
     assert!(row.ends_with("comfyui:latest") && !row.contains("image comfyui"), "the image is a column, not a detail: {row}");
     let row = table.lines().find(|l| l.contains("ethproofs")).unwrap();
-    assert!(row.starts_with("app") && row.contains("mean prove 1.2 s"), "{row}");
+    assert!(row.starts_with("ethproofs") && row.contains("mean prove 1.2 s"), "{row}");
     assert!(row.ends_with("ghcr.io/projectzkm/ziren-gpu@sha256:d4b8"), "a proof app shows its prover image: {row}");
 }
 
@@ -132,7 +132,7 @@ fn batch_creation_sends_namespace_selector() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = token_file("batch-add");
     let server = stub(listener, 1, |_, _| (201,
-        r#"{"type":"batch","kind":"batch","name":"training","namespace":"11111111111111111111111111111111","priority":77,"batch":{"image":"python:3","max_gpus":8,"allow":["/tmp"]}}"#.into()));
+        r#"{"type":"batch","name":"training","namespace":"11111111111111111111111111111111","priority":77,"batch":{"image":"python:3","max_gpus":8,"allow":["/tmp"]}}"#.into()));
     let output = cli().args(["--json", "batch", "add", "training", "--namespace", "alice", "--url", &url,
             "--image", "python:3", "--allow", "/tmp", "--priority", "77", "--token-file"])
         .arg(&token).output().unwrap();
@@ -147,9 +147,11 @@ fn batch_creation_sends_namespace_selector() {
 }
 
 #[test]
-fn app_registration_sends_the_program_and_its_policy() {
+fn app_creation_sends_the_spec_and_a_provers_program_and_policy() {
     let elf = std::env::temp_dir().join(format!("fleet-app-add-{}.elf", std::process::id()));
     std::fs::write(&elf, b"program").unwrap();
+    let spec = std::env::temp_dir().join(format!("fleet-app-add-{}.json", std::process::id()));
+    std::fs::write(&spec, r#"{"kind":"ziren-gpu","image":"ziren-gpu:1","gpus":4}"#).unwrap();
     let elf_id = { use sha2::Digest; hex::encode(sha2::Sha256::digest(b"program")) };
     for by_file in [false, true] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -158,20 +160,28 @@ fn app_registration_sends_the_program_and_its_policy() {
         let server = stub(listener, 1, |_, body| (201, body.to_string()));
         let mut cmd = cli();
         cmd.args(["--json", "--namespace", "zkm", "--url", &url, "--token-file"]).arg(&token)
-            .args(["app", "add", "ethproofs-z4", "--class", "latency", "--anchor", "exclusive", "--backend", "cuda", "--priority", "-2"]);
+            .args(["app", "add", "ethproofs-z4", "--spec"]).arg(&spec).args(["--class", "latency", "--anchor", "exclusive", "--backend", "cuda", "--priority", "-2"]);
         if by_file { cmd.arg("--elf").arg(&elf); } else { cmd.args(["--elf-id", &format!("0x{}", elf_id.to_uppercase())]); }
         let output = cmd.output().unwrap();
         let seen = server.join().unwrap();
         std::fs::remove_file(token).unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert!(seen[0].line.starts_with("POST /apps?namespace=zkm HTTP/1.1"), "{}", seen[0].line);
-        assert_eq!(seen[0].body, serde_json::json!({"name":"ethproofs-z4","elf_id":elf_id,"class":"latency","anchor":"exclusive",
-            "backends":["cuda"],"priority":-2}));
+        assert_eq!(seen[0].body, serde_json::json!({"name":"ethproofs-z4","priority":-2,
+            "spec":{"kind":"ziren-gpu","image":"ziren-gpu:1","gpus":4},
+            "proof":{"elf_id":elf_id,"class":"latency","anchor":"exclusive","backends":["cuda"]}}));
     }
     std::fs::remove_file(elf).unwrap();
-    let output = cli().args(["--namespace", "zkm", "--url", "http://127.0.0.1:1", "--token-file", "/dev/null", "app", "add", "x"]).output().unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--elf-id ID or --elf FILE"));
+    let refused = |args: &[&str]| {
+        let output = cli().args(["--namespace", "zkm", "--url", "http://127.0.0.1:1", "--token-file", "/dev/null", "app", "add", "x"])
+            .args(args).output().unwrap();
+        assert!(!output.status.success());
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(refused(&["--elf-id", "aa"]).contains("--spec"));
+    let spec_arg = spec.to_str().unwrap();
+    assert!(refused(&["--spec", spec_arg, "--class", "latency"]).contains("--elf-id ID or --elf FILE"));
+    std::fs::remove_file(spec).unwrap();
 }
 
 #[test]
@@ -179,8 +189,8 @@ fn app_commands_address_every_app_by_its_name() {
     for (args, method, leaf, body, reply) in [
         (vec!["priority", "ethproofs", "-5"], "PUT", "/priority", serde_json::json!({"priority":-5}), r#"{"priority":-5}"#),
         (vec!["disable", "ethproofs"], "PUT", "/disabled", serde_json::Value::Null,
-            r#"{"kind":"app","name":"ethproofs","disabled":true,"resources":{"gpus":1}}"#),
-        (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"kind":"service","name":"comfyui","disabled":false}"#),
+            r#"{"name":"ethproofs","disabled":true,"resources":{"gpus":1},"proof":{"elf_id":"aaaa"}}"#),
+        (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"name":"comfyui","disabled":false,"spec":{"image":"comfyui:1"}}"#),
         (vec!["scale", "ethproofs", "--replicas", "2", "--node", "gpu-box"], "PUT", "/scale", serde_json::json!({"replicas":2,"node":"gpu-box"}),
             r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"node":"gpu-box"}"#),
         (vec!["update", "comfyui", "--image", "comfyui:2"], "PUT", "/settings", serde_json::json!({"image":"comfyui:2"}),
@@ -227,7 +237,7 @@ fn app_logs_read_the_control_plane_route_and_print_the_raw_log_or_the_error() {
 
 #[test]
 fn app_delete_says_what_goes_until_confirmed() {
-    let app = r#"{"kind":"app","name":"ethproofs","jobs":{"total":4,"active":0},"proof":{"elf_id":"aaaa"}}"#;
+    let app = r#"{"name":"ethproofs","jobs":{"total":4,"active":0},"proof":{"elf_id":"aaaa"}}"#;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let token = token_file("app-delete");
@@ -248,11 +258,11 @@ fn app_delete_says_what_goes_until_confirmed() {
 /// Two batches as `GET /batches` returns them: the app record's shape, with the policy under `batch`.
 fn batch_list() -> String {
     serde_json::json!([
-        {"type":"batch", "kind":"batch", "name":"training", "namespace":"alice", "tag":"scope=default", "tags":["scope=default"],
+        {"type":"batch",  "name":"training", "namespace":"alice", "tag":"scope=default", "tags":["scope=default"],
          "state":"enabled", "priority":3, "disabled":false,
          "jobs":{"total":2,"active":1,"succeeded":1,"failed":0,"last_at":1_800_000_100.0},
          "batch":{"image":"python:3","max_gpus":2,"allow":["/tmp"],"workers":[]}},
-        {"type":"batch", "kind":"batch", "name":"idle", "namespace":"alice", "tag":null, "tags":[""],
+        {"type":"batch",  "name":"idle", "namespace":"alice", "tag":null, "tags":[""],
          "state":"disabled", "priority":0, "disabled":true,
          "jobs":{"total":0,"active":0,"succeeded":0,"failed":0,"last_at":null},
          "batch":{"image":"python:3","max_gpus":1,"workers":[]}},

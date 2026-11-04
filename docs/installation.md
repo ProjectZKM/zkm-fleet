@@ -39,8 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/se
 Omit `--cuda` for a CPU-only node and `--cpus` to let Ray detect capacity. The
 node needs outbound HTTPS (HTTP/2) to port 8905. A cron watchdog keeps Ray and
 the agent running; pass `--no-cron` to supervise `deploy/node-start.sh` yourself.
-Configure apps and batches in `etc/services.yaml` and `etc/batches.yaml`
-(see the [app](../deploy/services.example.yaml) and
+Configure the node's apps and batches in `etc/apps.yaml` and `etc/batches.yaml`
+(see the [app](../deploy/apps.example.yaml) and
 [batch](../deploy/batches.example.yaml) examples).
 
 Verify on the control host:

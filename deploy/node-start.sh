@@ -6,7 +6,7 @@ exec 9>"$FLEET_WORKDIR/node-agent.lock"
 flock -n 9 || exit 0
 export RUST_LOG=${RUST_LOG:-info}
 ARGS=(--scheduler "$FLEET_SCHEDULER" --cluster-token-file "$FLEET_ETC/cluster.token"
-      --name "$FLEET_NODE_NAME" --services "$FLEET_ETC/services.yaml" --batches "$FLEET_ETC/batches.yaml"
+      --name "$FLEET_NODE_NAME" --apps "$FLEET_ETC/apps.yaml" --batches "$FLEET_ETC/batches.yaml"
       --jobs-dir "$FLEET_JOBS_DIR" --bridge "$FLEET_HOME/bridge" --python "$FLEET_HOME/venv/bin/python")
 [ -z "${FLEET_SCHEDULER_CA:-}" ] || ARGS+=(--scheduler-ca-file "$FLEET_SCHEDULER_CA")
 # One approved root per line. Keep roots configured when proof actors are disabled.

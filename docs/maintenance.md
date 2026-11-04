@@ -98,10 +98,29 @@ for log locations and the distinction between node capacity and app allocation.
 
 Deploy a tested Git revision. Changes to shared models or execution protocols
 require updating the control host and nodes together: the scheduler, agent and
-Python bridge must agree on machine report version 2. A compatible change limited
+Python bridge must agree on machine report version 3. A compatible change limited
 to scheduler permissions, CLI or MCP needs only a control-host update. Use the
 pause procedure above before replacing node programs. A program update does not
 require restarting Ray or changing its pool.
+
+Upgrading from report version 2 changes all three at once. Let in-flight commands finish,
+stop the scheduler and every node, and migrate their stored state before starting the new
+binaries. The scheduler's per-node records move from `workloads/services` to
+`workloads/deployments` (`service` becomes `spec`), stored commands and `service:`
+reservations take the new names, and each registered proof app needs its app record. A
+node's `etc/services.yaml` becomes `etc/apps.yaml` (`services:` becomes `apps:`) and its
+`node-start.sh` passes `--apps`. Back up `data_dir`, Postgres and the node's `etc/` first.
+
+The same release retires the scheduler's SDK stage API (`GenerateProof`/`GetStatus`
+on `stage_addr`): SDK clients prove through their
+[app-owned proof endpoint](reference.md#app-owned-proof-endpoint). Remove `stage_addr`,
+`tls`, `public_url`, `long_poll_ms` and `proof_output_dir` from `fleet.yaml` first; the
+scheduler refuses to start with them. Let proof jobs submitted through the stage API
+finish: one still queued or running fails when the new scheduler starts. Remove the
+gateway's `/stage.v1.StageService/` route, which has nothing behind it. The control
+host's `data_dir/elf`, `data_dir/jobs` and `data_dir/proofs` held that API's payloads;
+delete them once rollback is no longer needed. A node ignores `proof_output_dir` in
+`apps.yaml`.
 
 Build the generic programs from that revision:
 
@@ -117,7 +136,7 @@ transaction: each app takes a name (its tenant's when that tenant had one app in
 the namespace, else `TENANT-<first 8 hex of the ELF id>`) and the default
 placement policy, jobs name their app, `TENANT/ELF` grants become app names, and
 namespace-less tenant signer tokens are removed. Update each prover's
-`services.yaml` entry to `app: NAME` plus `elf_id`. Remove `tenants`,
+`apps.yaml` entry to `app: NAME` plus `elf_id`. Remove `tenants`,
 `default_tenant`, `require_signature` and `admin_token_file` from `fleet.yaml`
 first; the scheduler refuses to start with them. Issue an administrator token with
 `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`, since the old
@@ -167,7 +186,7 @@ sudo systemctl start zkm-fleet-node.service
 The offline wheel command assumes Ray and PyYAML are already installed at the
 versions required by the package. For cron installations, pause and restore the
 watchdog as described above. Preserve `etc/watchdog.env`, including node capacity
-and `FLEET_NODE_SUPERVISED`, along with `services.yaml`, `batches.yaml` and credentials.
+and `FLEET_NODE_SUPERVISED`, along with `apps.yaml`, `batches.yaml` and credentials.
 Keep independent app endpoints running when their programs are unchanged.
 Verify the fresh heartbeat, total/free resources, app states and saved progress
 before following [verify and resume](#verify-and-resume).
@@ -185,7 +204,7 @@ deploy/fleet-ctl.sh node upgrade v0.1.2          # download and verify the node 
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge   # local node files over ssh
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge target/release/fleet-proof-app
 deploy/fleet-ctl.sh scheduler rollback           # or node rollback: restore the last upgrade's backup
-deploy/fleet-ctl.sh app cleanup SERVICE-0        # leftovers of a failed app start
+deploy/fleet-ctl.sh app cleanup APP-0            # leftovers of a failed app start
 ```
 
 An upgrade copies what it replaces to `backup/` first, then waits for the scheduler's

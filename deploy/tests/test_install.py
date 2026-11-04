@@ -61,7 +61,7 @@ def test_generic_node_installs_only_agent_and_declared_python_dependencies(insta
     assert not (prefix / "bridge/.mypy_cache").exists()
     assert not (prefix / "bridge/tests").exists()
     assert (temporary / "pip.args").read_text().splitlines()[-1] == str(ROOT / "bridge")
-    configuration = prefix / "etc/services.yaml"
+    configuration = prefix / "etc/apps.yaml"
     configuration.write_text(configuration.read_text() + "# owner configuration\n")
     assert run().returncode == 0
     assert configuration.read_text().endswith("# owner configuration\n")

@@ -1,4 +1,4 @@
-//! Bounded reads of an app service's log for `fleetctl app logs`.
+//! Bounded reads of an app's log for `fleetctl app logs`.
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},

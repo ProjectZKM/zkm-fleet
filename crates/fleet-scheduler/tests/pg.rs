@@ -466,7 +466,7 @@ async fn admin_issue_writes_the_first_administrators_token_into_the_database() {
     let db = in_schema(&url, "issue");
     let dir = tempfile::tempdir().unwrap();
     let cfg: fleet_scheduler::config::SchedulerConfig = serde_yaml::from_str(&format!(
-        "public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\ndatabase_url: \"{db}\"\n", dir.path().display())).unwrap();
+        "data_dir: {}\ncluster_token_file: unused\ndatabase_url: \"{db}\"\n", dir.path().display())).unwrap();
     let out = dir.path().join("admin.token");
     let token = fleet_scheduler::issue_admin_token(&cfg, "ops", &out).await.unwrap();
     let secret = std::fs::read_to_string(&out).unwrap();

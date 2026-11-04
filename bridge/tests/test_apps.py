@@ -1,12 +1,12 @@
-"""Local service execution keeps dedicated proof servers and confirms cleanup."""
+"""Local app execution keeps dedicated proof servers and confirms cleanup."""
 from unittest.mock import Mock
 import pytest
 from fleet_bridge import reconcile
 
 @pytest.mark.parametrize("gpus", [[], ["2", "3"]])
-def test_serving_apps_use_nvidia_only_when_ray_grants_gpus(gpus):
+def test_apps_use_nvidia_only_when_ray_grants_gpus(gpus):
     from fleet_bridge import actors
-    cfg = reconcile.load_services({"services": [{"name": "web", "kind": "app",
+    cfg = reconcile.load_apps({"apps": [{"name": "web", "kind": "app",
         "image": "web:latest", "port_base": 8080, "gpus": len(gpus), "cpus": 2,
         "command": ["serve", "--port", "{port}"]}]})
     spec = reconcile.replica_specs(cfg)["web-0"]
@@ -20,9 +20,9 @@ def test_serving_apps_use_nvidia_only_when_ray_grants_gpus(gpus):
         assert not any("nvidia" in arg.lower() for arg in command)
         assert "--gpus" not in command
 
-def test_cpu_serving_actor_starts_without_gpu_discovery(monkeypatch):
+def test_cpu_app_actor_starts_without_gpu_discovery(monkeypatch):
     from fleet_bridge import actors
-    cfg = reconcile.load_services({"services": [{"name": "web", "kind": "app",
+    cfg = reconcile.load_apps({"apps": [{"name": "web", "kind": "app",
         "image": "web:latest", "port_base": 8080, "gpus": 0, "cpus": 2}]})
     spec = reconcile.replica_specs(cfg)["web-0"]
     discover = Mock(side_effect=AssertionError("CPU app must not request GPUs"))
@@ -41,7 +41,7 @@ def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrat
     from fleet_bridge.model import ReplicaHealth
     actor = object.__new__(actors._ZirenGpuProver)
     actor.spec = Mock()
-    actor.spec.service.worker_command = ["/opt/eth-proofs"] if integrated else None
+    actor.spec.app.worker_command = ["/opt/eth-proofs"] if integrated else None
     actor.name, actor.container = "eth-0", "fleet-gpu-eth-0"
     actor.gpus, actor.gpu_port = ["0"], 30100
     actor.node = Mock()
@@ -60,7 +60,7 @@ def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrat
 
 def test_integrated_worker_needs_no_native_prover_binary_or_control_credentials(tmp_path, monkeypatch):
     from fleet_bridge import actors
-    cfg = reconcile.load_services({"log_dir": str(tmp_path), "services": [{
+    cfg = reconcile.load_apps({"log_dir": str(tmp_path), "apps": [{
         "name": "worker", "kind": "ziren-gpu", "image": "prover:latest",
         "namespace": "a" * 32, "app": "worker", "elf_id": "b" * 64,
         "worker_command": ["/opt/worker"], "proof_storage_root": str(tmp_path / "state"),
@@ -101,25 +101,25 @@ def test_stop_kills_actor_without_restart_and_removes_reservation(monkeypatch):
     remove.assert_called_once_with(pg)
 
 
-def test_gpu_services_must_be_bound_to_one_app():
+def test_gpu_provers_must_be_bound_to_one_app():
     with pytest.raises(ValueError, match="proves one program"):
-        reconcile.load_services({"services": [{"name": "shared-gpu", "kind": "ziren-gpu"}]})
+        reconcile.load_apps({"apps": [{"name": "shared-gpu", "kind": "ziren-gpu"}]})
     with pytest.raises(ValueError, match="full ELF SHA-256"):
-        reconcile.load_services({"services": [{"name": "short", "kind": "ziren-gpu", "elf_id": "abc"}]})
+        reconcile.load_apps({"apps": [{"name": "short", "kind": "ziren-gpu", "elf_id": "abc"}]})
     with pytest.raises(ValueError, match="must be a name"):
-        reconcile.load_services({"services": [{"name": "old", "kind": "ziren-gpu", "app": "eth/" + "a" * 64, "elf_id": "a" * 64}]})
+        reconcile.load_apps({"apps": [{"name": "old", "kind": "ziren-gpu", "app": "eth/" + "a" * 64, "elf_id": "a" * 64}]})
     with pytest.raises(ValueError, match="is its own app"):
-        reconcile.load_services({"services": [{"name": "wrong-kind", "kind": "app", "app": "eth"}]})
+        reconcile.load_apps({"apps": [{"name": "wrong-kind", "kind": "app", "app": "eth"}]})
     with pytest.raises(ValueError, match="only a Ziren prover"):
-        reconcile.load_services({"services": [{"name": "web", "kind": "app", "elf_id": "a" * 64}]})
-    assert reconcile.load_services({"services": [{"name": "web", "kind": "app"}]}).services[0].app == "web"
-    prover = reconcile.load_services({"services": [{"name": "eth-gpu", "kind": "ziren-gpu", "app": "eth", "elf_id": "A" * 64}]}).services[0]
+        reconcile.load_apps({"apps": [{"name": "web", "kind": "app", "elf_id": "a" * 64}]})
+    assert reconcile.load_apps({"apps": [{"name": "web", "kind": "app"}]}).apps[0].app == "web"
+    prover = reconcile.load_apps({"apps": [{"name": "eth-gpu", "kind": "ziren-gpu", "app": "eth", "elf_id": "A" * 64}]}).apps[0]
     assert (prover.app, prover.elf_id) == ("eth", "a" * 64)
 
 
 def test_proof_replicas_each_get_one_server_and_the_same_app_storage_root():
     from fleet_bridge import actors
-    cfg = reconcile.load_services({"scheduler": "https://scheduler:8905", "cluster_token_file": "/etc/cluster.token", "services": [{
+    cfg = reconcile.load_apps({"scheduler": "https://scheduler:8905", "cluster_token_file": "/etc/cluster.token", "apps": [{
         "name": "eth", "kind": "ziren-gpu", "namespace": "a"*32,
         "app": "eth", "elf_id": "b"*64, "proof_storage_root": "/srv/eth", "replicas": 2, "gpus": 2,
     }]})
@@ -139,17 +139,17 @@ def test_integrated_worker_requires_single_machine_pinned_replica():
     config = {"name": "eth", "kind": "ziren-gpu", "app": "eth", "elf_id": "b" * 64,
               "worker_command": ["/opt/eth-proofs"], "proof_storage_root": "/srv/eth",
               "machine": "ant", "replicas": 1}
-    assert reconcile.load_services({"services": [config]}).services[0].worker_command == ["/opt/eth-proofs"]
+    assert reconcile.load_apps({"apps": [config]}).apps[0].worker_command == ["/opt/eth-proofs"]
     for update in [{"replicas": 2}, {"machine": None}, {"proof_storage_root": None}]:
         with pytest.raises(ValueError, match="machine-pinned"):
-            reconcile.load_services({"services": [{**config, **update}]})
+            reconcile.load_apps({"apps": [{**config, **update}]})
 
 
 def test_integrated_worker_environment_keeps_replica_scope_and_credentials_separate(tmp_path, monkeypatch):
     from fleet_bridge import actors
     env_file = tmp_path / "worker.env"
     env_file.write_text('ETH_PROOFS_API_TOKEN="worker token"\nFLEET_GPU_ENDPOINT=http://evil\nFLEET_APP_ELF_ID=wrong\n')
-    cfg = reconcile.load_services({"services": [{"name": "eth", "kind": "ziren-gpu",
+    cfg = reconcile.load_apps({"apps": [{"name": "eth", "kind": "ziren-gpu",
         "namespace": "a" * 32, "app": "eth", "elf_id": "b" * 64, "proof_storage_root": "/srv/eth",
         "machine": "ant", "worker_command": ["/opt/eth-proofs"], "worker_env_file": str(env_file)}]})
     spec = reconcile.replica_specs(cfg)["eth-0"]
@@ -184,7 +184,7 @@ def test_worker_process_uses_argument_vector_and_waits_after_forced_stop(tmp_pat
     assert worker.log.closed
 
 def test_failed_start_removes_its_placement_group(monkeypatch):
-    cfg = reconcile.load_services({"services": [{"name": "web", "kind": "app",
+    cfg = reconcile.load_apps({"apps": [{"name": "web", "kind": "app",
         "image": "web:latest", "port_base": 8080, "gpus": 0, "cpus": 2}]})
     spec = reconcile.replica_specs(cfg)["web-0"]
     monkeypatch.setattr(reconcile, "placement_group", lambda *a, **k: Mock())

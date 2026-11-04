@@ -1,11 +1,11 @@
-# Merge this service into the selected machine's existing services.yaml.
-# Replace the legacy EthProofs service only after draining its SDK pipeline.
-# Keep GOAT's service configuration unchanged.
-services:
+# Merge this entry into the selected machine's existing apps.yaml.
+# Replace the legacy EthProofs entry only after draining its SDK pipeline.
+# Keep GOAT's entry unchanged.
+apps:
   - name: ethproofs-v2-gpu
     kind: ziren-gpu
     namespace: REPLACE_WITH_NAMESPACE_ID
-    app: ethproofs # the namespace app this server proves for (fleetctl app add ethproofs --elf-id ...)
+    app: ethproofs # the namespace app this server proves for (fleetctl app add ethproofs --spec ... --elf-id ...)
     elf_id: REPLACE_WITH_GUEST_ELF_SHA256
     proof_storage_root: /srv/zkm-fleet/apps/ethproofs
     machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP

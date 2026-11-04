@@ -1,5 +1,4 @@
-//! HTTP: public values for the SDK (`/{proof_id}/wrap/public_values.bin`), health, the
-//! nodes' internal relays, and the API fleetctl uses. Every API route needs a token holding the
+//! HTTP: health, the nodes' internal relays, and the API fleetctl uses. Every API route needs a token holding the
 //! permission `required` names for it; its handler scopes it to the token's namespace, tag and
 //! app grants. An administrator's token reaches every namespace.
 
@@ -13,11 +12,10 @@ use axum::{
     Extension, Json, Router,
 };
 use fleet_proto::model::v1::{
-    NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest, PublicValuesQuery,
+    NamespaceSelector, CreateNamespaceRequest, CreateTokenRequest,
     AllocationRequest,
 };
 
-use crate::blobs::{self, is_safe_id};
 use crate::fleet::Scheduler;
 use crate::store::Token;
 use crate::token::{self, Permission};
@@ -48,7 +46,6 @@ pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/access", get(access))
         .route("/healthz", get(|| async { "ok" }))
-        .route("/:proof_id/wrap/public_values.bin", get(public_values))
         .with_state(state.clone())
         .merge(api)
         .merge(crate::proof_fetch::router(state.clone()))
@@ -103,31 +100,6 @@ async fn access(State(s): State<HttpState>, headers: HeaderMap) -> Response {
 
 fn internal(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response()
-}
-
-/// The SDK fetches this with a plain GET of the URL GetStatus gave it, which carries the
-/// proof's key: only the caller GetStatus answered can read it.
-async fn public_values(
-    State(s): State<HttpState>,
-    Path(proof_id): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<PublicValuesQuery>,
-) -> Response {
-    if !is_safe_id(&proof_id) { return StatusCode::NOT_FOUND.into_response(); }
-    let job = match s.fleet.job(&proof_id).await {
-        Ok(Some(j)) => j,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => return internal(e),
-    };
-    let allowed = q.token_id.as_ref().and_then(|id| s.fleet.token_for_id(id)).is_some_and(|c| {
-        c.namespace.as_deref() == Some(job.namespace.as_str()) && c.tag.as_deref().unwrap_or("") == job.tag
-            && c.apps.as_ref().is_none_or(|apps| apps.contains(&job.app))
-            && s.fleet.public_values_open(&format!("{proof_id}\0{}", c.id), q.key.as_deref())
-    });
-    if !allowed { return StatusCode::NOT_FOUND.into_response(); }
-    match s.fleet.proof_output(&job, blobs::PUBLIC_VALUES).await {
-        Ok(bytes) => ([("content-type", "application/octet-stream")], bytes).into_response(),
-        Err(e) => crate::proof_fetch::response_error(e),
-    }
 }
 
 async fn status(State(s): State<HttpState>) -> Response {

@@ -28,7 +28,7 @@ struct NodeAgentArgs {
     #[arg(long)]
     name: String,
     #[arg(long)]
-    services: PathBuf,
+    apps: PathBuf,
     #[arg(long)]
     batches: PathBuf,
     #[arg(long)]
@@ -120,8 +120,8 @@ async fn main() -> Result<()> {
         .current_dir(&a.bridge)
         .arg("-m")
         .arg("fleet_bridge.node")
-        .arg("--services")
-        .arg(&a.services)
+        .arg("--apps")
+        .arg(&a.apps)
         .arg("--batches")
         .arg(&a.batches)
         .arg("--jobs-dir")
@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
                         let path = {
                             let s = snapshot.lock().await;
                             s.as_ref()
-                                .and_then(|s| log_path(&s.report, &request.service))
+                                .and_then(|s| log_path(&s.report, &request.entry))
                         };
                         log_reads.spawn(serve_log(
                             http.clone(),
@@ -288,13 +288,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// The log file this machine reported for a service. Only a path the bridge itself
+/// The log file this machine reported for an app entry. Only a path the bridge itself
 /// reported, and only a node log, is ever read.
-fn log_path(report: &Value, service: &str) -> Option<PathBuf> {
-    let path = report["services"]
+fn log_path(report: &Value, entry: &str) -> Option<PathBuf> {
+    let path = report["apps"]
         .as_array()?
         .iter()
-        .find(|s| s["name"].as_str() == Some(service))?["logs"]
+        .find(|s| s["name"].as_str() == Some(entry))?["logs"]
         .get(0)?
         .as_str()?;
     let path = PathBuf::from(path);

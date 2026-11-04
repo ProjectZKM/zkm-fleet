@@ -8,7 +8,7 @@
 #   node upgrade [TAG]            install a release's fleet-node, bridge and fleet-proof-app
 #   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   the same from local files
 #   node rollback                 restore what the last node upgrade replaced
-#   app cleanup SERVICE-0         remove the placement group and container a failed app start left
+#   app cleanup APP-0             remove the placement group and container a failed app start left
 #
 # -n prints what would change and changes nothing. Settings come from the environment or
 # ${FLEET_CTL_ENV:-~/.config/zkm-fleet/ctl.env}: FLEET_PREFIX (install dir), FLEET_NODE_SSH
@@ -191,7 +191,7 @@ node_rollback() {
 }
 
 app_cleanup() {
-  "$PREFIX/venv/bin/python" - "${1:?usage: app cleanup SERVICE-0, e.g. ethproofs-v6-gpu-0}" "$DRY" <<'PY'
+  "$PREFIX/venv/bin/python" - "${1:?usage: app cleanup APP-0, e.g. ethproofs-v6-gpu-0}" "$DRY" <<'PY'
 import subprocess, sys, ray
 from ray._raylet import PlacementGroupID
 from ray.util import placement_group_table

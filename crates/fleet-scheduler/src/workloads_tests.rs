@@ -1,5 +1,5 @@
 use super::*;
-use crate::{blobs::BlobStore, config::SchedulerConfig, quota::Quota, store::MemoryStore};
+use crate::{config::SchedulerConfig, quota::Quota, store::MemoryStore};
 use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
@@ -16,7 +16,8 @@ fn proof_elf() -> String {
 
 /// Registers the tests' proof app (program `elf`) in the namespace.
 async fn register(c: &WorkloadController, ns: &str, name: &str, elf: &str) {
-    c.fleet.add_app(ns, &fleet_proto::model::v1::RegisterAppRequest { name: name.into(), elf_id: elf.into(), ..Default::default() }).await.unwrap();
+    let proof = fleet_proto::model::v1::AppProof { elf_id: elf.into(), ..Default::default() };
+    c.fleet.add_app(ns, name, 0, &proof).await.unwrap();
 }
 
 /// A request through the whole API router: authorized by its token, then handled.
@@ -28,11 +29,10 @@ async fn serve(c: &Arc<WorkloadController>, request: Request) -> Response {
 
 async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\n",dir.path().display())).unwrap();
+    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("data_dir: {}\ncluster_token_file: cluster\n",dir.path().display())).unwrap();
     let fleet = Scheduler::new(
         cfg,
         Arc::new(MemoryStore::default()),
-        BlobStore::new(dir.path()).unwrap(),
         "cluster".into(),
     );
     fleet.load_tokens().await.unwrap();
@@ -53,7 +53,7 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     (dir, control, namespace)
 }
 fn inventory(namespace: &str) -> NodeReport {
-    serde_json::from_value(json!({"version":2,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+    serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
 }
 fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
     JobReport {
@@ -81,7 +81,7 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         "/apps".to_string(),
         "/batches".to_string(),
         "/batches/training".to_string(),
-        "/apps/service".to_string(),
+        "/apps/model".to_string(),
         "/batches/training/jobs".to_string(),
         format!("/batches/training/jobs/{}", job.id),
     ] {
@@ -94,8 +94,8 @@ async fn apps_and_batches_have_separate_lifecycles_after_restart() {
         for row in rows {
             if path.starts_with("/apps") {
                 assert_eq!(row["type"], "app", "{path}: {row}");
-                assert_eq!(row["kind"], "service", "{path}: {row}");
-                assert_eq!(row["name"], "service");
+                assert!(row.get("kind").is_none() && row["spec"].is_object(), "{path}: {row}");
+                assert_eq!(row["name"], "model");
             } else {
                 assert_eq!(row["type"], "batch", "{path}: {row}");
             }
@@ -117,7 +117,7 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
         c.fleet.set_tag_quota(&ns, "scope=default", Quota {gpus:Some(1.0),cpus:None,
                 },
             ).await.unwrap();
-        let app = if proof {PROOF.to_string()} else {"service".into()};
+        let app = if proof {PROOF.to_string()} else {"model".into()};
         let views = c.app_resources(&ns, &app, Some("scope=default"));
         assert_eq!(views["resources"], json!({"gpus":2.0,"cpus":4.0,"replicas":2,"nodes":["gpu"]}));
         assert_eq!(views["namespace_quota"],json!({"gpus":2.0,"cpus":8.0}));
@@ -136,17 +136,17 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
         let listed: Value = serde_json::from_slice(&axum::body::to_bytes(
             scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await.into_body(), usize::MAX).await.unwrap()).unwrap();
         let shown = app_view(&listed);
-        assert_eq!(shown[if proof { "proof" } else { "service" }]["image"], "runner:1", "an app shows the image it runs in: {shown}");
+        assert_eq!(shown[if proof { "proof" } else { "spec" }]["image"], "runner:1", "an app shows the image it runs in: {shown}");
         let mut second = scale_inventory(&ns,proof,true);
         second.machine="second-machine".into();
-        second.services[0]["image"]=json!("runner:2");
+        second.apps[0]["image"]=json!("runner:2");
         c.report("gpu-2","second-session",second).await.unwrap();
         assert_eq!(c.app_resources(&ns,&app,None)["resources"],json!({"gpus":4.0,"cpus":8.0,"replicas":4,"nodes":["gpu","gpu-2"]}));
         assert_eq!(c.app_resources(&ns,&app,None)["images"],json!(["runner:1","runner:2"]));
         if proof {
             let listed: Value = serde_json::from_slice(&axum::body::to_bytes(
                 scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await.into_body(), usize::MAX).await.unwrap()).unwrap();
-            assert_eq!(app_view(&listed)["proof"]["image"], json!(["runner:1","runner:2"]), "while its services differ, each image");
+            assert_eq!(app_view(&listed)["proof"]["image"], json!(["runner:1","runner:2"]), "while its deployments differ, each image");
         }
         c.fleet.set_quota(&ns,Quota {gpus:None,cpus:Some(0.0),
                 },
@@ -166,9 +166,9 @@ async fn app_resource_views_keep_disabled_settings_and_shared_quotas_after_resta
 async fn app_readiness_follows_fresh_reports_for_both_runners() {
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
-        let name = if proof { PROOF.to_string() } else { "service".into() };
+        let name = if proof { PROOF.to_string() } else { "model".into() };
         let mut report = scale_inventory(&ns, proof, false);
-        report.services[0]["ready"] = json!(false);
+        report.apps[0]["ready"] = json!(false);
         c.report("gpu", "session", report).await.unwrap();
         assert_eq!(c.app_resources(&ns, &name, None)["state"], "starting");
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
@@ -203,19 +203,19 @@ async fn app_and_batch_tag_selectors_scope_visibility_and_job_counts() {
     }
     let secret = "ab".repeat(32);
     c.fleet.add_user_token(&"a".repeat(32), &format!("0x{}", "b".repeat(40)), "reader",
-        Some(vec!["training".into(), "service".into()]),
+        Some(vec!["training".into(), "model".into()]),
         Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))), Some(ns.clone()), None, Vec::new(),
         ).await.unwrap();
     let response = scale_call(c.clone(), &secret, "GET", "/batches/training", Value::Null,
     ).await;
     assert_eq!(response.status(), StatusCode::OK);
     let batch: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
-    assert_eq!((batch["type"].as_str(), batch["kind"].as_str(), batch["state"].as_str()), (Some("batch"), Some("batch"), Some("enabled")),
+    assert_eq!((batch["type"].as_str(), batch["state"].as_str()), (Some("batch"), Some("enabled")),
         "a batch has the app record's shape: {batch}");
     assert_eq!((batch["jobs"]["total"].as_u64(), batch["jobs"]["active"].as_u64()), (Some(1), Some(1)));
     assert_eq!((batch["batch"]["image"].as_str(), batch["batch"]["max_gpus"].as_u64()), (Some("test"), Some(2)));
     assert!(batch["batch"].get("name").is_none() && batch.get("persistent").is_none() && batch.get("removed").is_none(), "{batch}");
-    assert_eq!(scale_call(c.clone(), &secret, "GET", "/apps/service", Value::Null).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(scale_call(c.clone(), &secret, "GET", "/apps/model", Value::Null).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(scale_call(c, "admin", "GET", &format!("/apps?namespace={ns}&tag=bare"), Value::Null).await.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -230,7 +230,7 @@ async fn bare_tags_are_rejected_even_if_present_in_stored_quotas() {
     assert!(c.fleet.set_tag_quota(&ns, "team=research", Quota::default()).await.is_ok());
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     let mut invalid = scale_inventory(&ns, false, true);
-    invalid.services[0]["tag"] = json!("bare");
+    invalid.apps[0]["tag"] = json!("bare");
     assert!(c.report("gpu", "session", invalid).await.is_err());
 }
 
@@ -241,47 +241,47 @@ async fn proof_replica_location_is_diagnostic_and_resolves_without_a_live_actor(
     let (_dir,c,ns)=setup().await;
     c.report("gpu", "session", scale_inventory(&ns,true,true)).await.unwrap();
     let mut job=ProofJob{inputs:None,outputs:None,id:"proof".into(),app:PROOF.into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"proof".into(),elf_id:"a".repeat(64),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
-        fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec!["service-1".into()],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
+        fail_status: None,error:String::new(),node:Some("model-0".into()),attempts:1,failed_on:vec!["model-1".into()],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
     };
     for control in [&*c, &WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap(),
     ] {
         let view=control.proof_job_value(&job);
         assert_eq!(view["node"],"gpu");
         assert_eq!(view["failed_on"],json!(["gpu"]));
-        assert_eq!(view["diagnostics"]["execution_replica"],"service-0");
+        assert_eq!(view["diagnostics"]["execution_replica"],"model-0");
     }
     let mut second = scale_inventory(&ns,true,true);
     second.machine="second-machine".into();
     c.report("gpu-2","second-session",second).await.unwrap();
     assert!(c.proof_job_value(&job)["node"].is_null(),"ambiguous replica names must not guess a machine");
-    // Storage metadata resolves historical jobs even after their service is removed.
+    // Storage metadata resolves historical jobs even after their app is removed.
     job.outputs=Some(fleet_proto::fleet::v1::ProofOutputs{machine:"machine".into(),..Default::default()});
-    c.inner.lock().services.clear();
+    c.inner.lock().deployments.clear();
     assert_eq!(c.proof_job_value(&job)["node"],"gpu");
     job.outputs=None;
     assert!(c.proof_job_value(&job)["node"].is_null());
-    assert_eq!(job.node.as_deref(),Some("service-0"),"presentation must not change execution routing");
+    assert_eq!(job.node.as_deref(),Some("model-0"),"presentation must not change execution routing");
 }
 
 #[tokio::test]
-async fn lifecycle_routes_reject_cross_type_access_and_serving_batch_submissions() {
+async fn lifecycle_routes_reject_cross_type_access_and_batch_submissions_to_apps() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     for (method, path, body, status) in [
         ("GET", "/apps/training", Value::Null, StatusCode::NOT_FOUND),
-        ("GET", "/batches/service", Value::Null, StatusCode::NOT_FOUND,
+        ("GET", "/batches/model", Value::Null, StatusCode::NOT_FOUND,
         ),
         ("PUT", "/apps/training/disabled", Value::Null, StatusCode::NOT_FOUND,
         ),
-        ("PUT", "/batches/service/priority", json!({"priority":100}), StatusCode::NOT_FOUND,
+        ("PUT", "/batches/model/priority", json!({"priority":100}), StatusCode::NOT_FOUND,
         ),
-        ("DELETE", "/batches/service", Value::Null, StatusCode::NOT_FOUND,
+        ("DELETE", "/batches/model", Value::Null, StatusCode::NOT_FOUND,
         ),
-        ("PUT", "/batches/service/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST,
+        ("PUT", "/batches/model/scale", json!({"gpus":2}), StatusCode::BAD_REQUEST,
         ),
         ("POST", "/apps", json!({"name":"finite","image":"test","namespace":ns}), StatusCode::BAD_REQUEST,
         ),
-        ("POST", "/batches/service/jobs", json!({"command":["true"]}), StatusCode::CONFLICT,
+        ("POST", "/batches/model/jobs", json!({"command":["true"]}), StatusCode::CONFLICT,
         ),
     ] {
         let response = scale_call(c.clone(), "admin", method, path, body).await;
@@ -289,7 +289,7 @@ async fn lifecycle_routes_reject_cross_type_access_and_serving_batch_submissions
     }
     assert!(c.inner.lock().jobs.is_empty());
     assert!(c.inner.lock().commands.is_empty());
-    assert_eq!(c.inner.lock().apps["service"].spec["priority"], 0);
+    assert_eq!(c.inner.lock().apps["model"].spec["priority"], 0);
 }
 
 #[tokio::test]
@@ -832,8 +832,8 @@ async fn restart_repairs_stop_intent_written_before_its_command() {
 
 fn scale_inventory(ns: &str, proof: bool, disabled: bool) -> NodeReport {
     let mut report = inventory(ns);
-    report.services = vec![json!({"name":"service","kind":if proof {"ziren-gpu"}else{"app"},
-        "namespace":ns,"tag":"scope=default","app":if proof {PROOF.to_string()}else{"service".into()},"elf_id":if proof {proof_elf()}else{String::new()},
+    report.apps = vec![json!({"name":"model","kind":if proof {"ziren-gpu"}else{"app"},
+        "namespace":ns,"tag":"scope=default","app":if proof {PROOF.to_string()}else{"model".into()},"elf_id":if proof {proof_elf()}else{String::new()},
         "gpus":1,"cpus":2,"replicas":2,"disabled":disabled,"ready":!disabled,"cleaned":disabled,"image":"runner:1"}).into()];
     if !disabled { report.free_gpus=0.0;report.free_cpus=4.0; }
     report
@@ -858,15 +858,15 @@ async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tag: &str, apps:
 }
 
 #[tokio::test]
-async fn scoped_managers_cannot_change_service_execution_or_batch_host_access() {
+async fn scoped_managers_cannot_change_app_execution_or_batch_host_access() {
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
         register(&c, &ns, PROOF, &proof_elf()).await;
         c.report("gpu", "session", scale_inventory(&ns, proof, true)).await.unwrap();
         let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
-        let app = if proof { PROOF } else { "service" };
+        let app = if proof { PROOF } else { "model" };
         let path = format!("/apps/{app}/settings");
-        let before = c.inner.lock().services["gpu-service"].clone();
+        let before = c.inner.lock().deployments["gpu-model"].clone();
         for set in [
             json!({"image":"untrusted:latest"}), json!({"command":["sh"]}),
             json!({"env":{"LD_PRELOAD":"/data/owner.so"}}), json!({"user":"0:0"}),
@@ -874,7 +874,7 @@ async fn scoped_managers_cannot_change_service_execution_or_batch_host_access() 
             json!({"stop_timeout_s":10,"command":["sh"]}),
         ] {
             assert_eq!(scale_call(c.clone(), &owner, "PUT", &path, set.clone()).await.status(), StatusCode::FORBIDDEN, "{set}");
-            assert_eq!(c.inner.lock().services["gpu-service"], before, "a refused update must not create a transition");
+            assert_eq!(c.inner.lock().deployments["gpu-model"], before, "a refused update must not create a transition");
         }
         assert_eq!(scale_call(c.clone(), "admin", "PUT", &format!("{path}?namespace={ns}"),
             json!({"image":"trusted:2","user":"1000:1000","volumes":["/srv/app:ro"]})).await.status(), StatusCode::ACCEPTED);
@@ -882,7 +882,7 @@ async fn scoped_managers_cannot_change_service_execution_or_batch_host_access() 
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
     let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
-    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/settings", json!({"stop_timeout_s":10})).await.status(), StatusCode::ACCEPTED);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/model/settings", json!({"stop_timeout_s":10})).await.status(), StatusCode::ACCEPTED);
     for body in [
         json!({"name":"unsafe","image":"test","allow":["/var/run"]}),
         json!({"name":"unsafe","image":"test","user":"0:0"}),
@@ -959,20 +959,20 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
 }
 
 #[tokio::test]
-async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() {
+async fn app_owners_manage_apps_and_scale_without_widening_grants_or_tags() {
     for proof in [false, true] {
         let (_dir, c, ns) = setup().await;
         let elf = "a".repeat(64);
         register(&c, &ns, PROOF, &elf).await;
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
-        let app = if proof { PROOF.to_string() } else { "service".into() };
+        let app = if proof { PROOF.to_string() } else { "model".into() };
         let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
         let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec![app]), false).await;
         let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec!["other".into()]), true).await;
         let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
-        let other_signer = user_token(&c, &ns, 5, "scope=default", Some(vec!["service".into()]), false).await;
-        let scale = if proof { format!("/apps/{PROOF}/scale") } else { "/apps/service/scale".into() };
-        let disabled = if proof { format!("/apps/{PROOF}/disabled") } else { "/apps/service/disabled".into() };
+        let other_signer = user_token(&c, &ns, 5, "scope=default", Some(vec!["model".into()]), false).await;
+        let scale = if proof { format!("/apps/{PROOF}/scale") } else { "/apps/model/scale".into() };
+        let disabled = if proof { format!("/apps/{PROOF}/disabled") } else { "/apps/model/disabled".into() };
         for token in [&consumer, &restricted, &foreign_tag] {
             for (method, path, body) in [
                 ("PUT", scale.as_str(), json!({"replicas":1})),
@@ -996,8 +996,8 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
         assert_eq!(scale_call(c.clone(), &owner, "PUT", &format!("{scale}?namespace=other"),
             json!({"replicas":1})).await.status(), StatusCode::FORBIDDEN);
         if !proof {
-            assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/service/priority", json!({"priority":31})).await.status(), StatusCode::OK);
-            assert_eq!(c.inner.lock().apps["service"].spec["priority"], 31);
+            assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/model/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+            assert_eq!(c.inner.lock().apps["model"].spec["priority"], 31);
         }
         for (method, disabled_state) in [("PUT", true), ("DELETE", false)] {
             let control = c.clone();
@@ -1005,7 +1005,7 @@ async fn app_owners_manage_services_and_scale_without_widening_grants_or_tags() 
             let path = disabled.clone();
             let request = tokio::spawn(async move { scale_call(control, &token, method, &path, Value::Null).await });
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !c.inner.lock().services.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled_state)) {
+                while !c.inner.lock().deployments.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled_state)) {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }).await.unwrap();
@@ -1124,7 +1124,7 @@ async fn app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
         assert_eq!(response.status(), StatusCode::OK);
         let app: Value = response.json().await.unwrap();
         assert_eq!(app["disabled"], disabled);
-        assert_eq!(app["kind"], "app");
+        assert!(app["proof"].is_object());
         assert_eq!(c.fleet.app(&ns, PROOF).unwrap().priority, 31);
     }
     for selector in [String::new(), "?tag=scope=default".into()] {
@@ -1138,32 +1138,33 @@ async fn app_http_metadata_is_owner_managed_and_quotas_are_admin_managed() {
     assert!(!c.fleet.app_known(&ns, PROOF));
     assert!(c.fleet.app_known(&other_ns, PROOF));
     let again = client.post(format!("{url}/apps")).bearer_auth(&owner)
-        .json(&json!({"name":PROOF,"elf_id":elf,"priority":17,"class":"latency","anchor":"exclusive","backends":["cuda"]})).send().await.unwrap();
+        .json(&json!({"name":PROOF,"priority":17,"spec":{"image":"ziren-gpu:1"},
+            "proof":{"elf_id":elf,"class":"latency","anchor":"exclusive","backends":["cuda"]}})).send().await.unwrap();
     assert_eq!(again.status(), StatusCode::CREATED);
     let app: Value = again.json().await.unwrap();
     assert_eq!((app["priority"].clone(), app["proof"]["class"].clone(), app["proof"]["anchor"].clone()), (json!(17), json!("latency"), json!("exclusive")));
     for (body, status) in [
-        (json!({"name":"twice","elf_id":elf}), StatusCode::CONFLICT),
-        (json!({"name":PROOF,"elf_id":"c".repeat(64)}), StatusCode::CONFLICT),
-        (json!({"name":"bad","elf_id":"c".repeat(64),"class":"fast"}), StatusCode::BAD_REQUEST),
+        (json!({"name":"twice","spec":{"image":"ziren-gpu:1"},"proof":{"elf_id":elf}}), StatusCode::CONFLICT),
+        (json!({"name":PROOF,"spec":{"image":"ziren-gpu:1"},"proof":{"elf_id":"c".repeat(64)}}), StatusCode::CONFLICT),
+        (json!({"name":"bad","spec":{"image":"ziren-gpu:1"},"proof":{"elf_id":"c".repeat(64),"class":"fast"}}), StatusCode::BAD_REQUEST),
     ] {
         assert_eq!(client.post(format!("{url}/apps")).bearer_auth(&owner).json(&body).send().await.unwrap().status(), status, "{body}");
     }
-    assert_eq!(client.post(format!("{url}/apps")).bearer_auth(&consumer).json(&json!({"name":"mine","elf_id":"d".repeat(64)}))
+    assert_eq!(client.post(format!("{url}/apps")).bearer_auth(&consumer).json(&json!({"name":"mine","spec":{"image":"ziren-gpu:1"},"proof":{"elf_id":"d".repeat(64)}}))
         .send().await.unwrap().status(), StatusCode::FORBIDDEN);
     server.abort();
 }
 fn request_resources(body: Value) -> ScaleRequest { serde_json::from_value(body).unwrap() }
-/// The node writes the configuration a change sends between stopping and starting a service,
+/// The node writes the configuration a change sends between stopping and starting a entry,
 /// answering with `report`.
 async fn node_writes_config(c: &WorkloadController, mut report: NodeReport) {
     c.dispatch().await.unwrap();
     let command=c.inner.lock().commands.values().find(|v|!v.done&&v.operation==NodeOperation::App as i32).cloned().expect("configuration step");
-    report.results=vec![CommandResult{id:command.id.clone(),result:json!({"updated":["service"]}).into(),error:None}];
+    report.results=vec![CommandResult{id:command.id.clone(),result:json!({"updated":["model"]}).into(),error:None}];
     c.report("gpu","session",report).await.unwrap();
     c.dispatch().await.unwrap();
 }
-/// Plays the node through the pending changes of a service until none is pending.
+/// Plays the node through the pending changes of an app until none is pending.
 async fn node_completes_changes(c: &WorkloadController, ns: &str, proof: bool) {
     for _ in 0..100 {
         c.dispatch().await.unwrap();
@@ -1172,20 +1173,20 @@ async fn node_completes_changes(c: &WorkloadController, ns: &str, proof: bool) {
             Some(command) if command.operation==NodeOperation::App as i32 => node_writes_config(c,scale_inventory(ns,proof,true)).await,
             Some(command) => {
                 let disabled=command.parameters["disabled"].as_bool().unwrap();
-                let mut observed=command.parameters["service"].clone();
+                let mut observed=command.parameters["app"].clone();
                 observed["disabled"]=json!(disabled);observed["ready"]=json!(!disabled);observed["cleaned"]=json!(disabled);
-                finish_service_command(c,ns,proof,&command,disabled,Some(observed)).await;
+                finish_app_command(c,ns,proof,&command,disabled,Some(observed)).await;
             }
-            None if c.inner.lock().services.values().all(|s|!s.scale.as_ref().is_some_and(ScaleStatus::pending)) => return,
+            None if c.inner.lock().deployments.values().all(|s|!s.scale.as_ref().is_some_and(ScaleStatus::pending)) => return,
             None => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
         }
     }
     panic!("the change did not finish");
 }
-async fn finish_service_command(c: &WorkloadController, ns: &str, proof: bool, command: &CommandRecord, disabled: bool, target: Option<Value>,
+async fn finish_app_command(c: &WorkloadController, ns: &str, proof: bool, command: &CommandRecord, disabled: bool, target: Option<Value>,
 ) {
     let mut report=scale_inventory(ns,proof,disabled);
-    if let Some(target)=target { report.services[0]=target.into(); }
+    if let Some(target)=target { report.apps[0]=target.into(); }
     report.results=vec![CommandResult {id:command.id.clone(),result: (if disabled {json!({"cleaned":true})}else{json!({"ready":true})})
         .into(),error:None,
     }];
@@ -1201,7 +1202,7 @@ async fn owner_scale_rejects_invalid_capacity_quota_and_batches() {
     c.fleet.add_user_token(&"a".repeat(32),&"b".repeat(40),"owner",None,
         Some(hex::encode(sha2::Sha256::digest(secret.as_bytes()))),Some(ns.clone()),Some("scope=default".into()),vec!["read".into(),"submit".into(),"manage".into()],
         ).await.unwrap();
-    let path=format!("/apps/service/scale?namespace={ns}");
+    let path=format!("/apps/model/scale?namespace={ns}");
     assert_eq!(scale_call(c.clone(),&secret,"GET",&path,Value::Null).await.status(),StatusCode::OK);
     assert_eq!(scale_call(c.clone(),"cluster","PUT",&path,json!({"gpus":1})).await.status(),StatusCode::UNAUTHORIZED);
     for body in [json!({"replicas":0}),json!({"replicas":65}),json!({"cpus":0}),json!({"gpus":-1}),json!({"image":"other"}),json!({}),
@@ -1230,10 +1231,10 @@ async fn owner_scale_rejects_invalid_capacity_quota_and_batches() {
         ).await.unwrap();
     assert_eq!(scale_call(c.clone(),&secret,"PUT",&path,json!({"cpus":3})).await.status(),StatusCode::UNPROCESSABLE_ENTITY);
     let other=c.fleet.create_namespace("other",Quota::default()).await.unwrap();
-    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/scale?namespace={}",other.id),json!({"replicas":1})).await.status(),StatusCode::NOT_FOUND);
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/model/scale?namespace={}",other.id),json!({"replicas":1})).await.status(),StatusCode::NOT_FOUND);
     assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/training/scale?namespace={ns}"),json!({"replicas":1})).await.status(),StatusCode::BAD_REQUEST);
     assert!(c.inner.lock().commands.is_empty());
-    assert!(c.inner.lock().services.values().all(|s|s.scale.is_none()));
+    assert!(c.inner.lock().deployments.values().all(|s|s.scale.is_none()));
 }
 
 #[tokio::test]
@@ -1241,17 +1242,17 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
-    let value=c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
+    let value=c.request_scale(&ns,"model",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
         ).await.unwrap();
     assert_eq!(value["state"],"draining");
-    for (method, path) in [("PUT", format!("/apps/service/disabled?namespace={ns}")),
-        ("DELETE", format!("/apps/service/disabled?namespace={ns}")),
-        ("DELETE", format!("/apps/service?namespace={ns}")),
+    for (method, path) in [("PUT", format!("/apps/model/disabled?namespace={ns}")),
+        ("DELETE", format!("/apps/model/disabled?namespace={ns}")),
+        ("DELETE", format!("/apps/model?namespace={ns}")),
     ] {
         assert_eq!(scale_call(c.clone(),"admin",method,&path,json!({})).await.status(),StatusCode::CONFLICT);
     }
-    assert_eq!(c.inner.lock().apps["service"].spec["disabled"],false);
-    assert!(c.request_scale(&ns,"service",request_resources(json!({"replicas":1}))).await.is_err());
+    assert_eq!(c.inner.lock().apps["model"].spec["disabled"],false);
+    assert!(c.request_scale(&ns,"model",request_resources(json!({"replicas":1}))).await.is_err());
     let c=Arc::new(WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap());
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     c.dispatch().await.unwrap();
@@ -1259,10 +1260,10 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     assert!(stop.admitted);
     // Replaying a report cannot reopen the old allocation or change the target.
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["gpus"],2.0);
-    assert_eq!(c.app_resources(&ns,"service",None)["resources"]["gpus"],2.0,"listings show the durable requested settings while scaling");
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["gpus"],2.0);
+    assert_eq!(c.app_resources(&ns,"model",None)["resources"]["gpus"],2.0,"listings show the durable requested settings while scaling");
     assert_eq!(c.inner.lock().commands.len(),1);
-    finish_service_command(&c,&ns,false,&stop,true,None).await;
+    finish_app_command(&c,&ns,false,&stop,true,None).await;
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
     // Another workload consumes the freed GPUs; scale waits rather than starting over capacity.
     let mut occupied=scale_inventory(&ns,false,true);occupied.free_gpus=0.0;
@@ -1275,14 +1276,14 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
     assert_eq!(c.inner.lock().commands.len(),3);
     assert!(c.inner.lock().commands[&start.id].admitted);
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
-    let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
-    finish_service_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
-    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"complete");
-    assert_eq!(c.inner.lock().apps["service"].spec["replicas"],1);
+    let mut observed=start.parameters["app"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
+    finish_app_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
+    assert_eq!(c.inner.lock().apps["model"].spec["replicas"],1);
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     // A node-local edit after completion cannot overwrite the durable desired allocation.
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    let repaired=c.scale_status(&ns,"service",None).unwrap();
+    let repaired=c.scale_status(&ns,"model",None).unwrap();
     assert_eq!(repaired["state"],"draining");
     assert_eq!(repaired["gpus"],2.0);
     assert_eq!(repaired["replicas"],1);
@@ -1298,7 +1299,7 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     register(&c, &ns, PROOF, &elf).await;
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
     let mut job=ProofJob{inputs:None,outputs:None,id:"active-proof".into(),app:PROOF.into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:"active-proof".into(),elf_id:elf.clone(),kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Running as i32,
-        fail_status: None,error:String::new(),node:Some("service-0".into()),attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
+        fail_status: None,error:String::new(),node:Some("model-0".into()),attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:None,
     };
     c.fleet.store.upsert(&job).await.unwrap();
     c.request_scale(&ns,PROOF,request_resources(json!({"replicas":1})),
@@ -1315,32 +1316,32 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     assert!(!stop.admitted);
     job.state=ProofJobState::Succeeded as i32;job.finished_ms=Some(2);c.fleet.store.upsert(&job).await.unwrap();
     c.dispatch().await.unwrap();assert!(c.inner.lock().commands[&stop.id].admitted);
-    finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
+    finish_app_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
     node_writes_config(&c,scale_inventory(&ns,true,true)).await;
     let start=c.inner.lock().commands.values().find(|v|v.parameters["scale_phase"]=="apply").unwrap().clone();
-    let mut observed=start.parameters["service"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);
-    finish_service_command(&c,&ns,true,&start,false,Some(observed)).await;
+    let mut observed=start.parameters["app"].clone();observed["disabled"]=json!(false);observed["ready"]=json!(true);
+    finish_app_command(&c,&ns,true,&start,false,Some(observed)).await;
     assert!(c.fleet.app_disabled(&ns, PROOF));
     c.dispatch().await.unwrap();
     assert!(!c.fleet.app_disabled(&ns, PROOF));
     c.fleet.set_app_disabled(&ns, PROOF,true).await.unwrap();
     // The authoritative lifecycle intent, not an old observed flag, determines whether scaling resumes the app.
-    let mut stopped=start.parameters["service"].clone();
+    let mut stopped=start.parameters["app"].clone();
     stopped["disabled"]=json!(true);stopped["ready"]=json!(false);stopped["cleaned"]=json!(true);
-    c.command("gpu",NodeOperation::SetService,json!({"service":stopped,"disabled":true}),
+    c.command("gpu",NodeOperation::SetApp,json!({"app":stopped,"disabled":true}),
     ).unwrap();
     let normal=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
-    finish_service_command(&c,&ns,true,&normal,true,Some(stopped)).await;
+    finish_app_command(&c,&ns,true,&normal,true,Some(stopped)).await;
     c.request_scale(&ns,PROOF,request_resources(json!({"gpus":2,"replicas":1})),
     ).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
-    finish_service_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
+    finish_app_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
     node_writes_config(&c,scale_inventory(&ns,true,true)).await;
     let apply=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     assert_eq!(apply.parameters["disabled"],true);
-    let mut observed=apply.parameters["service"].clone();observed["disabled"]=json!(true);observed["cleaned"]=json!(true);observed["ready"]=json!(false);
-    finish_service_command(&c,&ns,true,&apply,true,Some(observed)).await;c.dispatch().await.unwrap();
+    let mut observed=apply.parameters["app"].clone();observed["disabled"]=json!(true);observed["cleaned"]=json!(true);observed["ready"]=json!(false);
+    finish_app_command(&c,&ns,true,&apply,true,Some(observed)).await;c.dispatch().await.unwrap();
     assert!(c.fleet.app_disabled(&ns, PROOF));
     assert_eq!(c.scale_status(&ns,PROOF,None).unwrap()["state"],"complete");
 }
@@ -1349,34 +1350,34 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
 async fn scale_failure_retains_new_reservation_until_confirmed_cleanup_and_can_be_retried() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    c.request_scale(&ns,"service",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
+    c.request_scale(&ns,"model",request_resources(json!({"gpus":2,"cpus":4,"replicas":1})),
     ).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
-    finish_service_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
+    finish_app_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
     node_writes_config(&c,scale_inventory(&ns,false,true)).await;
     let apply=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
     assert!(apply.admitted);assert_eq!(c.fleet.usage(&ns).gpus,2.0);
     let mut failed=scale_inventory(&ns,false,true);
-    let mut partial=apply.parameters["service"].clone();partial["disabled"]=json!(false);partial["ready"]=json!(false);partial["cleaned"]=json!(false);
-    failed.services=vec![partial.clone().into()];
+    let mut partial=apply.parameters["app"].clone();partial["disabled"]=json!(false);partial["ready"]=json!(false);partial["cleaned"]=json!(false);
+    failed.apps=vec![partial.clone().into()];
     failed.results=vec![CommandResult {id:apply.id,error:Some("container start failed".into()),result:Value::Null.into(),
     }];
     c.report("gpu","session",failed).await.unwrap();c.dispatch().await.unwrap();
-    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"failed");
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"failed");
     assert_eq!(c.fleet.usage(&ns).gpus,2.0);
-    let mut report=scale_inventory(&ns,false,true);report.services=vec![partial.into()];
+    let mut report=scale_inventory(&ns,false,true);report.apps=vec![partial.into()];
     c.report("gpu","session",report).await.unwrap();c.dispatch().await.unwrap();
-    // The failed service stays down: the node writes it disabled and stops it.
+    // The failed app stays down: the node writes it disabled and stops it.
     let config=command_where(&c,|v|!v.done&&v.operation==NodeOperation::App as i32).unwrap();
     assert_eq!(config.parameters["set"],json!({"disabled":true}));
-    let cleanup=command_where(&c,|v|!v.done&&v.operation==NodeOperation::SetService as i32).unwrap();
+    let cleanup=command_where(&c,|v|!v.done&&v.operation==NodeOperation::SetApp as i32).unwrap();
     assert_eq!(cleanup.parameters["disabled"],true);
-    let mut observed=cleanup.parameters["service"].clone();observed["disabled"]=json!(true);observed["ready"]=json!(false);observed["cleaned"]=json!(true);
-    finish_service_command(&c,&ns,false,&cleanup,true,Some(observed)).await;
+    let mut observed=cleanup.parameters["app"].clone();observed["disabled"]=json!(true);observed["ready"]=json!(false);observed["cleaned"]=json!(true);
+    finish_app_command(&c,&ns,false,&cleanup,true,Some(observed)).await;
     assert_eq!(c.fleet.usage(&ns).gpus,0.0);
-    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"failed");
-    let retried=c.request_scale(&ns,"service",request_resources(json!({"replicas":1}))).await.unwrap();
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"failed");
+    let retried=c.request_scale(&ns,"model",request_resources(json!({"replicas":1}))).await.unwrap();
     assert_eq!(retried["state"],"draining");assert_eq!(retried["disabled"],false);
 }
 
@@ -1387,7 +1388,7 @@ async fn public_nodes_are_machines_and_machine_drain_covers_current_and_future_p
     let elf="a".repeat(64);
     register(&c, &ns, PROOF, &elf).await;
     let mut report=inventory(&ns);
-    report.services=vec![json!({"name":"proof","kind":"ziren-gpu","namespace":ns,
+    report.apps=vec![json!({"name":"proof","kind":"ziren-gpu","namespace":ns,
         "app":PROOF.to_string(),"gpus":1,"cpus":2,"replicas":1,"disabled":false,"ready":true}).into()];
     c.report("gpu","session",report).await.unwrap();
     let replica=NodeInfo{name:"proof-0".into(),machine:"machine".into(),backend:"cuda".into(),
@@ -1443,9 +1444,9 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
 async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admission_guard() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, true, false);
-    report.services[0]["worker_command"] = json!(["/opt/eth-proofs"]);
-    report.services[0]["machine"] = json!("machine");
-    report.services[0]["replicas"] = json!(1);
+    report.apps[0]["worker_command"] = json!(["/opt/eth-proofs"]);
+    report.apps[0]["machine"] = json!("machine");
+    report.apps[0]["replicas"] = json!(1);
     c.report("gpu", "session", report).await.unwrap();
     assert!(c.fleet.app_worker_owned(&ns, PROOF));
     assert!(!c.fleet.app_worker_owned(&ns, "other"));
@@ -1461,44 +1462,44 @@ async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admissi
 async fn integrated_worker_owner_must_be_cleaned_before_moving() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, true, false);
-    report.services[0]["worker_command"] = json!(["/opt/eth-proofs"]);
-    report.services[0]["replicas"] = json!(1);
+    report.apps[0]["worker_command"] = json!(["/opt/eth-proofs"]);
+    report.apps[0]["replicas"] = json!(1);
     let mut invalid = report.clone();
-    invalid.services[0]["replicas"] = json!(2);
+    invalid.apps[0]["replicas"] = json!(2);
     assert!(c.report("gpu", "session", invalid).await.is_err());
     let mut duplicate = report.clone();
-    let mut another = duplicate.services[0].clone();
+    let mut another = duplicate.apps[0].clone();
     another["name"] = json!("second");
-    duplicate.services.push(another);
+    duplicate.apps.push(another);
     assert!(c.report("gpu", "session", duplicate).await.is_err());
     c.report("gpu", "session", report.clone()).await.unwrap();
     assert!(c.report("other", "session", report.clone()).await.is_err());
-    let service = report.services[0].clone();
-    assert!(c.command("other", NodeOperation::SetService,
-        json!({"service":service,"disabled":false})).is_err());
-    c.inner.lock().services.get_mut("gpu-service").unwrap().disabled = true;
-    assert!(c.command("other", NodeOperation::SetService,
-        json!({"service":service,"disabled":false})).is_err());
-    c.fleet.release_job(&ns, "service:gpu-service").await.unwrap();
-    assert!(c.command("other", NodeOperation::SetService,
-        json!({"service":service,"disabled":false})).is_ok());
+    let entry = report.apps[0].clone();
+    assert!(c.command("other", NodeOperation::SetApp,
+        json!({"app":entry,"disabled":false})).is_err());
+    c.inner.lock().deployments.get_mut("gpu-model").unwrap().disabled = true;
+    assert!(c.command("other", NodeOperation::SetApp,
+        json!({"app":entry,"disabled":false})).is_err());
+    c.fleet.release_job(&ns, "deployment:gpu-model").await.unwrap();
+    assert!(c.command("other", NodeOperation::SetApp,
+        json!({"app":entry,"disabled":false})).is_ok());
 }
 
 #[tokio::test]
-async fn a_service_operation_replaces_an_enable_still_waiting_for_capacity() {
+async fn an_app_operation_replaces_an_enable_still_waiting_for_capacity() {
     let (_dir, c, ns) = setup().await;
     let report = scale_inventory(&ns, false, true);
-    let service = report.services[0].clone();
+    let entry = report.apps[0].clone();
     c.report("gpu", "session", report).await.unwrap();
-    let enable = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap();
+    let enable = c.command("gpu", NodeOperation::SetApp, json!({"app":entry,"disabled":false})).unwrap();
     assert!(!c.inner.lock().commands[&enable].admitted, "an enable waits until the node can fit it");
-    let disable = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":true})).unwrap();
+    let disable = c.command("gpu", NodeOperation::SetApp, json!({"app":entry,"disabled":true})).unwrap();
     let commands = c.inner.lock().commands.clone();
     assert!(commands[&enable].done && commands[&enable].error.as_deref().unwrap().contains("replaced"));
-    assert!(!commands[&disable].done && c.inner.lock().services["gpu-service"].disabled);
+    assert!(!commands[&disable].done && c.inner.lock().deployments["gpu-model"].disabled);
     // Once the node has been sent an operation, it is not replaced.
     c.inner.lock().commands.get_mut(&disable).unwrap().admitted = true;
-    let error = c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap_err();
+    let error = c.command("gpu", NodeOperation::SetApp, json!({"app":entry,"disabled":false})).unwrap_err();
     assert!(error.to_string().contains("already pending"), "{error}");
 }
 
@@ -1510,11 +1511,11 @@ async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
         register(&c, &ns, PROOF, &elf).await;
         c.report("gpu", "session", scale_inventory(&ns, proof, false)).await.unwrap();
         c.fleet.log_relay.heartbeat("gpu", "session");
-        let app = if proof { PROOF.to_string() } else { "service".into() };
+        let app = if proof { PROOF.to_string() } else { "model".into() };
         let consumer = user_token(&c, &ns, 2, "scope=default", Some(vec![app]), false).await;
         let restricted = user_token(&c, &ns, 3, "scope=default", Some(vec!["other".into()]), true).await;
         let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
-        let logs = if proof { format!("/apps/{PROOF}/logs") } else { "/apps/service/logs".into() };
+        let logs = if proof { format!("/apps/{PROOF}/logs") } else { "/apps/model/logs".into() };
         let query = |extra: &str| format!("{logs}?{extra}");
         for token in [&restricted, &foreign_tag] {
             let status = scale_call(c.clone(), token, "GET", &logs, Value::Null).await.status();
@@ -1533,7 +1534,7 @@ async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }).await.unwrap();
-        assert_eq!((asked.service.as_str(), asked.lines), ("service", 5));
+        assert_eq!((asked.entry.as_str(), asked.lines), ("model", 5));
         c.fleet.log_relay.claim(&asked.ticket, "gpu", "session").unwrap().send(Ok(b"hello\n".to_vec())).unwrap();
         let response = request.await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -1545,7 +1546,7 @@ async fn app_logs_are_relayed_from_the_node_and_follow_app_scope() {
 async fn app_logs_of_an_offline_node_are_unavailable() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
-    let status = scale_call(c, "admin", "GET", &format!("/apps/service/logs?namespace={ns}"), Value::Null).await.status();
+    let status = scale_call(c, "admin", "GET", &format!("/apps/model/logs?namespace={ns}"), Value::Null).await.status();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -1555,16 +1556,16 @@ async fn a_starting_app_says_why_it_is_not_running() {
     let mut report = scale_inventory(&ns, false, true);
     report.free_gpus = 1.0;
     report.free_cpus = 3.0;
-    let service = report.services[0].clone();
+    let entry = report.apps[0].clone();
     c.report("gpu", "session", report).await.unwrap();
-    c.command("gpu", NodeOperation::SetService, json!({"service":service,"disabled":false})).unwrap();
-    let view = c.app_resources(&ns, "service", None);
+    c.command("gpu", NodeOperation::SetApp, json!({"app":entry,"disabled":false})).unwrap();
+    let view = c.app_resources(&ns, "model", None);
     assert_eq!(view["state"], "starting");
     assert_eq!(view["detail"], "waiting for capacity: needs 2 GPU and 4 CPU, gpu has 1 GPU and 3 CPU free");
     c.inner.lock().commands.values_mut().for_each(|c| c.admitted = true);
-    assert_eq!(c.app_resources(&ns, "service", None)["detail"], "starting on gpu");
+    assert_eq!(c.app_resources(&ns, "model", None)["detail"], "starting on gpu");
     c.inner.lock().commands.values_mut().for_each(|c| c.done = true);
-    assert_eq!(c.app_resources(&ns, "service", None)["detail"], "waiting for gpu to report it ready");
+    assert_eq!(c.app_resources(&ns, "model", None)["detail"], "waiting for gpu to report it ready");
 }
 
 #[tokio::test]
@@ -1573,10 +1574,10 @@ async fn enabling_an_integrated_worker_without_a_registered_app_keeps_heartbeats
     let report=scale_inventory(&ns,true,true);
     assert!(!c.fleet.app_known(&ns, PROOF));
     c.report("gpu","session",report.clone()).await.unwrap();
-    let mut service:Value=report.services[0].clone().into();service["disabled"]=json!(false);
-    let id=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    let mut entry:Value=report.apps[0].clone().into();entry["disabled"]=json!(false);
+    let id=c.command("gpu",NodeOperation::SetApp,json!({"app":entry,"disabled":false})).unwrap();
     let command=c.inner.lock().commands.get(&id).cloned().unwrap();
-    finish_service_command(&c,&ns,true,&command,false,None).await;
+    finish_app_command(&c,&ns,true,&command,false,None).await;
     assert!(c.inner.lock().commands[&id].done,"the enable result must be recorded, not rejected with the whole heartbeat");
     c.report("gpu","session",scale_inventory(&ns,true,false)).await.unwrap();
 }
@@ -1586,17 +1587,17 @@ async fn a_scale_waiting_to_start_says_why() {
     let (_dir,c,ns)=setup().await;
     let mut report=scale_inventory(&ns,false,true);
     report.free_gpus=1.0;report.free_cpus=3.0;
-    let service=report.services[0].clone();
+    let entry=report.apps[0].clone();
     c.report("gpu","session",report).await.unwrap();
-    let id=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    let id=c.command("gpu",NodeOperation::SetApp,json!({"app":entry,"disabled":false})).unwrap();
     {
         let mut i=c.inner.lock();
-        let intent=i.services.get_mut("gpu-service").unwrap();
-        let mut scale=scaling::new_scale(intent.service.clone(),false);
+        let intent=i.deployments.get_mut("gpu-model").unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
         scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;scale.start=Some(id);
         intent.scale=Some(scale);
     }
-    let view=c.app_resources(&ns,"service",None);
+    let view=c.app_resources(&ns,"model",None);
     assert_eq!(view["state"],"starting");
     assert_eq!(view["detail"],"waiting for capacity: needs 2 GPU and 4 CPU, gpu has 1 GPU and 3 CPU free");
 }
@@ -1606,48 +1607,48 @@ async fn a_scale_waiting_for_capacity_to_start_can_be_resized() {
     let (_dir,c,ns)=setup().await;
     let mut report=scale_inventory(&ns,false,true);
     report.free_gpus=1.0;report.free_cpus=3.0;
-    let service=report.services[0].clone();
+    let entry=report.apps[0].clone();
     c.report("gpu","session",report).await.unwrap();
-    let start=c.command("gpu",NodeOperation::SetService,json!({"service":service,"disabled":false})).unwrap();
+    let start=c.command("gpu",NodeOperation::SetApp,json!({"app":entry,"disabled":false})).unwrap();
     {
         let mut i=c.inner.lock();
-        let intent=i.services.get_mut("gpu-service").unwrap();
-        let mut scale=scaling::new_scale(intent.service.clone(),false);
+        let intent=i.deployments.get_mut("gpu-model").unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
         scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;scale.start=Some(start.clone());
         intent.scale=Some(scale);
     }
-    let path=format!("/apps/service/scale?namespace={ns}");
+    let path=format!("/apps/model/scale?namespace={ns}");
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"gpus":0,"cpus":1})).await.status(),StatusCode::ACCEPTED);
     c.advance_scales().await.unwrap();
     let old=c.inner.lock().commands[&start].clone();
     assert!(old.done && old.error.as_deref().is_some_and(|e|e.contains("replaced")),"{old:?}");
     c.inner.lock().commands.get_mut(&start).unwrap().admitted=true;
     c.inner.lock().commands.get_mut(&start).unwrap().done=false;
-    c.inner.lock().services.get_mut("gpu-service").unwrap().scale.as_mut().unwrap().start=Some(start);
-    c.inner.lock().services.get_mut("gpu-service").unwrap().scale.as_mut().unwrap().phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+    c.inner.lock().deployments.get_mut("gpu-model").unwrap().scale.as_mut().unwrap().start=Some(start);
+    c.inner.lock().deployments.get_mut("gpu-model").unwrap().scale.as_mut().unwrap().phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":2})).await.status(),StatusCode::CONFLICT,"a start already sent to the node must finish first");
 }
 
 /// One integrated worker (a dedicated proof server running the app's own worker).
 fn integrated_inventory(ns: &str) -> NodeReport {
     let mut report=scale_inventory(ns,true,false);
-    report.services[0]["worker_command"]=json!(["/opt/eth-proofs"]);
-    report.services[0]["replicas"]=json!(1);
-    report.services[0]["machine"]=json!("machine");
+    report.apps[0]["worker_command"]=json!(["/opt/eth-proofs"]);
+    report.apps[0]["replicas"]=json!(1);
+    report.apps[0]["machine"]=json!("machine");
     report
 }
 
 #[tokio::test]
-async fn a_disabled_service_its_node_stopped_reporting_is_forgotten() {
+async fn a_disabled_app_its_node_stopped_reporting_is_forgotten() {
     let (_dir,c,ns)=setup().await;
-    let record=c.dir.join("services").join("gpu-service.json");
+    let record=c.dir.join("deployments").join("gpu-model.json");
     c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
     c.report("gpu","session",inventory(&ns)).await.unwrap();
-    assert!(c.inner.lock().services.contains_key("gpu-service") && record.exists(),"an enabled service may only be missing for now");
-    c.inner.lock().services.get_mut("gpu-service").unwrap().disabled=true;
-    c.fleet.release_job(&ns,"service:gpu-service").await.unwrap();
+    assert!(c.inner.lock().deployments.contains_key("gpu-model") && record.exists(),"an enabled app may only be missing for now");
+    c.inner.lock().deployments.get_mut("gpu-model").unwrap().disabled=true;
+    c.fleet.release_job(&ns,"deployment:gpu-model").await.unwrap();
     c.report("gpu","session",inventory(&ns)).await.unwrap();
-    assert!(!c.inner.lock().services.contains_key("gpu-service"));
+    assert!(!c.inner.lock().deployments.contains_key("gpu-model"));
     assert!(!record.exists());
 }
 
@@ -1673,12 +1674,12 @@ async fn deleting_a_registered_app_tells_every_node_which_app_was_deleted() {
 }
 
 #[tokio::test]
-async fn deleting_a_serving_app_tells_its_nodes() {
+async fn deleting_an_app_tells_its_nodes() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
-    c.inner.lock().apps.get_mut("service").unwrap().spec["disabled"]=json!(true);
-    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/service?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"app":{"namespace":ns,"namespace_name":"test","name":"service"},"remove":true}))]);
+    c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"]=json!(true);
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/model?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},"remove":true}))]);
 }
 
 #[tokio::test]
@@ -1715,42 +1716,42 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     for bad in [json!({}),json!({"gpus":1}),json!({"image":""}),json!({"image":"--privileged"}),json!({"env":{"A":1}})] {
-        let refused=c.request_update(&ns,"service",None,bad.clone()).await.unwrap_err();
+        let refused=c.request_update(&ns,"model",None,bad.clone()).await.unwrap_err();
         assert_eq!(refused.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,400,"{bad}");
     }
     let set=json!({"image":"web:2","env":{"A":"1"}});
-    assert_eq!(c.request_update(&ns,"service",None,set.clone()).await.unwrap()["state"],"draining");
-    assert!(c.request_update(&ns,"service",None,json!({"image":"web:3"})).await.is_err(),"one operation at a time");
+    assert_eq!(c.request_update(&ns,"model",None,set.clone()).await.unwrap()["state"],"draining");
+    assert!(c.request_update(&ns,"model",None,json!({"image":"web:3"})).await.is_err(),"one operation at a time");
     c.dispatch().await.unwrap();
     let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
-    finish_service_command(&c,&ns,false,&stop,true,None).await;
+    finish_app_command(&c,&ns,false,&stop,true,None).await;
     c.dispatch().await.unwrap();
     let update=command_where(&c,|cmd|cmd.operation==NodeOperation::App as i32).unwrap();
-    assert_eq!(*update.parameters,json!({"service":{"name":"service"},
+    assert_eq!(*update.parameters,json!({"entry":{"name":"model"},
         "set":{"image":"web:2","env":{"A":"1"},"gpus":1,"cpus":2,"replicas":2,"disabled":false}}));
-    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none(),"the service starts only after the node wrote the settings");
-    node_answers(&c,&ns,&update,json!({"updated":["service"]})).await;
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none(),"the app starts only after the node wrote the settings");
+    node_answers(&c,&ns,&update,json!({"updated":["model"]})).await;
     let start=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").unwrap();
-    assert_eq!(start.parameters["service"]["image"],"web:2");
-    let mut observed=start.parameters["service"].clone();
+    assert_eq!(start.parameters["app"]["image"],"web:2");
+    let mut observed=start.parameters["app"].clone();
     observed["disabled"]=json!(false);observed["ready"]=json!(true);observed["cleaned"]=json!(false);
-    finish_service_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
-    assert_eq!(c.scale_status(&ns,"service",None).unwrap()["state"],"complete");
-    assert_eq!(c.inner.lock().apps["service"].spec["image"],"web:2");
-    assert_eq!(c.inner.lock().apps["service"].spec["env"],json!({"A":"1"}));
+    finish_app_command(&c,&ns,false,&start,false,Some(observed)).await;c.dispatch().await.unwrap();
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
+    assert_eq!(c.inner.lock().apps["model"].spec["image"],"web:2");
+    assert_eq!(c.inner.lock().apps["model"].spec["env"],json!({"A":"1"}));
 }
 
 #[tokio::test]
-async fn an_update_the_node_cannot_write_fails_and_leaves_the_service_stopped() {
+async fn an_update_the_node_cannot_write_fails_and_leaves_the_app_stopped() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
-    c.request_update(&ns,"service",None,json!({"image":"web:2"})).await.unwrap();
+    c.request_update(&ns,"model",None,json!({"image":"web:2"})).await.unwrap();
     c.dispatch().await.unwrap();
     let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
-    finish_service_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
+    finish_app_command(&c,&ns,false,&stop,true,None).await;c.dispatch().await.unwrap();
     let update=command_where(&c,|cmd|cmd.operation==NodeOperation::App as i32).unwrap();
     node_answers(&c,&ns,&update,json!({"updated":[]})).await;
-    let status=c.scale_status(&ns,"service",None).unwrap();
+    let status=c.scale_status(&ns,"model",None).unwrap();
     assert_eq!((status["state"].as_str(),status["error"].as_str()),(Some("failed"),Some("node did not write the new configuration")));
     assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none());
 }
@@ -1785,7 +1786,7 @@ async fn a_registered_app_update_changes_its_server() {
     let path=format!("/apps/{PROOF}/settings?namespace={ns}");
     assert_eq!(scale_call(c.clone(),"admin","GET",&path,Value::Null).await.status(),StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"image":"prover:2"})).await.status(),StatusCode::ACCEPTED);
-    let scale=c.inner.lock().services["gpu-service"].scale.clone().unwrap();
+    let scale=c.inner.lock().deployments["gpu-model"].scale.clone().unwrap();
     assert_eq!((scale.set.as_ref().map(|s|s.0.clone()),scale.target["image"].as_str()),(Some(json!({"image":"prover:2"})),Some("prover:2")));
 }
 
@@ -1796,7 +1797,7 @@ async fn answer(c: &WorkloadController, mut report: NodeReport, command: &Comman
 }
 async fn change_pending(c: &WorkloadController, disabled: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !c.inner.lock().services.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled)) {
+        while !c.inner.lock().deployments.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled)) {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }).await.unwrap();
@@ -1807,9 +1808,9 @@ async fn disabling_an_app_whose_node_is_offline_is_kept_until_it_returns() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     c.inner.lock().workers.get_mut("gpu").unwrap().seen=0.0;
-    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/disabled?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    let scale=c.inner.lock().services["gpu-service"].scale.clone().unwrap();
-    assert!(scale.pending() && scale.disabled,"the node stops the service when it reconnects");
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/model/disabled?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
+    let scale=c.inner.lock().deployments["gpu-model"].scale.clone().unwrap();
+    assert!(scale.pending() && scale.disabled,"the node stops the app when it reconnects");
 }
 
 #[tokio::test]
@@ -1817,7 +1818,7 @@ async fn an_enable_waiting_for_capacity_can_be_cancelled() {
     let (_dir,c,ns)=setup().await;
     let mut occupied=scale_inventory(&ns,false,true);occupied.free_gpus=0.0;occupied.free_cpus=0.0;
     c.report("gpu","session",occupied.clone()).await.unwrap();
-    let path=format!("/apps/service/disabled?namespace={ns}");
+    let path=format!("/apps/model/disabled?namespace={ns}");
     let enable=tokio::spawn({let (c,path)=(c.clone(),path.clone());async move{scale_call(c,"admin","DELETE",&path,Value::Null).await}});
     change_pending(&c,false).await;
     c.dispatch().await.unwrap();
@@ -1832,21 +1833,21 @@ async fn an_enable_waiting_for_capacity_can_be_cancelled() {
     assert_eq!(disable.await.unwrap().status(),StatusCode::OK);
     enable.abort();
     assert!(c.inner.lock().commands[&start.id].error.as_deref().is_some_and(|e|e.contains("replaced")),"the start was never sent");
-    assert!(c.inner.lock().services["gpu-service"].disabled);
+    assert!(c.inner.lock().deployments["gpu-model"].disabled);
 }
 
 #[tokio::test]
 async fn an_enable_carries_the_apps_current_priority() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
-    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/service/priority?namespace={ns}"),json!({"priority":31})).await.status(),StatusCode::OK);
-    let path=format!("/apps/service/disabled?namespace={ns}");
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&format!("/apps/model/priority?namespace={ns}"),json!({"priority":31})).await.status(),StatusCode::OK);
+    let path=format!("/apps/model/disabled?namespace={ns}");
     let enable=tokio::spawn({let c=c.clone();async move{scale_call(c,"admin","DELETE",&path,Value::Null).await}});
     change_pending(&c,false).await;
     node_completes_changes(&c,&ns,false).await;
     assert_eq!(enable.await.unwrap().status(),StatusCode::OK);
     let start=command_where(&c,|v|v.parameters["scale_phase"]=="apply").unwrap();
-    assert_eq!(start.parameters["service"]["priority"],31,"admission and preemption use the app's priority");
+    assert_eq!(start.parameters["app"]["priority"],31,"admission and preemption use the app's priority");
 }
 
 #[tokio::test]
@@ -1891,15 +1892,194 @@ async fn a_token_issued_or_revoked_outside_the_scheduler_takes_effect_on_reload(
 }
 
 #[tokio::test]
-async fn a_service_record_follows_the_app_its_node_configures() {
+async fn a_deployment_record_follows_the_app_its_node_configures() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, true, false);
-    report.services[0]["app"] = json!(format!("eth/{}", proof_elf()));
-    report.services[0].as_object_mut().unwrap().remove("elf_id");
+    report.apps[0]["app"] = json!(format!("eth/{}", proof_elf()));
+    report.apps[0].as_object_mut().unwrap().remove("elf_id");
     c.report("gpu", "session", report).await.unwrap();
     c.report("gpu", "session", scale_inventory(&ns, true, false)).await.unwrap();
-    let service = c.inner.lock().services["gpu-service"].service.clone();
-    assert_eq!((service["app"].clone(), service["elf_id"].clone()), (json!(PROOF), json!(proof_elf())));
-    let saved: AppDeployment = serde_json::from_slice(&std::fs::read(c.dir.join("services/gpu-service.json")).unwrap()).unwrap();
-    assert_eq!(saved.service["app"], PROOF, "and so does its saved record");
+    let entry = c.inner.lock().deployments["gpu-model"].spec.clone();
+    assert_eq!((entry["app"].clone(), entry["elf_id"].clone()), (json!(PROOF), json!(proof_elf())));
+    let saved: AppDeployment = serde_json::from_slice(&std::fs::read(c.dir.join("deployments/gpu-model.json")).unwrap()).unwrap();
+    assert_eq!(saved.spec["app"], PROOF, "and so does its saved record");
+}
+
+#[tokio::test]
+async fn an_app_named_like_a_batch_does_not_attach_to_it() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = inventory(&ns);
+    report.apps = vec![json!({"name":"training","kind":"app","namespace":ns,"app":"training","gpus":1,"cpus":1,
+        "replicas":1,"disabled":true,"ready":false,"cleaned":true,"image":"runner:1"}).into()];
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(!c.inner.lock().apps["training"].persistent, "the batch keeps its record");
+    assert!(!c.inner.lock().deployments.contains_key("gpu-training"), "and the app is not attached to it");
+}
+
+/// Places `name` as enabling it does (`deploy`), the chosen node writing the entry it is sent
+/// and reporting it: that node and the entry.
+async fn deployed(c: &Arc<WorkloadController>, ns: &str, name: &str) -> anyhow::Result<(String, Value)> {
+    let task = tokio::spawn({
+        let (c, ns, name) = (c.clone(), ns.to_owned(), name.to_owned());
+        async move { c.deploy(&ns, &name).await }
+    });
+    let create = loop {
+        let sent = c.inner.lock().commands.values()
+            .find(|cmd| !cmd.done && cmd.parameters["create"]["name"] == name).cloned();
+        if let Some(sent) = sent {
+            break sent;
+        }
+        if task.is_finished() {
+            return task.await.unwrap().map(|_| unreachable!("placed without a create"));
+        }
+        tokio::task::yield_now().await;
+    };
+    let entry = create.parameters["create"].clone();
+    let (session, mut report) = {
+        let i = c.inner.lock();
+        let w = &i.workers[&create.worker];
+        (w.session.clone(), w.report.clone())
+    };
+    let mut observed = entry.clone();
+    for (key, value) in [("app", json!(name)), ("ready", json!(false)), ("cleaned", json!(true))] {
+        observed[key] = value;
+    }
+    report.apps.push(observed.into());
+    report.results = vec![CommandResult { id: create.id.clone(), result: json!({"created":[name]}).into(), error: None }];
+    c.report(&create.worker, &session, report).await.unwrap();
+    task.await.unwrap()?;
+    Ok((create.worker, entry))
+}
+
+#[tokio::test]
+async fn an_app_is_created_on_no_node_and_placed_when_enabled() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,
+        "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}});
+    let response = scale_call(c.clone(), "admin", "POST", "/apps", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!((created["state"].as_str(), created["spec"]["workers"].clone()), (Some("disabled"), json!([])));
+    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "no node is told before the app is enabled");
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"spec":{"port_base":1}})).await.status(),
+        StatusCode::BAD_REQUEST);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"spec":{"image":"x","port_base":1}})).await.status(),
+        StatusCode::CONFLICT, "a batch's name is taken");
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"pinned","namespace":ns,"node":"gpu","spec":{"image":"x","port_base":1}})).await.status(),
+        StatusCode::BAD_REQUEST, "the scheduler picks the node");
+    let (node, entry) = deployed(&c, &ns, "model").await.unwrap();
+    assert_eq!((node.as_str(), entry), ("gpu", json!({"name":"model","kind":"app","namespace":ns,"disabled":true,"priority":0,
+        "replicas":1,"gpus":1,"cpus":2,"image":"serve:1","port_base":50100,"health_path":"/health",
+        "command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}})));
+    assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
+    assert!(c.inner.lock().deployments.contains_key("gpu-model"), "enabling it starts that deployment");
+    c.deploy(&ns, "model").await.unwrap();
+    assert!(remove_commands(&c, NodeOperation::App).iter().all(|(_, m)| m["create"].is_null()), "a placed app is not placed again");
+    let huge = json!({"name":"huge","namespace":ns,"spec":{"image":"x","port_base":1,"gpus":2,"replicas":2}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", huge).await.status(), StatusCode::CREATED);
+    let refused = deployed(&c, &ns, "huge").await.unwrap_err();
+    assert!(refused.to_string().contains("no ready node has 4 GPUs"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_proof_app_is_an_app_whose_container_proves_its_program() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"eth","namespace":ns,"priority":5,"spec":{"image":"ziren-gpu:1","gpus":1,"proof_storage_root":"/proofs"},
+        "proof":{"elf_id":"AB".repeat(32),"class":"latency"}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    let proof = c.fleet.app(&ns, "eth").unwrap();
+    assert!(!proof.disabled, "it takes jobs, which wait for its prover");
+    assert_eq!((proof.elf_id.as_str(), proof.class.as_str(), proof.priority), ("ab".repeat(32).as_str(), "latency", 5));
+    let listed: Value = serde_json::from_slice(&to_bytes(
+        scale_call(c.clone(), "admin", "GET", "/apps", Value::Null).await.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let rows: Vec<&Value> = listed.as_array().unwrap().iter().filter(|a| a["name"] == "eth").collect();
+    assert_eq!(rows.len(), 1, "listed once: {listed}");
+    assert_eq!((rows[0]["proof"]["class"].as_str(), rows[0]["spec"]["image"].as_str()), (Some("latency"), Some("ziren-gpu:1")));
+    let (node, entry) = deployed(&c, &ns, "eth").await.unwrap();
+    assert_eq!((node.as_str(), entry["kind"].as_str(), entry["elf_id"].as_str(), entry["proof_storage_root"].as_str()),
+        ("gpu", Some("ziren-gpu"), Some("ab".repeat(32).as_str()), Some("/proofs")));
+    assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/apps/eth", Value::Null).await.status(), StatusCode::OK);
+    assert!(!c.fleet.app_known(&ns, "eth") && c.inner.lock().apps["eth"].removed, "deleting it removes both records");
+}
+
+#[tokio::test]
+async fn an_app_goes_to_the_node_its_replicas_fit_most_tightly() {
+    let (_dir, c, ns) = setup().await;
+    let node = |total: u32, free: u32| -> NodeReport {
+        let mut report = inventory(&ns);
+        (report.total_gpus, report.free_gpus) = (total as f64, free as f64);
+        report
+    };
+    c.report("big", "session", node(8, 8)).await.unwrap();
+    c.report("busy", "session", node(8, 0)).await.unwrap();
+    c.report("small", "session", node(2, 2)).await.unwrap();
+    let mut placed = Vec::new();
+    for (name, gpus) in [("one", 1), ("four", 4), ("eight", 8)] {
+        let body = json!({"name":name,"namespace":ns,"spec":{"image":"serve:1","port_base":50100,"gpus":gpus}});
+        assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED, "{name}");
+        placed.push(deployed(&c, &ns, name).await.unwrap().0);
+    }
+    // One card fits the small node's free cards most tightly; four and eight fit only the big
+    // node's.
+    assert_eq!(placed, ["small", "big", "big"]);
+    // With no eight cards free anywhere, the app waits on a node that has them, the one with
+    // the most free cards, the first by name on a tie.
+    c.report("big", "session", node(8, 0)).await.unwrap();
+    let body = json!({"name":"later","namespace":ns,"spec":{"image":"serve:1","port_base":50100,"gpus":8}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(deployed(&c, &ns, "later").await.unwrap().0, "big");
+}
+
+#[tokio::test]
+async fn an_app_with_a_mistyped_setting_is_refused_before_it_is_recorded() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("port_base", Value::Null),
+        ("workdir", json!(1)), ("kind", json!("vm")), ("backend", json!("cpu"))] {
+        let mut body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","port_base":50100}});
+        body["spec"][key] = value;
+        assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::BAD_REQUEST, "{key}");
+    }
+    let flat = json!({"name":"model","namespace":ns,"image":"serve:1","port_base":50100});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", flat).await.status(), StatusCode::BAD_REQUEST, "settings belong under spec");
+    assert!(!c.inner.lock().apps.contains_key("model"));
+}
+
+#[tokio::test]
+async fn a_namespace_owner_creates_its_app_but_not_host_mounts_or_users() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let owner = user_token(&c, &ns, 7, "scope=default", None, true).await;
+    let reader = user_token(&c, &ns, 8, "scope=default", Some(vec!["model".into()]), false).await;
+    let body = json!({"name":"model","spec":{"image":"serve:1","port_base":50100,"command":["serve","{port}"],
+        "env":{"A":"1"},"workdir":"/srv"}});
+    for (key, value) in [("volumes", json!(["/models:ro"])), ("user", json!("0:0"))] {
+        let mut admin_only = body.clone();
+        admin_only["spec"][key] = value;
+        assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", admin_only).await.status(), StatusCode::FORBIDDEN, "{key}");
+    }
+    let prover = json!({"name":"eth","spec":{"image":"ziren-gpu:1","proof_storage_root":"/proofs"},"proof":{"elf_id":"ab".repeat(32)}});
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", prover).await.status(), StatusCode::FORBIDDEN, "proof_storage_root");
+    assert_eq!(scale_call(c.clone(), &reader, "POST", "/apps", body.clone()).await.status(), StatusCode::FORBIDDEN, "creation needs manage");
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    let app = c.inner.lock().apps["model"].clone();
+    assert_eq!((app.namespace.as_str(), app.tag.as_deref()), (ns.as_str(), Some("scope=default")), "in the token's namespace and tag");
+    assert_eq!(deployed(&c, &ns, "model").await.unwrap().1["tag"], "scope=default");
+}
+
+#[test]
+fn a_failed_record_write_leaves_no_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory in the record's place makes the final rename fail after the write.
+    let path = dir.path().join("app.json");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep"), b"").unwrap();
+    assert!(atomic(&path, b"{}").is_err());
+    let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("app.json")], "only the record's own path remains");
+    atomic(&dir.path().join("other.json"), b"{}").unwrap();
+    assert_eq!(std::fs::read(dir.path().join("other.json")).unwrap(), b"{}");
 }

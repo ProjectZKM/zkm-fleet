@@ -6,13 +6,15 @@ import "fleet/v1/types.proto";
 import "fleet/model/v1/model.proto";
 
 // Nodes initiate every connection. Heartbeats carry control metadata only;
-// app-owned storage holds payloads. FetchInputs/PublishOutput remain for legacy jobs.
+// app-owned storage holds payloads.
 
+// A proof's input, as a file in app storage (ProofInputs.input), and what a node sends its
+// GPU server.
 message ProveRequest {
   string job_id = 1;
   // Hex SHA-256 of the guest ELF, without 0x.
   string elf_id = 2;
-  // Empty when the node reported this ELF as cached; the node answers
+  // Empty when the node has this ELF cached; the GPU server answers
   // FAILED_PRECONDITION "elf_missing" if it was evicted meanwhile.
   bytes elf = 3;
   // ZKMStdin.buffer, one entry per guest read.
@@ -23,6 +25,7 @@ message ProveRequest {
   ProofKind kind = 6;
 }
 
+// What a node's GPU server returns; the node writes it to app storage (ProofOutputs).
 message ProveResponse {
   // serde_json of zkm_sdk::ZKMProof: what the SDK's network prover parses.
   bytes proof_json = 1;
@@ -41,18 +44,7 @@ service ControlService {
   rpc Register(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc Deregister(DeregisterRequest) returns (DeregisterResponse);
-  // Legacy payload path, refused for jobs with app-owned references.
-  rpc FetchInputs(FetchInputsRequest) returns (ProveRequest);
-  rpc PublishOutput(PublishOutputRequest) returns (PublishOutputResponse);
 }
-
-message PublishOutputRequest {
-  string node_id = 1;
-  Assignment assignment = 2;
-  ProveResponse result = 3;
-}
-
-message PublishOutputResponse {}
 
 message Assignment {
   string job_id = 1;
@@ -72,12 +64,6 @@ message Completion {
   uint64 cycles = 5;
   uint64 prove_ms = 6;
   ProofOutputs outputs = 7;
-}
-
-message FetchInputsRequest {
-  string node_id = 1;
-  Assignment assignment = 2;
-  bool include_elf = 3;
 }
 
 message NodeInfo {
