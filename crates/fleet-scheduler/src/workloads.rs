@@ -1632,14 +1632,21 @@ fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)?;
+    let written = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        // A failed write (a full disk, say) must not leave its temporary file behind.
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     fs::File::open(path.parent().unwrap())?.sync_all()?;
     Ok(())
 }

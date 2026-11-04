@@ -1971,3 +1971,17 @@ async fn a_namespace_owner_creates_its_serving_app_but_not_host_mounts_or_users(
     let (_, message) = remove_commands(&c, NodeOperation::App).remove(0);
     assert_eq!(message["create"]["tag"], "scope=default");
 }
+
+#[test]
+fn a_failed_record_write_leaves_no_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    // A directory in the record's place makes the final rename fail after the write.
+    let path = dir.path().join("app.json");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep"), b"").unwrap();
+    assert!(atomic(&path, b"{}").is_err());
+    let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, vec![std::ffi::OsString::from("app.json")], "only the record's own path remains");
+    atomic(&dir.path().join("other.json"), b"{}").unwrap();
+    assert_eq!(std::fs::read(dir.path().join("other.json")).unwrap(), b"{}");
+}
