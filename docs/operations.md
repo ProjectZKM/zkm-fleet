@@ -106,8 +106,12 @@ Existing allocations are accounted for when replacing an app's own allocation.
 
 To change the node pool, edit `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in
 `etc/watchdog.env`, then restart local Ray after pausing the node's workloads.
-An empty `RAY_NUM_CPUS` enables automatic detection. Scaling an app does not
-increase node capacity. Follow the [node maintenance procedure](maintenance.md).
+An empty `RAY_NUM_CPUS` enables automatic detection, and an empty
+`CUDA_VISIBLE_DEVICES` gives the node no GPUs. Local Ray listens on ports 6379-6381,
+52365, 8080 (metrics) and 10002-19999 (workers). On a machine where another service holds
+one, set `RAY_METRICS_EXPORT_PORT`, `RAY_MIN_WORKER_PORT` and `RAY_MAX_WORKER_PORT` in
+`etc/watchdog.env`. Scaling an app does not increase node capacity. Follow the
+[node maintenance procedure](maintenance.md).
 
 ## Apps and batches
 

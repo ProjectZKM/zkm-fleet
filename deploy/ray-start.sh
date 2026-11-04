@@ -1,9 +1,11 @@
 #!/bin/bash
 # Independent local Ray instance, never joined to another machine.
 # CUDA_VISIBLE_DEVICES limits managed cards; RAY_NUM_CPUS limits managed CPUs.
+# RAY_METRICS_EXPORT_PORT and RAY_MIN/MAX_WORKER_PORT move ports another service holds.
 set -euo pipefail
-COMMON=(--node-manager-port=6380 --object-manager-port=6381 --min-worker-port=10002 --max-worker-port=19999
-        --metrics-export-port=8080 --dashboard-agent-listen-port=52365 --disable-usage-stats)
+COMMON=(--node-manager-port=6380 --object-manager-port=6381
+        --min-worker-port="${RAY_MIN_WORKER_PORT:-10002}" --max-worker-port="${RAY_MAX_WORKER_PORT:-19999}"
+        --metrics-export-port="${RAY_METRICS_EXPORT_PORT:-8080}" --dashboard-agent-listen-port=52365 --disable-usage-stats)
 # Ray's object store and the GPU server both use /dev/shm; Ray sizes its share itself unless told.
 [ -n "${RAY_OBJECT_STORE_BYTES:-}" ] && COMMON+=(--object-store-memory="$RAY_OBJECT_STORE_BYTES")
 # The node's workspace: Ray's session files (logs, sockets) and spilled objects, off the root disk.

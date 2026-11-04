@@ -58,6 +58,7 @@ set -euo pipefail
 . "$HOME/app/fleet/etc/watchdog.env"
 export PATH="$FLEET_HOME/venv/bin:$PATH"
 export CUDA_VISIBLE_DEVICES RAY_NUM_CPUS FLEET_WORKDIR
+export RAY_METRICS_EXPORT_PORT RAY_MIN_WORKER_PORT RAY_MAX_WORKER_PORT
 exec 8>"$FLEET_WORKDIR/watchdog.lock"
 flock 8
 ray stop
