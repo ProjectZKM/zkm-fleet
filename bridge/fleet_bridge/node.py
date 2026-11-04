@@ -150,6 +150,32 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
     return True
 
 
+def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
+    """Appends one entry to a `services` list, keeping every other line as written. The entry
+    goes on one line in YAML flow style, under a block list, an empty list or a missing key."""
+    text = path.read_text()
+    root = yaml.compose(text)
+    node = next((v for k, v in root.value if k.value == section), None) if root else None
+    item = f"- {json.dumps(entry)}\n"
+    if isinstance(node, yaml.SequenceNode) and node.value and not node.flow_style:
+        last = node.value[-1]
+        end = offset = last.start_mark.index
+        for line in text[offset:last.end_mark.index].splitlines(keepends=True):
+            offset += len(line)
+            if _is_content(line):
+                end = offset
+        if not text[:end].endswith("\n"):
+            text, end = text + "\n", len(text) + 1
+        text = text[:end] + " " * (last.start_mark.column - 2) + item + text[end:]
+    elif isinstance(node, yaml.SequenceNode) and not node.value:
+        text = text[:node.start_mark.index].rstrip(" ") + "\n  " + item + text[node.end_mark.index:]
+    elif node is None and root is not None:
+        text = text if text.endswith("\n") or not text else text + "\n"
+        text += f"{section}:\n  " + item
+    else:
+        raise ValueError(f"{section}: must be a list to add an entry to")
+    _replace(path, text)
+
 class NodeExecutor:
     def __init__(self, services: str, batches: str, jobs_dir: str) -> None:
         self.services, self.batches, self.jobs_dir = Path(services), batches, Path(jobs_dir)
@@ -384,7 +410,17 @@ class NodeExecutor:
         A removed service has what is left of its replicas cleaned up the way disabling does;
         app data stays (storage roots, workdirs, env files and images belong to the operator).
         Settings are written to the configuration only: the scheduler drains and stops a
-        service first and starts it again afterwards."""
+        service first and starts it again afterwards. `p["create"]` adds a new serving app's
+        service (`kind: app`) to the configuration, disabled until the app is enabled."""
+        if "create" in p:
+            entry = p["create"]
+            if AppSpec.load(entry).kind.value != "app":
+                raise ValueError(f"{entry['name']}: an app is created as a kind: app service")
+            entries = (yaml.safe_load(self.services.read_text()) or {}).get("services") or []
+            if any(e.get("name") == entry["name"] for e in entries):
+                raise ValueError(f"{entry['name']} is already configured on this node")
+            append_entry(self.services, "services", entry)
+            return {"created": [entry["name"]]}
         if "batch" in p:
             name, path = p["batch"]["name"], Path(self.batches)
             if p.get("remove"):

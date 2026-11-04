@@ -415,3 +415,33 @@ def test_batch_launch_keeps_approved_regular_storage_usable(executor, monkeypatc
     monkeypatch.setattr(jobs, "launch", launch)
     executor.launch(p)
     assert launch.call_args.args[0].mounts[0].path == str(path)
+
+
+@pytest.mark.parametrize("text", [
+    SERVICES,
+    "# machine config\nservices:\n- name: only\n  kind: app\n  image: a:1\n# trailing note\n",
+    "# machine config\nservices: []\n",
+])
+def test_append_entry_keeps_every_other_line(tmp_path, text):
+    p=tmp_path/"services.yaml";p.write_text(text)
+    node.append_entry(p,"services",{"name":"new","kind":"app","namespace":"zkm","disabled":True,"image":"web:1"})
+    services=yaml.safe_load(p.read_text())["services"]
+    assert services[-1]=={"name":"new","kind":"app","namespace":"zkm","disabled":True,"image":"web:1"}
+    assert [s["name"] for s in services[:-1]]==[s["name"] for s in yaml.safe_load(text)["services"] or []]
+    for line in text.splitlines():
+        if line.startswith("#"):
+            assert line in p.read_text()
+
+
+def test_create_adds_a_disabled_serving_app_and_refuses_a_taken_name(executor):
+    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
+    assert app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)
+    assert yaml.safe_load(executor.services.read_text())["services"][-1]==entry
+    result,error=app_message(executor,"create-2",{"create":entry},app="web",ns="a"*32)
+    assert error and "already configured" in str(error)
+
+
+def test_create_refuses_a_service_that_is_not_an_app(executor):
+    before=executor.services.read_text()
+    result,error=app_message(executor,"create-1",{"create":{"name":"web","kind":"ziren-cpu","namespace":"a"*32}},app="web",ns="a"*32)
+    assert error and executor.services.read_text()==before

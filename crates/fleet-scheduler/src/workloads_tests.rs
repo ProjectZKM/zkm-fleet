@@ -1903,3 +1903,35 @@ async fn a_service_record_follows_the_app_its_node_configures() {
     let saved: AppDeployment = serde_json::from_slice(&std::fs::read(c.dir.join("services/gpu-service.json")).unwrap()).unwrap();
     assert_eq!(saved.service["app"], PROOF, "and so does its saved record");
 }
+
+#[tokio::test]
+async fn a_service_named_like_a_batch_does_not_attach_to_it() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = inventory(&ns);
+    report.services = vec![json!({"name":"training","kind":"app","namespace":ns,"app":"training","gpus":1,"cpus":1,
+        "replicas":1,"disabled":true,"ready":false,"cleaned":true,"image":"runner:1"}).into()];
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(!c.inner.lock().apps["training"].persistent, "the batch keeps its record");
+    assert!(!c.inner.lock().services.contains_key("gpu-training"), "and the service is not attached to it");
+}
+
+#[tokio::test]
+async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","gpus":1,"cpus":2,
+        "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}});
+    let response = scale_call(c.clone(), "admin", "POST", "/services", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(c.inner.lock().apps["model"].persistent);
+    assert_eq!(remove_commands(&c, NodeOperation::App), vec![("gpu".to_string(), json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},
+        "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"replicas":1,"gpus":1.0,"cpus":2,"image":"serve:1",
+        "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}}))]);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", body).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", json!({"name":"other","namespace":ns,"node":"gpu"})).await.status(),
+        StatusCode::BAD_REQUEST);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", json!({"name":"training","namespace":ns,"node":"gpu","image":"x"})).await.status(),
+        StatusCode::CONFLICT, "a batch's name is taken");
+    assert_eq!(scale_call(c, "admin", "POST", "/services", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x"})).await.status(),
+        StatusCode::NOT_FOUND);
+}

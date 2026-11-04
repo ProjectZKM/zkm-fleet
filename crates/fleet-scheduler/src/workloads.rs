@@ -753,7 +753,14 @@ impl WorkloadController {
                 spec["priority"] = json!(0);
             }
             let persistent = text(&spec, "kind") == "app";
-            let mut app = self.inner.lock().apps.get(&name).cloned().unwrap_or(WorkloadTemplate {
+            let existing = self.inner.lock().apps.get(&name).cloned();
+            // Apps and batches share one name space: a node's batch and serving app of the same
+            // name would otherwise merge into one record. The one already known keeps the name.
+            if existing.as_ref().is_some_and(|a| !a.removed && a.persistent != persistent) {
+                tracing::warn!(app = %name, "node reports an app and a batch with the same name; ignoring the one that is not registered");
+                continue;
+            }
+            let mut app = existing.unwrap_or(WorkloadTemplate {
                 name: name.clone(),
                 namespace: namespace.id.clone(),
                 tag: None,
@@ -775,6 +782,7 @@ impl WorkloadController {
             let name = text(observed, "name");
             if !is_safe_id(name)
                 || !matches!(text(observed, "kind"), "app" | "ziren-gpu" | "ziren-cpu")
+                || text(observed, "kind") == "app" && self.inner.lock().apps.get(name).is_some_and(|a| !a.removed && !a.persistent)
             {
                 continue;
             }
@@ -1681,7 +1689,7 @@ const BATCH_ADMIN_SETTINGS: [&str; 2] = ["user", "allow"];
 /// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batches"] {
+    for root in ["apps", "batches", "services"] {
         router = router
             .route(&format!("/{root}"), any(handle))
             .route(&format!("/{root}/*path"), any(handle));
@@ -1793,6 +1801,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         let last = |a: &Value| a["jobs"]["last_at"].as_f64().unwrap_or(0.0);
         apps.sort_by(|a, b| last(b).total_cmp(&last(a)));
         return Ok(Json(apps).into_response());
+    }
+    if method == Method::POST && parts == ["services"] {
+        let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+        return s.create_serving_app(c, &q, body).await;
     }
     if method == Method::POST && parts == ["apps"] {
         if !batch {

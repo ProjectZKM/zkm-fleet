@@ -598,3 +598,87 @@ impl WorkloadController {
         Ok(())
     }
 }
+
+impl WorkloadController {
+    /// Registers a serving app: a `kind: app` service on `node`, which the node writes to its
+    /// services.yaml disabled, so `fleetctl app enable` starts it. The name is one of the
+    /// namespace's apps and batches, so it is checked against both here and when the node reports.
+    pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>, body: Value) -> anyhow::Result<Response> {
+        let name = text(&body, "name").to_string();
+        if !crate::fleet::valid_app_name(&name) {
+            return Err(fail(400, "invalid app name"));
+        }
+        let node = text(&body, "node").to_string();
+        if node.is_empty() {
+            return Err(fail(400, "node is required: the node that runs the app"));
+        }
+        let allowed = ["name", "namespace", "node", "image", "user", "replicas", "gpus", "cpus", "shm_gb",
+            "port_base", "health_path", "workdir", "volumes", "env", "command"];
+        if body.as_object().is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str()))) {
+            return Err(fail(400, "unknown app fields"));
+        }
+        if !body["image"].as_str().is_some_and(|i| !i.is_empty() && !i.starts_with('-')) {
+            return Err(fail(400, "image is required"));
+        }
+        let (namespace, tag) = self.scope(c, q, body["namespace"].as_str())?;
+        WorkloadController::require_grant(c, &name)?;
+        WorkloadController::require_admin_settings(c, body.as_object().unwrap(), &Self::ADMIN_SERVICE_SETTINGS)?;
+        let replicas = body["replicas"].as_u64().unwrap_or(1);
+        if !(1..=64).contains(&replicas) {
+            return Err(fail(400, "replicas must be between 1 and 64"));
+        }
+        let gpus = body["gpus"].as_f64().unwrap_or(1.0);
+        if !(gpus >= 0.0 && gpus.is_finite()) || body["cpus"].as_u64().is_none() && !body["cpus"].is_null() {
+            return Err(fail(400, "gpus must be a number of cards and cpus a whole number"));
+        }
+        if !body["env"].is_null() && body["env"].as_object().is_none_or(|e| e.values().any(|v| !v.is_string())) {
+            return Err(fail(400, "env must map names to strings"));
+        }
+        if !body["command"].is_null() && body["command"].as_array().is_none_or(|a| a.iter().any(|v| !v.is_string())) {
+            return Err(fail(400, "command must be a list of strings"));
+        }
+        if !body["volumes"].is_null() && body["volumes"].as_array().is_none_or(|a| a.iter().any(|v| !v.is_string())) {
+            return Err(fail(400, "volumes must be a list of paths"));
+        }
+        let _ops = self.ops.lock().await;
+        {
+            let i = self.inner.lock();
+            if !node.is_empty() && !i.workers.contains_key(&node) {
+                return Err(fail(404, "unknown node"));
+            }
+            if i.apps.get(&name).is_some_and(|a| !a.removed)
+                || i.services.values().any(|s| text(&s.service, "name") == name)
+                || self.fleet.app_known(&namespace, &name)
+            {
+                return Err(fail(409, format!("an app or batch named {name} exists")));
+            }
+        }
+        let mut entry = json!({"name": name, "kind": "app", "namespace": namespace, "disabled": true,
+            "replicas": replicas, "gpus": gpus, "cpus": body["cpus"].as_u64().unwrap_or(1)});
+        if let Some(tag) = &tag {
+            entry["tag"] = json!(tag);
+        }
+        for key in ["image", "user", "shm_gb", "port_base", "health_path", "workdir", "volumes", "env", "command"] {
+            if !body[key].is_null() {
+                entry[key] = body[key].clone();
+            }
+        }
+        let mut spec = entry.clone();
+        spec["priority"] = json!(0);
+        let app = WorkloadTemplate {
+            name: name.clone(),
+            namespace: namespace.clone(),
+            tag: tag.clone(),
+            spec: spec.into(),
+            persistent: true,
+            removed: false,
+            workers: vec![node.clone()],
+        };
+        let mut message = self.app_message(&namespace, &name);
+        message["create"] = entry;
+        self.command(&node, NodeOperation::App, message)?;
+        self.save("apps", &name, &app)?;
+        self.inner.lock().apps.insert(name, app.clone());
+        Ok((StatusCode::CREATED, Json(self.serving_app_value(&app, tag.as_deref()))).into_response())
+    }
+}

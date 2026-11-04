@@ -85,7 +85,8 @@ struct AppArgs {
 #[derive(Subcommand)]
 enum AppCmd {
     /// Register a proof program as an app of the namespace: NAME --elf-id ID, or NAME --elf FILE.
-    /// Serving deployments are initially configured in the node's services.yaml.
+    /// Or a serving app (a long-running container with a port): NAME --service --node NODE --image IMAGE,
+    /// then `app enable` starts it.
     Add {
         #[command(flatten)]
         add: AddApp,
@@ -502,6 +503,73 @@ struct AddApp {
     #[arg(long, allow_hyphen_values = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
+    /// Register a serving app (a long-running container with its own port, such as a model
+    /// server) instead of a proof program. It starts disabled: `app enable` starts it.
+    #[arg(long)]
+    #[serde(skip)]
+    service: bool,
+    /// Serving app: the node that runs it.
+    #[arg(long)]
+    #[serde(skip)]
+    node: Option<String>,
+    /// Serving app: container image.
+    #[arg(long)]
+    #[serde(skip)]
+    image: Option<String>,
+    /// Serving app: container user, UID:GID (administrator credentials).
+    #[arg(long)]
+    #[serde(skip)]
+    user: Option<String>,
+    /// Serving app: replicas on the node (default 1).
+    #[arg(long)]
+    #[serde(skip)]
+    replicas: Option<u32>,
+    /// Serving app: GPU cards per replica (default 1; 0 for none).
+    #[arg(long)]
+    #[serde(skip)]
+    gpus: Option<f64>,
+    /// Serving app: CPUs per replica (default 1).
+    #[arg(long)]
+    #[serde(skip)]
+    cpus: Option<u32>,
+    /// Serving app: /dev/shm size in GiB.
+    #[arg(long)]
+    #[serde(skip)]
+    shm_gb: Option<u32>,
+    /// Serving app: replica i serves on port_base + i.
+    #[arg(long)]
+    #[serde(skip)]
+    port_base: Option<u32>,
+    /// Serving app: path that answers 200 when a replica is ready (default /).
+    #[arg(long)]
+    #[serde(skip)]
+    health_path: Option<String>,
+    /// Serving app: working directory in the container.
+    #[arg(long)]
+    #[serde(skip)]
+    workdir: Option<String>,
+    /// Serving app: a host path to mount at the same path, PATH[:ro|:rw] (repeat; administrator credentials).
+    #[arg(long = "mount")]
+    #[serde(skip)]
+    mounts: Vec<String>,
+    /// Serving app: K=V; repeat (administrator credentials).
+    #[arg(long)]
+    #[serde(skip)]
+    env: Vec<String>,
+    /// Serving app: the command, after `--`; {port} is the replica's port.
+    #[arg(last = true)]
+    #[serde(skip)]
+    command: Vec<String>,
+}
+
+impl AddApp {
+    /// Whether a flag only a serving app takes is set.
+    fn has_service_flags(&self) -> bool {
+        self.node.is_some() || self.image.is_some() || self.user.is_some() || self.replicas.is_some()
+            || self.gpus.is_some() || self.cpus.is_some() || self.shm_gb.is_some() || self.port_base.is_some()
+            || self.health_path.is_some() || self.workdir.is_some() || !self.mounts.is_empty()
+            || !self.env.is_empty() || !self.command.is_empty()
+    }
 }
 
 #[derive(Args)]
@@ -1102,10 +1170,16 @@ fn env_map(pairs: &[String]) -> anyhow::Result<Value> {
     Ok(Value::Object(env))
 }
 
-/// Registers a proof program as an app of the namespace.
+/// Registers a proof program as an app of the namespace, or a serving app with --service.
 fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
         bail!("app registration requires --namespace NAME; an administrator must create the namespace first");
+    }
+    if add.service {
+        return add_serving_app(add, conn, out);
+    }
+    if add.has_service_flags() {
+        bail!("--node, --image, --mount, --env and the command take a serving app: add --service");
     }
     let mut body = serde_json::to_value(add)?;
     body["elf_id"] = json!(match (&add.elf, &add.elf_id) {
@@ -1122,6 +1196,49 @@ fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
     out.done(
         &format!("added app {}: program {} (its jobs are accepted from now on)", add.name, body["elf_id"].as_str().unwrap_or("")),
+        v,
+    );
+    Ok(())
+}
+
+/// Registers a serving app on one node; the node's services.yaml gets its entry, disabled.
+fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+    if add.elf.is_some() || add.elf_id.is_some() || add.class.is_some() || add.anchor.is_some()
+        || !add.backends.is_empty() || add.zkm_version.is_some() || add.max_queued.is_some() || add.priority.is_some()
+    {
+        bail!("a serving app runs a container: it takes no proof program (--elf, --elf-id) or proof settings");
+    }
+    let node = add.node.as_deref().filter(|n| !n.is_empty()).context("--node NODE: the node that runs the app")?;
+    let image = add.image.as_deref().filter(|i| !i.is_empty()).context("--image IMAGE: the app's container image")?;
+    let mut body = json!({"name": add.name, "node": node, "image": image});
+    let optional = [
+        ("user", json!(add.user)),
+        ("replicas", json!(add.replicas)),
+        ("gpus", json!(add.gpus)),
+        ("cpus", json!(add.cpus)),
+        ("shm_gb", json!(add.shm_gb)),
+        ("port_base", json!(add.port_base)),
+        ("health_path", json!(add.health_path)),
+        ("workdir", json!(add.workdir)),
+    ];
+    for (key, value) in optional {
+        if !value.is_null() {
+            body[key] = value;
+        }
+    }
+    if !add.mounts.is_empty() {
+        body["volumes"] = json!(add.mounts);
+    }
+    if !add.command.is_empty() {
+        body["command"] = json!(add.command);
+    }
+    if !add.env.is_empty() {
+        body["env"] = env_map(&add.env)?;
+    }
+    let a = FleetClient::new(conn)?;
+    let v = a.send(a.req(reqwest::Method::POST, "/services").json(&body))?;
+    out.done(
+        &format!("added app {} on {node}: disabled until `fleetctl app enable {}`", add.name, add.name),
         v,
     );
     Ok(())
