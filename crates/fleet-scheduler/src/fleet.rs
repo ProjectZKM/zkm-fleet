@@ -7,14 +7,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use tokio::sync::{watch, Notify};
+use tokio::sync::Notify;
 
-use fleet_proto::fleet::v1::{Assignment, Completion, HeartbeatRequest, HeartbeatResponse, NodeInfo, ProveRequest,
+use fleet_proto::fleet::v1::{Assignment, Completion, HeartbeatRequest, HeartbeatResponse, NodeInfo,
 };
 use fleet_proto::stage::v1::Status as StageStatus;
 
-use crate::blobs::{self, BlobStore};
 use crate::config::SchedulerConfig;
+use fleet_proto::artifacts::is_safe_id;
 use crate::placement::{self, AnchorPolicy, AppPolicy, PlacementDecision, PlacementCandidate, SchedulingClass};
 use crate::quota::{Allocation, Quota, Usage};
 use crate::store::{normalize_address, App, ProofJob, ProofJobState, Namespace, Store, Token};
@@ -83,12 +83,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-struct ProofJobEntry {
-    job: ProofJob,
-    /// Bumped on every change; `GetStatus` long-polls on it.
-    changed: watch::Sender<u64>,
-}
-
 pub struct RegisteredProver {
     pub id: String,
     pub info: NodeInfo,
@@ -103,7 +97,7 @@ pub struct RegisteredProver {
 
 #[derive(Default)]
 struct SchedulerState {
-    jobs: HashMap<String, ProofJobEntry>,
+    jobs: HashMap<String, ProofJob>,
     nodes: HashMap<String, RegisteredProver>,
     /// (namespace, app) -> dedicated node name.
     anchors: HashMap<(String, String), String>,
@@ -117,9 +111,9 @@ struct SchedulerState {
 
 pub struct Scheduler {
     pub cfg: SchedulerConfig,
-    pub stage_submissions: tokio::sync::Mutex<()>,
+    /// Serializes proof submissions' id reservation.
+    pub submissions: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
-    pub blobs: BlobStore,
     pub proof_fetch: crate::proof_fetch::ProofFetcher,
     pub log_relay: crate::log_relay::LogRelay,
     cluster_token: String,
@@ -174,14 +168,12 @@ impl Scheduler {
     pub fn new(
         cfg: SchedulerConfig,
         store: Arc<dyn Store>,
-        blobs: BlobStore,
         cluster_token: String,
     ) -> Arc<Self> {
         Arc::new(Self {
-            stage_submissions: tokio::sync::Mutex::new(()),
+            submissions: tokio::sync::Mutex::new(()),
             cfg,
             store,
-            blobs,
             proof_fetch: crate::proof_fetch::ProofFetcher::default(),
             log_relay: crate::log_relay::LogRelay::default(),
             cluster_token,
@@ -337,26 +329,6 @@ impl Scheduler {
         }
     }
 
-    /// The key a public values URL carries: an HMAC of the proof id under a secret derived
-    /// from the cluster token, so the URL works only for whoever GetStatus gave it to.
-    pub fn public_values_key(&self, proof_id: &str) -> String {
-        use hmac::Mac;
-        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(
-            format!("zkm-fleet public values\0{}", self.cluster_token).as_bytes(),
-        )
-        .expect("HMAC takes any key length");
-        mac.update(proof_id.as_bytes());
-        hex::encode(&mac.finalize().into_bytes()[..16])
-    }
-
-    /// Whether `key` opens this proof's public values.
-    pub fn public_values_open(&self, proof_id: &str, key: Option<&str>) -> bool {
-        use subtle_eq::ConstantTimeEq;
-        key.is_some_and(|k| {
-            k.as_bytes().ct_eq(self.public_values_key(proof_id).as_bytes())
-        })
-    }
-
     pub fn namespace(&self, reference: &str) -> Option<Namespace> {
         self.namespaces.lock().values().find(|n| n.id == reference || n.name == reference).cloned()
     }
@@ -510,7 +482,7 @@ impl Scheduler {
     ) -> anyhow::Result<Allocation> {
         let _ops = self.quota_ops.lock().await;
         let deployment = id.strip_prefix("deployment:");
-        anyhow::ensure!(deployment.map_or_else(|| blobs::is_safe_id(id), blobs::is_safe_id), "invalid job/app id");
+        anyhow::ensure!(deployment.map_or_else(|| is_safe_id(id), is_safe_id), "invalid job/app id");
         let n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
         let prefix = if deployment.is_some() { "" } else { "job:" };
         let a = Allocation { id: format!("{prefix}{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus,
@@ -597,10 +569,6 @@ impl Scheduler {
         use sha2::Digest;
         let tag = tag.unwrap_or("");
         format!("p-{}", hex::encode(sha2::Sha256::digest(format!("{namespace}\0{tag}\0{client_id}"))))
-    }
-
-    pub fn public_values_key_for(&self, id: &str, issuer: &str) -> String {
-        self.public_values_key(&format!("{id}\0{issuer}"))
     }
 
     /// Records a token. An administrator's holds `admin` alone and no namespace; any other
@@ -698,9 +666,20 @@ impl Scheduler {
         self.wake.notify_one();
     }
 
-    /// Reloads queued and running jobs after a restart; running ones go back to the queue.
+    /// Reloads queued and running jobs after a restart; running ones go back to the queue. A
+    /// job without inputs in app storage came through the retired stage API: it fails.
     pub async fn recover(&self) -> anyhow::Result<usize> {
         let mut jobs = self.store.incomplete().await?;
+        for j in jobs.iter_mut().filter(|j| j.inputs.is_none()) {
+            j.state = ProofJobState::Failed as i32;
+            j.fail_status = Some(StageStatus::InternalError as i32);
+            j.error = "its inputs were sent through the retired stage API: submit it again through its app's endpoint".into();
+            j.finished_ms = Some(now_ms());
+            self.store.upsert(j).await?;
+            self.release_quota(&format!("proof:{}", j.id)).await?;
+            tracing::warn!(job = %j.id, "failed: submitted through the retired stage API");
+        }
+        jobs.retain(|j| j.inputs.is_some());
         for j in &mut jobs {
             if j.state() == ProofJobState::Running {
                 // `node` stays as a hint: that node may still be proving the job and
@@ -712,14 +691,7 @@ impl Scheduler {
         let n = jobs.len();
         let mut inner = self.inner.lock();
         for j in jobs {
-            let (tx, _) = watch::channel(0);
-            inner.jobs.insert(
-                j.id.clone(),
-                ProofJobEntry {
-                    job: j,
-                    changed: tx,
-                },
-            );
+            inner.jobs.insert(j.id.clone(), j);
         }
         drop(inner);
         self.wake.notify_one();
@@ -731,7 +703,7 @@ impl Scheduler {
             .lock()
             .jobs
             .values()
-            .filter(|e| e.job.namespace == namespace && e.job.app == app && !e.job.state().is_terminal())
+            .filter(|e| e.namespace == namespace && e.app == app && !e.state().is_terminal())
             .count()
     }
 
@@ -739,10 +711,8 @@ impl Scheduler {
     pub async fn submit(&self, job: ProofJob) -> anyhow::Result<bool> {
         job.validate()?;
         anyhow::ensure!(self.namespace(&job.namespace).is_some(), "job namespace does not exist");
+        anyhow::ensure!(job.state().is_terminal() || job.inputs.is_some(), "a proof job's inputs are in app storage");
         let _ops = self.app_ops.read().await;
-        if !job.state().is_terminal() && job.inputs.is_none() && !self.blobs.has_elf(&job.elf_id) {
-            anyhow::bail!("program {} is not stored (its app was deleted): send the ELF itself again", job.elf_id);
-        }
         {
             let inner = self.inner.lock();
             if inner.jobs.contains_key(&job.id) {
@@ -753,18 +723,14 @@ impl Scheduler {
             return Ok(false);
         }
         self.store.upsert(&job).await?;
-        let (tx, _) = watch::channel(0);
-        self.inner
-            .lock()
-            .jobs
-            .insert(job.id.clone(), ProofJobEntry { job, changed: tx });
+        self.inner.lock().jobs.insert(job.id.clone(), job);
         self.wake.notify_one();
         Ok(true)
     }
 
     pub async fn job(&self, id: &str) -> anyhow::Result<Option<ProofJob>> {
         if let Some(e) = self.inner.lock().jobs.get(id) {
-            return Ok(Some(e.job.clone()));
+            return Ok(Some(e.clone()));
         }
         self.store.get(id).await
     }
@@ -798,7 +764,7 @@ impl Scheduler {
             .lock()
             .jobs
             .values()
-            .filter(|e| e.job.namespace == namespace && e.job.app == name && !e.job.state().is_terminal())
+            .filter(|e| e.namespace == namespace && e.app == name && !e.state().is_terminal())
             .count() as u64;
         if app.active > 0 || live > 0 {
             return Err(refuse(409, format!(
@@ -806,7 +772,6 @@ impl Scheduler {
                 app.active.max(live)
             )));
         }
-        let elf_id = app.elf_id.clone();
         let ids = self.store.delete_app(namespace, name).await?;
         self.apps.lock().remove(&(namespace.to_string(), name.to_string()));
         {
@@ -820,20 +785,8 @@ impl Scheduler {
                 }
             }
         }
-        let mut files_failed = 0;
-        for id in &ids {
-            if self.blobs.remove_job(id).is_err() {
-                files_failed += 1;
-            }
-        }
-        let shared = apps.iter().any(|a| a.elf_id == elf_id && (a.name != name || a.namespace != namespace))
-            || self.inner.lock().jobs.values().any(|e| e.job.elf_id == elf_id);
-        let elf_removed = !shared && self.blobs.remove_elf(&elf_id).unwrap_or(false);
-        tracing::info!(app = %name, jobs = ids.len(), elf_removed, "app deleted");
-        Ok(serde_json::json!({
-            "app": name, "jobs_deleted": ids.len(), "elf_removed": elf_removed,
-            "files_not_removed": files_failed,
-        }))
+        tracing::info!(app = %name, jobs = ids.len(), "app deleted");
+        Ok(serde_json::json!({"app": name, "jobs_deleted": ids.len()}))
     }
 
     /// The newest jobs (the store has every one) that the filter selects.
@@ -842,41 +795,11 @@ impl Scheduler {
         self.store.recent(f, limit).await
     }
 
-    /// Waits up to `timeout` for the job to reach a terminal state.
-    pub async fn wait_terminal(&self, id: &str, timeout: Duration) {
-        let rx = {
-            let inner = self.inner.lock();
-            match inner.jobs.get(id) {
-                Some(e) if !e.job.state().is_terminal() => e.changed.subscribe(),
-                _ => return,
-            }
-        };
-        let mut rx = rx;
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            match tokio::time::timeout_at(deadline, rx.changed()).await {
-                Ok(Ok(())) => {
-                    if self
-                        .inner
-                        .lock()
-                        .jobs
-                        .get(id)
-                        .map_or(true, |e| e.job.state().is_terminal())
-                    {
-                        return;
-                    }
-                }
-                _ => return,
-            }
-        }
-    }
-
     fn update_job(&self, id: &str, f: impl FnOnce(&mut ProofJob)) -> Option<ProofJob> {
         let mut inner = self.inner.lock();
-        let e = inner.jobs.get_mut(id)?;
-        f(&mut e.job);
-        e.changed.send_modify(|v| *v += 1);
-        Some(e.job.clone())
+        let job = inner.jobs.get_mut(id)?;
+        f(job);
+        Some(job.clone())
     }
 
     // ---------------------------------------------------------------- nodes
@@ -920,9 +843,9 @@ impl Scheduler {
         // The worker can resume the same lease without waiting for a scheduler restart.
         let busy = inner.jobs.values()
             .find(|e| {
-                e.job.state() == ProofJobState::Running && e.job.node.as_deref() == Some(info.name.as_str())
+                e.state() == ProofJobState::Running && e.node.as_deref() == Some(info.name.as_str())
             })
-            .map(|e| e.job.id.clone());
+            .map(|e| e.id.clone());
         tracing::info!(node = %info.name, backend = %info.backend, gpus = info.gpus, "node registered");
         inner.nodes.insert(
             id.clone(),
@@ -1003,7 +926,7 @@ impl Scheduler {
         let inner = self.inner.lock();
         let (mut queued, mut running) = (0, 0);
         for e in inner.jobs.values() {
-            match e.job.state() {
+            match e.state() {
                 ProofJobState::Queued => queued += 1,
                 ProofJobState::Running => running += 1,
                 _ => {}
@@ -1083,19 +1006,19 @@ impl Scheduler {
         let mut queued: Vec<(std::cmp::Reverse<i32>, u64, String)> = inner
             .jobs
             .values()
-            .filter(|e| e.job.state() == ProofJobState::Queued)
+            .filter(|e| e.state() == ProofJobState::Queued)
             .map(|e| {
                 (
-                    std::cmp::Reverse(e.job.priority),
-                    e.job.created_ms,
-                    e.job.id.clone(),
+                    std::cmp::Reverse(e.priority),
+                    e.created_ms,
+                    e.id.clone(),
                 )
             })
             .collect();
         queued.sort();
         let mut out = Vec::new();
         for (_, _, job_id) in queued {
-            let job = inner.jobs[&job_id].job.clone();
+            let job = inner.jobs[&job_id].clone();
             let Some(policy) = policies.get(&(job.namespace.clone(), job.app.clone())) else {
                 continue;
             };
@@ -1145,7 +1068,7 @@ impl Scheduler {
                     && self.allocations.lock().contains_key(&format!("proof:{}", job.id)) {
                     continue;
                 }
-                inner.jobs.get_mut(&job_id).unwrap().job.node = None;
+                inner.jobs.get_mut(&job_id).unwrap().node = None;
             }
             let ids: Vec<String> = inner.nodes.keys().cloned().collect();
             let views: Vec<PlacementCandidate> = ids
@@ -1192,7 +1115,7 @@ impl Scheduler {
         node_id: &str,
     ) {
         let name = inner.nodes[node_id].info.name.clone();
-        let job = &inner.jobs[job_id].job;
+        let job = &inner.jobs[job_id];
         let anchor_key = (job.namespace.clone(), job.app.clone());
         let anchor = inner.anchors.get(&anchor_key).cloned();
         if app.anchor != AnchorPolicy::None && anchor.as_deref() != Some(name.as_str()) {
@@ -1209,13 +1132,12 @@ impl Scheduler {
         }
         inner.nodes.get_mut(node_id).unwrap().busy = Some(job_id.to_string());
         let e = inner.jobs.get_mut(job_id).unwrap();
-        e.job.state = ProofJobState::Running as i32;
-        e.job.node = Some(name);
-        if e.job.started_ms.is_none() {
-            e.job.attempts += 1;
-            e.job.started_ms = Some(now_ms());
+        e.state = ProofJobState::Running as i32;
+        e.node = Some(name);
+        if e.started_ms.is_none() {
+            e.attempts += 1;
+            e.started_ms = Some(now_ms());
         }
-        e.changed.send_modify(|v| *v += 1);
     }
 
     fn release(&self, node_id: &str, job_id: &str, elf_id: Option<&str>) {
@@ -1237,7 +1159,7 @@ impl Scheduler {
     async fn prepare(self: Arc<Self>, job_id: String, _node_id: String) {
         loop {
             let _ops = self.completion_ops.lock().await;
-            let Some(job) = self.inner.lock().jobs.get(&job_id).map(|e| e.job.clone()) else { return; };
+            let Some(job) = self.inner.lock().jobs.get(&job_id).cloned() else { return; };
             if job.state() != ProofJobState::Running { return; }
             let allocation = self.allocations.lock().get(&format!("proof:{job_id}")).cloned();
             let durable = async {
@@ -1265,25 +1187,19 @@ impl Scheduler {
     ) -> Result<Vec<u8>, tonic::Status> {
         if job.state() != ProofJobState::Succeeded { return Err(tonic::Status::failed_precondition("proof has not succeeded",
             )); }
-        if let Some(outputs) = &job.outputs {
-            let reference = match name {
-                blobs::PROOF => outputs.proof.clone(),
-                blobs::PUBLIC_VALUES => outputs.public_values.clone(),
-                _ => return Err(tonic::Status::not_found("unknown proof output")),
-            }.ok_or_else(|| tonic::Status::internal("output reference missing"))?;
-            let output_root = job.inputs.as_ref().ok_or_else(|| tonic::Status::internal("output root missing"))?.output_root.clone();
-            self.proof_fetch.fetch(&outputs.machine, fleet_proto::fleet::v1::ProofFetch {
-                job_id: job.id.clone(), lease: Self::assignment(job).lease, elf_id: job.elf_id.clone(),
-                output_root, name: name.into(), reference: Some(reference), ..Default::default()
-            },
-                ).await
-        } else {
-            self.blobs.sdk_output(job, name).await.map_err(|e| {
-                if e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-                    tonic::Status::not_found("proof output is not available on the control plane")
-                } else { tonic::Status::internal(e.to_string()) }
-            })
-        }
+        // A job proved through the retired stage API kept its output on the control host.
+        let outputs = job.outputs.as_ref()
+            .ok_or_else(|| tonic::Status::not_found("proof output is not available: the job came through the retired stage API"))?;
+        let reference = match name {
+            fleet_proto::artifacts::PROOF => outputs.proof.clone(),
+            fleet_proto::artifacts::PUBLIC_VALUES => outputs.public_values.clone(),
+            _ => return Err(tonic::Status::not_found("unknown proof output")),
+        }.ok_or_else(|| tonic::Status::internal("output reference missing"))?;
+        let output_root = job.inputs.as_ref().ok_or_else(|| tonic::Status::internal("output root missing"))?.output_root.clone();
+        self.proof_fetch.fetch(&outputs.machine, fleet_proto::fleet::v1::ProofFetch {
+            job_id: job.id.clone(), lease: Self::assignment(job).lease, elf_id: job.elf_id.clone(),
+            output_root, name: name.into(), reference: Some(reference), ..Default::default()
+        }).await
     }
 
     /// Fence input access and completion reports by session, worker and execution attempt.
@@ -1294,40 +1210,10 @@ impl Scheduler {
             .ok_or_else(|| tonic::Status::not_found("job missing"))?;
         if j.node.as_deref() != Some(&name) || j.started_ms.is_none()
             || Self::assignment(&j).job_id != a.job_id
-            || Self::assignment(&j).elf_id != a.elf_id || Self::assignment(&j).lease != a.lease
-            || (j.inputs.is_some() && Self::assignment(&j) != *a) {
+            || Self::assignment(&j) != *a {
             return Err(tonic::Status::failed_precondition("assignment superseded"));
         }
         Ok(j)
-    }
-
-    pub async fn fetch_inputs(&self, node_id: &str, a: &Assignment, with_elf: bool,
-    ) -> Result<ProveRequest, tonic::Status> {
-        let j = self.assigned_job(node_id, a).await?;
-        if j.state().is_terminal() { return Err(tonic::Status::failed_precondition("job already finished")); }
-        if j.inputs.is_some() { return Err(tonic::Status::failed_precondition("inputs are in app-owned storage; read the assignment references directly",
-            )); }
-        self.build_request(&j, with_elf).map_err(|e| tonic::Status::internal(e.to_string()))
-    }
-
-    /// Nodes initiate output publication; the scheduler never connects to a node.
-    pub async fn publish_output(&self, node_id: &str, a: &Assignment, result: fleet_proto::fleet::v1::ProveResponse,
-    ) -> Result<(), tonic::Status> {
-        let _ops = self.completion_ops.lock().await;
-        let j = self.assigned_job(node_id, a).await?;
-        if j.inputs.is_some() { return Err(tonic::Status::failed_precondition("outputs stay in app-owned storage; report references in completion metadata",
-            )); }
-        if !matches!(j.state(), ProofJobState::Running | ProofJobState::Succeeded) {
-            return Err(tonic::Status::failed_precondition("job cannot publish output",
-            ));
-        }
-        if result.proof_json.is_empty() || result.proof_json.len() > 64 << 20 || result.public_values.len() > 64 << 20 {
-            return Err(tonic::Status::invalid_argument("invalid proof output size"));
-        }
-        let blobs = self.blobs.clone();
-        tokio::task::spawn_blocking(move || blobs.publish_output(&j, &result)).await
-            .map_err(|e| tonic::Status::internal(e.to_string()))?
-            .map_err(|e| tonic::Status::internal(e.to_string()))
     }
 
     pub async fn exchange(&self, r: HeartbeatRequest) -> Result<HeartbeatResponse, tonic::Status> {
@@ -1354,9 +1240,9 @@ impl Scheduler {
                 n.busy.as_ref().filter(|id| inner.deliverable.contains(*id))
                     .and_then(|id| inner.jobs.get(id))
                     .filter(|e| {
-                            e.job.state() == ProofJobState::Running && e.job.node.as_ref() == Some(&n.info.name)
+                            e.state() == ProofJobState::Running && e.node.as_ref() == Some(&n.info.name)
                         })
-                    .map(|e| Self::assignment(&e.job))
+                    .map(|e| Self::assignment(&e))
             })
         };
         Ok(HeartbeatResponse { known: true, assignment, completed_lease,
@@ -1422,23 +1308,6 @@ impl Scheduler {
         Ok(())
     }
 
-    fn build_request(&self, job: &ProofJob, with_elf: bool) -> anyhow::Result<ProveRequest> {
-        let stdin: Vec<Vec<u8>> = bincode::deserialize(&self.blobs.get(&job.id, blobs::STDIN)?)?;
-        let receipts: Vec<Vec<u8>> =
-            bincode::deserialize(&self.blobs.get(&job.id, blobs::RECEIPTS)?)?;
-        Ok(ProveRequest {
-            job_id: job.id.clone(),
-            elf_id: job.elf_id.clone(),
-            elf: if with_elf {
-                self.blobs.elf(&job.elf_id)?
-            } else {
-                Vec::new()
-            },
-            stdin_buffer: stdin,
-            receipts,
-            kind: job.kind as i32,
-        })
-    }
 
 
 }

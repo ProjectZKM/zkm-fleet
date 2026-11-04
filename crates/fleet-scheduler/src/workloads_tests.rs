@@ -1,5 +1,5 @@
 use super::*;
-use crate::{blobs::BlobStore, config::SchedulerConfig, quota::Quota, store::MemoryStore};
+use crate::{config::SchedulerConfig, quota::Quota, store::MemoryStore};
 use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
@@ -29,11 +29,10 @@ async fn serve(c: &Arc<WorkloadController>, request: Request) -> Response {
 
 async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     let dir = tempfile::tempdir().unwrap();
-    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://localhost\ndata_dir: {}\ncluster_token_file: cluster\n",dir.path().display())).unwrap();
+    let cfg: SchedulerConfig = serde_yaml::from_str(&format!("data_dir: {}\ncluster_token_file: cluster\n",dir.path().display())).unwrap();
     let fleet = Scheduler::new(
         cfg,
         Arc::new(MemoryStore::default()),
-        BlobStore::new(dir.path()).unwrap(),
         "cluster".into(),
     );
     fleet.load_tokens().await.unwrap();

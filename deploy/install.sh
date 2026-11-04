@@ -64,13 +64,11 @@ if [ "$ROLE" = control ]; then
   [ -n "$PUBLIC_URL" ] || PUBLIC_URL="https://$IP:8905"
   [ -f "$ETC/tls/ca.pem" ] || "$FLEETCTL" init tls --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname),$IP}" >/dev/null
   [ -f "$ETC/fleet.yaml" ] || cat > "$ETC/fleet.yaml" <<EOF
-stage_addr: 0.0.0.0:51000
 control_addr: 0.0.0.0:51001
 control_tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
 http_addr: 0.0.0.0:9191
-public_url: $PUBLIC_URL
 database_url_file: /etc/zkm-fleet/database_url
 data_dir: /var/lib/zkm-fleet
 cluster_token_file: /etc/zkm-fleet/cluster.token

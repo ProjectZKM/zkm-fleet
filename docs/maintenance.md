@@ -122,6 +122,17 @@ registered proof app gains its app record from the entry a node runs for it. A n
 `PSQL="docker run --rm -i --network host postgres:16 psql"`. Each run copies what it
 changes to a `.pre-app-model-<time>` sibling first.
 
+The same release retires the scheduler's SDK stage API (`GenerateProof`/`GetStatus`
+on `stage_addr`): SDK clients prove through their
+[app-owned proof endpoint](reference.md#app-owned-proof-endpoint). Remove `stage_addr`,
+`tls`, `public_url`, `long_poll_ms` and `proof_output_dir` from `fleet.yaml` first; the
+scheduler refuses to start with them. Let proof jobs submitted through the stage API
+finish: one still queued or running fails when the new scheduler starts. Remove the
+gateway's `/stage.v1.StageService/` route, which has nothing behind it. The control
+host's `data_dir/elf`, `data_dir/jobs` and `data_dir/proofs` held that API's payloads;
+delete them once rollback is no longer needed. A node ignores `proof_output_dir` in
+`apps.yaml`.
+
 Build the generic programs from that revision:
 
 ```bash

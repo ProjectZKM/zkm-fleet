@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(about = "zkm-fleet scheduler: stage API, node control, dispatch")]
+#[command(about = "zkm-fleet scheduler: apps, proof jobs, batches and node control")]
 struct SchedulerArgs {
     /// Scheduler configuration (YAML).
     #[arg(short, long, env = "FLEET_CONFIG", default_value = "fleet.yaml", global = true)]

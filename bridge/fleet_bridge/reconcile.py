@@ -24,7 +24,7 @@ NAMESPACE = "zkm-fleet"
 ACTORS: dict[AppRuntime, Any] = {AppRuntime.ZIREN_GPU: ZirenGpuProver, AppRuntime.ZIREN_CPU: ZirenCpuProver,
                                   AppRuntime.APP: GpuApp}
 # the cluster settings a replica's hash covers, as the file names them
-_SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "proof_output_dir", "gpu_port_range")
+_SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "gpu_port_range")
 
 
 def load_apps(data: Mapping[str, Any]) -> AppsConfig:

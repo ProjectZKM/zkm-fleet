@@ -76,8 +76,7 @@ def _node_env(spec: AppReplicaSpec, backend: str, app_env: bool = False, **extra
                    cluster_token_file=c.cluster_token_file, machine=socket.gethostname(),
                    app_namespace=app_namespace, app=app, app_elf_id=app_elf_id,
                    app_storage_root=spec.app.proof_storage_root,
-                   rust_log=spec.app.rust_log, cpus=int(spec.app.cpus),
-                   output_dir=c.proof_output_dir or os.path.join(c.log_dir, "proofs"), **extra)  # type: ignore[arg-type]
+                   rust_log=spec.app.rust_log, cpus=int(spec.app.cpus), **extra)  # type: ignore[arg-type]
     env = dict(os.environ)
     env.update(to_env(node))
     if app_env:

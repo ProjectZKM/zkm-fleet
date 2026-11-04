@@ -65,7 +65,7 @@ enum Cmd {
     Token(TokenArgs),
     /// Inspect your namespace; administrators manage shared quotas and access.
     Namespace(NamespaceArgs),
-    /// Set up a cluster's secrets, offline: the cluster token, the stage API's certificates
+    /// Set up a cluster's secrets, offline: the cluster token, the gateway's certificates
     /// (install.sh runs these; no scheduler is needed).
     #[command(subcommand)]
     Init(InitCmd),
@@ -303,13 +303,13 @@ struct TokenBundle {
         /// Env file for the client (0600): ZKM_PROVER, ENDPOINT, token and signing key.
         #[arg(long)]
         out: PathBuf,
-        /// Stage API endpoint clients use, e.g. https://fleet.example:51000.
+        /// The SDK endpoint clients use: their app's endpoint (fleet-proof-app), e.g. http://127.0.0.1:51012.
         #[arg(long)]
         endpoint: String,
-        /// Server name in the stage certificate, when it is not the SDK's default "stage".
+        /// Server name in the endpoint's certificate, when it is not the SDK's default "stage".
         #[arg(long)]
         domain_name: Option<String>,
-        /// CA bundle used to verify the stage server certificate; omit when the SDK can use system trust roots.
+        /// CA bundle used to verify the endpoint's certificate; omit when the SDK can use system trust roots.
         #[arg(long)]
         server_ca: Option<PathBuf>,
  }
@@ -563,7 +563,7 @@ enum InitCmd {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Create a CA and the stage API's server certificate.
+    /// Create a CA and the server certificate of the gateway and the control API.
     Tls {
         #[arg(long)]
         dir: PathBuf,
@@ -1520,7 +1520,7 @@ fn init(cmd: &InitCmd, out: &OutputWriter) -> anyhow::Result<()> {
             out.done(
                 &format!(
                     "CA and server certificate for {names:?} in {d}\n\
-                     scheduler: tls.cert_path={d}/server.pem tls.key_path={d}/server.key\n\
+                     scheduler: control_tls.cert_path={d}/server.pem control_tls.key_path={d}/server.key\n\
                      clients:   CA_CERT_PATH={d}/ca.pem (and DOMAIN_NAME={} if not \"stage\")",
                     names[0]
                 ),

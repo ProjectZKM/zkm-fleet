@@ -1,4 +1,3 @@
-pub mod blobs;
 pub mod config;
 pub mod control;
 pub mod fleet;
@@ -10,7 +9,6 @@ pub mod log_relay;
 pub mod proof_fetch;
 pub mod quota;
 pub mod workloads;
-pub mod stage;
 pub mod store;
 pub mod token;
 
@@ -21,7 +19,6 @@ use tokio::sync::watch;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
 use fleet_proto::fleet::v1::control_service_server::ControlServiceServer;
-use fleet_proto::stage::v1::stage_service_server::StageServiceServer;
 
 /// Resolves on SIGTERM or Ctrl-C.
 async fn terminated() {
@@ -49,18 +46,14 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
                 (Arc::new(store::MemoryStore::default()), None)
             }
         };
-    let blobs = blobs::BlobStore::new(&cfg.data_dir)?.with_proof_output(
-        cfg.proof_output_dir
-            .clone()
-            .unwrap_or_else(|| cfg.data_dir.join("proofs")),
-    );
-    let fleet = fleet::Scheduler::new(cfg.clone(), store, blobs, cluster_token.clone());
+    let fleet = fleet::Scheduler::new(cfg.clone(), store, cluster_token.clone());
     let mut tokens = fleet.load_tokens().await?;
     if cfg.database_url.is_none() {
         // Nothing outside this process can issue one into memory: it issues its own.
         let path = cfg.data_dir.join("admin.token");
         let (admin, secret) = token::new_admin_token("in-memory scheduler");
         fleet.add_user_token(&admin.id, &admin.address, &admin.label, None, admin.token_hash.clone(), None, None, admin.permissions.clone()).await?;
+        std::fs::create_dir_all(&cfg.data_dir)?;
         let _ = std::fs::remove_file(&path);
         write_secret(&path, &secret)?;
         tracing::warn!(path = %path.display(), "administrator token for this in-memory scheduler");
@@ -75,23 +68,6 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         "scheduler state loaded"
     );
 
-    let mut stage_server = Server::builder();
-    if let Some(tls) = &cfg.tls {
-        let identity = Identity::from_pem(
-            std::fs::read(&tls.cert_path)?,
-            std::fs::read(&tls.key_path)?,
-        );
-        stage_server = stage_server.tls_config(ServerTlsConfig::new().identity(identity))?;
-    } else {
-        tracing::warn!("stage API without TLS: keep it off untrusted networks");
-    }
-    // The deprecated SDK stage API, kept for existing network clients (stage.rs).
-    let stage = StageServiceServer::new(stage::ProofStageService {
-        fleet: fleet.clone(),
-    })
-    .max_decoding_message_size(1 << 30)
-    .max_encoding_message_size(1 << 30);
-    let stage_addr = cfg.stage_addr.parse()?;
     let (stop_tx, stop_rx) = watch::channel(false);
     let stopping = move || {
         let mut rx = stop_rx.clone();
@@ -99,10 +75,6 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
             let _ = rx.wait_for(|stop| *stop).await;
         }
     };
-    let stage_task = stage_server
-        .add_service(stage)
-        .serve_with_shutdown(stage_addr, stopping());
-
     let workloads = Arc::new(workloads::WorkloadController::new(
         fleet.clone(),
         cluster_token.clone(),
@@ -118,9 +90,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let control = tonic::codegen::InterceptedService::new(
         ControlServiceServer::new(control::ProverControlService {
             fleet: fleet.clone(),
-        })
-        .max_decoding_message_size(1 << 30)
-        .max_encoding_message_size(1 << 30),
+        }),
         token::ClusterTokenVerifier(Arc::new(cluster_token)),
     );
     let control_addr = cfg.control_addr.parse()?;
@@ -147,7 +117,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
     let http_task = axum::serve(listener, http).with_graceful_shutdown(stopping());
 
-    tracing::info!(stage = %cfg.stage_addr, control = %cfg.control_addr, http = %cfg.http_addr, "listening");
+    tracing::info!(control = %cfg.control_addr, http = %cfg.http_addr, "listening");
     let dispatcher = tokio::spawn(fleet.clone().dispatch_loop());
     let dispatch_loop = tokio::spawn(workloads.dispatch_loop());
     let f = fleet.clone();
@@ -159,7 +129,6 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     });
     let servers = async {
         tokio::try_join!(
-            anyhow_of(stage_task),
             anyhow_of(control_task),
             anyhow_of(http_task)
         )?;

@@ -45,8 +45,7 @@ For example:
 
 ```bash
 fleetctl namespace create alice --gpus 6 --cpus 64 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl namespace get alice
 fleetctl namespace quota alice --tag team=research --gpus 2 --cpus 16
 fleetctl namespace get alice --tag team=research
@@ -54,7 +53,8 @@ fleetctl namespace get alice --tag team=research
 
 Creation writes `alice.env`, `alice.token` and, when `--server-ca` is supplied,
 `alice.ca.pem` beside the environment file. Give that bundle to the owner securely.
-`--endpoint` is the proof SDK gateway; `--url` selects Fleet's control API.
+`--endpoint` is the bundle's SDK `ENDPOINT`, the owner's
+[app-owned proof endpoint](reference.md#app-owned-proof-endpoint); `--url` selects Fleet's control API.
 Use an existing CA certificate here; `init tls` belongs to control-host installation.
 
 Each `quota` command replaces both limits: an omitted limit becomes unlimited,

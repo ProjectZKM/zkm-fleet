@@ -8,7 +8,6 @@ node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
-proof_output_dir: /var/lib/zkm-fleet/proofs # legacy proof jobs only
 apps:
   # Resources not reserved by enabled apps remain available to batch jobs.
   - name: ethproofs-gpu

@@ -163,7 +163,7 @@ proofs remain fetchable through the machine agent.
 App owners control retention of their input and output files.
 
 `fleetctl job fetch JOB_ID --out DIR` downloads proof JSON and public values (the
-destination must not exist). For reference jobs, Fleet authorizes the request,
+destination must not exist). Fleet authorizes the request,
 delivers a short-lived fetch ticket in the machine's next ordinary heartbeat,
 and relays the node's HTTPS response in bounded memory. `fleet-ziren-node fetch-artifact`
 verifies committed files against the job, execution lease and
@@ -217,9 +217,8 @@ file with one absolute root per line; `deploy/install.sh node --proof-storage-ro
 installs this configuration. Keep these roots configured when GPU actors stop.
 The machine agent executes storage-only fetches separately from its heartbeats and Ray operations.
 
-Reference jobs avoid control-host input uploads and proactive output publication.
-A remote fetch through Fleet still transfers its requested bytes through the
-control host. The app endpoint logs input storage and metadata admission time
+Fleet stores no proof inputs or outputs. A remote fetch through Fleet transfers its
+requested bytes through the control host. The app endpoint logs input storage and metadata admission time
 separately from the node's `prove_ms`.
 
 **Proving time is execution time.** For GPU proofs, `prove_ms` comes from the
@@ -231,21 +230,6 @@ The SDK response carries this value in `GetStatus.proving_time`. Reporting clien
 must preserve it (for example, through `take_prove_ms()`); an SDK that only logs
 it needs a timing accessor. Integrated EthProofs takes execution timing directly
 from its GPU response and excludes preparation, queueing and reporting.
-
-### Scheduler stage API (deprecated)
-
-The scheduler still serves the SDK's gRPC stage API (`GenerateProof`, `GetStatus`)
-on `stage_addr` (default `0.0.0.0:51000`, behind the HTTPS gateway on `8905`) for
-`ZKM_PROVER=network` clients whose `ENDPOINT` points at Fleet. Its remaining client
-is reth-processor's `eth-proofs` and `host`. Such a request carries the program and
-its inputs to the control host's blob storage, and outputs come back through the
-control-host fetch relay.
-
-This endpoint is deprecated. It keeps working and takes no new features. Point new
-SDK clients at an [app-owned proof endpoint](#app-owned-proof-endpoint) instead:
-the same SDK and token, with `ENDPOINT` set to that endpoint's stage port, and
-payloads kept in app storage. The HTTP proof job routes (`/apps/NAME/jobs`) that
-app endpoints use are not deprecated.
 
 ## Namespaces, access and quotas
 
@@ -302,8 +286,7 @@ inside that namespace and tag:
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl --token-file alice.token --namespace alice --tag scope=default batch add training --image IMAGE
 fleetctl --token-file alice.token --namespace alice --tag scope=default app add eth --spec prover.json --elf-id FULL_ELF_SHA256
 ```
@@ -432,8 +415,7 @@ indefinitely; normal job lifecycle rules and existing application timeouts still
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl namespace quota alice --gpus 4 --cpus 32
 fleetctl namespace get alice       # quota and currently reserved units
 fleetctl namespace quota alice     # clear both caps: unlimited (a write operation)
@@ -536,14 +518,13 @@ control namespace, while Fleet namespace IDs scope policy and accounting.
 
 ```bash
 fleetctl namespace create team --gpus 8 --cpus 64 \
-  --endpoint https://fleet.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out team.env
+  --endpoint http://127.0.0.1:51012 --out team.env
 fleetctl namespace quota team --tag scope=research --gpus 2 --cpus 16
 fleetctl namespace quota team --tag scope=production --gpus 6 --cpus 48
 fleetctl namespace get team                  # namespace quota, usage and tags
 fleetctl namespace get team --tag scope=research   # namespace totals and tag quota/usage
 fleetctl token issue --namespace team --tag scope=research \
-  --app training --endpoint https://fleet.example:8905 --out alice.env
+  --app training --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl --namespace team --tag scope=research job
 ```
 
@@ -565,8 +546,7 @@ Users cannot select another tag or spoof it in a submission body.
 
 ```bash
 fleetctl namespace create alice --gpus 2 --cpus 16 \
-  --endpoint https://stage.example:8905 --domain-name stage \
-  --server-ca /etc/zkm-fleet/tls/ca.pem --out alice.env
+  --endpoint http://127.0.0.1:51012 --out alice.env
 fleetctl namespace list
 fleetctl namespace get alice
 # Give alice.env, alice.token, and alice.ca.pem (if generated) to the owner securely.
@@ -575,7 +555,7 @@ FLEET_TOKEN_FILE=alice.token FLEET_NAMESPACE=alice FLEET_TAG=scope=default \
 
 # Copies the namespace, optional tag, permissions, app grants and label to a new key/token.
 fleetctl token refresh OLD_TOKEN_ID \
-  --endpoint https://stage.example:8905 --out alice-next.env
+  --endpoint http://127.0.0.1:51012 --out alice-next.env
 # After the user verifies the replacement:
 fleetctl token revoke OLD_TOKEN_ID
 
@@ -583,8 +563,8 @@ fleetctl namespace suspend alice
 fleetctl namespace resume alice
 ```
 
-Namespace creation requires the HTTPS stage gateway details so the owner bundle
-can submit proofs. `refresh` does not revoke
+Namespace creation takes the SDK endpoint the owner's clients use, their
+[app-owned proof endpoint](#app-owned-proof-endpoint), for the bundle's `ENDPOINT`. `refresh` does not revoke
 the old key automatically or overwrite an existing bundle.
 
 Issuance requires an existing, active namespace. A typo cannot silently create a
@@ -624,7 +604,7 @@ token's address. The scheduler finds the job's app by namespace and ELF ID.
 `GetStatus` needs a token of that namespace with `read` or `submit`.
 The SDK signs and receives its original proof ID. The scheduler resolves
 `(namespace_id, optional_tag, client_proof_id)` to a unique internal ID, derived from their
-SHA-256 hash for new jobs. Nodes, blob keys, retries and deduplication use that
+SHA-256 hash for new jobs. Nodes, retries and deduplication use that
 internal ID. Different tags can submit the same client proof ID independently.
 Resubmission within a tag returns the existing job without replacing input. Reference submissions with conflicting inputs or proof parameters are rejected.
 
@@ -779,7 +759,7 @@ their GPU allocation. Resizing a proof already in progress is tracked in
 |---|---|---|
 | user token (`FLEET_TOKEN_FILE`) | the namespace owner/client | namespace/token issuance; authorizes proof RPCs and HTTP APIs within its scope; revocable |
 | SDK signing key (`ZKM_PRIVATE_KEY`) | the client | generated in the token bundle and bound internally to its token |
-| stage server certificate + CA | gateway; clients get `CA_CERT_PATH` when supplied | `install.sh` (`fleetctl init tls`) |
+| server certificate + CA | gateway and control API; clients get `CA_CERT_PATH` when supplied | `install.sh` (`fleetctl init tls`) |
 | cluster token | scheduler and every node; authenticates node-initiated requests | `install.sh` (`fleetctl init token`) |
 | admin token | operators | `install.sh` (`fleet-scheduler issue-admin`); more with `fleetctl token admin` |
 

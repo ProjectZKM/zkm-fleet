@@ -1,4 +1,4 @@
-//! ProofJob metadata. New proof jobs reference app-owned storage; legacy payloads use blobs.
+//! ProofJob metadata. A proof job references its inputs and outputs in app-owned storage.
 
 use std::collections::HashMap;
 
@@ -353,7 +353,7 @@ CREATE INDEX fleet_jobs_owner ON fleet_jobs(owner,created_ms DESC);
 CREATE INDEX fleet_jobs_created ON fleet_jobs (created_ms DESC);
 CREATE INDEX fleet_jobs_app ON fleet_jobs (namespace, app, created_ms DESC);
 CREATE INDEX fleet_jobs_active ON fleet_jobs (created_ms) WHERE state IN ('queued', 'running');
-COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Payloads are files in the data dir.';
+COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Inputs and outputs are files in app storage.';
 COMMENT ON COLUMN fleet_jobs.id IS 'Internal proof ID; namespaced requests retain the SDK ID in client_id.';
 COMMENT ON COLUMN fleet_jobs.owner IS 'Authenticated submitting address; immutable audit identity.';
 COMMENT ON COLUMN fleet_jobs.namespace IS 'Immutable namespace ID; resource accounting and access scope.';
@@ -454,7 +454,7 @@ fn migrate_15() -> String {
          WHERE a.namespace = j.namespace AND a.tenant = j.app AND a.elf_id = j.elf_id), '');
      DROP INDEX fleet_jobs_app;
      CREATE INDEX fleet_jobs_app ON fleet_jobs (namespace, app, created_ms DESC);
-     COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Payloads are files in the data dir.';
+     COMMENT ON TABLE fleet_jobs IS 'Proof jobs: instances of a proof app (a namespace''s named program). Inputs and outputs are files in app storage.';
      COMMENT ON COLUMN fleet_jobs.app IS 'The app''s name in the namespace; empty for a request refused before its app was known.';
      UPDATE fleet_tokens t SET apps = array_remove(ARRAY(SELECT CASE WHEN g LIKE '%/%' THEN
          (SELECT a.name FROM fleet_apps a WHERE a.namespace = t.namespace AND a.tenant || '/' || a.elf_id = g) ELSE g END

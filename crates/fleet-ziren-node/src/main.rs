@@ -12,7 +12,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 use fleet_proto::fleet::v1::{
     control_service_client::ControlServiceClient, Assignment, Completion, DeregisterRequest,
-    FetchInputsRequest, HeartbeatRequest, NodeInfo, RegisterRequest, PublishOutputRequest,
+    HeartbeatRequest, NodeInfo, RegisterRequest,
 };
 use fleet_ziren_node::output::Output;
 use fleet_proto::{artifacts, fleet::v1::ProofOutputs};
@@ -59,9 +59,6 @@ pub struct ProverArgs {
     app: String,
     #[arg(long, env = "FLEET_APP_ELF_ID", default_value = "")]
     app_elf_id: String,
-    /// Durable node output for legacy jobs; reference jobs use app-owned storage.
-    #[arg(long, env = "FLEET_OUTPUT_DIR", default_value = "proof-output")]
-    output_dir: std::path::PathBuf,
     /// Administrator-approved app storage root; references cannot escape it.
     #[arg(long, env = "FLEET_APP_STORAGE_ROOT")]
     app_storage_root: Option<std::path::PathBuf>,
@@ -122,8 +119,8 @@ type Control =
 
 type Outcome = Result<(u64, u64, Option<ProofOutputs>), tonic::Status>;
 
-/// All scheduler connections originate here. Proof work and output persistence
-/// run separately so neither can block health and ownership heartbeats.
+/// All scheduler connections originate here. Proof work runs separately so it cannot block
+/// health and ownership heartbeats.
 async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenProver>) -> anyhow::Result<()> {
     let mut endpoint =
         Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5));
@@ -143,18 +140,9 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
             "scheduler control must use HTTPS outside loopback");
     }
     let mut client: Control = ControlServiceClient::with_interceptor(
-        endpoint.clone().connect_lazy(),
-        prover::BearerTokenInterceptor::new(&token)?,
-    )
-    .max_decoding_message_size(1 << 30)
-    .max_encoding_message_size(1 << 30);
-    let inputs: Control = ControlServiceClient::with_interceptor(
         endpoint.connect_lazy(),
         prover::BearerTokenInterceptor::new(&token)?,
-    )
-    .max_decoding_message_size(1 << 30)
-    .max_encoding_message_size(1 << 30);
-    let output = Output::new(args.output_dir.clone())?;
+    );
     let info = NodeInfo {
         name: args.name.clone(),
         backend: args.backend.clone(),
@@ -172,8 +160,6 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
     let mut period = Duration::from_secs(5);
     let mut working: Option<(Assignment, tokio::task::JoinHandle<Outcome>)> = None;
     let mut pending: Option<(Assignment, Outcome)> = None;
-    let mut uploading: Option<tokio::task::JoinHandle<Result<(), tonic::Status>>> = None;
-    let mut uploaded = false;
     loop {
         if node_id.is_none() {
             let mut request = tonic::Request::new(RegisterRequest {
@@ -197,39 +183,8 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
                     .await
                     .unwrap_or_else(|e| Err(tonic::Status::internal(e.to_string())));
                 pending = Some((assignment, result));
-                uploaded = false;
             }
-            if uploading.as_ref().is_some_and(|task| task.is_finished()) {
-                match uploading.take().unwrap().await {
-                    Ok(Ok(())) => uploaded = true,
-                    other => tracing::warn!(error = ?other, "proof publication failed; retrying while heartbeats continue"),
-                }
-            }
-            if pending.as_ref().is_some_and(|(_, result)| matches!(result, Ok((_, _, Some(_))))) {
-                uploaded = true; // Output references travel in completion metadata only.
-            }
-            if !uploaded && uploading.is_none() {
-                if let Some((assignment, Ok(_))) = &pending {
-                    let assignment = assignment.clone();
-                    let out = output.clone();
-                    let node_id = id.clone();
-                    let mut publisher = inputs.clone();
-                    uploading = Some(tokio::spawn(async move {
-                        let result = tokio::task::spawn_blocking({
-                            let assignment = assignment.clone();
-                            move || out.read(&assignment)
-                        }).await.map_err(|e| tonic::Status::internal(e.to_string()))?
-                            .map_err(|e| tonic::Status::internal(e.to_string()))?;
-                        let mut request = tonic::Request::new(PublishOutputRequest {
-                            node_id, assignment: Some(assignment), result: Some(result),
-                        });
-                        request.set_timeout(Duration::from_secs(30));
-                        publisher.publish_output(request).await?;
-                        Ok(())
-                    }));
-                }
-            }
-            let completion = pending.as_ref().filter(|(_, result)| uploaded || result.is_err()).map(|(assignment, result)| {
+            let completion = pending.as_ref().map(|(assignment, result)| {
                 let mut completion = Completion {
                     assignment: Some(assignment.clone()),
                     ..Default::default()
@@ -276,87 +231,9 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
                     }
                     if working.is_none() && pending.is_none() {
                         if let Some(assignment) = r.assignment {
-                            let mut store = inputs.clone();
-                            let n = node.clone();
-                            let req = FetchInputsRequest {
-                                node_id: id.clone(),
-                                include_elf: !n.cached().contains(&assignment.elf_id),
-                                assignment: Some(assignment.clone()),
-                            };
                             tracing::info!(job = %assignment.job_id, lease = %assignment.lease, "accepted assignment");
-                            let legacy_output = output.clone();
-                            let storage_root = args.app_storage_root.clone();
-                            let execution = assignment.clone();
-                            working = Some((
-                                assignment,
-                                tokio::spawn(async move {
-                                    let out = match execution.inputs.as_ref() {
-                                        Some(references) => {
-                                            let root = storage_root.as_ref().ok_or_else(|| tonic::Status::failed_precondition("app storage root must be configured"))?;
-                                            let path = artifacts::path_in_root(&references.output_root, root).map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
-                                            if artifacts::file_uri(&path).map_err(|e| tonic::Status::invalid_argument(e.to_string()))? != references.output_root.trim_end_matches('/') { return Err(tonic::Status::invalid_argument("output root must be a canonical app storage path")); }
-                                            Output::new(path).map_err(|e| tonic::Status::invalid_argument(e.to_string()))?
-                                        },
-                                        None => legacy_output,
-                                    };
-                                    let saved = tokio::task::spawn_blocking({
-                                        let out = out.clone();
-                                        let execution = execution.clone();
-                                        move || out.completed(&execution)
-                                    })
-                                    .await
-                                    .map_err(|e| tonic::Status::unavailable(e.to_string()))?
-                                    .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
-                                    if let Some(metadata) = saved {
-                                        let refs = if execution.inputs.is_some() {Some(out.references(&execution).map_err(|e|tonic::Status::internal(e.to_string()))?)} else {None};
-                                        return Ok((metadata.0,metadata.1,refs));
-                                    }
-                                    let inputs = if let Some(references) = execution.inputs.clone() {
-                                        let root = storage_root.ok_or_else(||tonic::Status::failed_precondition("app storage root missing"))?;
-                                        let assignment = execution.clone();
-                                        let cached = n.cached().contains(&assignment.elf_id);
-                                        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                                            artifacts::validate_inputs(&references, &assignment.elf_id)?;
-                                            let bytes = artifacts::read(references.input.as_ref().unwrap(),&root,artifacts::MAX_INPUT)?;
-                                            let mut input = fleet_proto::fleet::v1::ProveRequest::decode(bytes.as_slice())?;
-                                            anyhow::ensure!(input.elf_id==assignment.elf_id && input.kind==assignment.kind,"input parameters do not match assignment");
-                                            input.job_id=assignment.job_id;
-                                            if !cached {input.elf=artifacts::read(references.elf.as_ref().unwrap(),&root,artifacts::MAX_INPUT)?;}
-                                            Ok(input)
-                                        }).await.map_err(|e|tonic::Status::internal(e.to_string()))?.map_err(|e|tonic::Status::invalid_argument(e.to_string()))?
-                                    } else { store
-                                        .fetch_inputs(req)
-                                        .await
-                                        .map_err(|e| {
-                                            if e.code() == tonic::Code::NotFound {
-                                                tonic::Status::unavailable(e.message().to_owned())
-                                            } else {
-                                                e
-                                            }
-                                        })?
-                                        .into_inner() };
-                                    let result = Arc::new(n.prove(inputs).await?);
-                                    loop {
-                                        let published = tokio::task::spawn_blocking({
-                                            let out = out.clone();
-                                            let execution = execution.clone();
-                                            let result = result.clone();
-                                            move || out.publish(&execution, &result)
-                                        })
-                                        .await;
-                                        match published {
-                                            Ok(Ok(())) => {
-                                                let refs = if execution.inputs.is_some() {Some(out.references(&execution).map_err(|e|tonic::Status::internal(e.to_string()))?)} else {None};
-                                                return Ok((result.cycles, result.prove_ms, refs))
-                                            }
-                                            other => {
-                                                tracing::error!(job = %execution.job_id, error = ?other, "proof output write failed; retaining proof and reservation")
-                                            }
-                                        }
-                                        tokio::time::sleep(Duration::from_secs(5)).await;
-                                    }
-                                }),
-                            ));
+                            let task = tokio::spawn(execute(assignment.clone(), args.app_storage_root.clone(), node.clone()));
+                            working = Some((assignment, task));
                         }
                     }
                 }
@@ -374,7 +251,6 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
             } => {
                 let (assignment, _) = working.take().unwrap();
                 pending = Some((assignment, result.unwrap_or_else(|e| Err(tonic::Status::internal(e.to_string())))));
-                uploaded = false;
             },
             _ = tokio::time::sleep(period) => {},
             _ = tokio::signal::ctrl_c() => {
@@ -382,5 +258,60 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
                 return Ok(());
             }
         }
+    }
+}
+
+/// Proves one assignment: reads its input from app storage, writes the proof beside it, and
+/// returns the output references. A proof already written for this lease is not proved again.
+async fn execute(execution: Assignment, storage_root: Option<std::path::PathBuf>, node: Arc<prover::ZirenProver>) -> Outcome {
+    let references = execution.inputs.clone()
+        .ok_or_else(|| tonic::Status::failed_precondition("an assignment's inputs are in app storage"))?;
+    let root = storage_root.ok_or_else(|| tonic::Status::failed_precondition("app storage root must be configured"))?;
+    let path = artifacts::path_in_root(&references.output_root, &root).map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    if artifacts::file_uri(&path).map_err(|e| tonic::Status::invalid_argument(e.to_string()))? != references.output_root.trim_end_matches('/') {
+        return Err(tonic::Status::invalid_argument("output root must be a canonical app storage path"));
+    }
+    let out = Output::new(path).map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    let saved = tokio::task::spawn_blocking({
+        let (out, execution) = (out.clone(), execution.clone());
+        move || out.completed(&execution)
+    })
+    .await
+    .map_err(|e| tonic::Status::unavailable(e.to_string()))?
+    .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
+    let references_of = |out: &Output| out.references(&execution).map_err(|e| tonic::Status::internal(e.to_string()));
+    if let Some((cycles, prove_ms)) = saved {
+        return Ok((cycles, prove_ms, Some(references_of(&out)?)));
+    }
+    let cached = node.cached().contains(&execution.elf_id);
+    let input = tokio::task::spawn_blocking({
+        let assignment = execution.clone();
+        move || -> anyhow::Result<_> {
+            artifacts::validate_inputs(&references, &assignment.elf_id)?;
+            let bytes = artifacts::read(references.input.as_ref().unwrap(), &root, artifacts::MAX_INPUT)?;
+            let mut input = fleet_proto::fleet::v1::ProveRequest::decode(bytes.as_slice())?;
+            anyhow::ensure!(input.elf_id == assignment.elf_id && input.kind == assignment.kind, "input parameters do not match assignment");
+            input.job_id = assignment.job_id;
+            if !cached {
+                input.elf = artifacts::read(references.elf.as_ref().unwrap(), &root, artifacts::MAX_INPUT)?;
+            }
+            Ok(input)
+        }
+    })
+    .await
+    .map_err(|e| tonic::Status::internal(e.to_string()))?
+    .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    let result = Arc::new(node.prove(input).await?);
+    loop {
+        let published = tokio::task::spawn_blocking({
+            let (out, execution, result) = (out.clone(), execution.clone(), result.clone());
+            move || out.publish(&execution, &result)
+        })
+        .await;
+        match published {
+            Ok(Ok(())) => return Ok((result.cycles, result.prove_ms, Some(references_of(&out)?))),
+            other => tracing::error!(job = %execution.job_id, error = ?other, "proof output write failed; retaining proof and reservation"),
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

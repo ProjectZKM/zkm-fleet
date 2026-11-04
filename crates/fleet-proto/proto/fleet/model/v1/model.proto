@@ -285,11 +285,6 @@ message ProofJobsQuery {
   required uint64 limit = 4;
 }
 
-message PublicValuesQuery {
-  optional string key = 1;
-  optional string token_id = 2;
-}
-
 message SubmitProofRequest {
   required string proof_id = 1;
   required string elf_id = 2;

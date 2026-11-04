@@ -287,7 +287,7 @@ pub fn response_error(error: Status) -> Response {
 mod tests {
     use super::*;
     use crate::{
-        blobs::BlobStore, config::SchedulerConfig, fleet::Scheduler, http::HttpState, workloads::WorkloadController,
+        config::SchedulerConfig, fleet::Scheduler, http::HttpState, workloads::WorkloadController,
         store::MemoryStore,
     };
     use std::{future::IntoFuture, sync::Arc};
@@ -381,11 +381,10 @@ mod tests {
     #[tokio::test]
     async fn relay_checks_cluster_auth_fencing_size_hash_and_single_use_without_files() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg: SchedulerConfig = serde_yaml::from_str(&format!("public_url: http://unused\ndata_dir: {}\ncluster_token_file: unused\n",dir.path().display())).unwrap();
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!("data_dir: {}\ncluster_token_file: unused\n",dir.path().display())).unwrap();
         let fleet = Scheduler::new(
             cfg,
             Arc::new(MemoryStore::default()),
-            BlobStore::new(dir.path()).unwrap(),
             SECRET.into(),
         );
         let state = HttpState {

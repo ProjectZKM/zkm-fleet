@@ -453,7 +453,6 @@ class ControlPlaneConfig(Record):
     cluster_token_file: str | None = None
     node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
-    proof_output_dir: str | None = None
     gpu_port_range: tuple[int, int] = (30100, 30199)
 
 
@@ -601,7 +600,6 @@ class NodeEnvironment(Record):
     app_elf_id: str | None = field(default=None, metadata={"env": "FLEET_APP_ELF_ID"})
     rust_log: str = field(metadata={"env": "RUST_LOG"})
     exit_with_parent: bool = field(default=True, metadata={"env": "FLEET_EXIT_WITH_PARENT"})
-    output_dir: str | None = field(default=None, metadata={"env": "FLEET_OUTPUT_DIR"})
     app_storage_root: str | None = field(default=None, metadata={"env": "FLEET_APP_STORAGE_ROOT"})
     cpus: int = field(default=0, metadata={"env": "FLEET_CPUS"})
     gpus: int | None = field(default=None, metadata={"env": "FLEET_GPUS"})

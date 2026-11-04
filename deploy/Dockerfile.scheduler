@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd -r -u 10001 fleet && mkdir -p /var/lib/zkm-fleet && chown fleet /var/lib/zkm-fleet
 COPY --from=build /src/target/release/fleet-scheduler /src/target/release/fleetctl /src/target/release/fleet-mcp /usr/local/bin/
 USER fleet
-EXPOSE 51000 51001 9191
+EXPOSE 51001 9191
 HEALTHCHECK --interval=15s --timeout=3s CMD curl -sf http://127.0.0.1:9191/healthz || exit 1
 ENTRYPOINT ["fleet-scheduler"]
 CMD ["-c", "/etc/zkm-fleet/fleet.yaml"]

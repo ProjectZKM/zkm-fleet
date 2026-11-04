@@ -99,10 +99,10 @@ allocation with `fleetctl app scale`; resource settings can change independently
 of the worker package.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
 GPU allocation and preparation concurrency are separate settings.
-This app no longer uses the external EthProofs client (reth-processor's `eth-proofs`);
-it calls its local GPU server directly. reth-processor itself still proves through
-the scheduler's SDK stage API, which is kept but deprecated; see
-[Scheduler stage API (deprecated)](../../docs/reference.md#scheduler-stage-api-deprecated).
+This app does not use the external EthProofs client (reth-processor's `eth-proofs`);
+it calls its local GPU server directly. The scheduler no longer serves the SDK stage
+API that client used; an SDK client proves through an
+[app-owned proof endpoint](../../docs/reference.md#app-owned-proof-endpoint).
 GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an app-owner decision; inspect it with `fleetctl --namespace zkm app` using an
 owner token for namespace `zkm`.

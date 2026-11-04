@@ -1,12 +1,12 @@
 //! Batch policy and durable records live in the control plane. Workers execute typed
 //! commands with their own Ray instance and initiate every control connection.
 use crate::{
-    blobs::is_safe_id,
     fleet::Scheduler,
     preemption::{PreemptionCandidate, NodeCapacity, PreemptionRequest},
     store::Token,
     token,
 };
+use fleet_proto::artifacts::is_safe_id;
 use axum::{
     body::to_bytes,
     extract::{Request, State},
