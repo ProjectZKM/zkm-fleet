@@ -123,10 +123,12 @@ host's `data_dir/elf`, `data_dir/jobs` and `data_dir/proofs` held that API's pay
 delete them once rollback is no longer needed. A node ignores `proof_output_dir` in
 `apps.yaml`.
 
-Build the generic programs from that revision:
+Build the generic programs from that revision, naming the release with
+`FLEET_VERSION` so each node's agent reports it in `fleetctl node` (a build that
+names nothing shows `-`):
 
 ```bash
-cargo build --locked --release \
+FLEET_VERSION=0.1.6 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node
 ```
 
