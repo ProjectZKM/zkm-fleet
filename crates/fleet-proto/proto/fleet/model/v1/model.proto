@@ -135,6 +135,16 @@ message RegisterAppRequest {
   optional string namespace = 9;
 }
 
+// A serving app: a long-running container with its own port on `node`. `service` holds
+// the settings of its services.yaml entry, which the node writes as a disabled `kind: app`
+// service (validated in models.rs).
+message RegisterServingAppRequest {
+  required string name = 1;
+  required string node = 2;
+  required Json service = 3;
+  optional string namespace = 4;
+}
+
 message WorkloadTemplate {
   required string name = 1;
   required string namespace = 2;

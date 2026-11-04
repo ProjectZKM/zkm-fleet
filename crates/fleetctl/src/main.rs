@@ -1156,11 +1156,13 @@ fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -
     }
     let node = add.node.as_deref().filter(|n| !n.is_empty()).context("--node NODE: the node that runs the app")?;
     let path = add.spec.as_ref().context("--spec FILE: the app's settings as JSON")?;
-    let mut body: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+    let service: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
         .with_context(|| format!("{}: JSON settings", path.display()))?;
-    let settings = body.as_object_mut().context("--spec: a JSON object of settings")?;
-    settings.insert("name".into(), json!(add.name));
-    settings.insert("node".into(), json!(node));
+    if !service.is_object() {
+        bail!("--spec: a JSON object of settings");
+    }
+    // A RegisterServingAppRequest (model.proto).
+    let body = json!({"name": add.name, "node": node, "service": service});
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
     out.done(

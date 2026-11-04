@@ -1919,20 +1919,20 @@ async fn a_service_named_like_a_batch_does_not_attach_to_it() {
 async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","gpus":1,"cpus":2,
-        "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}});
+    let body = json!({"name":"model","namespace":ns,"node":"gpu","service":{"image":"serve:1","gpus":1,"cpus":2,
+        "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}});
     let response = scale_call(c.clone(), "admin", "POST", "/apps", body.clone()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert!(c.inner.lock().apps["model"].persistent);
     assert_eq!(remove_commands(&c, NodeOperation::App), vec![("gpu".to_string(), json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},
-        "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"replicas":1,"gpus":1.0,"cpus":2,"image":"serve:1",
+        "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"replicas":1,"gpus":1,"cpus":2,"image":"serve:1",
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}}))]);
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu"})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu","service":{"port_base":1}})).await.status(),
         StatusCode::BAD_REQUEST);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","image":"x","port_base":1})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","service":{"image":"x","port_base":1}})).await.status(),
         StatusCode::CONFLICT, "a batch's name is taken");
-    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x","port_base":1})).await.status(),
+    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","service":{"image":"x","port_base":1}})).await.status(),
         StatusCode::NOT_FOUND);
 }
 
@@ -1942,10 +1942,12 @@ async fn a_serving_app_with_a_mistyped_setting_is_refused_before_its_node_sees_i
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("port_base", Value::Null),
         ("workdir", json!(1)), ("kind", json!("app"))] {
-        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","port_base":50100});
-        body[key] = value;
+        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","service":{"image":"serve:1","port_base":50100}});
+        body["service"][key] = value;
         assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::BAD_REQUEST, "{key}");
     }
+    let flat = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","port_base":50100});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", flat).await.status(), StatusCode::BAD_REQUEST, "settings belong under service");
     assert!(remove_commands(&c, NodeOperation::App).is_empty() && !c.inner.lock().apps.contains_key("model"));
 }
 
@@ -1955,11 +1957,11 @@ async fn a_namespace_owner_creates_its_serving_app_but_not_host_mounts_or_users(
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let owner = user_token(&c, &ns, 7, "scope=default", None, true).await;
     let reader = user_token(&c, &ns, 8, "scope=default", Some(vec!["model".into()]), false).await;
-    let body = json!({"name":"model","node":"gpu","image":"serve:1","port_base":50100,"command":["serve","{port}"],
-        "env":{"A":"1"},"workdir":"/srv"});
+    let body = json!({"name":"model","node":"gpu","service":{"image":"serve:1","port_base":50100,"command":["serve","{port}"],
+        "env":{"A":"1"},"workdir":"/srv"}});
     for (key, value) in [("volumes", json!(["/models:ro"])), ("user", json!("0:0"))] {
         let mut admin_only = body.clone();
-        admin_only[key] = value;
+        admin_only["service"][key] = value;
         assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", admin_only).await.status(), StatusCode::FORBIDDEN, "{key}");
     }
     assert_eq!(scale_call(c.clone(), &reader, "POST", "/apps", body.clone()).await.status(), StatusCode::FORBIDDEN, "creation needs manage");

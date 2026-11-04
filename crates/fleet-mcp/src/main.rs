@@ -210,15 +210,17 @@ struct AppLogs {
     node: Option<String>,
 }
 
+/// A serving app's registration, as `RegisterServingAppRequest` in model.proto; its
+/// namespace is the token's.
 #[derive(Deserialize, schemars::JsonSchema)]
-struct CreateServingApp {
+struct RegisterServingApp {
     name: String,
     /// The node that runs the app.
     node: String,
     /// The app's settings, the keys of its services.yaml entry: image (required), command,
     /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
     /// image and port_base are required; user and volumes require administrator credentials.
-    settings: serde_json::Map<String, Value>,
+    service: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone)]
@@ -309,7 +311,7 @@ impl FleetMcp {
     )]
     async fn app_create_serving(
         &self,
-        Parameters(input): Parameters<CreateServingApp>,
+        Parameters(input): Parameters<RegisterServingApp>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
         // fleetctl reads the settings from a file, kept private for this one call.
@@ -318,7 +320,7 @@ impl FleetMcp {
             .suffix(".json")
             .tempfile()
             .map_err(|e| tool_error(&format!("creating temporary settings file: {e}")))?;
-        spec.write_all(Value::Object(input.settings).to_string().as_bytes())
+        spec.write_all(Value::Object(input.service).to_string().as_bytes())
             .map_err(|e| tool_error(&format!("writing temporary settings file: {e}")))?;
         let args = vec![
             "app".into(),

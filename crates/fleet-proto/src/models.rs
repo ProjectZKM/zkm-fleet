@@ -286,10 +286,68 @@ impl PreemptionPlan {
     }
 }
 
+impl RegisterServingAppRequest {
+    /// The settings of a serving app's services.yaml entry it may be registered with. The
+    /// scheduler adds its name, kind, namespace and tag, and registers it disabled.
+    pub const SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
+        "port_base", "health_path", "workdir", "volumes", "env", "user"];
+
+    /// Checked before the app is recorded: a setting the node refuses later would leave an
+    /// app record with no service behind it.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.name.is_empty() && self.name.len() <= 63
+                && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+            "invalid app name: letters, digits, _ . -, at most 63"
+        );
+        anyhow::ensure!(!self.node.is_empty(), "node is required: the node that runs the app");
+        let service = self.service.as_object()
+            .ok_or_else(|| anyhow::anyhow!("service must be a JSON object of settings"))?;
+        if let Some(key) = service.keys().find(|k| !Self::SETTINGS.contains(&k.as_str())) {
+            anyhow::bail!("unknown service setting {key}; a serving app takes {}", Self::SETTINGS.join(", "));
+        }
+        let set = |key: &str| service.get(key).filter(|v| !v.is_null());
+        anyhow::ensure!(
+            set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
+            "image is required"
+        );
+        anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
+        let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
+        let invalid = ["user", "health_path", "workdir"].into_iter().find(|k| set(k).is_some_and(|v| !v.is_string()))
+            .or_else(|| ["cpus", "shm_gb", "port_base"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
+            .or_else(|| ["command", "volumes"].into_iter().find(|k| set(k).is_some_and(strings)))
+            .or_else(|| set("replicas").is_some_and(|r| r.as_u64().is_none_or(|r| !(1..=64).contains(&r))).then_some("replicas"))
+            .or_else(|| set("gpus").is_some_and(|g| g.as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())).then_some("gpus"))
+            .or_else(|| set("env").is_some_and(|e| e.as_object().is_none_or(|e| e.values().any(|v| !v.is_string()))).then_some("env"));
+        if let Some(key) = invalid {
+            anyhow::bail!("invalid service setting {key}");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    fn a_serving_app_registration_takes_only_its_service_settings() {
+        let request = |service: Value| RegisterServingAppRequest {
+            name: "model".into(), node: "gpu".into(), service: service.into(), namespace: None,
+        };
+        let valid = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
+        assert!(request(valid.clone()).validate().is_ok());
+        for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
+            ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("app"))] {
+            let mut service = valid.clone();
+            service[key] = value;
+            assert!(request(service).validate().is_err(), "{key}");
+        }
+        let body: Result<RegisterServingAppRequest, _> =
+            serde_json::from_value(json!({"name":"model","node":"gpu","service":valid,"image":"serve:1"}));
+        assert!(body.is_err(), "settings belong under service");
+    }
 
     #[test]
     fn node_reports_share_the_json_and_protobuf_contract() {

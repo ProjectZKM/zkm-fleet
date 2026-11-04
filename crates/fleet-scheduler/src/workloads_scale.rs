@@ -607,53 +607,15 @@ impl WorkloadController {
     /// service) disabled, so `fleetctl app enable` starts it and admits it against the namespace's
     /// quota. The name is one of the namespace's apps and batches, so it is checked against both
     /// here and when the node reports.
-    pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>, body: Value) -> anyhow::Result<Response> {
-        let name = text(&body, "name").to_string();
-        if !crate::fleet::valid_app_name(&name) {
-            return Err(fail(400, "invalid app name"));
-        }
-        let node = text(&body, "node").to_string();
-        if node.is_empty() {
-            return Err(fail(400, "node is required: the node that runs the app"));
-        }
-        let allowed = ["name", "namespace", "node", "image", "user", "replicas", "gpus", "cpus", "shm_gb",
-            "port_base", "health_path", "workdir", "volumes", "env", "command"];
-        let fields = body.as_object().ok_or_else(|| fail(400, "an app is a JSON object"))?;
-        if let Some(key) = fields.keys().find(|k| !allowed.contains(&k.as_str())) {
-            return Err(fail(400, format!("unknown app field {key}; an app takes {}", allowed.join(", "))));
-        }
-        if !body["image"].as_str().is_some_and(|i| !i.is_empty() && !i.starts_with('-')) {
-            return Err(fail(400, "image is required"));
-        }
-        if body["port_base"].is_null() {
-            return Err(fail(400, "port_base is required: replica i serves on port_base + i"));
-        }
-        // Checked here, not only by the node: a setting the node refuses would leave an app
-        // record with no service behind it.
-        let set = |key: &str| !body[key].is_null();
-        if let Some(key) = ["user", "health_path", "workdir"].into_iter().find(|k| set(k) && !body[*k].is_string())
-            .or_else(|| ["replicas", "cpus", "shm_gb", "port_base"].into_iter().find(|k| set(k) && body[*k].as_u64().is_none()))
-            .or_else(|| ["gpus"].into_iter().find(|k| set(k) && body[*k].as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())))
-        {
-            return Err(fail(400, format!("invalid {key}")));
-        }
-        let (namespace, tag) = self.scope(c, q, body["namespace"].as_str())?;
+    pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>,
+        request: fleet_proto::model::v1::RegisterServingAppRequest,
+    ) -> anyhow::Result<Response> {
+        request.validate().map_err(|e| fail(400, e.to_string()))?;
+        let (name, node) = (request.name.clone(), request.node.clone());
+        let service = request.service.as_object().cloned().unwrap_or_default();
+        let (namespace, tag) = self.scope(c, q, request.namespace.as_deref())?;
         WorkloadController::require_grant(c, &name)?;
-        WorkloadController::require_admin_settings(c, fields, &Self::ADMIN_CREATE_SETTINGS)?;
-        let replicas = body["replicas"].as_u64().unwrap_or(1);
-        if !(1..=64).contains(&replicas) {
-            return Err(fail(400, "replicas must be between 1 and 64"));
-        }
-        let gpus = body["gpus"].as_f64().unwrap_or(1.0);
-        if !body["env"].is_null() && body["env"].as_object().is_none_or(|e| e.values().any(|v| !v.is_string())) {
-            return Err(fail(400, "env must map names to strings"));
-        }
-        if !body["command"].is_null() && body["command"].as_array().is_none_or(|a| a.iter().any(|v| !v.is_string())) {
-            return Err(fail(400, "command must be a list of strings"));
-        }
-        if !body["volumes"].is_null() && body["volumes"].as_array().is_none_or(|a| a.iter().any(|v| !v.is_string())) {
-            return Err(fail(400, "volumes must be a list of paths"));
-        }
+        WorkloadController::require_admin_settings(c, &service, &Self::ADMIN_CREATE_SETTINGS)?;
         let _ops = self.ops.lock().await;
         {
             let i = self.inner.lock();
@@ -668,14 +630,12 @@ impl WorkloadController {
             }
         }
         let mut entry = json!({"name": name, "kind": "app", "namespace": namespace, "disabled": true,
-            "replicas": replicas, "gpus": gpus, "cpus": body["cpus"].as_u64().unwrap_or(1)});
+            "replicas": 1, "gpus": 1.0, "cpus": 1});
         if let Some(tag) = &tag {
             entry["tag"] = json!(tag);
         }
-        for key in ["image", "user", "shm_gb", "port_base", "health_path", "workdir", "volumes", "env", "command"] {
-            if !body[key].is_null() {
-                entry[key] = body[key].clone();
-            }
+        for (key, value) in service.into_iter().filter(|(_, v)| !v.is_null()) {
+            entry[key.as_str()] = value;
         }
         let mut spec = entry.clone();
         spec["priority"] = json!(0);
