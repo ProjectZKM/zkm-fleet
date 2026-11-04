@@ -410,7 +410,7 @@ class NodeExecutor:
         A removed service has what is left of its replicas cleaned up the way disabling does;
         app data stays (storage roots, workdirs, env files and images belong to the operator).
         Settings are written to the configuration only: the scheduler drains and stops a
-        service first and starts it again afterwards. `p["create"]` adds a new serving app's
+        service first and starts it again afterwards. `p["create"]` adds a new app's
         service (`kind: app`) to the configuration, disabled until the app is enabled."""
         if "create" in p:
             entry = p["create"]

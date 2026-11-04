@@ -1815,8 +1815,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)
                     .map_err(|e| fail(400, format!("invalid app registration: {e}")))?;
             body.validate().map_err(|e| fail(400, e.to_string()))?;
-            if body.is_serving() {
-                return s.create_serving_app(c, &q, body).await;
+            if body.has_spec() {
+                return s.create_app(c, &q, body).await;
             }
             let (namespace, tag) = s.scope(c, &q, body.namespace.as_deref())?;
             WorkloadController::require_grant(c, &body.name)?;

@@ -210,17 +210,15 @@ struct AppLogs {
     node: Option<String>,
 }
 
-/// A serving app's `RegisterAppRequest` (model.proto): its name, node and service settings.
-/// Its namespace is the token's.
+/// An app's `RegisterAppRequest` (model.proto) by its container: its name and spec. Its
+/// namespace is the token's; the scheduler picks its node.
 #[derive(Deserialize, schemars::JsonSchema)]
-struct RegisterServingApp {
+struct CreateApp {
     name: String,
-    /// The node that runs the app.
-    node: String,
-    /// The app's settings, the keys of its services.yaml entry: image (required), command,
+    /// The app's container settings, the keys of its services.yaml entry: image, command,
     /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
     /// image and port_base are required; user and volumes require administrator credentials.
-    service: serde_json::Map<String, Value>,
+    spec: serde_json::Map<String, Value>,
     /// Priority inherited by the app's replicas (default 0; higher values run first).
     priority: Option<i32>,
 }
@@ -307,13 +305,13 @@ impl FleetMcp {
     }
 
     #[tool(
-        name = "fleet_app_create_serving",
-        description = "Create a serving app (a long-running container with its own port, such as a model server) on a node in the authenticated namespace. It starts disabled; enabling it admits it against the namespace's quota. A namespace token with manage permission may create one; user and volumes require administrator credentials. The scheduler validates the settings.",
+        name = "fleet_app_create",
+        description = "Create an app (a long-running container with its own port, such as a model server) in the authenticated namespace; the scheduler validates its settings and picks the node. It starts disabled; enabling it admits it against the namespace's quota. A namespace token with manage permission may create one; user and volumes require administrator credentials.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
-    async fn app_create_serving(
+    async fn app_create(
         &self,
-        Parameters(input): Parameters<RegisterServingApp>,
+        Parameters(input): Parameters<CreateApp>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
         // fleetctl reads the settings from a file, kept private for this one call.
@@ -322,14 +320,12 @@ impl FleetMcp {
             .suffix(".json")
             .tempfile()
             .map_err(|e| tool_error(&format!("creating temporary settings file: {e}")))?;
-        spec.write_all(Value::Object(input.service).to_string().as_bytes())
+        spec.write_all(Value::Object(input.spec).to_string().as_bytes())
             .map_err(|e| tool_error(&format!("writing temporary settings file: {e}")))?;
         let mut args = vec![
             "app".into(),
             "add".into(),
             input.name,
-            "--node".into(),
-            input.node,
             "--spec".into(),
             spec.path().display().to_string(),
         ];

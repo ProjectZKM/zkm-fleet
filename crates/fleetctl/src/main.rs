@@ -53,7 +53,7 @@ struct ConnectionOptions {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Apps: registered proof programs and serving deployments.
+    /// Apps: long-running containers, and the programs provers prove.
     App(AppArgs),
     /// Finite batch workloads and their jobs.
     Batch(BatchArgs),
@@ -84,9 +84,9 @@ struct AppArgs {
 
 #[derive(Subcommand)]
 enum AppCmd {
-    /// Register a proof program as an app of the namespace: NAME --elf-id ID, or NAME --elf FILE.
-    /// Or a serving app (a long-running container with a port): NAME --node NODE --spec FILE.json;
-    /// `app enable` starts it.
+    /// Create an app of the namespace: NAME --spec FILE.json, a container the scheduler places
+    /// on a node, which `app enable` starts. Or register the program a node's provers prove:
+    /// NAME --elf-id ID, or NAME --elf FILE.
     Add {
         #[command(flatten)]
         add: AddApp,
@@ -503,23 +503,12 @@ struct AddApp {
     #[arg(long, allow_hyphen_values = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
-    /// Serving app: the node that runs it. With --spec, makes a serving app, not a proof program.
-    #[arg(long)]
-    #[serde(skip)]
-    node: Option<String>,
-    /// Serving app: a JSON file with the app's settings, the keys of its services.yaml entry
+    /// A JSON file with the app's container settings, the keys of its services.yaml entry
     /// (image, command, replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes,
     /// env, user). image and port_base are required; user and volumes need administrator credentials.
     #[arg(long)]
     #[serde(skip)]
     spec: Option<PathBuf>,
-}
-
-impl AddApp {
-    /// A serving app names its node and its settings file; a proof app names a program.
-    fn is_serving(&self) -> bool {
-        self.node.is_some() || self.spec.is_some()
-    }
 }
 
 #[derive(Args)]
@@ -1120,13 +1109,13 @@ fn env_map(pairs: &[String]) -> anyhow::Result<Value> {
     Ok(Value::Object(env))
 }
 
-/// Registers a proof program as an app of the namespace, or a serving app given --node and --spec.
+/// Creates an app of the namespace from its --spec, or registers the program its provers prove.
 fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
         bail!("app registration requires --namespace NAME; an administrator must create the namespace first");
     }
-    if add.is_serving() {
-        return add_serving_app(add, conn, out);
+    if add.spec.is_some() {
+        return add_app_from_spec(add, conn, out);
     }
     let mut body = serde_json::to_value(add)?;
     body["elf_id"] = json!(match (&add.elf, &add.elf_id) {
@@ -1137,7 +1126,7 @@ fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow
         }
         (None, Some(id)) => id.trim_start_matches("0x").to_ascii_lowercase(),
         (Some(_), Some(_)) => bail!("give --elf-id or --elf FILE, not both"),
-        (None, None) => bail!("give the program: --elf-id ID or --elf FILE"),
+        (None, None) => bail!("give the app's container, --spec FILE.json, or its program, --elf-id ID or --elf FILE"),
     });
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
@@ -1148,26 +1137,26 @@ fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow
     Ok(())
 }
 
-fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+fn add_app_from_spec(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if add.elf.is_some() || add.elf_id.is_some() || add.class.is_some() || add.anchor.is_some()
         || !add.backends.is_empty() || add.zkm_version.is_some() || add.max_queued.is_some()
     {
-        bail!("a serving app runs a container: it takes no proof program (--elf, --elf-id) or proof policy");
+        bail!("--spec takes no proof program (--elf, --elf-id) or proof policy: a prover's container is configured on its node");
     }
-    let node = add.node.as_deref().filter(|n| !n.is_empty()).context("--node NODE: the node that runs the app")?;
     let path = add.spec.as_ref().context("--spec FILE: the app's settings as JSON")?;
-    let service: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+    let spec: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
         .with_context(|| format!("{}: JSON settings", path.display()))?;
-    if !service.is_object() {
+    if !spec.is_object() {
         bail!("--spec: a JSON object of settings");
     }
-    // A serving app's RegisterAppRequest (model.proto).
-    let mut body = json!({"name": add.name, "node": node, "service": service});
+    // The app's RegisterAppRequest (model.proto); the scheduler picks its node.
+    let mut body = json!({"name": add.name, "spec": spec});
     if let Some(priority) = add.priority {
         body["priority"] = json!(priority);
     }
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
+    let node = v["service"]["workers"].as_array().and_then(|w| w.first()).and_then(Value::as_str).unwrap_or("?").to_owned();
     out.done(
         &format!("added app {} on {node}: disabled until `fleetctl app enable {}`", add.name, add.name),
         v,

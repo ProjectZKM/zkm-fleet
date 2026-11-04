@@ -184,7 +184,7 @@ impl WorkloadController {
     // Services can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
     pub(super) const ADMIN_SERVICE_SETTINGS: [&'static str; 6] = ["image", "env", "command", "user", "workdir", "volumes"];
-    // A namespace's owner creates its own serving apps, as it does its batches: the host's
+    // A namespace's owner creates its own apps, as it does its batches: the host's
     // filesystem and user ids stay administrator settings.
     const ADMIN_CREATE_SETTINGS: [&'static str; 2] = ["user", "volumes"];
 
@@ -603,25 +603,23 @@ impl WorkloadController {
 }
 
 impl WorkloadController {
-    /// Registers a serving app on `node`: the node writes its services.yaml entry (a `kind: app`
-    /// service) disabled, so `fleetctl app enable` starts it and admits it against the namespace's
-    /// quota. The name is one of the namespace's apps and batches, so it is checked against both
-    /// here and when the node reports.
-    pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>,
+    /// Registers an app by its container: the scheduler picks its node (`place_app`), whose
+    /// services.yaml then gets the entry (a `kind: app` service) disabled, so `fleetctl app
+    /// enable` starts it and admits it against the namespace's quota. The name is one of the
+    /// namespace's apps and batches, so it is checked against both here and when the node
+    /// reports.
+    pub(super) async fn create_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>,
         request: fleet_proto::model::v1::RegisterAppRequest,
     ) -> anyhow::Result<Response> {
-        // `request` is a validated serving app's registration.
-        let (name, node) = (request.name.clone(), request.node.clone().unwrap_or_default());
-        let service = request.service.as_deref().and_then(Value::as_object).cloned().unwrap_or_default();
+        // `request` is validated and has its spec.
+        let name = request.name.clone();
+        let spec = request.spec.as_deref().and_then(Value::as_object).cloned().unwrap_or_default();
         let (namespace, tag) = self.scope(c, q, request.namespace.as_deref())?;
         WorkloadController::require_grant(c, &name)?;
-        WorkloadController::require_admin_settings(c, &service, &Self::ADMIN_CREATE_SETTINGS)?;
+        WorkloadController::require_admin_settings(c, &spec, &Self::ADMIN_CREATE_SETTINGS)?;
         let _ops = self.ops.lock().await;
         {
             let i = self.inner.lock();
-            if !i.workers.contains_key(&node) {
-                return Err(fail(404, "unknown node"));
-            }
             if i.apps.get(&name).is_some_and(|a| !a.removed)
                 || i.services.values().any(|s| text(&s.service, "name") == name)
                 || self.fleet.app_known(&namespace, &name)
@@ -634,15 +632,15 @@ impl WorkloadController {
         if let Some(tag) = &tag {
             entry["tag"] = json!(tag);
         }
-        for (key, value) in service.into_iter().filter(|(_, v)| !v.is_null()) {
+        for (key, value) in spec.into_iter().filter(|(_, v)| !v.is_null()) {
             entry[key.as_str()] = value;
         }
-        let spec = entry.clone();
+        let node = self.place_app(&entry)?;
         let app = WorkloadTemplate {
             name: name.clone(),
             namespace: namespace.clone(),
             tag: tag.clone(),
-            spec: spec.into(),
+            spec: entry.clone().into(),
             persistent: true,
             removed: false,
             workers: vec![node.clone()],
@@ -653,5 +651,27 @@ impl WorkloadController {
         self.save("apps", &name, &app)?;
         self.inner.lock().apps.insert(name, app.clone());
         Ok((StatusCode::CREATED, Json(self.serving_app_value(&app, tag.as_deref()))).into_response())
+    }
+
+    /// The node for a new app's `entry`: a live, ready node that is not draining and has the
+    /// GPUs and CPUs of all its replicas. One that has them free now is preferred, the one
+    /// with the fewest free GPUs among those, as a batch-class proof app is placed, so larger
+    /// requests keep the larger gaps; otherwise the one with the most free GPUs, where the app
+    /// waits for room when it is enabled.
+    fn place_app(&self, entry: &Value) -> anyhow::Result<String> {
+        let replicas = entry["replicas"].as_f64().unwrap_or(1.0);
+        let gpus = entry["gpus"].as_f64().unwrap_or(1.0) * replicas;
+        let cpus = entry["cpus"].as_f64().unwrap_or(1.0) * replicas;
+        let large: Vec<String> = self.inner.lock().workers.iter()
+            .filter(|(_, w)| w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .map(|(id, _)| id.clone()).collect();
+        let sizes: Vec<(String, f64, f64)> = large.into_iter()
+            .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))
+            .collect();
+        let fits = |&(_, g, c): &&(String, f64, f64)| g + 1e-9 >= gpus && c + 1e-9 >= cpus;
+        sizes.iter().filter(fits).min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
+            .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))))
+            .map(|(id, _, _)| id.clone())
+            .ok_or_else(|| fail(503, format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")))
     }
 }

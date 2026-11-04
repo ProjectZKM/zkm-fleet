@@ -1916,10 +1916,10 @@ async fn a_service_named_like_a_batch_does_not_attach_to_it() {
 }
 
 #[tokio::test]
-async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
+async fn an_app_is_created_on_a_node_the_scheduler_picks_and_names_stay_unique() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let body = json!({"name":"model","namespace":ns,"node":"gpu","service":{"image":"serve:1","gpus":1,"cpus":2,
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}});
     let response = scale_call(c.clone(), "admin", "POST", "/apps", body.clone()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
@@ -1928,40 +1928,70 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
         "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"priority":0,"replicas":1,"gpus":1,"cpus":2,"image":"serve:1",
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}}))]);
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu","service":{"port_base":1}})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"spec":{"port_base":1}})).await.status(),
         StatusCode::BAD_REQUEST);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","service":{"image":"x","port_base":1}})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"spec":{"image":"x","port_base":1}})).await.status(),
         StatusCode::CONFLICT, "a batch's name is taken");
-    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","service":{"image":"x","port_base":1}})).await.status(),
-        StatusCode::NOT_FOUND);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"pinned","namespace":ns,"node":"gpu","spec":{"image":"x","port_base":1}})).await.status(),
+        StatusCode::BAD_REQUEST, "the scheduler picks the node");
+    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"huge","namespace":ns,"spec":{"image":"x","port_base":1,"gpus":2,"replicas":2}})).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE, "no node has 4 GPUs");
 }
 
 #[tokio::test]
-async fn a_serving_app_with_a_mistyped_setting_is_refused_before_its_node_sees_it() {
+async fn an_app_goes_to_the_node_its_replicas_fit_most_tightly() {
+    let (_dir, c, ns) = setup().await;
+    let node = |total: u32, free: u32| -> NodeReport {
+        let mut report = inventory(&ns);
+        (report.total_gpus, report.free_gpus) = (total as f64, free as f64);
+        report
+    };
+    c.report("big", "session", node(8, 8)).await.unwrap();
+    c.report("busy", "session", node(8, 0)).await.unwrap();
+    c.report("small", "session", node(2, 2)).await.unwrap();
+    let mut placed = Vec::new();
+    for (name, gpus) in [("one", 1), ("four", 4), ("eight", 8)] {
+        let body = json!({"name":name,"namespace":ns,"spec":{"image":"serve:1","port_base":50100,"gpus":gpus}});
+        assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED, "{name}");
+        placed.push(remove_commands(&c, NodeOperation::App).remove(0).0);
+    }
+    // One card fits the small node's free cards most tightly; four and eight fit only the big
+    // node's.
+    assert_eq!(placed, ["small", "big", "big"]);
+    // With no eight cards free anywhere, the app waits on a node that has them, the one with
+    // the most free cards, the first by name on a tie.
+    c.report("big", "session", node(8, 0)).await.unwrap();
+    let body = json!({"name":"later","namespace":ns,"spec":{"image":"serve:1","port_base":50100,"gpus":8}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(remove_commands(&c, NodeOperation::App).remove(0).0, "big");
+}
+
+#[tokio::test]
+async fn an_app_with_a_mistyped_setting_is_refused_before_a_node_sees_it() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("port_base", Value::Null),
         ("workdir", json!(1)), ("kind", json!("app"))] {
-        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","service":{"image":"serve:1","port_base":50100}});
-        body["service"][key] = value;
+        let mut body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","port_base":50100}});
+        body["spec"][key] = value;
         assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::BAD_REQUEST, "{key}");
     }
-    let flat = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","port_base":50100});
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", flat).await.status(), StatusCode::BAD_REQUEST, "settings belong under service");
+    let flat = json!({"name":"model","namespace":ns,"image":"serve:1","port_base":50100});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", flat).await.status(), StatusCode::BAD_REQUEST, "settings belong under spec");
     assert!(remove_commands(&c, NodeOperation::App).is_empty() && !c.inner.lock().apps.contains_key("model"));
 }
 
 #[tokio::test]
-async fn a_namespace_owner_creates_its_serving_app_but_not_host_mounts_or_users() {
+async fn a_namespace_owner_creates_its_app_but_not_host_mounts_or_users() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let owner = user_token(&c, &ns, 7, "scope=default", None, true).await;
     let reader = user_token(&c, &ns, 8, "scope=default", Some(vec!["model".into()]), false).await;
-    let body = json!({"name":"model","node":"gpu","service":{"image":"serve:1","port_base":50100,"command":["serve","{port}"],
+    let body = json!({"name":"model","spec":{"image":"serve:1","port_base":50100,"command":["serve","{port}"],
         "env":{"A":"1"},"workdir":"/srv"}});
     for (key, value) in [("volumes", json!(["/models:ro"])), ("user", json!("0:0"))] {
         let mut admin_only = body.clone();
-        admin_only["service"][key] = value;
+        admin_only["spec"][key] = value;
         assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", admin_only).await.status(), StatusCode::FORBIDDEN, "{key}");
     }
     assert_eq!(scale_call(c.clone(), &reader, "POST", "/apps", body.clone()).await.status(), StatusCode::FORBIDDEN, "creation needs manage");

@@ -287,45 +287,47 @@ impl PreemptionPlan {
 }
 
 impl RegisterAppRequest {
-    /// The settings of a serving app's services.yaml entry it may be registered with. The
-    /// scheduler adds its name, kind, namespace, tag and priority, and registers it disabled.
-    pub const SERVICE_SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
+    /// The settings of an app's services.yaml entry it may be registered with. The scheduler
+    /// adds its name, kind, namespace, tag and priority, and registers it disabled.
+    pub const SPEC_SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
         "port_base", "health_path", "workdir", "volumes", "env", "user"];
 
-    /// A serving app names its node and service; a proof app names its program.
-    pub fn is_serving(&self) -> bool {
-        self.node.is_some() || self.service.is_some()
+    /// The app is registered by its container, which the scheduler places, rather than by the
+    /// program its node-configured provers prove.
+    pub fn has_spec(&self) -> bool {
+        self.spec.is_some()
     }
 
-    /// Which kind of app this registers, and that it carries only that kind's fields. A proof
-    /// app's program and policy are checked where it is registered; a serving app's settings
-    /// here, before the app is recorded, since a setting the node refuses later would leave an
-    /// app record with no service behind it.
+    /// That the request names the app's container or its program, not both. The program and
+    /// its policy are checked where the app is registered; the container's settings here,
+    /// before the app is recorded, since a setting the node refuses later would leave an app
+    /// record with no service behind it.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.is_serving() {
+        if !self.has_spec() {
             anyhow::ensure!(
                 self.elf_id.as_deref().is_some_and(|e| !e.is_empty()),
-                "elf_id is required for a proof app (a serving app gives node and service instead)"
+                "an app needs its container (spec) or the program its provers prove (elf_id)"
             );
             return Ok(());
         }
+        // A prover's container needs the node's prover configuration, so it is still
+        // configured on its node.
         anyhow::ensure!(
             self.elf_id.is_none() && self.class.is_none() && self.anchor.is_none() && self.backends.is_empty()
                 && self.zkm_version.is_none() && self.max_queued.is_none(),
-            "a serving app takes no proof program or proof policy (elf_id, class, anchor, backends, zkm_version, max_queued)"
+            "an app's spec takes no proof program or policy (elf_id, class, anchor, backends, zkm_version, max_queued)"
         );
         anyhow::ensure!(
             !self.name.is_empty() && self.name.len() <= 63
                 && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
             "invalid app name: letters, digits, _ . -, at most 63"
         );
-        anyhow::ensure!(self.node.as_deref().is_some_and(|n| !n.is_empty()), "node is required: the node that runs the app");
-        let service = self.service.as_deref().and_then(Value::as_object)
-            .ok_or_else(|| anyhow::anyhow!("service is required: a JSON object of settings"))?;
-        if let Some(key) = service.keys().find(|k| !Self::SERVICE_SETTINGS.contains(&k.as_str())) {
-            anyhow::bail!("unknown service setting {key}; a serving app takes {}", Self::SERVICE_SETTINGS.join(", "));
+        let spec = self.spec.as_deref().and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("spec must be a JSON object of settings"))?;
+        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str())) {
+            anyhow::bail!("unknown app setting {key}; an app's spec takes {}", Self::SPEC_SETTINGS.join(", "));
         }
-        let set = |key: &str| service.get(key).filter(|v| !v.is_null());
+        let set = |key: &str| spec.get(key).filter(|v| !v.is_null());
         anyhow::ensure!(
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
@@ -339,7 +341,7 @@ impl RegisterAppRequest {
             .or_else(|| set("gpus").is_some_and(|g| g.as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())).then_some("gpus"))
             .or_else(|| set("env").is_some_and(|e| e.as_object().is_none_or(|e| e.values().any(|v| !v.is_string()))).then_some("env"));
         if let Some(key) = invalid {
-            anyhow::bail!("invalid service setting {key}");
+            anyhow::bail!("invalid app setting {key}");
         }
         Ok(())
     }
@@ -351,26 +353,28 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn an_app_registration_is_a_proof_app_or_a_serving_app() {
-        let serving = |service: Value| -> RegisterAppRequest {
-            serde_json::from_value(json!({"name":"model","node":"gpu","service":service})).unwrap()
+    fn an_app_registers_its_container_or_its_program() {
+        let app = |spec: Value| -> RegisterAppRequest {
+            serde_json::from_value(json!({"name":"model","spec":spec})).unwrap()
         };
         let valid = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
-        assert!(serving(valid.clone()).is_serving() && serving(valid.clone()).validate().is_ok());
+        assert!(app(valid.clone()).has_spec() && app(valid.clone()).validate().is_ok());
         for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
             ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("app"))] {
-            let mut service = valid.clone();
-            service[key] = value;
-            assert!(serving(service).validate().is_err(), "{key}");
+            let mut spec = valid.clone();
+            spec[key] = value;
+            assert!(app(spec).validate().is_err(), "{key}");
         }
-        let proof: RegisterAppRequest = serde_json::from_value(json!({"name":"eth","elf_id":"ab".repeat(32)})).unwrap();
-        assert!(!proof.is_serving() && proof.validate().is_ok(), "a proof app's request is unchanged");
+        let program: RegisterAppRequest = serde_json::from_value(json!({"name":"eth","elf_id":"ab".repeat(32)})).unwrap();
+        assert!(!program.has_spec() && program.validate().is_ok(), "a program's registration is unchanged");
         let neither: RegisterAppRequest = serde_json::from_value(json!({"name":"eth"})).unwrap();
-        assert!(neither.validate().is_err(), "a proof app still needs its program");
-        let both: RegisterAppRequest = serde_json::from_value(json!({"name":"model","node":"gpu","service":valid,"elf_id":"ab".repeat(32)})).unwrap();
-        assert!(both.validate().is_err(), "an app is one kind");
-        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","node":"gpu","image":"serve:1"})).is_err(),
-            "settings belong under service");
+        assert!(neither.validate().is_err(), "an app needs its container or its program");
+        let both: RegisterAppRequest = serde_json::from_value(json!({"name":"model","spec":valid,"elf_id":"ab".repeat(32)})).unwrap();
+        assert!(both.validate().is_err(), "a prover's container is configured on its node");
+        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","image":"serve:1"})).is_err(),
+            "settings belong under spec");
+        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","node":"gpu","spec":{}})).is_err(),
+            "the scheduler picks the node");
     }
 
     #[test]

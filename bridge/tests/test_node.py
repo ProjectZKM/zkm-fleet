@@ -433,7 +433,7 @@ def test_append_entry_keeps_every_other_line(tmp_path, text):
             assert line in p.read_text()
 
 
-def test_create_adds_a_disabled_serving_app_and_refuses_a_taken_name(executor):
+def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
     entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
     assert app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)
     assert yaml.safe_load(executor.services.read_text())["services"][-1]==entry
