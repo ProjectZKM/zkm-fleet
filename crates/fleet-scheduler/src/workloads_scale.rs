@@ -747,8 +747,9 @@ impl WorkloadController {
 
     /// Moves an app the scheduler placed whose `start` waits for room on its node to a node
     /// that has the room now. That node writes the app's entry as the old node has it, disabled
-    /// (a node that lacks the entry's host files refuses it, and is not asked again); once it
-    /// reports the entry, the old node removes its own and the app starts on the new node.
+    /// (a node whose create fails is not asked again); once it reports the entry, the old node
+    /// removes its own and the app starts on the new node. What the app keeps on a node's disks
+    /// is the app's own: nothing of it is copied.
     /// Returns whether a move is under way, so the start stays unsent. `fits`: the start has
     /// its room on its own node. The caller holds the operation lock.
     pub(super) fn relocate(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
@@ -775,7 +776,7 @@ impl WorkloadController {
             return Ok(false);
         }
         // Not the node it waits on, one that already configures an entry of this name, or
-        // one that refused this entry.
+        // one whose create of it failed.
         let except: Vec<String> = {
             let i = self.inner.lock();
             i.workers.iter()

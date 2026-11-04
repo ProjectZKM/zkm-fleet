@@ -2007,7 +2007,7 @@ async fn a_proof_app_is_an_app_whose_container_proves_its_program() {
 
 /// Plays `nodes` through the commands sent to them, one at a time, until none is left: each
 /// writes, starts and stops app entries in its report as its command asks. `refuse` names
-/// nodes that refuse a `create`, the way one without the entry's files does.
+/// nodes whose `create` fails.
 async fn play_nodes(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeReport>, refuse: &[&str]) {
     for _ in 0..100 {
         c.dispatch().await.unwrap();
@@ -2025,7 +2025,7 @@ async fn play_nodes(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeRep
             if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
         } else if !p["create"].is_null() {
             if refuse.contains(&command.worker.as_str()) {
-                error = Some("missing on this machine: /opt/eth-proofs".to_string());
+                error = Some("apps.yaml is not writable".to_string());
                 Value::Null
             } else {
                 let mut entry = p["create"].clone();
@@ -2063,7 +2063,7 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
         (report.machine, report.free_gpus) = (machine.into(), free_gpus);
         report
     };
-    // Its node's cards are taken by then; a node that lacks its files has room.
+    // Its node's cards are taken by then; a node that cannot write its entry has room.
     let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone()), ("bare".into(), node("bare", 2.0))]);
     nodes.get_mut("gpu").unwrap().free_gpus = 0.0;
     for (id, report) in &nodes {
@@ -2073,7 +2073,7 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
     play_nodes(&c, &mut nodes, &["bare"]).await;
     let waiting = |c: &WorkloadController| c.inner.lock().commands.values()
         .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| v.worker.clone()).collect::<Vec<_>>();
-    assert_eq!(waiting(&c), ["gpu"], "a node that refused the app leaves it waiting where it is");
+    assert_eq!(waiting(&c), ["gpu"], "a node that failed to create the app leaves it waiting where it is");
     c.dispatch().await.unwrap();
     assert!(remove_commands(&c, NodeOperation::App).is_empty(), "and is not asked again");
 
@@ -2113,10 +2113,10 @@ async fn an_app_a_node_refuses_to_create_is_placed_again_on_the_next_enable() {
         tokio::task::yield_now().await;
     };
     let mut report = inventory(&ns);
-    report.results = vec![CommandResult { id: create.id, result: Value::Null.into(), error: Some("missing on this machine: /data".into()) }];
+    report.results = vec![CommandResult { id: create.id, result: Value::Null.into(), error: Some("apps.yaml is not writable".into()) }];
     c.report("gpu", "session", report).await.unwrap();
     let refused = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("enabling answers").unwrap().unwrap_err();
-    assert!(refused.to_string().contains("could not create the app: missing on this machine"), "{refused}");
+    assert!(refused.to_string().contains("could not create the app: apps.yaml is not writable"), "{refused}");
     assert!(c.inner.lock().apps["model"].workers.is_empty());
 }
 

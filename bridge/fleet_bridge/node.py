@@ -150,14 +150,6 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
     return True
 
 
-def host_paths(app: AppSpec) -> list[str]:
-    """The files of this machine an app's entry runs with: its worker program, environment
-    file, storage root and volume sources. A node takes an entry only when it has them."""
-    paths = [app.worker_command[0]] if app.worker_command and os.path.isabs(app.worker_command[0]) else []
-    paths += [p for p in (app.worker_env_file, app.proof_storage_root) if p]
-    return paths + [v.partition(":")[0] for v in app.volumes]
-
-
 def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
     """Appends one entry to an `apps` list, keeping every other line as written. The entry
     goes on one line in YAML flow style, under a block list, an empty list or a missing key."""
@@ -422,10 +414,7 @@ class NodeExecutor:
         entry to the configuration, disabled until the app is enabled."""
         if "create" in p:
             entry = p["create"]
-            missing = [path for path in host_paths(AppSpec.load(entry)) if not os.path.exists(path)]
-            if missing:
-                # The scheduler then leaves the app where it is.
-                raise ValueError(f"missing on this machine: {', '.join(missing)}")
+            AppSpec.load(entry)
             entries = (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []
             if any(e.get("name") == entry["name"] for e in entries):
                 raise ValueError(f"{entry['name']} is already configured on this node")
