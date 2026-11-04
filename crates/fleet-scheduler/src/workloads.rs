@@ -850,7 +850,7 @@ impl WorkloadController {
                         && c.worker == worker_id
                         && (c.operation == NodeOperation::SetApp as i32 && text(&c.parameters["app"], "name") == name
                             || c.operation == NodeOperation::App as i32 && text(&c.parameters["entry"], "name") == name
-                            // A moved app's old node removes its entry.
+                            // A start placed on another node: its own node removes its entry.
                             || c.operation == NodeOperation::App as i32 && c.parameters["remove"] == json!(true)
                                 && text(&c.parameters["app"], "name") == text(observed, "app"))
                 })
@@ -1362,7 +1362,8 @@ impl WorkloadController {
                     || self
                         .capacity(&c.worker)
                         .is_some_and(|(fg, fc)| fg + 1e-6 >= g && fc + 1e-6 >= cpu);
-                if self.move_waiting_app(&c, fits)? {
+                // Free room on any node first; preempting only when there is none.
+                if self.place_start(&c, fits)? {
                     continue;
                 }
                 if !fits {

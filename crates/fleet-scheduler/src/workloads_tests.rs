@@ -2052,7 +2052,7 @@ async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String,
 }
 
 #[tokio::test]
-async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
+async fn an_app_start_is_placed_on_a_node_with_room() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100}});
@@ -2073,12 +2073,27 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
     nodes_run_commands(&c, &mut nodes, &["bare"]).await;
     let waiting_starts = |c: &WorkloadController| c.inner.lock().commands.values()
         .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| v.worker.clone()).collect::<Vec<_>>();
-    assert_eq!(waiting_starts(&c), ["gpu"], "a node that failed to create the app leaves it waiting where it is");
+    assert_eq!(waiting_starts(&c), ["gpu"], "a node that failed to create the app leaves it waiting on its own");
     c.dispatch().await.unwrap();
-    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "and is not asked again");
+    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "and is not picked again");
 
+    // A start that preempted on its own node keeps the room that frees, though another node
+    // has room by then.
+    let mut preempted = submit(&c).await;
+    (preempted.worker, preempted.stop) = (Some("gpu".into()), Some("preempt".into()));
+    preempted.status["state"] = json!("running");
+    c.inner.lock().jobs.insert(preempted.id.clone(), preempted.clone());
     nodes.insert("big".into(), report_of("big", 2.0));
     c.report("big", "session", nodes["big"].clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "placed on its own node while it preempts there");
+    preempted.status["state"] = json!("cancelled");
+    c.inner.lock().jobs.insert(preempted.id.clone(), preempted);
+    for command in c.inner.lock().commands.values_mut().filter(|v| v.operation == NodeOperation::PreemptJob as i32) {
+        command.done = true;
+    }
+
+    // Otherwise it takes the room another node has.
     c.dispatch().await.unwrap();
     let created = remove_commands(&c, NodeOperation::App);
     assert_eq!(created.len(), 1);
@@ -2087,7 +2102,7 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
     assert!(["ready", "cleaned", "logs", "namespace_ref"].iter().all(|k| entry.get(*k).is_none()), "{entry}");
     nodes_run_commands(&c, &mut nodes, &["bare"]).await;
     assert!(waiting_starts(&c).is_empty());
-    assert!(nodes["gpu"].apps.is_empty(), "its old node removed the entry");
+    assert!(nodes["gpu"].apps.is_empty(), "its own node removed the entry");
     let ready = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true) && a["disabled"] == json!(false));
     assert!(ready, "it runs on the node that had room: {:?}", nodes["big"].apps);
     let i = c.inner.lock();

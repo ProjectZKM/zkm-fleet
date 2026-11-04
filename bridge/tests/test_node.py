@@ -304,7 +304,7 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
 
 
 def test_removing_an_app_keeps_its_data(executor,monkeypatch,tmp_path):
-    """A moved app's old node removes its entry; the app's storage is the app's own."""
+    """A start placed on another node has its own node remove the entry; the app's storage is its own."""
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:True)
     data={name:tmp_path/"data"/name for name in ("storage","workdir","models")}

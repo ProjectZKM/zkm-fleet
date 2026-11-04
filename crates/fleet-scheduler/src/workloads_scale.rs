@@ -745,14 +745,15 @@ impl WorkloadController {
             .ok_or_else(|| fail(503, format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")))
     }
 
-    /// Moves an app the scheduler placed whose `start` waits for room on its node to a node
-    /// that has the room now. That node writes the app's entry as the old node has it, disabled
-    /// (a node whose create fails is not asked again); once it reports the entry, the old node
-    /// removes its own and the app starts on the new node. What the app keeps on a node's disks
-    /// is the app's own: nothing of it is copied.
-    /// Returns whether a move is under way, so the start stays unsent. `fits`: the start has
-    /// its room on its own node. The caller holds the operation lock.
-    pub(super) fn move_waiting_app(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
+    /// Places a queued `start` of an app the scheduler placed, as `place_app` places a new
+    /// app: on its own node when that has the room (`fits`), else on the node that fits it
+    /// best now. That node is sent the app's entry, disabled, and the start runs there once it
+    /// reports it (`start_on`); a node whose create fails is not picked again. With no room
+    /// anywhere the caller preempts on the start's own node, and the start keeps the room that
+    /// frees. Nothing of what the app keeps on a node's disks is copied: that is the app's own.
+    /// Returns whether the start runs on another node, so it is not sent to its own. The caller
+    /// holds the operation lock.
+    pub(super) fn place_start(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
         let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
@@ -769,14 +770,17 @@ impl WorkloadController {
         let created_on = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
             .find(|w| self.inner.lock().deployments.contains_key(&format!("{w}-{name}")));
         if let Some(target) = created_on {
-            self.hand_over(start, &target)?;
+            self.start_on(start, &target)?;
             return Ok(true);
         }
-        if fits {
+        let preempting = self.inner.lock().jobs.values().any(|r| {
+            r.worker.as_deref() == Some(start.worker.as_str()) && r.stop.as_deref() == Some("preempt") && !terminal(r.state())
+        });
+        if fits || preempting {
             return Ok(false);
         }
-        // Not the node it waits on, one that already configures an entry of this name, or
-        // one whose create of it failed.
+        // Not its own node, one that already configures an entry of this name, or one whose
+        // create of it failed.
         let skip: Vec<String> = {
             let i = self.inner.lock();
             i.workers.iter()
@@ -802,16 +806,15 @@ impl WorkloadController {
         let mut message = self.app_message(namespace, app);
         message["create"] = entry;
         self.command(&target, NodeOperation::App, message)?;
-        tracing::info!(app, from = start.worker, to = target, "moving an app that waits for room to a node that has it");
+        tracing::info!(app, node = target, "placing an app's start on a node with room for it");
         Ok(true)
     }
 
-    /// Hands a moving app over to `target`, which reports its entry: the start waiting on the
-    /// old node is not sent, the old deployment is done and its node removes the entry, and the
-    /// app starts on `target`.
-    /// Removing the entry stops what is left of the app there; its data stays where the app
-    /// keeps it, which may be storage the new node shares.
-    fn hand_over(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
+    /// Runs `start` on `target`, which reports the app's entry: the start is not sent to its
+    /// own node, that node's deployment is done and the node removes its entry, and the app
+    /// starts on `target`. Removing the entry stops what is left of the app there; its data
+    /// stays where the app keeps it, which may be storage `target` shares.
+    fn start_on(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
         let old_key = format!("{}-{name}", start.worker);
@@ -826,7 +829,7 @@ impl WorkloadController {
         }
         let mut unsent = start.clone();
         unsent.done = true;
-        unsent.error = Some(format!("the app moved to {target}, which has room for it"));
+        unsent.error = Some(format!("the app starts on {target}, which has room for it"));
         self.save("commands", &unsent.id, &unsent)?;
         self.inner.lock().commands.insert(unsent.id.clone(), unsent);
         self.tell_nodes([&start.worker], self.app_message(namespace, app), json!({"remove": true}))?;
@@ -836,7 +839,7 @@ impl WorkloadController {
             self.save("apps", app, &template)?;
             self.inner.lock().apps.insert(app.into(), template);
         }
-        tracing::info!(app, from = start.worker, to = target, "app moved; starting it there");
+        tracing::info!(app, node = target, "starting the app on the node placed for it");
         self.begin_toggle(&[format!("{target}-{name}")], false)
     }
 }
