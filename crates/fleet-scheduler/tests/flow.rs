@@ -363,11 +363,17 @@ fn request_with(h: &Harness, id: &str, elf: &[u8], stdin_buffer: Vec<Vec<u8>>, k
     req
 }
 
-/// Content-addressed, as an app's endpoint stores its files.
+/// Content-addressed, as an app's endpoint stores its files: written once and whole (a
+/// temporary file renamed into place), since a prover may be reading the same file for an
+/// earlier submission of the same input.
 fn store(h: &Harness, dir: &str, bytes: &[u8]) -> ArtifactRef {
     let path = h.storage.join(dir).join(artifacts::hash(bytes));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, bytes).unwrap();
+    if !path.exists() {
+        let temp = path.with_extension(uuid::Uuid::new_v4().to_string());
+        std::fs::write(&temp, bytes).unwrap();
+        std::fs::rename(temp, &path).unwrap();
+    }
     artifacts::reference(&path, bytes).unwrap()
 }
 
