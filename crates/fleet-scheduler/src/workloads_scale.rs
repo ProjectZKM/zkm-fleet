@@ -682,7 +682,7 @@ impl WorkloadController {
             match pending {
                 Some(pending) => pending,
                 None => {
-                    let node = self.place_app(&template.spec)?;
+                    let (node, _) = self.place_app(&template.spec, &[])?;
                     let mut message = self.app_message(namespace, app);
                     message["create"] = template.spec.0.clone();
                     let create = self.command(&node, NodeOperation::App, message)?;
@@ -708,7 +708,8 @@ impl WorkloadController {
                 }
                 if let Some(error) = failed.filter(|e| !e.is_empty()) {
                     // The next enable places it again.
-                    if let Some(mut template) = self.inner.lock().apps.get(app).cloned() {
+                    let template = self.inner.lock().apps.get(app).cloned();
+                    if let Some(mut template) = template {
                         template.workers.clear();
                         self.save("apps", app, &template)?;
                         self.inner.lock().apps.insert(app.into(), template);
@@ -726,21 +727,112 @@ impl WorkloadController {
     /// and CPUs of all its replicas. One that has them free now is preferred, the one with the
     /// fewest free GPUs among those, as a batch-class proof app is placed, so larger requests
     /// keep the larger gaps; otherwise the one with the most free GPUs, where the app waits for
-    /// room.
-    fn place_app(&self, entry: &Value) -> anyhow::Result<String> {
+    /// room. Whether it has the room now comes along. `except` are nodes not to pick.
+    fn place_app(&self, entry: &Value, except: &[String]) -> anyhow::Result<(String, bool)> {
         let replicas = entry["replicas"].as_f64().unwrap_or(1.0);
         let gpus = entry["gpus"].as_f64().unwrap_or(1.0) * replicas;
         let cpus = entry["cpus"].as_f64().unwrap_or(1.0) * replicas;
         let large: Vec<String> = self.inner.lock().workers.iter()
-            .filter(|(_, w)| w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .filter(|(id, w)| !except.contains(id) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
         let sizes: Vec<(String, f64, f64)> = large.into_iter()
             .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))
             .collect();
         let fits = |&(_, g, c): &&(String, f64, f64)| g + 1e-9 >= gpus && c + 1e-9 >= cpus;
         sizes.iter().filter(fits).min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
-            .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))))
-            .map(|(id, _, _)| id.clone())
+            .map(|(id, _, _)| (id.clone(), true))
+            .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))).map(|(id, _, _)| (id.clone(), false)))
             .ok_or_else(|| fail(503, format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")))
+    }
+
+    /// Moves an app the scheduler placed whose `start` waits for room on its node to a node
+    /// that has the room now. That node writes the app's entry as the old node has it, disabled
+    /// (a node that lacks the entry's host files refuses it, and is not asked again); once it
+    /// reports the entry, the old node removes its own and the app starts on the new node.
+    /// Returns whether a move is under way, so the start stays unsent. `fits`: the start has
+    /// its room on its own node. The caller holds the operation lock.
+    pub(super) fn relocate(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
+        let s = &start.parameters["app"];
+        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
+        if !placed {
+            return Ok(false);
+        }
+        let creates: Vec<CommandRecord> = self.inner.lock().commands.values()
+            .filter(|c| c.worker != start.worker && c.operation == NodeOperation::App as i32
+                && text(&c.parameters["create"], "name") == name)
+            .cloned().collect();
+        if creates.iter().any(|c| !c.done) {
+            return Ok(true);
+        }
+        let moved = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
+            .find(|w| self.inner.lock().deployments.contains_key(&format!("{w}-{name}")));
+        if let Some(target) = moved {
+            self.finish_move(start, &target)?;
+            return Ok(true);
+        }
+        if fits {
+            return Ok(false);
+        }
+        // Not the node it waits on, one that already configures an entry of this name, or
+        // one that refused this entry.
+        let except: Vec<String> = {
+            let i = self.inner.lock();
+            i.workers.iter()
+                .filter(|(id, w)| **id == start.worker || w.report.apps.iter().any(|a| text(a, "name") == name))
+                .map(|(id, _)| id.clone())
+                .chain(creates.iter().filter(|c| c.error.is_some()).map(|c| c.worker.clone()))
+                .collect()
+        };
+        let Ok((target, true)) = self.place_app(s, &except) else {
+            return Ok(false);
+        };
+        let mut entry = s.clone();
+        if let Some(fields) = entry.as_object_mut() {
+            // What the old node reported about the entry, not its configuration.
+            for key in ["ready", "logs", "cleaned", "namespace_ref"] {
+                fields.remove(key);
+            }
+        }
+        entry["disabled"] = json!(true);
+        if !entry["machine"].is_null() {
+            entry["machine"] = json!(self.inner.lock().workers[&target].report.machine);
+        }
+        let mut message = self.app_message(namespace, app);
+        message["create"] = entry;
+        self.command(&target, NodeOperation::App, message)?;
+        tracing::info!(app, from = start.worker, to = target, "moving an app that waits for room to a node that has it");
+        Ok(true)
+    }
+
+    /// The new node reports the moved app's entry: the start on the old node is not sent, the
+    /// old deployment is done and its node removes the entry, and the app starts on `target`.
+    fn finish_move(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
+        let s = &start.parameters["app"];
+        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let old_key = format!("{}-{name}", start.worker);
+        let old = self.inner.lock().deployments.get(&old_key).cloned();
+        if let Some(mut old) = old {
+            old.disabled = true;
+            if let Some(scale) = old.scale.as_mut().filter(|s| s.pending()) {
+                scale.phase = Phase::Complete as i32;
+            }
+            self.save("deployments", &old_key, &old)?;
+            self.inner.lock().deployments.insert(old_key, old);
+        }
+        let mut start = start.clone();
+        start.done = true;
+        start.error = Some(format!("the app moved to {target}, which has room for it"));
+        self.save("commands", &start.id, &start)?;
+        self.inner.lock().commands.insert(start.id.clone(), start.clone());
+        self.tell_nodes([&start.worker], self.app_message(namespace, app), json!({"remove": true}))?;
+        let template = self.inner.lock().apps.get(app).cloned();
+        if let Some(mut template) = template {
+            template.workers = vec![target.into()];
+            self.save("apps", app, &template)?;
+            self.inner.lock().apps.insert(app.into(), template);
+        }
+        tracing::info!(app, from = start.worker, to = target, "app moved; starting it there");
+        self.begin_toggle(&[format!("{target}-{name}")], false)
     }
 }

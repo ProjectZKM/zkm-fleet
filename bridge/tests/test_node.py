@@ -447,3 +447,16 @@ def test_create_adds_a_prover_and_refuses_an_invalid_entry(executor):
     before=executor.apps_file.read_text()
     result,error=app_message(executor,"create-2",{"create":{**prover,"name":"other","elf_id":""}},app="other",ns="a"*32)
     assert error and "elf_id" in str(error) and executor.apps_file.read_text()==before
+
+
+def test_create_refuses_an_entry_whose_files_are_not_on_this_machine(executor, tmp_path):
+    worker = tmp_path/"eth-proofs"; worker.write_text(""); state = tmp_path/"state"; state.mkdir()
+    entry = {"name":"eth","kind":"ziren-gpu","namespace":"a"*32,"disabled":True,"image":"ziren-gpu:1","elf_id":"b"*64,
+             "machine":"m1","worker_command":[str(worker)],"worker_env_file":str(tmp_path/"worker.env"),"proof_storage_root":str(state),
+             "volumes":[f"{tmp_path/'models'}:ro"]}
+    before = executor.apps_file.read_text()
+    result, error = app_message(executor,"create-1",{"create":entry},app="eth",ns="a"*32)
+    assert error and str(tmp_path/"worker.env") in str(error) and str(tmp_path/"models") in str(error)
+    assert str(worker) not in str(error) and executor.apps_file.read_text() == before
+    (tmp_path/"worker.env").write_text(""); (tmp_path/"models").mkdir()
+    assert app_message(executor,"create-2",{"create":entry},app="eth",ns="a"*32) == ({"created":["eth"]},None)
