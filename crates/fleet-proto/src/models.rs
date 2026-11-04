@@ -286,25 +286,44 @@ impl PreemptionPlan {
     }
 }
 
-impl RegisterServingAppRequest {
+impl RegisterAppRequest {
     /// The settings of a serving app's services.yaml entry it may be registered with. The
-    /// scheduler adds its name, kind, namespace and tag, and registers it disabled.
-    pub const SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
+    /// scheduler adds its name, kind, namespace, tag and priority, and registers it disabled.
+    pub const SERVICE_SETTINGS: [&'static str; 12] = ["image", "command", "replicas", "gpus", "cpus", "shm_gb",
         "port_base", "health_path", "workdir", "volumes", "env", "user"];
 
-    /// Checked before the app is recorded: a setting the node refuses later would leave an
+    /// A serving app names its node and service; a proof app names its program.
+    pub fn is_serving(&self) -> bool {
+        self.node.is_some() || self.service.is_some()
+    }
+
+    /// Which kind of app this registers, and that it carries only that kind's fields. A proof
+    /// app's program and policy are checked where it is registered; a serving app's settings
+    /// here, before the app is recorded, since a setting the node refuses later would leave an
     /// app record with no service behind it.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.is_serving() {
+            anyhow::ensure!(
+                self.elf_id.as_deref().is_some_and(|e| !e.is_empty()),
+                "elf_id is required for a proof app (a serving app gives node and service instead)"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.elf_id.is_none() && self.class.is_none() && self.anchor.is_none() && self.backends.is_empty()
+                && self.zkm_version.is_none() && self.max_queued.is_none(),
+            "a serving app takes no proof program or proof policy (elf_id, class, anchor, backends, zkm_version, max_queued)"
+        );
         anyhow::ensure!(
             !self.name.is_empty() && self.name.len() <= 63
                 && self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
             "invalid app name: letters, digits, _ . -, at most 63"
         );
-        anyhow::ensure!(!self.node.is_empty(), "node is required: the node that runs the app");
-        let service = self.service.as_object()
-            .ok_or_else(|| anyhow::anyhow!("service must be a JSON object of settings"))?;
-        if let Some(key) = service.keys().find(|k| !Self::SETTINGS.contains(&k.as_str())) {
-            anyhow::bail!("unknown service setting {key}; a serving app takes {}", Self::SETTINGS.join(", "));
+        anyhow::ensure!(self.node.as_deref().is_some_and(|n| !n.is_empty()), "node is required: the node that runs the app");
+        let service = self.service.as_deref().and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("service is required: a JSON object of settings"))?;
+        if let Some(key) = service.keys().find(|k| !Self::SERVICE_SETTINGS.contains(&k.as_str())) {
+            anyhow::bail!("unknown service setting {key}; a serving app takes {}", Self::SERVICE_SETTINGS.join(", "));
         }
         let set = |key: &str| service.get(key).filter(|v| !v.is_null());
         anyhow::ensure!(
@@ -332,21 +351,26 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn a_serving_app_registration_takes_only_its_service_settings() {
-        let request = |service: Value| RegisterServingAppRequest {
-            name: "model".into(), node: "gpu".into(), service: service.into(), namespace: None,
+    fn an_app_registration_is_a_proof_app_or_a_serving_app() {
+        let serving = |service: Value| -> RegisterAppRequest {
+            serde_json::from_value(json!({"name":"model","node":"gpu","service":service})).unwrap()
         };
         let valid = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
-        assert!(request(valid.clone()).validate().is_ok());
+        assert!(serving(valid.clone()).is_serving() && serving(valid.clone()).validate().is_ok());
         for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
             ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("app"))] {
             let mut service = valid.clone();
             service[key] = value;
-            assert!(request(service).validate().is_err(), "{key}");
+            assert!(serving(service).validate().is_err(), "{key}");
         }
-        let body: Result<RegisterServingAppRequest, _> =
-            serde_json::from_value(json!({"name":"model","node":"gpu","service":valid,"image":"serve:1"}));
-        assert!(body.is_err(), "settings belong under service");
+        let proof: RegisterAppRequest = serde_json::from_value(json!({"name":"eth","elf_id":"ab".repeat(32)})).unwrap();
+        assert!(!proof.is_serving() && proof.validate().is_ok(), "a proof app's request is unchanged");
+        let neither: RegisterAppRequest = serde_json::from_value(json!({"name":"eth"})).unwrap();
+        assert!(neither.validate().is_err(), "a proof app still needs its program");
+        let both: RegisterAppRequest = serde_json::from_value(json!({"name":"model","node":"gpu","service":valid,"elf_id":"ab".repeat(32)})).unwrap();
+        assert!(both.validate().is_err(), "an app is one kind");
+        assert!(serde_json::from_value::<RegisterAppRequest>(json!({"name":"model","node":"gpu","image":"serve:1"})).is_err(),
+            "settings belong under service");
     }
 
     #[test]

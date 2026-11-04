@@ -260,7 +260,7 @@ impl Scheduler {
         if !valid_app_name(&r.name) {
             return Err(refuse(400, "name: letters, digits, _ . -, at most 63".into()));
         }
-        let elf_id = r.elf_id.trim().trim_start_matches("0x").to_ascii_lowercase();
+        let elf_id = r.elf_id.as_deref().unwrap_or("").trim().trim_start_matches("0x").to_ascii_lowercase();
         if !valid_elf_id(&elf_id) {
             return Err(refuse(400, "elf_id: the program's id, 64 hex digits (the sha256 of the ELF)".into()));
         }

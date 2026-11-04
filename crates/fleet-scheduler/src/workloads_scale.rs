@@ -608,11 +608,11 @@ impl WorkloadController {
     /// quota. The name is one of the namespace's apps and batches, so it is checked against both
     /// here and when the node reports.
     pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>,
-        request: fleet_proto::model::v1::RegisterServingAppRequest,
+        request: fleet_proto::model::v1::RegisterAppRequest,
     ) -> anyhow::Result<Response> {
-        request.validate().map_err(|e| fail(400, e.to_string()))?;
-        let (name, node) = (request.name.clone(), request.node.clone());
-        let service = request.service.as_object().cloned().unwrap_or_default();
+        // `request` is a validated serving app's registration.
+        let (name, node) = (request.name.clone(), request.node.clone().unwrap_or_default());
+        let service = request.service.as_deref().and_then(Value::as_object).cloned().unwrap_or_default();
         let (namespace, tag) = self.scope(c, q, request.namespace.as_deref())?;
         WorkloadController::require_grant(c, &name)?;
         WorkloadController::require_admin_settings(c, &service, &Self::ADMIN_CREATE_SETTINGS)?;
@@ -630,15 +630,14 @@ impl WorkloadController {
             }
         }
         let mut entry = json!({"name": name, "kind": "app", "namespace": namespace, "disabled": true,
-            "replicas": 1, "gpus": 1.0, "cpus": 1});
+            "priority": request.priority.unwrap_or(0), "replicas": 1, "gpus": 1.0, "cpus": 1});
         if let Some(tag) = &tag {
             entry["tag"] = json!(tag);
         }
         for (key, value) in service.into_iter().filter(|(_, v)| !v.is_null()) {
             entry[key.as_str()] = value;
         }
-        let mut spec = entry.clone();
-        spec["priority"] = json!(0);
+        let spec = entry.clone();
         let app = WorkloadTemplate {
             name: name.clone(),
             namespace: namespace.clone(),

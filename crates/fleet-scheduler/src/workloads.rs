@@ -1804,14 +1804,13 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     }
     if method == Method::POST && parts == ["apps"] {
         if !batch {
-            let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-            // A serving app names the node that runs it and its service settings; a proof app
-            // names a program.
-            if body.get("node").is_some() || body.get("service").is_some() {
-                let request = serde_json::from_value(body).map_err(|e| fail(400, format!("invalid serving app: {e}")))?;
-                return s.create_serving_app(c, &q, request).await;
+            let body: fleet_proto::model::v1::RegisterAppRequest =
+                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)
+                    .map_err(|e| fail(400, format!("invalid app registration: {e}")))?;
+            body.validate().map_err(|e| fail(400, e.to_string()))?;
+            if body.is_serving() {
+                return s.create_serving_app(c, &q, body).await;
             }
-            let body: fleet_proto::model::v1::RegisterAppRequest = serde_json::from_value(body)?;
             let (namespace, tag) = s.scope(c, &q, body.namespace.as_deref())?;
             WorkloadController::require_grant(c, &body.name)?;
             let _ops = s.ops.lock().await;

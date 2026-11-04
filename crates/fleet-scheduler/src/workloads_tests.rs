@@ -16,7 +16,7 @@ fn proof_elf() -> String {
 
 /// Registers the tests' proof app (program `elf`) in the namespace.
 async fn register(c: &WorkloadController, ns: &str, name: &str, elf: &str) {
-    c.fleet.add_app(ns, &fleet_proto::model::v1::RegisterAppRequest { name: name.into(), elf_id: elf.into(), ..Default::default() }).await.unwrap();
+    c.fleet.add_app(ns, &fleet_proto::model::v1::RegisterAppRequest { name: name.into(), elf_id: Some(elf.into()), ..Default::default() }).await.unwrap();
 }
 
 /// A request through the whole API router: authorized by its token, then handled.
@@ -1925,7 +1925,7 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
     assert_eq!(response.status(), StatusCode::CREATED);
     assert!(c.inner.lock().apps["model"].persistent);
     assert_eq!(remove_commands(&c, NodeOperation::App), vec![("gpu".to_string(), json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},
-        "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"replicas":1,"gpus":1,"cpus":2,"image":"serve:1",
+        "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"priority":0,"replicas":1,"gpus":1,"cpus":2,"image":"serve:1",
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}}))]);
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu","service":{"port_base":1}})).await.status(),

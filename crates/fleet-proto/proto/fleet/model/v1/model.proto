@@ -121,11 +121,14 @@ message App {
   optional double mean_prove_ms = 17;
 }
 
-// Registers a proof app (POST /apps). Unset policy fields take the defaults: class batch,
-// anchor none, any backend and circuit version, 64 queued jobs, priority 0.
+// Registers an app (POST /apps): a proof app by its program (`elf_id`), or a serving app,
+// a long-running container with its own port, by `node` and `service` (validated in
+// models.rs). A proof app's unset policy fields take the defaults: class batch, anchor none,
+// any backend and circuit version, 64 queued jobs. Priority defaults to 0.
 message RegisterAppRequest {
   required string name = 1;
-  required string elf_id = 2;
+  // A proof app's program, the SHA-256 of its ELF; required for a proof app.
+  optional string elf_id = 2;
   optional string class = 3;
   optional string anchor = 4;
   repeated string backends = 5;
@@ -133,16 +136,10 @@ message RegisterAppRequest {
   optional uint32 max_queued = 7;
   optional int32 priority = 8;
   optional string namespace = 9;
-}
-
-// A serving app: a long-running container with its own port on `node`. `service` holds
-// the settings of its services.yaml entry, which the node writes as a disabled `kind: app`
-// service (validated in models.rs).
-message RegisterServingAppRequest {
-  required string name = 1;
-  required string node = 2;
-  required Json service = 3;
-  optional string namespace = 4;
+  // A serving app: the node that runs it, and the settings of its services.yaml entry,
+  // which the node writes as a disabled `kind: app` service.
+  optional string node = 10;
+  optional Json service = 11;
 }
 
 message WorkloadTemplate {

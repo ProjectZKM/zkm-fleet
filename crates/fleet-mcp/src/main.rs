@@ -210,8 +210,8 @@ struct AppLogs {
     node: Option<String>,
 }
 
-/// A serving app's registration, as `RegisterServingAppRequest` in model.proto; its
-/// namespace is the token's.
+/// A serving app's `RegisterAppRequest` (model.proto): its name, node and service settings.
+/// Its namespace is the token's.
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RegisterServingApp {
     name: String,
@@ -221,6 +221,8 @@ struct RegisterServingApp {
     /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
     /// image and port_base are required; user and volumes require administrator credentials.
     service: serde_json::Map<String, Value>,
+    /// Priority inherited by the app's replicas (default 0; higher values run first).
+    priority: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -322,7 +324,7 @@ impl FleetMcp {
             .map_err(|e| tool_error(&format!("creating temporary settings file: {e}")))?;
         spec.write_all(Value::Object(input.service).to_string().as_bytes())
             .map_err(|e| tool_error(&format!("writing temporary settings file: {e}")))?;
-        let args = vec![
+        let mut args = vec![
             "app".into(),
             "add".into(),
             input.name,
@@ -331,6 +333,9 @@ impl FleetMcp {
             "--spec".into(),
             spec.path().display().to_string(),
         ];
+        if let Some(priority) = input.priority {
+            args.extend(["--priority".into(), priority.to_string()]);
+        }
         self.call(parts, args).await
     }
 

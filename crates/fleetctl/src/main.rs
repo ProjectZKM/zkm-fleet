@@ -1150,9 +1150,9 @@ fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow
 
 fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if add.elf.is_some() || add.elf_id.is_some() || add.class.is_some() || add.anchor.is_some()
-        || !add.backends.is_empty() || add.zkm_version.is_some() || add.max_queued.is_some() || add.priority.is_some()
+        || !add.backends.is_empty() || add.zkm_version.is_some() || add.max_queued.is_some()
     {
-        bail!("a serving app runs a container: it takes no proof program (--elf, --elf-id) or proof settings");
+        bail!("a serving app runs a container: it takes no proof program (--elf, --elf-id) or proof policy");
     }
     let node = add.node.as_deref().filter(|n| !n.is_empty()).context("--node NODE: the node that runs the app")?;
     let path = add.spec.as_ref().context("--spec FILE: the app's settings as JSON")?;
@@ -1161,8 +1161,11 @@ fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -
     if !service.is_object() {
         bail!("--spec: a JSON object of settings");
     }
-    // A RegisterServingAppRequest (model.proto).
-    let body = json!({"name": add.name, "node": node, "service": service});
+    // A serving app's RegisterAppRequest (model.proto).
+    let mut body = json!({"name": add.name, "node": node, "service": service});
+    if let Some(priority) = add.priority {
+        body["priority"] = json!(priority);
+    }
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
     out.done(

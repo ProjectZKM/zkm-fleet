@@ -341,7 +341,7 @@ async fn machine_drain_blocks_new_proofs_and_keeps_active_execution_and_completi
     let f = fresh(config(dir.path()), store.clone()).await;
     let ns = f.create_namespace("app", Quota::default()).await.unwrap();
     let elf = f.blobs.put_elf(b"elf").unwrap();
-    f.add_app(&ns.id, &fleet_proto::model::v1::RegisterAppRequest { name: "proof".into(), elf_id: elf.clone(), ..Default::default() }).await.unwrap();
+    f.add_app(&ns.id, &fleet_proto::model::v1::RegisterAppRequest { name: "proof".into(), elf_id: Some(elf.clone()), ..Default::default() }).await.unwrap();
     let job = ProofJob {
         inputs: None, outputs: None, id: "active".into(), client_id: "active".into(),
         namespace: ns.id.clone(), owner: "ab".repeat(20), tag: String::new(),
