@@ -752,7 +752,7 @@ impl WorkloadController {
     /// is the app's own: nothing of it is copied.
     /// Returns whether a move is under way, so the start stays unsent. `fits`: the start has
     /// its room on its own node. The caller holds the operation lock.
-    pub(super) fn relocate(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
+    pub(super) fn move_waiting_app(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
         let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
@@ -766,10 +766,10 @@ impl WorkloadController {
         if creates.iter().any(|c| !c.done) {
             return Ok(true);
         }
-        let moved = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
+        let created_on = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
             .find(|w| self.inner.lock().deployments.contains_key(&format!("{w}-{name}")));
-        if let Some(target) = moved {
-            self.finish_move(start, &target)?;
+        if let Some(target) = created_on {
+            self.hand_over(start, &target)?;
             return Ok(true);
         }
         if fits {
@@ -777,7 +777,7 @@ impl WorkloadController {
         }
         // Not the node it waits on, one that already configures an entry of this name, or
         // one whose create of it failed.
-        let except: Vec<String> = {
+        let skip: Vec<String> = {
             let i = self.inner.lock();
             i.workers.iter()
                 .filter(|(id, w)| **id == start.worker || w.report.apps.iter().any(|a| text(a, "name") == name))
@@ -785,7 +785,7 @@ impl WorkloadController {
                 .chain(creates.iter().filter(|c| c.error.is_some()).map(|c| c.worker.clone()))
                 .collect()
         };
-        let Ok((target, true)) = self.place_app(s, &except) else {
+        let Ok((target, true)) = self.place_app(s, &skip) else {
             return Ok(false);
         };
         let mut entry = s.clone();
@@ -806,11 +806,12 @@ impl WorkloadController {
         Ok(true)
     }
 
-    /// The new node reports the moved app's entry: the start on the old node is not sent, the
-    /// old deployment is done and its node removes the entry, and the app starts on `target`.
+    /// Hands a moving app over to `target`, which reports its entry: the start waiting on the
+    /// old node is not sent, the old deployment is done and its node removes the entry, and the
+    /// app starts on `target`.
     /// Removing the entry stops what is left of the app there; its data stays where the app
     /// keeps it, which may be storage the new node shares.
-    fn finish_move(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
+    fn hand_over(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
         let old_key = format!("{}-{name}", start.worker);
@@ -823,11 +824,11 @@ impl WorkloadController {
             self.save("deployments", &old_key, &old)?;
             self.inner.lock().deployments.insert(old_key, old);
         }
-        let mut start = start.clone();
-        start.done = true;
-        start.error = Some(format!("the app moved to {target}, which has room for it"));
-        self.save("commands", &start.id, &start)?;
-        self.inner.lock().commands.insert(start.id.clone(), start.clone());
+        let mut unsent = start.clone();
+        unsent.done = true;
+        unsent.error = Some(format!("the app moved to {target}, which has room for it"));
+        self.save("commands", &unsent.id, &unsent)?;
+        self.inner.lock().commands.insert(unsent.id.clone(), unsent);
         self.tell_nodes([&start.worker], self.app_message(namespace, app), json!({"remove": true}))?;
         let template = self.inner.lock().apps.get(app).cloned();
         if let Some(mut template) = template {

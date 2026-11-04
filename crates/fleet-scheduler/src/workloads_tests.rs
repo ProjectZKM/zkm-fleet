@@ -2005,10 +2005,10 @@ async fn a_proof_app_is_an_app_whose_container_proves_its_program() {
     assert!(!c.fleet.app_known(&ns, "eth") && c.inner.lock().apps["eth"].removed, "deleting it removes both records");
 }
 
-/// Plays `nodes` through the commands sent to them, one at a time, until none is left: each
-/// writes, starts and stops app entries in its report as its command asks. `refuse` names
-/// nodes whose `create` fails.
-async fn play_nodes(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeReport>, refuse: &[&str]) {
+/// Runs the commands sent to `nodes`, one at a time, until none is left: each node writes,
+/// starts and stops app entries in its report as its command asks. A `create` sent to one of
+/// `failing_creates` fails.
+async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeReport>, failing_creates: &[&str]) {
     for _ in 0..100 {
         c.dispatch().await.unwrap();
         let Some(command) = c.inner.lock().commands.values().find(|v| !v.done && v.admitted).cloned() else {
@@ -2024,7 +2024,7 @@ async fn play_nodes(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeRep
             }
             if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
         } else if !p["create"].is_null() {
-            if refuse.contains(&command.worker.as_str()) {
+            if failing_creates.contains(&command.worker.as_str()) {
                 error = Some("apps.yaml is not writable".to_string());
                 Value::Null
             } else {
@@ -2058,26 +2058,26 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
     let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100}});
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
     assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "gpu");
-    let node = |machine: &str, free_gpus: f64| {
+    let report_of = |machine: &str, free_gpus: f64| {
         let mut report = inventory(&ns);
         (report.machine, report.free_gpus) = (machine.into(), free_gpus);
         report
     };
     // Its node's cards are taken by then; a node that cannot write its entry has room.
-    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone()), ("bare".into(), node("bare", 2.0))]);
+    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone()), ("bare".into(), report_of("bare", 2.0))]);
     nodes.get_mut("gpu").unwrap().free_gpus = 0.0;
     for (id, report) in &nodes {
         c.report(id, "session", report.clone()).await.unwrap();
     }
     c.begin_toggle(&["gpu-model".into()], false).unwrap();
-    play_nodes(&c, &mut nodes, &["bare"]).await;
-    let waiting = |c: &WorkloadController| c.inner.lock().commands.values()
+    nodes_run_commands(&c, &mut nodes, &["bare"]).await;
+    let waiting_starts = |c: &WorkloadController| c.inner.lock().commands.values()
         .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| v.worker.clone()).collect::<Vec<_>>();
-    assert_eq!(waiting(&c), ["gpu"], "a node that failed to create the app leaves it waiting where it is");
+    assert_eq!(waiting_starts(&c), ["gpu"], "a node that failed to create the app leaves it waiting where it is");
     c.dispatch().await.unwrap();
     assert!(remove_commands(&c, NodeOperation::App).is_empty(), "and is not asked again");
 
-    nodes.insert("big".into(), node("big", 2.0));
+    nodes.insert("big".into(), report_of("big", 2.0));
     c.report("big", "session", nodes["big"].clone()).await.unwrap();
     c.dispatch().await.unwrap();
     let created = remove_commands(&c, NodeOperation::App);
@@ -2085,8 +2085,8 @@ async fn an_app_waiting_for_room_moves_to_a_node_that_has_it() {
     let (to, entry) = (&created[0].0, &created[0].1["create"]);
     assert_eq!((to.as_str(), entry["disabled"].clone(), entry["image"].as_str()), ("big", json!(true), Some("serve:1")));
     assert!(["ready", "cleaned", "logs", "namespace_ref"].iter().all(|k| entry.get(*k).is_none()), "{entry}");
-    play_nodes(&c, &mut nodes, &["bare"]).await;
-    assert!(waiting(&c).is_empty());
+    nodes_run_commands(&c, &mut nodes, &["bare"]).await;
+    assert!(waiting_starts(&c).is_empty());
     assert!(nodes["gpu"].apps.is_empty(), "its old node removed the entry");
     let ready = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true) && a["disabled"] == json!(false));
     assert!(ready, "it runs on the node that had room: {:?}", nodes["big"].apps);

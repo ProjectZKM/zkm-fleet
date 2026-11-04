@@ -1362,7 +1362,7 @@ impl WorkloadController {
                     || self
                         .capacity(&c.worker)
                         .is_some_and(|(fg, fc)| fg + 1e-6 >= g && fc + 1e-6 >= cpu);
-                if self.relocate(&c, fits)? {
+                if self.move_waiting_app(&c, fits)? {
                     continue;
                 }
                 if !fits {
