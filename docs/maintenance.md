@@ -103,13 +103,24 @@ to scheduler permissions, CLI or MCP needs only a control-host update. Use the
 pause procedure above before replacing node programs. A program update does not
 require restarting Ray or changing its pool.
 
-Upgrading from report version 2 changes all three at once. Rename each node's
-`etc/services.yaml` to `etc/apps.yaml` and its top-level `services:` key to `apps:`;
-`node-start.sh` from the same revision passes it as `--apps`. The scheduler keeps its
-app deployment records in `data_dir/workloads/deployments` and its reservations under
-`deployment:` ids; it does not read the old `workloads/services` records or release
-`service:` reservations, so disable apps and confirm their cleanup before the update,
-and enable them again afterward.
+Upgrading from report version 2 changes all three at once. Let in-flight commands finish,
+stop the scheduler and every node, and migrate their state with
+[`deploy/migrate-apps.py`](../deploy/migrate-apps.py) before starting the new binaries
+(`-n` first prints what it would change):
+
+```bash
+python3 deploy/migrate-apps.py -n scheduler DATA_DIR etc/database_url
+python3 deploy/migrate-apps.py scheduler DATA_DIR etc/database_url   # control host
+python3 deploy/migrate-apps.py node PREFIX                           # each node
+```
+
+The scheduler's per-node records move from `workloads/services` to
+`workloads/deployments`, stored commands and reservations take the new names, and each
+registered proof app gains its app record from the entry a node runs for it. A node's
+`etc/services.yaml` becomes `etc/apps.yaml` (`services:` becomes `apps:`) and its
+`node-start.sh` passes `--apps`. Without `psql` on the host, set
+`PSQL="docker run --rm -i --network host postgres:16 psql"`. Each run copies what it
+changes to a `.pre-app-model-<time>` sibling first.
 
 Build the generic programs from that revision:
 
