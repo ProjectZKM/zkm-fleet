@@ -195,6 +195,8 @@ message NodeReport {
   repeated Json apps = 9;
   repeated JobReport jobs = 10;
   repeated CommandResult results = 11;
+  // The release the agent was built from (the tag CI passes at build time); absent on older agents.
+  optional string agent_version = 12;
 }
 
 message JobReport {

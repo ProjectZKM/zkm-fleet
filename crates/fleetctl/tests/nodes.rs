@@ -18,7 +18,7 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                 "id": "gpu-box", "name": "gpu-box", "backend": "ray-local",
                 "gpus": 8, "cpus": 48, "free_gpus": 2, "free_cpus": 0,
                 "machine": "gpu-machine", "ready": true, "draining": false,
-                "busy": null, "heartbeat_age_ms": 1000
+                "busy": null, "agent_version": "v0.1.6", "heartbeat_age_ms": 1000
             });
             let body = serde_json::json!({"nodes": [node.clone()]}).to_string();
             let server = std::thread::spawn(move || {
@@ -89,7 +89,13 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
             } else {
                 let text = String::from_utf8(output.stdout).unwrap();
                 if detail {
-                    for expected in ["gpus 8", "cpus 48", "free_gpus 2", "free_cpus 0"] {
+                    for expected in [
+                        "gpus 8",
+                        "cpus 48",
+                        "free_gpus 2",
+                        "free_cpus 0",
+                        "agent_version v0.1.6",
+                    ] {
                         assert!(
                             text.lines().any(|line| line
                                 .split_whitespace()
@@ -102,7 +108,8 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                 } else {
                     let header = text.lines().next().unwrap();
                     assert!(
-                        header.contains("CPUS")
+                        header.contains("VERSION")
+                            && header.contains("CPUS")
                             && header.contains("FREE GPUS")
                             && header.contains("FREE CPUS"),
                         "{text}"
@@ -112,11 +119,11 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                         .nth(1)
                         .unwrap()
                         .split_whitespace()
-                        .take(6)
+                        .take(7)
                         .collect();
                     assert_eq!(
                         cells,
-                        ["gpu-box", "ray-local", "8", "48", "2", "0"],
+                        ["gpu-box", "ray-local", "v0.1.6", "8", "48", "2", "0"],
                         "{text}"
                     );
                 }

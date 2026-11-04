@@ -822,6 +822,7 @@ fn issue_token(a: &FleetClient, conn: &ConnectionOptions, out: &OutputWriter, na
 const NODE_COLS: &[out::TableColumn] = &[
     col("NODE", "name"),
     col("BACKEND", "backend"),
+    col("VERSION", "agent_version"),
     col("GPUS", "gpus"),
     col("CPUS", "cpus"),
     col("FREE GPUS", "free_gpus"),

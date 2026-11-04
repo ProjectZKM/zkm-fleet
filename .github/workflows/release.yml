@@ -69,6 +69,8 @@ jobs:
             ${{ runner.os }}-release-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
 
       - name: Build release components
+        env:
+          FLEET_VERSION: ${{ env.RELEASE_TAG }}
         run: |
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
