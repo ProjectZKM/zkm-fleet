@@ -62,19 +62,17 @@ async fn stopped() {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
     tokio::select! {_=term.recv()=>{},_=tokio::signal::ctrl_c()=>{}}
 }
-/// The release this agent was built for: the tag CI passes as FLEET_VERSION, else the
-/// crate version for local builds.
-const AGENT_VERSION: &str = match option_env!("FLEET_VERSION") {
-    Some(release) => release,
-    None => env!("CARGO_PKG_VERSION"),
-};
+/// The release this agent was built for, when the build named one (FLEET_VERSION).
+const AGENT_VERSION: Option<&str> = option_env!("FLEET_VERSION");
 /// The snapshot the agent sends: the bridge's report, marked not ready when it is stale,
-/// stamped with the agent's release.
-fn outbound(mut report: Value, stale: bool) -> Value {
+/// named with the agent's release when it has one.
+fn outbound(mut report: Value, stale: bool, version: Option<&str>) -> Value {
     if stale {
         report["ready"] = json!(false);
     }
-    report["agent_version"] = json!(AGENT_VERSION);
+    if let Some(version) = version {
+        report["agent_version"] = json!(version);
+    }
     report
 }
 async fn connect(endpoint: Endpoint) -> Result<WorkerServiceClient<Channel>> {
@@ -190,8 +188,13 @@ async fn main() -> Result<()> {
             }
             let report = {
                 let s = snapshot.lock().await;
-                s.as_ref()
-                    .map(|s| outbound(s.report.clone(), s.seen.elapsed() > Duration::from_secs(20)))
+                s.as_ref().map(|s| {
+                    outbound(
+                        s.report.clone(),
+                        s.seen.elapsed() > Duration::from_secs(20),
+                        AGENT_VERSION,
+                    )
+                })
             };
             let Some(report) = report else {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -534,13 +537,15 @@ mod tests {
 
     #[test]
     fn outbound_keeps_the_report_and_stamps_staleness_and_release() {
-        let fresh = outbound(json!({"version":3,"machine":"m","ready":true}), false);
+        let fresh = outbound(json!({"version":3,"machine":"m","ready":true}), false, Some("0.1.5"));
         assert_eq!(fresh["version"], 3);
         assert_eq!(fresh["machine"], "m");
         assert_eq!(fresh["ready"], true);
-        assert_eq!(fresh["agent_version"], AGENT_VERSION);
-        let stale = outbound(json!({"version":3,"machine":"m","ready":true}), true);
+        assert_eq!(fresh["agent_version"], "0.1.5");
+        let stale = outbound(json!({"version":3,"machine":"m","ready":true}), true, Some("0.1.5"));
         assert_eq!(stale["ready"], false);
-        assert_eq!(stale["agent_version"], AGENT_VERSION);
+        assert_eq!(stale["agent_version"], "0.1.5");
+        let unnamed = outbound(json!({"version":3,"machine":"m","ready":true}), false, None);
+        assert!(unnamed.get("agent_version").is_none());
     }
 }

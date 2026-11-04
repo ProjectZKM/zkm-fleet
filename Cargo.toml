@@ -4,7 +4,7 @@ default-members = ["crates/fleet-proto", "crates/fleet-scheduler", "crates/fleet
 resolver = "2"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.2"
 edition = "2021"
 publish = false
 
