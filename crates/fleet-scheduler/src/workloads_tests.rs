@@ -1935,3 +1935,15 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
     assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x"})).await.status(),
         StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_serving_app_with_a_mistyped_setting_is_refused_before_its_node_sees_it() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    for (key, value) in [("gpus", json!("2")), ("replicas", json!("2")), ("port_base", json!(-1)), ("workdir", json!(1)), ("kind", json!("app"))] {
+        let mut body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1"});
+        body[key] = value;
+        assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::BAD_REQUEST, "{key}");
+    }
+    assert!(remove_commands(&c, NodeOperation::App).is_empty() && !c.inner.lock().apps.contains_key("model"));
+}

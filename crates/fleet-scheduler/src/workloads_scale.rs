@@ -601,8 +601,9 @@ impl WorkloadController {
 
 impl WorkloadController {
     /// Registers a serving app on `node`: the node writes its services.yaml entry (a `kind: app`
-    /// service) disabled, so `fleetctl app enable` starts it. The name is one of the namespace's
-    /// apps and batches, so it is checked against both here and when the node reports.
+    /// service) disabled, so `fleetctl app enable` starts it and admits it against the namespace's
+    /// quota. The name is one of the namespace's apps and batches, so it is checked against both
+    /// here and when the node reports.
     pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>, body: Value) -> anyhow::Result<Response> {
         let name = text(&body, "name").to_string();
         if !crate::fleet::valid_app_name(&name) {
@@ -614,11 +615,21 @@ impl WorkloadController {
         }
         let allowed = ["name", "namespace", "node", "image", "user", "replicas", "gpus", "cpus", "shm_gb",
             "port_base", "health_path", "workdir", "volumes", "env", "command"];
-        if body.as_object().is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str()))) {
-            return Err(fail(400, "unknown app fields"));
+        let fields = body.as_object().ok_or_else(|| fail(400, "an app is a JSON object"))?;
+        if let Some(key) = fields.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return Err(fail(400, format!("unknown app field {key}; an app takes {}", allowed.join(", "))));
         }
         if !body["image"].as_str().is_some_and(|i| !i.is_empty() && !i.starts_with('-')) {
             return Err(fail(400, "image is required"));
+        }
+        // Checked here, not only by the node: a setting the node refuses would leave an app
+        // record with no service behind it.
+        let set = |key: &str| !body[key].is_null();
+        if let Some(key) = ["user", "health_path", "workdir"].into_iter().find(|k| set(k) && !body[*k].is_string())
+            .or_else(|| ["replicas", "cpus", "shm_gb", "port_base"].into_iter().find(|k| set(k) && body[*k].as_u64().is_none()))
+            .or_else(|| ["gpus"].into_iter().find(|k| set(k) && body[*k].as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())))
+        {
+            return Err(fail(400, format!("invalid {key}")));
         }
         let (namespace, tag) = self.scope(c, q, body["namespace"].as_str())?;
         WorkloadController::require_grant(c, &name)?;
@@ -628,9 +639,6 @@ impl WorkloadController {
             return Err(fail(400, "replicas must be between 1 and 64"));
         }
         let gpus = body["gpus"].as_f64().unwrap_or(1.0);
-        if !(gpus >= 0.0 && gpus.is_finite()) || body["cpus"].as_u64().is_none() && !body["cpus"].is_null() {
-            return Err(fail(400, "gpus must be a number of cards and cpus a whole number"));
-        }
         if !body["env"].is_null() && body["env"].as_object().is_none_or(|e| e.values().any(|v| !v.is_string())) {
             return Err(fail(400, "env must map names to strings"));
         }
@@ -643,7 +651,7 @@ impl WorkloadController {
         let _ops = self.ops.lock().await;
         {
             let i = self.inner.lock();
-            if !node.is_empty() && !i.workers.contains_key(&node) {
+            if !i.workers.contains_key(&node) {
                 return Err(fail(404, "unknown node"));
             }
             if i.apps.get(&name).is_some_and(|a| !a.removed)

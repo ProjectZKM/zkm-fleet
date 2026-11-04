@@ -215,26 +215,10 @@ struct CreateServingApp {
     name: String,
     /// The node that runs the app.
     node: String,
-    image: String,
-    /// Replicas on the node (default 1).
-    replicas: Option<u32>,
-    /// GPU cards per replica (default 1).
-    gpus: Option<f64>,
-    cpus: Option<u32>,
-    shm_gb: Option<u32>,
-    /// Replica i serves on port_base + i.
-    port_base: Option<u32>,
-    health_path: Option<String>,
-    workdir: Option<String>,
-    /// Host paths to mount, PATH[:ro|:rw]. Administrator credentials.
-    #[serde(default)]
-    mounts: Vec<String>,
-    /// Environment variables as K=V. Administrator credentials.
-    #[serde(default)]
-    env: Vec<String>,
-    /// The container command; {port} is the replica's port.
-    #[serde(default)]
-    command: Vec<String>,
+    /// The app's settings, the keys of its services.yaml entry: image (required), command,
+    /// replicas, gpus, cpus, shm_gb, port_base, health_path, workdir, volumes, env, user.
+    /// Image, command, env, user, workdir and volumes require administrator credentials.
+    settings: serde_json::Map<String, Value>,
 }
 
 #[derive(Clone)]
@@ -320,7 +304,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_app_create_serving",
-        description = "Create a serving app (a long-running container with its own port, such as a model server) on a node in the authenticated namespace. It starts disabled until an operator enables it. Mounts and environment require administrator credentials. The scheduler validates the spec and enforces namespace quotas.",
+        description = "Create a serving app (a long-running container with its own port, such as a model server) on a node in the authenticated namespace. It starts disabled; enabling it admits it against the namespace's quota. Image, command, env, user, workdir and volumes require administrator credentials. The scheduler validates the settings.",
         annotations(read_only_hint = false, destructive_hint = false)
     )]
     async fn app_create_serving(
@@ -328,39 +312,23 @@ impl FleetMcp {
         Parameters(input): Parameters<CreateServingApp>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<Value>, ErrorData> {
-        let mut args = vec![
+        // fleetctl reads the settings from a file, kept private for this one call.
+        let mut spec = tempfile::Builder::new()
+            .prefix("fleet-mcp-spec-")
+            .suffix(".json")
+            .tempfile()
+            .map_err(|e| tool_error(&format!("creating temporary settings file: {e}")))?;
+        spec.write_all(Value::Object(input.settings).to_string().as_bytes())
+            .map_err(|e| tool_error(&format!("writing temporary settings file: {e}")))?;
+        let args = vec![
             "app".into(),
             "add".into(),
             input.name,
             "--node".into(),
             input.node,
-            "--image".into(),
-            input.image,
+            "--spec".into(),
+            spec.path().display().to_string(),
         ];
-        let optional = [
-            ("--replicas", input.replicas.map(|v| v.to_string())),
-            ("--gpus", input.gpus.map(|v| v.to_string())),
-            ("--cpus", input.cpus.map(|v| v.to_string())),
-            ("--shm-gb", input.shm_gb.map(|v| v.to_string())),
-            ("--port-base", input.port_base.map(|v| v.to_string())),
-            ("--health-path", input.health_path),
-            ("--workdir", input.workdir),
-        ];
-        for (flag, value) in optional {
-            if let Some(value) = value {
-                args.extend([flag.into(), value]);
-            }
-        }
-        for mount in input.mounts {
-            args.extend(["--mount".into(), mount]);
-        }
-        for pair in input.env {
-            args.extend(["--env".into(), pair]);
-        }
-        if !input.command.is_empty() {
-            args.push("--".into());
-            args.extend(input.command);
-        }
         self.call(parts, args).await
     }
 
