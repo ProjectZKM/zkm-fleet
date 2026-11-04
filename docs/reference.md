@@ -241,10 +241,8 @@ control-host fetch relay.
 This endpoint is deprecated. It keeps working and takes no new features. Point new
 SDK clients at an [app-owned proof endpoint](#app-owned-proof-endpoint) instead:
 the same SDK and token, with `ENDPOINT` set to that endpoint's stage port, and
-payloads kept in app storage. The scheduler logs a `deprecated` warning the first
-time each token calls the stage API after a start, naming the token and its
-namespace, so the remaining clients can be found before the API is removed. The
-HTTP proof job routes (`/apps/NAME/jobs`) that app endpoints use are not deprecated.
+payloads kept in app storage. The HTTP proof job routes (`/apps/NAME/jobs`) that
+app endpoints use are not deprecated.
 
 ## Namespaces, access and quotas
 

@@ -6,7 +6,6 @@
 //! beside their own storage, which submits through `POST /apps/NAME/jobs`. That route shares
 //! `generate` and `status` below and is not deprecated.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,30 +25,12 @@ use crate::token;
 
 pub struct ProofStageService {
     pub fleet: Arc<Scheduler>,
-    /// Tokens already warned that they use the deprecated gRPC stage API.
-    warned: parking_lot::Mutex<HashSet<String>>,
 }
 
 /// Maps the request's steps to a proof kind, as the SDK's network prover sets them.
 pub use fleet_proto::sdk::kind_for;
 
 impl ProofStageService {
-    pub fn new(fleet: Arc<Scheduler>) -> Self {
-        Self { fleet, warned: Default::default() }
-    }
-
-    /// Logs, once per token, that a client still calls the deprecated gRPC stage API.
-    fn warn_deprecated(&self, caller: Option<&Token>) -> bool {
-        let id = caller.map(|c| c.id.clone()).unwrap_or_default();
-        if !self.warned.lock().insert(id.clone()) {
-            return false;
-        }
-        tracing::warn!(token = %id, namespace = caller.and_then(|c| c.namespace.as_deref()).unwrap_or(""),
-            label = caller.map(|c| c.label.as_str()).unwrap_or(""),
-            "deprecated: this client uses the scheduler's gRPC stage API; move it to fleet-proof-app (docs/reference.md, App-owned proof endpoint)");
-        true
-    }
-
     fn may_read_job(caller: &Token, job: &ProofJob) -> bool {
         caller.apps.as_ref().is_none_or(|apps| apps.contains(&job.app))
             // The SDK polls its own rejected submissions, including attempts for an
@@ -333,6 +314,7 @@ impl ProofStageService {
     }
 }
 
+/// Deprecated (see the module docs): kept for the SDK clients that still call it.
 #[tonic::async_trait]
 impl StageService for ProofStageService {
     async fn generate_proof(
@@ -340,7 +322,6 @@ impl StageService for ProofStageService {
         request: Request<GenerateProofRequest>,
     ) -> Result<Response<GenerateProofResponse>, Status> {
         let caller = self.caller(request.metadata())?;
-        self.warn_deprecated(caller.as_ref());
         Ok(Response::new(self.generate(request.into_inner(), caller, None, None).await))
     }
 
@@ -349,7 +330,6 @@ impl StageService for ProofStageService {
         request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
         let caller = self.caller(request.metadata())?;
-        self.warn_deprecated(caller.as_ref());
         Ok(Response::new(
             self.status(&request.into_inner().proof_id, caller).await,
         ))
@@ -372,7 +352,7 @@ mod tests {
         fleet.load_tokens().await.unwrap();
         let namespace = fleet.create_namespace("test", Quota::default()).await.unwrap().id;
         let elf_id = fleet.blobs.put_elf(b"test program").unwrap();
-        let api = ProofStageService::new(fleet.clone());
+        let api = ProofStageService { fleet: fleet.clone() };
         for (seed, permission) in [(1, "read"), (2, "submit")] {
             let secret = format!("{seed:02x}").repeat(48);
             let caller = fleet.add_user_token(&format!("{seed:02x}").repeat(16), &format!("{seed:02x}").repeat(20), "test",
@@ -404,21 +384,6 @@ mod tests {
                 assert_eq!(api.status(&client_id, Some(other)).await.status, StageStatus::Unspecified as i32);
             }
         }
-    }
-
-    #[tokio::test]
-    async fn the_deprecated_stage_api_warns_each_token_once() {
-        use crate::{blobs::BlobStore, config::SchedulerConfig, store::MemoryStore};
-        let dir = tempfile::tempdir().unwrap();
-        let cfg: SchedulerConfig = serde_yaml::from_str(&format!(
-            "public_url: http://localhost\ndata_dir: {}\ncluster_token_file: unused\n", dir.path().display()
-        )).unwrap();
-        let api = ProofStageService::new(Scheduler::new(cfg, Arc::new(MemoryStore::default()), BlobStore::new(dir.path()).unwrap(), "cluster".into()));
-        let token = |id: &str| Token { id: id.into(), ..Default::default() };
-        assert!(api.warn_deprecated(Some(&token("a"))));
-        assert!(!api.warn_deprecated(Some(&token("a"))), "a token is warned once");
-        assert!(api.warn_deprecated(Some(&token("b"))));
-        assert!(api.warn_deprecated(None) && !api.warn_deprecated(None));
     }
 
     #[test]
