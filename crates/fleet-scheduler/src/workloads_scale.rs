@@ -600,9 +600,9 @@ impl WorkloadController {
 }
 
 impl WorkloadController {
-    /// Registers a serving app: a `kind: app` service on `node`, which the node writes to its
-    /// services.yaml disabled, so `fleetctl app enable` starts it. The name is one of the
-    /// namespace's apps and batches, so it is checked against both here and when the node reports.
+    /// Registers a serving app on `node`: the node writes its services.yaml entry (a `kind: app`
+    /// service) disabled, so `fleetctl app enable` starts it. The name is one of the namespace's
+    /// apps and batches, so it is checked against both here and when the node reports.
     pub(super) async fn create_serving_app(&self, c: Option<&Token>, q: &BTreeMap<String, String>, body: Value) -> anyhow::Result<Response> {
         let name = text(&body, "name").to_string();
         if !crate::fleet::valid_app_name(&name) {

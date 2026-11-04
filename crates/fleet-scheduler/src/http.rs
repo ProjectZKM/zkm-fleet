@@ -68,7 +68,6 @@ pub fn required(method: &Method, path: &str) -> Permission {
         (&Method::POST, ["apps" | "batches", _, "jobs"]) => Permission::Submit,
         (&Method::POST, ["batches", _, "jobs", _, "cancel"]) => Permission::Submit,
         (_, ["batches", _, "jobs", _, "preempt"]) => Permission::Admin,
-        (&Method::POST, ["services"]) => Permission::Manage,
         (_, ["apps" | "batches", ..]) => Permission::Manage,
         _ => Permission::Admin,
     }

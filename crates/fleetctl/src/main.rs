@@ -85,8 +85,8 @@ struct AppArgs {
 #[derive(Subcommand)]
 enum AppCmd {
     /// Register a proof program as an app of the namespace: NAME --elf-id ID, or NAME --elf FILE.
-    /// Or a serving app (a long-running container with a port): NAME --service --node NODE --image IMAGE,
-    /// then `app enable` starts it.
+    /// Or a serving app (a long-running container with a port): NAME --node NODE --image IMAGE [-- COMMAND];
+    /// `app enable` starts it.
     Add {
         #[command(flatten)]
         add: AddApp,
@@ -503,12 +503,7 @@ struct AddApp {
     #[arg(long, allow_hyphen_values = true)]
     #[serde(skip_serializing_if = "Option::is_none")]
     priority: Option<i32>,
-    /// Register a serving app (a long-running container with its own port, such as a model
-    /// server) instead of a proof program. It starts disabled: `app enable` starts it.
-    #[arg(long)]
-    #[serde(skip)]
-    service: bool,
-    /// Serving app: the node that runs it.
+    /// Serving app: the node that runs it (with --image, makes a serving app, not a proof program).
     #[arg(long)]
     #[serde(skip)]
     node: Option<String>,
@@ -563,9 +558,14 @@ struct AddApp {
 }
 
 impl AddApp {
+    /// A serving app names its node and container image; a proof app names a program.
+    fn is_serving(&self) -> bool {
+        self.node.is_some() || self.image.is_some()
+    }
+
     /// Whether a flag only a serving app takes is set.
     fn has_service_flags(&self) -> bool {
-        self.node.is_some() || self.image.is_some() || self.user.is_some() || self.replicas.is_some()
+        self.user.is_some() || self.replicas.is_some()
             || self.gpus.is_some() || self.cpus.is_some() || self.shm_gb.is_some() || self.port_base.is_some()
             || self.health_path.is_some() || self.workdir.is_some() || !self.mounts.is_empty()
             || !self.env.is_empty() || !self.command.is_empty()
@@ -1170,16 +1170,16 @@ fn env_map(pairs: &[String]) -> anyhow::Result<Value> {
     Ok(Value::Object(env))
 }
 
-/// Registers a proof program as an app of the namespace, or a serving app with --service.
+/// Registers a proof program as an app of the namespace, or a serving app given --node and --image.
 fn add_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if conn.namespace.as_deref().is_none_or(str::is_empty) && conn.token_file.is_none() {
         bail!("app registration requires --namespace NAME; an administrator must create the namespace first");
     }
-    if add.service {
+    if add.is_serving() {
         return add_serving_app(add, conn, out);
     }
     if add.has_service_flags() {
-        bail!("--node, --image, --mount, --env and the command take a serving app: add --service");
+        bail!("--user, --replicas, --mount, --env and the command take a serving app: give --node NODE --image IMAGE");
     }
     let mut body = serde_json::to_value(add)?;
     body["elf_id"] = json!(match (&add.elf, &add.elf_id) {
@@ -1236,7 +1236,7 @@ fn add_serving_app(add: &AddApp, conn: &ConnectionOptions, out: &OutputWriter) -
         body["env"] = env_map(&add.env)?;
     }
     let a = FleetClient::new(conn)?;
-    let v = a.send(a.req(reqwest::Method::POST, "/services").json(&body))?;
+    let v = a.send(a.req(reqwest::Method::POST, "/apps").json(&body))?;
     out.done(
         &format!("added app {} on {node}: disabled until `fleetctl app enable {}`", add.name, add.name),
         v,

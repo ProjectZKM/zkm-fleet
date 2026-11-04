@@ -1689,7 +1689,7 @@ const BATCH_ADMIN_SETTINGS: [&str; 2] = ["user", "allow"];
 /// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
     let mut router = Router::new();
-    for root in ["apps", "batches", "services"] {
+    for root in ["apps", "batches"] {
         router = router
             .route(&format!("/{root}"), any(handle))
             .route(&format!("/{root}/*path"), any(handle));
@@ -1802,14 +1802,14 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         apps.sort_by(|a, b| last(b).total_cmp(&last(a)));
         return Ok(Json(apps).into_response());
     }
-    if method == Method::POST && parts == ["services"] {
-        let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
-        return s.create_serving_app(c, &q, body).await;
-    }
     if method == Method::POST && parts == ["apps"] {
         if !batch {
-            let body: fleet_proto::model::v1::RegisterAppRequest =
-                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
+            // A serving app names the node that runs it and its image; a proof app names a program.
+            if body.get("node").is_some() || body.get("image").is_some() {
+                return s.create_serving_app(c, &q, body).await;
+            }
+            let body: fleet_proto::model::v1::RegisterAppRequest = serde_json::from_value(body)?;
             let (namespace, tag) = s.scope(c, &q, body.namespace.as_deref())?;
             WorkloadController::require_grant(c, &body.name)?;
             let _ops = s.ops.lock().await;

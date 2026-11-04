@@ -1921,17 +1921,17 @@ async fn a_serving_app_is_created_on_its_node_and_names_stay_unique() {
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let body = json!({"name":"model","namespace":ns,"node":"gpu","image":"serve:1","gpus":1,"cpus":2,
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}});
-    let response = scale_call(c.clone(), "admin", "POST", "/services", body.clone()).await;
+    let response = scale_call(c.clone(), "admin", "POST", "/apps", body.clone()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert!(c.inner.lock().apps["model"].persistent);
     assert_eq!(remove_commands(&c, NodeOperation::App), vec![("gpu".to_string(), json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},
         "create":{"name":"model","kind":"app","namespace":ns,"disabled":true,"replicas":1,"gpus":1.0,"cpus":2,"image":"serve:1",
         "port_base":50100,"health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}}}))]);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", body).await.status(), StatusCode::CONFLICT);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", json!({"name":"other","namespace":ns,"node":"gpu"})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CONFLICT);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"other","namespace":ns,"node":"gpu"})).await.status(),
         StatusCode::BAD_REQUEST);
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/services", json!({"name":"training","namespace":ns,"node":"gpu","image":"x"})).await.status(),
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":"training","namespace":ns,"node":"gpu","image":"x"})).await.status(),
         StatusCode::CONFLICT, "a batch's name is taken");
-    assert_eq!(scale_call(c, "admin", "POST", "/services", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x"})).await.status(),
+    assert_eq!(scale_call(c, "admin", "POST", "/apps", json!({"name":"remote","namespace":ns,"node":"elsewhere","image":"x"})).await.status(),
         StatusCode::NOT_FOUND);
 }
