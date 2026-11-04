@@ -682,7 +682,7 @@ impl WorkloadController {
             match pending {
                 Some(pending) => pending,
                 None => {
-                    let node = self.place_app(&template.spec)?;
+                    let (node, _) = self.place_app(&template.spec, &[])?;
                     let mut message = self.app_message(namespace, app);
                     message["create"] = template.spec.0.clone();
                     let create = self.command(&node, NodeOperation::App, message)?;
@@ -708,7 +708,8 @@ impl WorkloadController {
                 }
                 if let Some(error) = failed.filter(|e| !e.is_empty()) {
                     // The next enable places it again.
-                    if let Some(mut template) = self.inner.lock().apps.get(app).cloned() {
+                    let template = self.inner.lock().apps.get(app).cloned();
+                    if let Some(mut template) = template {
                         template.workers.clear();
                         self.save("apps", app, &template)?;
                         self.inner.lock().apps.insert(app.into(), template);
@@ -726,21 +727,119 @@ impl WorkloadController {
     /// and CPUs of all its replicas. One that has them free now is preferred, the one with the
     /// fewest free GPUs among those, as a batch-class proof app is placed, so larger requests
     /// keep the larger gaps; otherwise the one with the most free GPUs, where the app waits for
-    /// room.
-    fn place_app(&self, entry: &Value) -> anyhow::Result<String> {
+    /// room. Whether it has the room now comes along. `except` are nodes not to pick.
+    fn place_app(&self, entry: &Value, except: &[String]) -> anyhow::Result<(String, bool)> {
         let replicas = entry["replicas"].as_f64().unwrap_or(1.0);
         let gpus = entry["gpus"].as_f64().unwrap_or(1.0) * replicas;
         let cpus = entry["cpus"].as_f64().unwrap_or(1.0) * replicas;
         let large: Vec<String> = self.inner.lock().workers.iter()
-            .filter(|(_, w)| w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .filter(|(id, w)| !except.contains(id) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
         let sizes: Vec<(String, f64, f64)> = large.into_iter()
             .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))
             .collect();
         let fits = |&(_, g, c): &&(String, f64, f64)| g + 1e-9 >= gpus && c + 1e-9 >= cpus;
         sizes.iter().filter(fits).min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
-            .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))))
-            .map(|(id, _, _)| id.clone())
+            .map(|(id, _, _)| (id.clone(), true))
+            .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))).map(|(id, _, _)| (id.clone(), false)))
             .ok_or_else(|| fail(503, format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")))
+    }
+
+    /// Places a queued `start` of an app the scheduler placed, as `place_app` places a new
+    /// app: on its own node when that has the room (`fits`), else on the node that fits it
+    /// best now. That node is sent the app's entry, disabled, and the start runs there once it
+    /// reports it (`start_on`); a node whose create fails is not picked again. With no room
+    /// anywhere the caller preempts on the start's own node, and the start keeps the room that
+    /// frees. Nothing of what the app keeps on a node's disks is copied: that is the app's own.
+    /// Returns whether the start runs on another node, so it is not sent to its own. The caller
+    /// holds the operation lock.
+    pub(super) fn place_start(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
+        let s = &start.parameters["app"];
+        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
+        if !placed {
+            return Ok(false);
+        }
+        let creates: Vec<CommandRecord> = self.inner.lock().commands.values()
+            .filter(|c| c.worker != start.worker && c.operation == NodeOperation::App as i32
+                && text(&c.parameters["create"], "name") == name)
+            .cloned().collect();
+        if creates.iter().any(|c| !c.done) {
+            return Ok(true);
+        }
+        let created_on = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
+            .find(|w| self.inner.lock().deployments.contains_key(&format!("{w}-{name}")));
+        if let Some(target) = created_on {
+            self.start_on(start, &target)?;
+            return Ok(true);
+        }
+        let preempting = self.inner.lock().jobs.values().any(|r| {
+            r.worker.as_deref() == Some(start.worker.as_str()) && r.stop.as_deref() == Some("preempt") && !terminal(r.state())
+        });
+        if fits || preempting {
+            return Ok(false);
+        }
+        // Not its own node, one that already configures an entry of this name, or one whose
+        // create of it failed.
+        let skip: Vec<String> = {
+            let i = self.inner.lock();
+            i.workers.iter()
+                .filter(|(id, w)| **id == start.worker || w.report.apps.iter().any(|a| text(a, "name") == name))
+                .map(|(id, _)| id.clone())
+                .chain(creates.iter().filter(|c| c.error.is_some()).map(|c| c.worker.clone()))
+                .collect()
+        };
+        let Ok((target, true)) = self.place_app(s, &skip) else {
+            return Ok(false);
+        };
+        let mut entry = s.clone();
+        if let Some(fields) = entry.as_object_mut() {
+            // What the old node reported about the entry, not its configuration.
+            for key in ["ready", "logs", "cleaned", "namespace_ref"] {
+                fields.remove(key);
+            }
+        }
+        entry["disabled"] = json!(true);
+        if !entry["machine"].is_null() {
+            entry["machine"] = json!(self.inner.lock().workers[&target].report.machine);
+        }
+        let mut message = self.app_message(namespace, app);
+        message["create"] = entry;
+        self.command(&target, NodeOperation::App, message)?;
+        tracing::info!(app, node = target, "placing an app's start on a node with room for it");
+        Ok(true)
+    }
+
+    /// Runs `start` on `target`, which reports the app's entry: the start is not sent to its
+    /// own node, that node's deployment is done and the node removes its entry, and the app
+    /// starts on `target`. Removing the entry stops what is left of the app there; its data
+    /// stays where the app keeps it, which may be storage `target` shares.
+    fn start_on(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
+        let s = &start.parameters["app"];
+        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let old_key = format!("{}-{name}", start.worker);
+        let old = self.inner.lock().deployments.get(&old_key).cloned();
+        if let Some(mut old) = old {
+            old.disabled = true;
+            if let Some(scale) = old.scale.as_mut().filter(|s| s.pending()) {
+                scale.phase = Phase::Complete as i32;
+            }
+            self.save("deployments", &old_key, &old)?;
+            self.inner.lock().deployments.insert(old_key, old);
+        }
+        let mut unsent = start.clone();
+        unsent.done = true;
+        unsent.error = Some(format!("the app starts on {target}, which has room for it"));
+        self.save("commands", &unsent.id, &unsent)?;
+        self.inner.lock().commands.insert(unsent.id.clone(), unsent);
+        self.tell_nodes([&start.worker], self.app_message(namespace, app), json!({"remove": true}))?;
+        let template = self.inner.lock().apps.get(app).cloned();
+        if let Some(mut template) = template {
+            template.workers = vec![target.into()];
+            self.save("apps", app, &template)?;
+            self.inner.lock().apps.insert(app.into(), template);
+        }
+        tracing::info!(app, node = target, "starting the app on the node placed for it");
+        self.begin_toggle(&[format!("{target}-{name}")], false)
     }
 }

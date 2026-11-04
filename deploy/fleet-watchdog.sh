@@ -3,6 +3,7 @@
 set -euo pipefail
 . "${FLEET_ENV:-/etc/zkm-fleet/watchdog.env}"
 export PATH="$FLEET_HOME/venv/bin:$PATH" CUDA_VISIBLE_DEVICES RAY_NUM_CPUS FLEET_WORKDIR
+export RAY_METRICS_EXPORT_PORT RAY_MIN_WORKER_PORT RAY_MAX_WORKER_PORT
 mkdir -p "$FLEET_LOG"
 exec 8>"$FLEET_WORKDIR/watchdog.lock"
 flock -n 8 || exit 0

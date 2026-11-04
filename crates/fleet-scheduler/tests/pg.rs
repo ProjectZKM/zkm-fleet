@@ -480,3 +480,30 @@ async fn admin_issue_writes_the_first_administrators_token_into_the_database() {
     assert_eq!(PgStore::connect(&db).await.unwrap().tokens().await.unwrap().len(), 1, "and no token is added");
     admin.execute("DROP SCHEMA issue CASCADE").await.unwrap();
 }
+
+#[tokio::test]
+async fn disabling_a_disabled_app_keeps_when_it_was_disabled() {
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "toggle").await;
+    let db = in_schema(&url, "toggle");
+    let store = PgStore::connect(&db).await.unwrap();
+    store.add_app(&app(SYSTEM_NAMESPACE, "goat", &"a".repeat(64), 1, 0)).await.unwrap();
+    let cfg: fleet_scheduler::config::SchedulerConfig = serde_yaml::from_str(
+        "data_dir: /tmp/fleet\ncluster_token_file: unused\n").unwrap();
+    let fleet = fleet_scheduler::fleet::Scheduler::new(cfg, std::sync::Arc::new(store), String::new());
+    fleet.load_apps().await.unwrap();
+    let disabled_ms = || async {
+        sqlx::query("SELECT disabled_ms FROM toggle.fleet_apps WHERE name = 'goat'")
+            .fetch_one(&admin).await.unwrap().get::<Option<i64>, _>("disabled_ms")
+    };
+    fleet.set_app_disabled(SYSTEM_NAMESPACE, "goat", true).await.unwrap();
+    let since = disabled_ms().await.expect("disabled");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    // A starting prover's state is mirrored onto its app on every heartbeat.
+    fleet.set_app_disabled(SYSTEM_NAMESPACE, "goat", true).await.unwrap();
+    assert_eq!(disabled_ms().await, Some(since));
+    fleet.set_app_disabled(SYSTEM_NAMESPACE, "goat", false).await.unwrap();
+    assert_eq!(disabled_ms().await, None);
+    admin.execute("DROP SCHEMA toggle CASCADE").await.unwrap();
+}

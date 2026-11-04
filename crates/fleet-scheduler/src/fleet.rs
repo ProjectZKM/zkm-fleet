@@ -290,12 +290,17 @@ impl Scheduler {
     }
 
     /// Disables an app (its new jobs are refused; queued and running ones finish) or
-    /// enables it again.
+    /// enables it again. Setting the state it is in changes nothing, so a prover's state
+    /// mirrored on every heartbeat keeps when the app was disabled.
     pub async fn set_app_disabled(&self, namespace: &str, name: &str, disabled: bool,
     ) -> anyhow::Result<serde_json::Value> {
         let _ops = self.app_ops.write().await;
         if !self.app_known(namespace, name) {
             return Err(refuse(404, format!("no app {name}")));
+        }
+        let unchanged = self.apps.lock().get(&(namespace.into(), name.into())).is_some_and(|a| a.disabled == disabled);
+        if unchanged {
+            return Ok(serde_json::json!({ "app": name, "disabled": disabled }));
         }
         self.store.set_app_disabled(namespace, name, disabled, now_ms()).await?;
         if let Some(a) = self.apps.lock().get_mut(&(namespace.into(), name.into())) { a.disabled = disabled; }

@@ -84,7 +84,10 @@ on_node() { # this script, run on the node over ssh
   ssh "$NODE_SSH" "FLEET_CTL_ON_NODE=1 FLEET_PREFIX=$NODE_PREFIX bash -s -- $flag $(printf '%q ' "$@")" < "$SELF"
 }
 
-compose() { run docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" "$@"; }
+# The release's compose file, then this site's changes to it, if any: upgrades replace only the release's.
+COMPOSE=(docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml")
+[ ! -f "$PREFIX/deploy/docker-compose.override.yml" ] || COMPOSE+=(-f "$PREFIX/deploy/docker-compose.override.yml")
+compose() { run "${COMPOSE[@]}" "$@"; }
 # Naming a profiled service starts it, so recreate MCP only where install.sh enabled it.
 control_services() { echo scheduler; grep -q '^COMPOSE_PROFILES=.*mcp' "$PREFIX/compose.env" 2>/dev/null && echo mcp || true; }
 scheduler_healthy() {
@@ -228,7 +231,7 @@ status() {
     return
   fi
   echo "== control host: healthz $(curl -fs http://127.0.0.1:9191/healthz || echo FAILING)"
-  docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" ps || true
+  "${COMPOSE[@]}" ps || true
   "$PREFIX/bin/fleetctl" node || true
   "$PREFIX/bin/fleetctl" app || true
   if [ -n "$NODE_SSH" ]; then on_node status; fi

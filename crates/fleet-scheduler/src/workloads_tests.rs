@@ -2005,6 +2005,136 @@ async fn a_proof_app_is_an_app_whose_container_proves_its_program() {
     assert!(!c.fleet.app_known(&ns, "eth") && c.inner.lock().apps["eth"].removed, "deleting it removes both records");
 }
 
+/// Runs the commands sent to `nodes`, one at a time, until none is left: each node writes,
+/// starts and stops app entries in its report as its command asks. A `create` sent to one of
+/// `failing_creates` fails.
+async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String, NodeReport>, failing_creates: &[&str]) {
+    for _ in 0..100 {
+        c.dispatch().await.unwrap();
+        let Some(command) = c.inner.lock().commands.values().find(|v| !v.done && v.admitted).cloned() else {
+            return;
+        };
+        let report = nodes.get_mut(&command.worker).unwrap();
+        let p = &command.parameters;
+        let mut error = None;
+        let result = if command.operation == NodeOperation::SetApp as i32 {
+            let disabled = p["disabled"].as_bool().unwrap();
+            for a in report.apps.iter_mut().filter(|a| a["name"] == p["app"]["name"]) {
+                (a["ready"], a["cleaned"]) = (json!(!disabled), json!(disabled));
+            }
+            if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
+        } else if !p["create"].is_null() {
+            if failing_creates.contains(&command.worker.as_str()) {
+                error = Some("apps.yaml is not writable".to_string());
+                Value::Null
+            } else {
+                let mut entry = p["create"].clone();
+                (entry["ready"], entry["cleaned"]) = (json!(false), json!(true));
+                report.apps.push(entry.into());
+                json!({"created":[p["create"]["name"]]})
+            }
+        } else if p["remove"] == json!(true) {
+            report.apps.retain(|a| a["app"] != p["app"]["name"]);
+            json!({"removed":[p["app"]["name"]]})
+        } else {
+            for a in report.apps.iter_mut().filter(|a| a["name"] == p["entry"]["name"]) {
+                for (k, v) in p["set"].as_object().unwrap() {
+                    a[k.as_str()] = v.clone();
+                }
+            }
+            json!({"updated":[p["entry"]["name"]]})
+        };
+        let mut sent = report.clone();
+        sent.results = vec![CommandResult { id: command.id.clone(), result: result.into(), error }];
+        c.report(&command.worker, "session", sent).await.unwrap();
+    }
+    panic!("the nodes never finished their commands");
+}
+
+#[tokio::test]
+async fn an_app_start_is_placed_on_a_node_with_room() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "gpu");
+    let report_of = |machine: &str, free_gpus: f64| {
+        let mut report = inventory(&ns);
+        (report.machine, report.free_gpus) = (machine.into(), free_gpus);
+        report
+    };
+    // Its node's cards are taken by then; a node that cannot write its entry has room.
+    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone()), ("bare".into(), report_of("bare", 2.0))]);
+    nodes.get_mut("gpu").unwrap().free_gpus = 0.0;
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    c.begin_toggle(&["gpu-model".into()], false).unwrap();
+    nodes_run_commands(&c, &mut nodes, &["bare"]).await;
+    let waiting_starts = |c: &WorkloadController| c.inner.lock().commands.values()
+        .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| v.worker.clone()).collect::<Vec<_>>();
+    assert_eq!(waiting_starts(&c), ["gpu"], "a node that failed to create the app leaves it waiting on its own");
+    c.dispatch().await.unwrap();
+    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "and is not picked again");
+
+    // A start that preempted on its own node keeps the room that frees, though another node
+    // has room by then.
+    let mut preempted = submit(&c).await;
+    (preempted.worker, preempted.stop) = (Some("gpu".into()), Some("preempt".into()));
+    preempted.status["state"] = json!("running");
+    c.inner.lock().jobs.insert(preempted.id.clone(), preempted.clone());
+    nodes.insert("big".into(), report_of("big", 2.0));
+    c.report("big", "session", nodes["big"].clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert!(remove_commands(&c, NodeOperation::App).is_empty(), "placed on its own node while it preempts there");
+    preempted.status["state"] = json!("cancelled");
+    c.inner.lock().jobs.insert(preempted.id.clone(), preempted);
+    for command in c.inner.lock().commands.values_mut().filter(|v| v.operation == NodeOperation::PreemptJob as i32) {
+        command.done = true;
+    }
+
+    // Otherwise it takes the room another node has.
+    c.dispatch().await.unwrap();
+    let created = remove_commands(&c, NodeOperation::App);
+    assert_eq!(created.len(), 1);
+    let (to, entry) = (&created[0].0, &created[0].1["create"]);
+    assert_eq!((to.as_str(), entry["disabled"].clone(), entry["image"].as_str()), ("big", json!(true), Some("serve:1")));
+    assert!(["ready", "cleaned", "logs", "namespace_ref"].iter().all(|k| entry.get(*k).is_none()), "{entry}");
+    nodes_run_commands(&c, &mut nodes, &["bare"]).await;
+    assert!(waiting_starts(&c).is_empty());
+    assert!(nodes["gpu"].apps.is_empty(), "its own node removed the entry");
+    let ready = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true) && a["disabled"] == json!(false));
+    assert!(ready, "it runs on the node that had room: {:?}", nodes["big"].apps);
+    let i = c.inner.lock();
+    assert_eq!(i.apps["model"].workers, ["big"]);
+    assert!(!i.deployments.contains_key("gpu-model") && !i.deployments["big-model"].disabled);
+}
+
+#[tokio::test]
+async fn an_app_a_node_refuses_to_create_is_placed_again_on_the_next_enable() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"port_base":50100}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    let task = tokio::spawn({
+        let (c, ns) = (c.clone(), ns.clone());
+        async move { c.deploy(&ns, "model").await }
+    });
+    let create = loop {
+        let sent = c.inner.lock().commands.values().find(|v| !v.done && !v.parameters["create"].is_null()).cloned();
+        if let Some(sent) = sent {
+            break sent;
+        }
+        tokio::task::yield_now().await;
+    };
+    let mut report = inventory(&ns);
+    report.results = vec![CommandResult { id: create.id, result: Value::Null.into(), error: Some("apps.yaml is not writable".into()) }];
+    c.report("gpu", "session", report).await.unwrap();
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("enabling answers").unwrap().unwrap_err();
+    assert!(refused.to_string().contains("could not create the app: apps.yaml is not writable"), "{refused}");
+    assert!(c.inner.lock().apps["model"].workers.is_empty());
+}
+
 #[tokio::test]
 async fn an_app_goes_to_the_node_its_replicas_fit_most_tightly() {
     let (_dir, c, ns) = setup().await;
