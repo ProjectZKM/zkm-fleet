@@ -57,6 +57,5 @@ downloads move together. Omit `--version` to install the latest release.
 source checkout instead, build the binaries and run `deploy/install.sh control|node
 --bin target/release` with the same options.
 
-See [operations](operations.md) for workloads, [maintenance](maintenance.md) for
-upgrades and day-2 work, and [migrations](migrations.md) for one-time moves between
-older releases.
+See [operations](operations.md) for workloads, and [maintenance](maintenance.md)
+for upgrades, day-2 work and the one-time migrations between older releases.

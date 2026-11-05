@@ -44,7 +44,6 @@ task database and proofs in app storage.
 | [Installation](docs/installation.md) | Dependencies, binaries, control host, execution nodes and registration |
 | [Operations](docs/operations.md) | Namespace commands, tags, node capacity, app scaling, batches and logs |
 | [Maintenance](docs/maintenance.md) | Upgrades, Ray capacity changes, self-built programs, liveness and troubleshooting |
-| [Migrations](docs/migrations.md) | One-time moves between specific older releases |
 | [Reference](docs/reference.md) | Protocols, namespaces, tokens, quotas, APIs, storage and ports |
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
 | [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
