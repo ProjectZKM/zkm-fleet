@@ -1294,21 +1294,22 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
 }
 
 #[tokio::test]
-async fn cpu_and_gpu_provers_drain_live_and_disconnected_proofs_before_stopping() {
+async fn app_stops_drain_live_and_disconnected_proofs_regardless_of_runtime() {
     use crate::store::{ProofJob, ProofJobState};
     use fleet_proto::fleet::v1::{NodeInfo, ProofKind};
 
-    for (kind, backend, gpus) in [("ziren-gpu", "cuda", 1), ("ziren-cpu", "cpu", 0)] {
+    for (kind, backend, gpus) in [("ziren-gpu", "cuda", 1), ("ziren-cpu", "cpu", 0), ("app", "cpu", 0)] {
         let (_dir, c, ns) = setup().await;
-        register(&c, &ns, PROOF, &proof_elf()).await;
+        register(&c, &ns, "model", &proof_elf()).await;
         let mut report = scale_inventory(&ns, true, false);
         report.apps[0]["kind"] = json!(kind);
         report.apps[0]["gpus"] = json!(gpus);
+        report.apps[0]["app"] = json!("model");
         c.report("gpu", "session", report.clone()).await.unwrap();
         let node = c.fleet.register(NodeInfo {
             name: "model-0".into(), machine: "machine".into(), backend: backend.into(),
             gpus, cpus: 2, control_version: 1, app_namespace: ns.clone(),
-            app: PROOF.into(), app_elf_id: proof_elf(), ..Default::default()
+            app: "model".into(), app_elf_id: proof_elf(), ..Default::default()
         }).unwrap();
         c.fleet.heartbeat(&node, true, vec![], true, "active-proof");
         let stop = c.command("gpu", NodeOperation::SetApp,
@@ -1319,7 +1320,7 @@ async fn cpu_and_gpu_provers_drain_live_and_disconnected_proofs_before_stopping(
         assert!(!c.inner.lock().commands[&stop].admitted, "{kind}: live proof");
 
         let mut job = ProofJob {
-            inputs: None, outputs: None, id: "active-proof".into(), app: PROOF.into(),
+            inputs: None, outputs: None, id: "active-proof".into(), app: "model".into(),
             owner: "b".repeat(40), namespace: ns.clone(), tag: String::new(),
             client_id: "active-proof".into(), elf_id: proof_elf(),
             kind: ProofKind::Compressed as i32, priority: 0,

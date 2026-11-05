@@ -1330,9 +1330,9 @@ impl WorkloadController {
                     continue;
                 }
             }
-            // Both CPU and GPU provers execute scheduler-owned proofs. Drain them before
-            // stopping replicas, including executions retained while a prover is disconnected.
-            if disabled && matches!(text(s, "kind"), "ziren-gpu" | "ziren-cpu") {
+            // Drain scheduler-owned executions before stopping an app, regardless of its
+            // runtime. Persisted executions also fence stops while a replica is disconnected.
+            if disabled {
                 let names = (0..s["replicas"].as_u64().unwrap_or(1))
                     .map(|n| format!("{}-{n}", text(s, "name")))
                     .collect::<HashSet<_>>();
