@@ -1641,6 +1641,73 @@ fn integrated_inventory(ns: &str) -> NodeReport {
 }
 
 #[tokio::test]
+async fn one_conflicting_scale_defers_without_stalling_the_dispatch() {
+    let (_dir,c,ns)=setup().await;
+    // "gpu" keeps an integrated worker of `model` running: it owns the app.
+    c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
+    // "cpu" reports the same app disabled and cleaned, plus an unrelated plain app.
+    let mut report=integrated_inventory(&ns);
+    report.free_gpus=2.0;report.free_cpus=8.0;
+    report.apps[0]["disabled"]=json!(true);
+    report.apps[0]["cleaned"]=json!(true);
+    let mut other=report.apps[0].clone();
+    other["name"]=json!("other");
+    other["app"]=json!("other");
+    other["kind"]=json!("app");
+    other["worker_command"]=json!(null);
+    other["replicas"]=json!(1);
+    report.apps.push(other);
+    c.report("cpu","session",report).await.unwrap();
+    // Both deployments hold a start: `model` on cpu conflicts with the owner on gpu, `other` does not.
+    for key in ["cpu-model","cpu-other"] {
+        let mut i=c.inner.lock();
+        let intent=i.deployments.get_mut(key).unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+        intent.scale=Some(scale);
+    }
+    // The conflict defers instead of stalling: the pass and the whole dispatch succeed, the
+    // conflicting start is still uncreated, and the other app's start was created.
+    c.advance_scales().await.unwrap();
+    c.dispatch().await.unwrap();
+    let i=c.inner.lock();
+    let stuck=i.deployments["cpu-model"].scale.as_ref().unwrap();
+    assert!(stuck.pending() && stuck.start.is_none());
+    assert!(i.deployments["cpu-other"].scale.as_ref().unwrap().start.is_some());
+}
+
+#[tokio::test]
+async fn a_start_whose_deployment_went_away_is_retired_before_it_places_the_app() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,false,true);
+    c.report("gpu","session",report.clone()).await.unwrap();
+    c.report("cpu","session",report).await.unwrap();
+    // A start of gpu's scale, not yet admitted.
+    {
+        let mut i=c.inner.lock();
+        let intent=i.deployments.get_mut("gpu-model").unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+        intent.scale=Some(scale);
+    }
+    c.advance_scales().await.unwrap();
+    let old=c.inner.lock().deployments["gpu-model"].scale.as_ref().unwrap().start.clone().unwrap();
+    // The app moves to cpu, as a placed start does: gpu's deployment goes away and cpu's
+    // takes the current operation. The same-worker replacement in command() cannot see this.
+    {
+        let mut i=c.inner.lock();
+        i.deployments.remove("gpu-model");
+        let intent=i.deployments.get_mut("cpu-model").unwrap();
+        intent.scale=Some(scaling::new_scale(intent.spec.clone(),false));
+    }
+    c.dispatch().await.unwrap();
+    let retired=c.inner.lock().commands[&old].clone();
+    assert!(retired.done && !retired.admitted);
+    assert_eq!(retired.error.as_deref(),Some("superseded by a newer change"));
+    assert!(c.inner.lock().deployments["cpu-model"].scale.as_ref().unwrap().pending());
+}
+
+#[tokio::test]
 async fn a_disabled_app_its_node_stopped_reporting_is_forgotten() {
     let (_dir,c,ns)=setup().await;
     let record=c.dir.join("deployments").join("gpu-model.json");
