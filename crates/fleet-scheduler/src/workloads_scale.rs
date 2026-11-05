@@ -450,7 +450,17 @@ impl WorkloadController {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>();
         for (key, intent) in intents {
-            let mut scale = intent.scale.clone().unwrap();
+            // One deployment's conflict (an old owner of an integrated worker, say) must not
+            // stall the rest of the fleet: defer it to the next pass and keep dispatching.
+            let name = key.clone();
+            if let Err(error) = self.advance_scale(key, intent).await {
+                tracing::warn!(deployment = %name, error = %error, "scale deferred to the next pass");
+            }
+        }
+        Ok(())
+    }
+    async fn advance_scale(&self, key: String, intent: AppDeployment) -> anyhow::Result<()> {
+        let mut scale = intent.scale.clone().unwrap();
             if scale.phase() == Phase::Draining {
                 // A proof app refuses jobs while its prover is down; an app's template records it.
                 self.sync_app_record(&intent.spec, true).await?;
@@ -473,7 +483,7 @@ impl WorkloadController {
                     .cloned()
                     .unwrap();
                 if !command.done {
-                    continue;
+                    return Ok(());
                 }
                 if command.error.is_some() || command.result["cleaned"].as_bool() != Some(true) {
                     scale.phase = Phase::Failed as i32;
@@ -483,7 +493,7 @@ impl WorkloadController {
                             .unwrap_or_else(|| "node did not confirm the app's cleanup".into()),
                     );
                     self.save_scale(&key, scale)?;
-                    continue;
+                    return Ok(());
                 }
                 // The node writes the target configuration while the app is stopped.
                 {
@@ -502,7 +512,7 @@ impl WorkloadController {
                     }
                     let command = self.inner.lock().commands.get(scale.update.as_ref().unwrap()).cloned().unwrap();
                     if !command.done {
-                        continue;
+                        return Ok(());
                     }
                     let written = command.result["updated"].as_array()
                         .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(text(&intent.spec, "name"))));
@@ -510,7 +520,7 @@ impl WorkloadController {
                         scale.phase = Phase::Failed as i32;
                         scale.error = Some(command.error.unwrap_or_else(|| "node did not write the new configuration".into()));
                         self.save_scale(&key, scale)?;
-                        continue;
+                        return Ok(());
                     }
                 }
                 scale.phase = Phase::Starting as i32;
@@ -529,7 +539,7 @@ impl WorkloadController {
                 .cloned()
                 .unwrap();
             if !command.done {
-                continue;
+                return Ok(());
             }
             let first_ack = scale.ready_since.is_none();
             let ready_since = *scale.ready_since.get_or_insert_with(now);
@@ -565,13 +575,13 @@ impl WorkloadController {
                 failed.scale = Some(scale);
                 self.save("deployments", &key, &failed)?;
                 self.inner.lock().deployments.insert(key, failed);
-                continue;
+                return Ok(());
             }
             if !applied {
                 if first_ack {
                     self.save_scale(&key, scale)?;
                 }
-                continue;
+                return Ok(());
             }
             if !scale.disabled {
                 self.sync_app_record(&scale.target, false).await?;
@@ -595,7 +605,6 @@ impl WorkloadController {
             }
             scale.phase = Phase::Complete as i32;
             self.save_scale(&key, scale)?;
-        }
         Ok(())
     }
 }

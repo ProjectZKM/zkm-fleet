@@ -1311,7 +1311,28 @@ impl WorkloadController {
         for mut c in waiting {
             let s = &c.parameters["app"];
             let disabled = c.parameters["disabled"].as_bool() == Some(true);
-            if disabled && text(s, "kind") == "ziren-gpu" {
+            // A start that names a superseded scale is stale: the deployment's current scale
+            // (or its absence) is authoritative. Retire it instead of letting it place the app
+            // on some other node, or evict the placement of the change that replaced it.
+            if !disabled && c.parameters.get("scale_id").is_some() {
+                let stale = {
+                    let i = self.inner.lock();
+                    i.deployments
+                        .get(&format!("{}-{}", c.worker, text(s, "name")))
+                        .and_then(|d| d.scale.as_ref())
+                        .is_none_or(|d| c.parameters["scale_id"].as_str() != Some(d.id()))
+                };
+                if stale {
+                    c.done = true;
+                    c.error = Some("superseded by a newer change".into());
+                    self.save("commands", &c.id, &c)?;
+                    self.inner.lock().commands.insert(c.id.clone(), c);
+                    continue;
+                }
+            }
+            // Drain scheduler-owned executions before stopping an app, regardless of its
+            // runtime. Persisted executions also fence stops while a replica is disconnected.
+            if disabled {
                 let names = (0..s["replicas"].as_u64().unwrap_or(1))
                     .map(|n| format!("{}-{n}", text(s, "name")))
                     .collect::<HashSet<_>>();
@@ -1324,8 +1345,6 @@ impl WorkloadController {
                 {
                     continue;
                 }
-            }
-            if disabled && text(s, "kind") == "ziren-gpu" {
                 let jobs = self
                     .fleet
                     .recent_jobs(

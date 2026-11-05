@@ -1294,6 +1294,55 @@ async fn persistent_scale_survives_restarts_releases_old_units_and_waits_for_new
 }
 
 #[tokio::test]
+async fn app_stops_drain_live_and_disconnected_proofs_regardless_of_runtime() {
+    use crate::store::{ProofJob, ProofJobState};
+    use fleet_proto::fleet::v1::{NodeInfo, ProofKind};
+
+    for (kind, backend, gpus) in [("ziren-gpu", "cuda", 1), ("ziren-cpu", "cpu", 0), ("app", "cpu", 0)] {
+        let (_dir, c, ns) = setup().await;
+        register(&c, &ns, "model", &proof_elf()).await;
+        let mut report = scale_inventory(&ns, true, false);
+        report.apps[0]["kind"] = json!(kind);
+        report.apps[0]["gpus"] = json!(gpus);
+        report.apps[0]["app"] = json!("model");
+        c.report("gpu", "session", report.clone()).await.unwrap();
+        let node = c.fleet.register(NodeInfo {
+            name: "model-0".into(), machine: "machine".into(), backend: backend.into(),
+            gpus, cpus: 2, control_version: 1, app_namespace: ns.clone(),
+            app: "model".into(), app_elf_id: proof_elf(), ..Default::default()
+        }).unwrap();
+        c.fleet.heartbeat(&node, true, vec![], true, "active-proof");
+        let stop = c.command("gpu", NodeOperation::SetApp,
+            json!({"app":report.apps[0],"disabled":true})).unwrap();
+
+        // The live prover's busy report alone fences the stop.
+        c.dispatch().await.unwrap();
+        assert!(!c.inner.lock().commands[&stop].admitted, "{kind}: live proof");
+
+        let mut job = ProofJob {
+            inputs: None, outputs: None, id: "active-proof".into(), app: "model".into(),
+            owner: "b".repeat(40), namespace: ns.clone(), tag: String::new(),
+            client_id: "active-proof".into(), elf_id: proof_elf(),
+            kind: ProofKind::Compressed as i32, priority: 0,
+            state: ProofJobState::Running as i32, fail_status: None, error: String::new(),
+            node: Some("model-0".into()), attempts: 1, failed_on: vec![], cycles: 0,
+            prove_ms: 0, created_ms: 1, started_ms: Some(1), finished_ms: None,
+        };
+        c.fleet.store.upsert(&job).await.unwrap();
+        c.fleet.deregister(&node);
+        // A disconnected prover's persisted execution must still fence the stop.
+        c.dispatch().await.unwrap();
+        assert!(!c.inner.lock().commands[&stop].admitted, "{kind}: disconnected proof");
+
+        job.state = ProofJobState::Succeeded as i32;
+        job.finished_ms = Some(2);
+        c.fleet.store.upsert(&job).await.unwrap();
+        c.dispatch().await.unwrap();
+        assert!(c.inner.lock().commands[&stop].admitted, "{kind}: drained");
+    }
+}
+
+#[tokio::test]
 async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled_apps_disabled() {
     use crate::store::{ProofJob,ProofJobState};
     use fleet_proto::fleet::v1::ProofKind;
@@ -1638,6 +1687,73 @@ fn integrated_inventory(ns: &str) -> NodeReport {
     report.apps[0]["replicas"]=json!(1);
     report.apps[0]["machine"]=json!("machine");
     report
+}
+
+#[tokio::test]
+async fn one_conflicting_scale_defers_without_stalling_the_dispatch() {
+    let (_dir,c,ns)=setup().await;
+    // "gpu" keeps an integrated worker of `model` running: it owns the app.
+    c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
+    // "cpu" reports the same app disabled and cleaned, plus an unrelated plain app.
+    let mut report=integrated_inventory(&ns);
+    report.free_gpus=2.0;report.free_cpus=8.0;
+    report.apps[0]["disabled"]=json!(true);
+    report.apps[0]["cleaned"]=json!(true);
+    let mut other=report.apps[0].clone();
+    other["name"]=json!("other");
+    other["app"]=json!("other");
+    other["kind"]=json!("app");
+    other["worker_command"]=json!(null);
+    other["replicas"]=json!(1);
+    report.apps.push(other);
+    c.report("cpu","session",report).await.unwrap();
+    // Both deployments hold a start: `model` on cpu conflicts with the owner on gpu, `other` does not.
+    for key in ["cpu-model","cpu-other"] {
+        let mut i=c.inner.lock();
+        let intent=i.deployments.get_mut(key).unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+        intent.scale=Some(scale);
+    }
+    // The conflict defers instead of stalling: the pass and the whole dispatch succeed, the
+    // conflicting start is still uncreated, and the other app's start was created.
+    c.advance_scales().await.unwrap();
+    c.dispatch().await.unwrap();
+    let i=c.inner.lock();
+    let stuck=i.deployments["cpu-model"].scale.as_ref().unwrap();
+    assert!(stuck.pending() && stuck.start.is_none());
+    assert!(i.deployments["cpu-other"].scale.as_ref().unwrap().start.is_some());
+}
+
+#[tokio::test]
+async fn a_start_whose_deployment_went_away_is_retired_before_it_places_the_app() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,false,true);
+    c.report("gpu","session",report.clone()).await.unwrap();
+    c.report("cpu","session",report).await.unwrap();
+    // A start of gpu's scale, not yet admitted.
+    {
+        let mut i=c.inner.lock();
+        let intent=i.deployments.get_mut("gpu-model").unwrap();
+        let mut scale=scaling::new_scale(intent.spec.clone(),false);
+        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
+        intent.scale=Some(scale);
+    }
+    c.advance_scales().await.unwrap();
+    let old=c.inner.lock().deployments["gpu-model"].scale.as_ref().unwrap().start.clone().unwrap();
+    // The app moves to cpu, as a placed start does: gpu's deployment goes away and cpu's
+    // takes the current operation. The same-worker replacement in command() cannot see this.
+    {
+        let mut i=c.inner.lock();
+        i.deployments.remove("gpu-model");
+        let intent=i.deployments.get_mut("cpu-model").unwrap();
+        intent.scale=Some(scaling::new_scale(intent.spec.clone(),false));
+    }
+    c.dispatch().await.unwrap();
+    let retired=c.inner.lock().commands[&old].clone();
+    assert!(retired.done && !retired.admitted);
+    assert_eq!(retired.error.as_deref(),Some("superseded by a newer change"));
+    assert!(c.inner.lock().deployments["cpu-model"].scale.as_ref().unwrap().pending());
 }
 
 #[tokio::test]
