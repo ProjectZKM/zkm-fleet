@@ -7,6 +7,13 @@ export RAY_METRICS_EXPORT_PORT RAY_MIN_WORKER_PORT RAY_MAX_WORKER_PORT
 mkdir -p "$FLEET_LOG"
 exec 8>"$FLEET_WORKDIR/watchdog.lock"
 flock -n 8 || exit 0
+# Ray's temp dir is a short link into the workspace. /tmp does not keep it across reboots, and
+# a stray ray-start.sh run with another workspace can repoint it; a dead link aborts every
+# agent restart, so keep it in place here.
+if [ -n "${FLEET_WORKDIR:-}" ]; then
+  LINK="${FLEET_RAY_LINK:-/tmp/zkf-ray-$(id -u)}"
+  [ -e "$LINK" ] || ln -sfn "$FLEET_WORKDIR/ray" "$LINK"
+fi
 FOUND=0
 for PID in $(pgrep -x -u "$(id -u)" raylet || true); do
   case "$(readlink "/proc/$PID/exe")" in "$FLEET_HOME/venv/"*) FOUND=1;; esac
