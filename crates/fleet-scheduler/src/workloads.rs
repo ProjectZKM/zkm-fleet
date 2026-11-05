@@ -1330,7 +1330,9 @@ impl WorkloadController {
                     continue;
                 }
             }
-            if disabled && text(s, "kind") == "ziren-gpu" {
+            // Both CPU and GPU provers execute scheduler-owned proofs. Drain them before
+            // stopping replicas, including executions retained while a prover is disconnected.
+            if disabled && matches!(text(s, "kind"), "ziren-gpu" | "ziren-cpu") {
                 let names = (0..s["replicas"].as_u64().unwrap_or(1))
                     .map(|n| format!("{}-{n}", text(s, "name")))
                     .collect::<HashSet<_>>();
@@ -1343,8 +1345,6 @@ impl WorkloadController {
                 {
                     continue;
                 }
-            }
-            if disabled && text(s, "kind") == "ziren-gpu" {
                 let jobs = self
                     .fleet
                     .recent_jobs(
