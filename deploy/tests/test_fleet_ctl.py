@@ -1,6 +1,7 @@
 """Exercise fleet-ctl.sh's compose calls with stand-in docker, curl and fleetctl."""
 import os
 from pathlib import Path
+import shlex
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -127,3 +128,30 @@ def test_watchdog_repairs_a_dead_ray_link(tmp_path):
         pytest.skip("a live fleet watchdog on this machine held the lock; nothing ran")
     assert link.is_symlink() and link.resolve() == (work / "ray").resolve()
     assert (tmp_path / "ray.log").exists(), "the repaired link let the watchdog start Ray"
+
+
+def test_remote_upgrade_preserves_scripts_position_without_a_proof_app(tmp_path):
+    prefix, commands = node_fixture(tmp_path)
+    newbin = tmp_path / "fleet-node"
+    executable(newbin, "exit 0\n")
+    newbridge = tmp_path / "bridge"
+    (newbridge / "fleet_bridge").mkdir(parents=True)
+    newscripts = tmp_path / "scripts"
+    newscripts.mkdir()
+    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh"):
+        (newscripts / name).write_text("#!/bin/bash\n")
+    remote_command = tmp_path / "remote-command"
+    executable(commands / "scp", "exit 0\n")
+    executable(commands / "ssh", 'case "$2" in *"bash -s"*) printf "%s\\n" "$2" > "$SSH_LOG";; esac\n')
+    environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+                   "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_CTL_ON_NODE": "0",
+                   "FLEET_NODE_SSH": "gpu-node", "SSH_LOG": str(remote_command)}
+    result = subprocess.run(
+        ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node", "upgrade", str(newbin), str(newbridge), "", str(newscripts)],
+        env=environment, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    args = shlex.split(remote_command.read_text())
+    upgrade = args[args.index("--") + 1:]
+    assert upgrade[:2] == ["node", "upgrade"]
+    stage = str(Path(upgrade[2]).parent)
+    assert upgrade[2:] == [f"{stage}/fleet-node", f"{stage}/bridge", "", f"{stage}/scripts"]

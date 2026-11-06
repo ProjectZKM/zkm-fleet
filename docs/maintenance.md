@@ -7,8 +7,9 @@ upgrades need none of them.
 
 ## Upgrading
 
-`deploy/fleet-ctl.sh` (in the release package, or in a checkout of that revision) is
-the upgrade path. Every upgrade copies what it replaces to `backup/` first, then waits
+`deploy/fleet-ctl.sh` (in the release package, or in a checkout of that revision)
+upgrades the control host and systemd-supervised nodes. Cron-supervised nodes use
+the manual procedure below. Every scripted upgrade copies what it replaces to `backup/` first, then waits
 for the scheduler's health check or the node's reconnection; the matching `rollback`
 restores that backup.
 
@@ -63,10 +64,38 @@ scripts' directory.
 A program update does not require restarting Ray or changing its pool; running apps
 and batches keep going through the agent restart. The upgrade touches neither
 `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`; keep independent
-app endpoints running when their programs are unchanged. For a node supervised by
-cron rather than systemd, the watchdog keeps restarting the old agent until the new
-files are in place — the script's stop/start window covers it, but do not start a
-second supervisor.
+app endpoints running when their programs are unchanged.
+
+#### Cron-supervised nodes
+
+`fleet-ctl.sh node upgrade` and `node rollback` require a systemd unit. For a
+cron-supervised node, first comment out its watchdog line with `crontab -e`, send
+SIGTERM to that installation's `fleet-node` process, and wait for it to exit.
+Keep Ray running. With `PACKAGE` set to an unpacked, checksum-verified release
+directory (or a local package from the tested revision), replace the programs:
+
+```bash
+FLEET_PREFIX="$HOME/app/fleet"
+BACKUP="$FLEET_PREFIX/backup/node-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$BACKUP/scripts"
+cp -a "$FLEET_PREFIX/bin/fleet-node" "$FLEET_PREFIX/bridge" "$BACKUP/"
+for script in node-start.sh ray-start.sh fleet-watchdog.sh; do
+  cp -a "$FLEET_PREFIX/deploy/$script" "$BACKUP/scripts/"
+done
+install -m 755 "$PACKAGE/bin/fleet-node" "$FLEET_PREFIX/bin/fleet-node"
+cp -a "$PACKAGE/bridge/fleet_bridge/." "$FLEET_PREFIX/bridge/fleet_bridge/"
+for script in node-start.sh ray-start.sh fleet-watchdog.sh; do
+  install -m 755 "$PACKAGE/deploy/$script" "$FLEET_PREFIX/deploy/$script"
+done
+FLEET_ENV="$FLEET_PREFIX/etc/watchdog.env" "$FLEET_PREFIX/deploy/fleet-watchdog.sh"
+```
+
+Restore the same cron line, then verify a fresh heartbeat and workload progress.
+If verification fails, pause cron and stop the agent again, restore `fleet-node`,
+`bridge/` and the launch scripts from `BACKUP`, and restart the watchdog before
+restoring cron. Preserve `etc/` and `work/`. If also updating `fleet-proof-app`,
+back up and replace that binary while its endpoint supervisor is stopped, then
+restart that supervisor; keep its previous binary for rollback.
 
 ### Control host and nodes together
 
@@ -90,7 +119,8 @@ FLEET_VERSION=0.1.6 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 ```
 
-Install with the local-file form of `node upgrade` above.
+For systemd nodes, install with the local-file form of `node upgrade` above;
+for cron nodes, follow the manual procedure with the tested local package.
 
 ## Changing a node's capacity
 
@@ -141,6 +171,11 @@ ray stop
 "$FLEET_HOME/deploy/ray-start.sh"
 SH
 ```
+
+**Restart the agent.** For systemd, run
+`sudo systemctl start zkm-fleet-node.service`. For cron, restore the watchdog line
+and run
+`FLEET_ENV="$HOME/app/fleet/etc/watchdog.env" ~/app/fleet/deploy/fleet-watchdog.sh`.
 
 **Verify and resume.** On the control host:
 

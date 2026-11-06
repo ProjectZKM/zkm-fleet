@@ -16,6 +16,7 @@
 # dir, default ~/app/fleet) and FLEET_RELEASE_REPO (default ProjectZKM/zkm-fleet).
 # FLEET_NODE_UNIT names the node's systemd unit; FLEET_PROOF_APP_UNITS the app endpoint
 # units a fleet-proof-app upgrade restarts. Every upgrade backs up what it replaces first.
+# Node upgrades and rollbacks require systemd; see docs/maintenance.md for cron nodes.
 set -euo pipefail
 SELF=$(readlink -f "$0")
 ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
@@ -165,6 +166,8 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
     if [ -n "$scripts" ]; then
       run ssh "$NODE_SSH" "mkdir -p $stage/scripts"
       run scp -q "$scripts"/node-start.sh "$scripts"/ray-start.sh "$scripts"/fleet-watchdog.sh "$NODE_SSH:$stage/scripts/"
+      # Keep the third argument reserved for the optional proof-app binary.
+      [ -n "$proof_app" ] || args+=("")
       args+=("$stage/scripts")
     fi
     on_node node upgrade "${args[@]}"
