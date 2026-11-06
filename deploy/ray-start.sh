@@ -13,7 +13,7 @@ COMMON=(--node-manager-port=6380 --object-manager-port=6381
 # capped at 107 bytes: Ray gets a short link into the workspace, not the workspace path itself.
 if [ -n "${FLEET_WORKDIR:-}" ]; then
   mkdir -p "$FLEET_WORKDIR/ray" "$FLEET_WORKDIR/spill"
-  LINK="/tmp/zkf-ray-$(id -u)"
+  LINK="${FLEET_RAY_LINK:-/tmp/zkf-ray-$(id -u)}"
   ln -sfn "$FLEET_WORKDIR/ray" "$LINK"
   COMMON+=(--temp-dir="$LINK" --object-spilling-directory="$FLEET_WORKDIR/spill")
 fi

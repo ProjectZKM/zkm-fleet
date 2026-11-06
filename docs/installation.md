@@ -12,8 +12,8 @@ checksums and runs `deploy/install.sh` with the packaged binaries.
 ## Control host
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/setup.sh | bash -s -- \
-  --version v0.1.2 control --public-url https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.1.6/deploy/setup.sh | bash -s -- \
+  --version v0.1.6 control --public-url https://fleet.example:8905 \
   --tls-names stage,fleet.example --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc"
 ```
 
@@ -30,8 +30,8 @@ Copy the control host's `etc/cluster.token` to the node (mode 600), and its
 `etc/tls/ca.pem` when using the private CA. Then run on the node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/main/deploy/setup.sh | bash -s -- \
-  --version v0.1.2 node --name gpu-1 --scheduler https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.1.6/deploy/setup.sh | bash -s -- \
+  --version v0.1.6 node --name gpu-1 --scheduler https://fleet.example:8905 \
   --cluster-token "$HOME/cluster.token" --scheduler-ca "$HOME/ca.pem" \
   --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc" --cuda 0,1,2,3 --cpus 32
 ```
@@ -51,10 +51,11 @@ fleetctl node gpu-1
 
 ## Options
 
-Omit `--version` to install the latest release. `--keep-package` keeps the
-downloaded package for inspection. To install from a source checkout instead,
-build the binaries and run `deploy/install.sh control|node --bin target/release`
-with the same options.
+Fetch `setup.sh` from the release you are installing: the script and the package it
+downloads move together. Omit `--version` to install the latest release.
+`--keep-package` keeps the downloaded package for inspection. To install from a
+source checkout instead, build the binaries and run `deploy/install.sh control|node
+--bin target/release` with the same options.
 
-See [operations](operations.md) for workloads and [maintenance](maintenance.md)
-for upgrades.
+See [operations](operations.md) for workloads, and [maintenance](maintenance.md)
+for upgrades, day-2 work and the one-time migrations between older releases.

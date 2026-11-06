@@ -5,8 +5,8 @@
 #   scheduler upgrade [TAG]       pull the release's scheduler image from GHCR, recreate it with Docker
 #                                 Compose and install its fleetctl (default: latest release)
 #   scheduler rollback            restore the image setting, fleetctl and compose files the last upgrade replaced
-#   node upgrade [TAG]            install a release's fleet-node, bridge and fleet-proof-app
-#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP]   the same from local files
+#   node upgrade [TAG]            install a release's fleet-node, bridge, fleet-proof-app and launch scripts
+#   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR]   the same from local files
 #   node rollback                 restore what the last node upgrade replaced
 #   app cleanup APP-0             remove the placement group and container a failed app start left
 #
@@ -16,6 +16,7 @@
 # dir, default ~/app/fleet) and FLEET_RELEASE_REPO (default ProjectZKM/zkm-fleet).
 # FLEET_NODE_UNIT names the node's systemd unit; FLEET_PROOF_APP_UNITS the app endpoint
 # units a fleet-proof-app upgrade restarts. Every upgrade backs up what it replaces first.
+# Node upgrades and rollbacks require systemd; see docs/maintenance.md for cron nodes.
 set -euo pipefail
 SELF=$(readlink -f "$0")
 ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
@@ -28,6 +29,11 @@ PROOF_APP_UNITS=${FLEET_PROOF_APP_UNITS:-}
 DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }
 run() { if [ "$DRY" = 1 ]; then echo "+ $*"; else "$@"; fi; }
+# Each upgrade downloads and unpacks its release into a temporary directory; it is removed
+# on exit (success or failure), so a fleet host's small disk never leaks ~400MB per upgrade.
+STAGE=""
+cleanup_stage() { [ -z "$STAGE" ] || rm -rf "$STAGE"; return 0; }
+trap cleanup_stage EXIT
 stamp() { date -u +%Y%m%dT%H%M%SZ; }
 RELEASE_REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}
 RELEASE_VERSION=${FLEET_RELEASE_VERSION:-latest}
@@ -56,6 +62,7 @@ prepare_release() {
   RELEASE_TAG=${RELEASE_TAG//$'\n'/}
   RELEASE_VERSION_NUMBER=${RELEASE_TAG#v}
   if [ -z "$stage" ]; then stage=$(mktemp -d); fi
+  STAGE=$stage
   RELEASE_PACKAGE="$stage/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
   RELEASE_CHECKSUM="$RELEASE_PACKAGE.sha256"
   local base="https://github.com/$RELEASE_REPO/releases/download/$RELEASE_TAG"
@@ -129,31 +136,41 @@ scheduler_rollback() {
   echo "restored $b"
 }
 
-node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], or node upgrade RELEASE_TAG
-  local bin=${1:-} bridge=${2:-} proof_app=${3:-}
+node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR], or node upgrade RELEASE_TAG
+  local bin=${1:-} bridge=${2:-} proof_app=${3:-} scripts=${4:-}
   if [ -n "$bin" ] && [ ! -f "$bin" ]; then
     local stage; stage=$(mktemp -d)
     prepare_release "$bin" "$stage"
     bin=$RELEASE_ROOT/bin/fleet-node
     bridge=$RELEASE_ROOT/bridge
     proof_app=$RELEASE_ROOT/bin/fleet-proof-app
+    scripts=$RELEASE_ROOT/deploy
   fi
   # A dry run never ships or validates downloaded files.
   if [ "$DRY" != 1 ]; then
-    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge [FLEET_PROOF_APP_BINARY] or node upgrade RELEASE_TAG"
+    [ -f "$bin" ] && [ -d "$bridge/fleet_bridge" ] || die "usage: node upgrade FLEET_NODE_BINARY DIR_CONTAINING_fleet_bridge [FLEET_PROOF_APP_BINARY] [DIR_CONTAINING_the_launch_scripts] or node upgrade RELEASE_TAG"
     [ -z "$proof_app" ] || [ -f "$proof_app" ] || die "no fleet-proof-app binary $proof_app"
+    [ -z "$scripts" ] || launch_scripts_dir "$scripts" || die "no launch scripts in $scripts"
   fi
   if remote; then # ship them, then upgrade on the node
     local stage; stage=/tmp/fleet-ctl-$(stamp)
+    local args=()
     run ssh "$NODE_SSH" "mkdir -p $stage/bridge"
     run scp -q "$bin" "$NODE_SSH:$stage/fleet-node"
     run scp -q -r "$bridge/fleet_bridge" "$NODE_SSH:$stage/bridge/"
+    args+=("$stage/fleet-node" "$stage/bridge")
     if [ -n "$proof_app" ]; then
       run scp -q "$proof_app" "$NODE_SSH:$stage/fleet-proof-app"
-      on_node node upgrade "$stage/fleet-node" "$stage/bridge" "$stage/fleet-proof-app"
-    else
-      on_node node upgrade "$stage/fleet-node" "$stage/bridge"
+      args+=("$stage/fleet-proof-app")
     fi
+    if [ -n "$scripts" ]; then
+      run ssh "$NODE_SSH" "mkdir -p $stage/scripts"
+      run scp -q "$scripts"/node-start.sh "$scripts"/ray-start.sh "$scripts"/fleet-watchdog.sh "$NODE_SSH:$stage/scripts/"
+      # Keep the third argument reserved for the optional proof-app binary.
+      [ -n "$proof_app" ] || args+=("")
+      args+=("$stage/scripts")
+    fi
+    on_node node upgrade "${args[@]}"
     run ssh "$NODE_SSH" "rm -rf $stage"
     return
   fi
@@ -162,10 +179,22 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], or node
   [ "$DRY" = 1 ] || (cd "$bridge" && "$PREFIX/venv/bin/python" -c "import fleet_bridge.node") || die "the new bridge does not import; nothing changed"
   run mkdir -p "$b"; run cp -a "$PREFIX/bin/fleet-node" "$PREFIX/bridge" "$b/"
   [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
+  if [ -n "$scripts" ]; then
+    run mkdir -p "$b/scripts"
+    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+      [ ! -f "$PREFIX/deploy/$s" ] || run cp -a "$PREFIX/deploy/$s" "$b/scripts/"
+    done
+  fi
   run install -m 755 "$bin" "$PREFIX/bin/fleet-node.new"
   run sudo systemctl stop "$NODE_UNIT"
   run mv "$PREFIX/bin/fleet-node.new" "$PREFIX/bin/fleet-node"
   run cp -a "$bridge/fleet_bridge/." "$PREFIX/bridge/fleet_bridge/"
+  if [ -n "$scripts" ]; then
+    run mkdir -p "$PREFIX/deploy"
+    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+      run install -m 755 "$scripts/$s" "$PREFIX/deploy/$s"
+    done
+  fi
   run sudo systemctl start "$NODE_UNIT"
   [ "$DRY" = 1 ] || node_connected || die "node did not reconnect; run: fleet-ctl.sh node rollback"
   if [ -n "$proof_app" ]; then
@@ -174,6 +203,12 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP], or node
     local unit; for unit in $PROOF_APP_UNITS; do run sudo systemctl restart "$unit"; done
   fi
   echo "node upgraded; previous files in $b"
+}
+launch_scripts_dir() { # a directory holding the node's three launch scripts
+  local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+    [ -f "$1/$s" ] || return 1
+  done
+  return 0
 }
 node_connected() { # the agent reconnecting, not just the unit running
   for _ in $(seq 45); do
@@ -185,6 +220,12 @@ node_rollback() {
   run sudo systemctl stop "$NODE_UNIT"
   run install -m 755 "$b/fleet-node" "$PREFIX/bin/fleet-node"
   run cp -a "$b/bridge/." "$PREFIX/bridge/"
+  if [ -d "$b/scripts" ]; then
+    run mkdir -p "$PREFIX/deploy"
+    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+      [ ! -f "$b/scripts/$s" ] || run install -m 755 "$b/scripts/$s" "$PREFIX/deploy/$s"
+    done
+  fi
   run sudo systemctl start "$NODE_UNIT"
   if [ -f "$b/fleet-proof-app" ]; then
     run install -m 755 "$b/fleet-proof-app" "$PREFIX/bin/fleet-proof-app"
@@ -241,7 +282,7 @@ case "${1:-}/${2:-}" in
   status/) status;;
   scheduler/upgrade) scheduler_upgrade "${3:-}";;
   scheduler/rollback) scheduler_rollback;;
-  node/upgrade) node_upgrade "${3:-}" "${4:-}" "${5:-}";;
+  node/upgrade) node_upgrade "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
   node/rollback) if remote; then on_node node rollback; else node_rollback; fi;;
   app/cleanup) if remote; then on_node app cleanup "${3:-}"; else app_cleanup "${3:-}"; fi;;
   *) sed -n '2,/^set -euo/p' "$SELF" | sed '$d;s/^# \{0,1\}//'; exit 2;;

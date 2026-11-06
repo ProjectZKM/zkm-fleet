@@ -4,7 +4,7 @@ default-members = ["crates/fleet-proto", "crates/fleet-scheduler", "crates/fleet
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.7"
 edition = "2021"
 publish = false
 
@@ -37,9 +37,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 alloy-primitives = { version = "1", features = ["k256"] }
 
-zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
-zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
-zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren", rev = "e08a98236d033f940160ccfe244dec12df0dddb0" }
+zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
+zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
+zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
 
 [profile.release]
 debug = 1

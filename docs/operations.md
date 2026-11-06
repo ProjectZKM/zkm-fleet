@@ -14,6 +14,20 @@ inspect their own namespace, including its shared quota and their tag's quota an
 usage. Node administration and namespace writes require an administrator token.
 Add `--json` for structured output.
 
+## Daily commands
+
+The short list; everything else is in the sections below or in `fleetctl --help`.
+
+```bash
+fleetctl node                   # machines: capacity, READY, heartbeats, the agent's VERSION
+fleetctl node NAME              # one machine's record
+fleetctl app                    # every app with its state, allocation and node
+fleetctl app logs APP -n 200    # an app's last log lines, read from where it runs
+fleetctl job -a                 # queued and running jobs
+fleetctl batch                  # batch workloads with their newest jobs
+fleetctl node drain NAME        # hold new placements on a machine (undrain to release)
+```
+
 ## Namespaces and access
 
 A namespace owns apps and batches and shares one GPU/CPU quota across their
