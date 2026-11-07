@@ -249,6 +249,17 @@ timeout, and no launch reaches them. Later releases scan only what is in flight 
 let reports in between jobs. On v0.1.7 and older, keep fewer jobs in flight: below
 about 50 the passes stay short.
 
+A bulk purge (`fleetctl job purge --older-than DAYS`) of a busy batch's history has the
+same symptom on v0.1.8 and older: it holds that lock while it writes a record and a
+node command for every job, minutes for tens of thousands. Its node commands then
+crowd out launches for as long again, at 16 per heartbeat. Later releases purge in
+chunks and send a node's purges after its other commands.
+
+The scheduler logs one `api request` line for each API call that can change state:
+method, path with query, status, duration, and the caller's token id, label,
+namespace and tag (never the token). `docker logs zkm-fleet-scheduler-1 | grep 'api
+request'` shows who submitted, cancelled, purged or reconfigured what.
+
 ## Installed files and backups
 
 Keep source/build files separate from the installed runtime. A node installation
