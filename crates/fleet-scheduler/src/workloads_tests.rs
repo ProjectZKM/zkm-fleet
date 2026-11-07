@@ -396,6 +396,76 @@ async fn commands_survive_restart_and_completed_launch_is_not_replayed() {
     assert!(restarted.inner.lock().commands[&command.id].done);
 }
 #[tokio::test]
+async fn scheduling_passes_see_only_open_records_and_unchanged_reports_write_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let job = submit(&c).await;
+    c.dispatch().await.unwrap();
+    let job = c.job(&job.id, None, &BTreeMap::new()).unwrap();
+    let launch = c.inner.lock().commands.values().next().unwrap().id.clone();
+    let open = |c: &WorkloadController| {
+        let i = c.inner.lock();
+        (i.jobs.open().count(), i.commands.open().count())
+    };
+    assert_eq!(open(&c), (1, 1));
+
+    // The node runs the launch; the job is open while it runs and holds its quota.
+    let mut report = inventory(&ns);
+    report.results.push(CommandResult { id: launch.clone(), result: json!({}).into(), error: None });
+    report.jobs.push(incoming(&job, "running", false));
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(open(&c), (1, 0));
+
+    // Each heartbeat reports the job again: unchanged, its record is not written again.
+    let path = c.dir.join("jobs").join(format!("{}.json", job.id));
+    let written = fs::metadata(&path).unwrap().ino();
+    report.results.clear();
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), written);
+    assert_eq!(c.fleet.allocations(&ns).len(), 1);
+
+    // Finished and cleaned up, it is history: kept, and no pass looks at it, before or after a restart.
+    report.jobs[0] = incoming(&job, "succeeded", true);
+    c.report("gpu", "session", report).await.unwrap();
+    assert_eq!(c.job(&job.id, None, &BTreeMap::new()).unwrap().state(), "succeeded");
+    assert_eq!(open(&c), (0, 0));
+    let restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
+    assert_eq!(open(&restarted), (0, 0));
+    let held = |c: &WorkloadController| {
+        let i = c.inner.lock();
+        (i.jobs.len(), i.commands.len())
+    };
+    assert_eq!(held(&restarted), (1, 1));
+    restarted.dispatch().await.unwrap();
+    assert!(restarted.inner.lock().commands[&launch].done, "a finished job's launch is not sent again");
+    assert_eq!(restarted.inner.lock().commands.len(), 1);
+}
+#[tokio::test]
+async fn a_job_its_quota_cannot_take_waits_without_rewriting_its_record() {
+    use std::os::unix::fs::MetadataExt;
+    let (_dir, c, ns) = setup().await;
+    let mut report = inventory(&ns);
+    (report.total_gpus, report.free_gpus) = (4.0, 4.0);
+    c.report("gpu", "session", report).await.unwrap();
+    let jobs = [submit(&c).await, submit(&c).await, submit(&c).await];
+    c.dispatch().await.unwrap();
+    let placed = |c: &WorkloadController| {
+        jobs.iter().filter(|j| c.job(&j.id, None, &BTreeMap::new()).unwrap().worker.is_some()).count()
+    };
+    assert_eq!(placed(&c), 2, "the namespace's 2-GPU quota takes two of the 1-GPU jobs");
+    let waiting = jobs.iter().map(|j| c.job(&j.id, None, &BTreeMap::new()).unwrap()).find(|j| j.worker.is_none()).unwrap();
+    assert_eq!(waiting.state(), "waiting_quota");
+    assert!(waiting.status["detail"].is_null(), "{:?}", waiting.status);
+    let path = c.dir.join("jobs").join(format!("{}.json", waiting.id));
+    let written = fs::metadata(&path).unwrap().ino();
+    c.dispatch().await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), written, "a pass that cannot place it leaves its record alone");
+    assert_eq!(placed(&c), 2);
+}
+#[tokio::test]
 async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
@@ -1549,7 +1619,7 @@ async fn an_app_operation_replaces_an_enable_still_waiting_for_capacity() {
     assert!(commands[&enable].done && commands[&enable].error.as_deref().unwrap().contains("replaced"));
     assert!(!commands[&disable].done && c.inner.lock().deployments["gpu-model"].disabled);
     // Once the node has been sent an operation, it is not replaced.
-    c.inner.lock().commands.get_mut(&disable).unwrap().admitted = true;
+    c.inner.lock().commands.update(&disable, |c| c.admitted = true).unwrap();
     let error = c.command("gpu", NodeOperation::SetApp, json!({"app":entry,"disabled":false})).unwrap_err();
     assert!(error.to_string().contains("already pending"), "{error}");
 }
@@ -1613,9 +1683,9 @@ async fn a_starting_app_says_why_it_is_not_running() {
     let view = c.app_resources(&ns, "model", None);
     assert_eq!(view["state"], "starting");
     assert_eq!(view["detail"], "waiting for capacity: needs 2 GPU and 4 CPU, gpu has 1 GPU and 3 CPU free");
-    c.inner.lock().commands.values_mut().for_each(|c| c.admitted = true);
+    c.inner.lock().commands.update_where(|_| true, |c| c.admitted = true);
     assert_eq!(c.app_resources(&ns, "model", None)["detail"], "starting on gpu");
-    c.inner.lock().commands.values_mut().for_each(|c| c.done = true);
+    c.inner.lock().commands.update_where(|_| true, |c| c.done = true);
     assert_eq!(c.app_resources(&ns, "model", None)["detail"], "waiting for gpu to report it ready");
 }
 
@@ -1673,8 +1743,7 @@ async fn a_scale_waiting_for_capacity_to_start_can_be_resized() {
     c.advance_scales().await.unwrap();
     let old=c.inner.lock().commands[&start].clone();
     assert!(old.done && old.error.as_deref().is_some_and(|e|e.contains("replaced")),"{old:?}");
-    c.inner.lock().commands.get_mut(&start).unwrap().admitted=true;
-    c.inner.lock().commands.get_mut(&start).unwrap().done=false;
+    c.inner.lock().commands.update(&start, |c| { c.admitted = true; c.done = false; }).unwrap();
     c.inner.lock().deployments.get_mut("gpu-model").unwrap().scale.as_mut().unwrap().start=Some(start);
     c.inner.lock().deployments.get_mut("gpu-model").unwrap().scale.as_mut().unwrap().phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":2})).await.status(),StatusCode::CONFLICT,"a start already sent to the node must finish first");
@@ -2207,9 +2276,7 @@ async fn an_app_start_is_placed_on_a_node_with_room() {
     assert!(remove_commands(&c, NodeOperation::App).is_empty(), "placed on its own node while it preempts there");
     preempted.status["state"] = json!("cancelled");
     c.inner.lock().jobs.insert(preempted.id.clone(), preempted);
-    for command in c.inner.lock().commands.values_mut().filter(|v| v.operation == NodeOperation::PreemptJob as i32) {
-        command.done = true;
-    }
+    c.inner.lock().commands.update_where(|v| v.operation == NodeOperation::PreemptJob as i32, |command| command.done = true);
 
     // Otherwise it takes the room another node has.
     c.dispatch().await.unwrap();

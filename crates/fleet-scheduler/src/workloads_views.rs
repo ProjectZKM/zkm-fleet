@@ -141,9 +141,9 @@ impl WorkloadController {
     }
 
     /// Why an enabled app is not running yet, for `fleetctl app`'s DETAIL column.
-    fn starting_reason(commands: &BTreeMap<String, CommandRecord>, intent: &AppDeployment, worker: Option<&NodeSession>) -> String {
+    fn starting_reason(commands: &super::records::Records<CommandRecord>, intent: &AppDeployment, worker: Option<&NodeSession>) -> String {
         let name = text(&intent.spec, "name");
-        let pending = commands.values().find(|c| {
+        let pending = commands.open().find(|c| {
             !c.done
                 && c.worker == intent.worker
                 && c.operation == NodeOperation::SetApp as i32

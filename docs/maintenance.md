@@ -236,6 +236,19 @@ working, and stale starts are retired; on older releases, stop the scheduler, ba
 up and remove the stale `data/workloads/deployments/<node>-<app>.json` (and any
 undone command for it under `data/workloads/commands/`), then start it again.
 
+### Every node's heartbeat times out while jobs queue
+
+The nodes log `node heartbeat rejected; local execution continues ... Timeout
+expired` and the gateway logs heartbeat 499s, yet they look idle while `fleetctl
+job` lists jobs `queued` (assigned; awaiting node acknowledgement). The scheduler sits
+at a full core with sqlx `slow_acquire` warnings although Postgres is idle. Up to
+v0.1.7 each dispatch pass scanned every job and command record ever kept, once per
+waiting job, while holding the lock node reports wait for. With tens of thousands of
+records and about a hundred jobs in flight a pass outlasts the nodes' 10 s heartbeat
+timeout, and no launch reaches them. Later releases scan only what is in flight and
+let reports in between jobs. On v0.1.7 and older, keep fewer jobs in flight: below
+about 50 the passes stay short.
+
 ## Installed files and backups
 
 Keep source/build files separate from the installed runtime. A node installation
