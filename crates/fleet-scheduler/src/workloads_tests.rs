@@ -466,6 +466,30 @@ async fn a_job_its_quota_cannot_take_waits_without_rewriting_its_record() {
     assert_eq!(placed(&c), 2);
 }
 #[tokio::test]
+async fn a_backlog_of_purges_does_not_hold_back_a_launch() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    // A bulk purge of history: more purges than one heartbeat carries, all ahead in id order.
+    for n in 0..20 {
+        let id = format!("0000-{n:02}");
+        c.inner.lock().commands.insert(id.clone(), CommandRecord {
+            id, worker: "gpu".into(), operation: NodeOperation::PurgeJob as i32,
+            parameters: json!({"id": format!("old-{n}"), "lease": "lease"}).into(),
+            done: false, result: Value::Null.into(), error: None, admitted: true,
+        });
+    }
+    let job = submit(&c).await;
+    c.dispatch().await.unwrap();
+    let launch = c.inner.lock().commands.about(&job.id).next().unwrap().id.clone();
+
+    let sent = heartbeat_commands(&c.inner.lock(), "gpu");
+    assert_eq!(sent.len(), 16);
+    assert_eq!(sent[0].id, launch, "the launch goes first");
+    assert!(sent[1..].iter().all(|c| c.operation == NodeOperation::PurgeJob as i32));
+    assert_eq!(sent[1].id, "0000-00", "purges keep their order");
+    assert!(heartbeat_commands(&c.inner.lock(), "other").is_empty());
+}
+#[tokio::test]
 async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();

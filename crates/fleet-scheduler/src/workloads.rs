@@ -1654,6 +1654,31 @@ impl WorkloadController {
     }
 }
 
+/// The commands one heartbeat hands `worker`: at most 16, purges after everything else. A
+/// purge only drops a finished job's node record, so thousands of them, as a bulk purge of
+/// history queues, must not hold back the launches, stops and app changes behind them.
+fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
+    const LIMIT: usize = 16;
+    let (mut work, mut purges) = (vec![], vec![]);
+    for c in i.commands.open().filter(|c| c.worker == worker && !c.done && c.admitted) {
+        if c.operation == NodeOperation::PurgeJob as i32 {
+            if purges.len() < LIMIT {
+                purges.push(c);
+            }
+        } else {
+            work.push(c);
+            if work.len() == LIMIT {
+                break;
+            }
+        }
+    }
+    work.into_iter()
+        .chain(purges)
+        .take(LIMIT)
+        .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
+        .collect()
+}
+
 pub struct NodeControlService(pub Arc<WorkloadController>);
 #[tonic::async_trait]
 impl WorkerService for NodeControlService {
@@ -1677,20 +1702,7 @@ impl WorkerService for NodeControlService {
             .await
             .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
         let r_worker = r.worker_id.clone();
-        let commands = self
-            .0
-            .inner
-            .lock()
-            .commands
-            .open()
-            .filter(|c| c.worker == r.worker_id && !c.done && c.admitted)
-            .take(16)
-            .map(|c| NodeCommand {
-                id: c.id.clone(),
-                operation: c.operation,
-                parameters: Some(c.parameters.clone()),
-            })
-            .collect();
+        let commands = heartbeat_commands(&self.0.inner.lock(), &r.worker_id);
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
