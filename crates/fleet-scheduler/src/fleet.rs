@@ -440,7 +440,7 @@ impl Scheduler {
             .map_err(|e| refuse(400, e.to_string()))
     }
 
-    fn fits_quota(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64,
+    pub(crate) fn fits_quota(&self, namespace: &str, tag: Option<&str>, id: &str, gpus: f64, cpus: f64,
     ) -> bool {
         let Some(n) = self.namespace(namespace) else { return false; };
         let tag_quota = n.tag_quotas.get(tag.unwrap_or("")).cloned().unwrap_or_default();
@@ -493,6 +493,11 @@ impl Scheduler {
         let a = Allocation { id: format!("{prefix}{id}"), namespace: n.id, tag: tag.map(str::to_owned), gpus, cpus,
         };
         let previous = self.allocations.lock().get(&a.id).cloned();
+        // Memory holds only what the store accepted, so an unchanged allocation is stored
+        // already. Dispatch restores every held job's allocation each pass: no write for it.
+        if previous.as_ref() == Some(&a) {
+            return Ok(a);
+        }
         self.allocate(a.clone(), restore)?;
         if let Err(e) = self.store.reserve(&a).await {
             let mut all = self.allocations.lock();

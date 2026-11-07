@@ -66,6 +66,29 @@ fn response_error(e: anyhow::Error) -> Response {
 
 use fleet_proto::model::v1::{WorkloadTemplate, Job, CommandRecord, NodeReport, ScaleStatus, AppDeployment};
 
+use records::{Record, Records};
+
+/// A job is open until it is finished, its quota released and no stop is pending.
+impl Record for Job {
+    fn open(&self) -> bool {
+        !terminal(self.state()) || self.quota_held || self.stop.is_some()
+    }
+}
+
+/// A command is open until its node has run it. Launch, cancel and preemption commands are
+/// also found by their job, done ones too: none is ever sent twice.
+impl Record for CommandRecord {
+    fn open(&self) -> bool {
+        !self.done
+    }
+    fn subject(&self) -> Option<&str> {
+        let job_operation = [NodeOperation::LaunchJob, NodeOperation::CancelJob, NodeOperation::PreemptJob]
+            .iter()
+            .any(|o| self.operation == *o as i32);
+        job_operation.then(|| self.parameters["id"].as_str()).flatten()
+    }
+}
+
 struct NodeSession {
     session: String,
     seen: f64,
@@ -75,8 +98,8 @@ struct NodeSession {
 #[derive(Default)]
 struct WorkloadState {
     apps: BTreeMap<String, WorkloadTemplate>,
-    jobs: BTreeMap<String, Job>,
-    commands: BTreeMap<String, CommandRecord>,
+    jobs: Records<Job>,
+    commands: Records<CommandRecord>,
     workers: BTreeMap<String, NodeSession>,
     deployments: BTreeMap<String, AppDeployment>,
 }
@@ -180,7 +203,7 @@ impl WorkloadController {
                     intent.worker == worker && intent.disabled
                         && !intent.scale.as_ref().is_some_and(ScaleStatus::pending)
                         && !reported.iter().any(|r| r == name)
-                        && !i.commands.values().any(|c| !c.done && c.worker == worker
+                        && !i.commands.open().any(|c| !c.done && c.worker == worker
                             && c.operation == NodeOperation::SetApp as i32
                             && text(&c.parameters["app"], "name") == name)
                 })
@@ -251,12 +274,19 @@ impl WorkloadController {
         parameters: Value,
     ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock();
-        if let Some(c) = inner.commands.values().find(|c| {
+        let same = |c: &&CommandRecord| {
             (!c.done || operation == NodeOperation::LaunchJob)
                 && c.worker == worker
                 && c.operation == operation as i32
                 && c.parameters == parameters
-        }) {
+        };
+        let found = match parameters["id"].as_str() {
+            Some(job) if matches!(operation, NodeOperation::LaunchJob | NodeOperation::CancelJob | NodeOperation::PreemptJob) => {
+                inner.commands.about(job).find(same)
+            }
+            _ => inner.commands.open().find(same),
+        };
+        if let Some(c) = found {
             return Ok(c.id.clone());
         }
         if operation == NodeOperation::SetApp {
@@ -276,15 +306,18 @@ impl WorkloadController {
             };
             // An operation still waiting for capacity was never sent to the node, so a newer one
             // replaces it. Without this an app that cannot be placed could not be disabled or scaled.
-            let waiting: Vec<_> = inner.commands.values().filter(|c| same_entry(c) && !c.admitted).map(|c| c.id.clone()).collect();
+            let waiting: Vec<_> = inner.commands.open().filter(|c| same_entry(c) && !c.admitted).map(|c| c.id.clone()).collect();
             for id in waiting {
-                if let Some(c) = inner.commands.get_mut(&id) {
+                let replaced = inner.commands.update(&id, |c| {
                     c.done = true;
                     c.error = Some("replaced by a newer app operation before it was sent to the node".into());
-                    self.save("commands", &id, &*c)?;
+                    c.clone()
+                });
+                if let Some(c) = replaced {
+                    self.save("commands", &id, &c)?;
                 }
             }
-            if inner.commands.values().any(same_entry) {
+            if inner.commands.open().any(same_entry) {
                 return Err(fail(409, "an app operation is already pending"));
             }
             let intent = AppDeployment {
@@ -323,7 +356,7 @@ impl WorkloadController {
         let proofs = self.fleet.status().nodes;
         let inner = self.inner.lock();
         inner.workers.iter().map(|(id, w)| {
-            let busy = inner.jobs.values()
+            let busy = inner.jobs.open()
                 .filter(|r| r.worker.as_deref() == Some(id) && !terminal(r.state()))
                 .map(|r| r.id.clone())
                 .chain(proofs.iter().filter(|n| n.machine == w.report.machine).filter_map(|n| n.busy.clone()),
@@ -846,7 +879,7 @@ impl WorkloadController {
                     observed["ready"].as_bool() != Some(true)
                 };
             let pending = {
-                self.inner.lock().commands.values().any(|c| {
+                self.inner.lock().commands.open().any(|c| {
                     !c.done
                         && c.worker == worker_id
                         && (c.operation == NodeOperation::SetApp as i32 && text(&c.parameters["app"], "name") == name
@@ -898,7 +931,7 @@ impl WorkloadController {
                 continue;
             }
             let existing = { self.inner.lock().jobs.get(&incoming.id).cloned() };
-            let mut r = if let Some(r) = existing {
+            let mut r = if let Some(r) = existing.clone() {
                 r
             } else {
                 let batch = text(&incoming.spec, "batch").to_string();
@@ -982,6 +1015,10 @@ impl WorkloadController {
                     )
                     .await?;
                 r.quota_held = true;
+            }
+            // A node reports each of its jobs every heartbeat; most are unchanged since the last.
+            if existing.as_ref() == Some(&r) {
+                continue;
             }
             self.save("jobs", &r.id, &r)?;
             self.inner.lock().jobs.insert(r.id.clone(), r);
@@ -1090,23 +1127,27 @@ impl WorkloadController {
         if !w.report.ready || w.draining || now() - w.seen > 30.0 {
             return None;
         }
+        // A job the node already reports as started is in its free capacity.
+        let started: HashSet<(&str, &str)> = w
+            .report
+            .jobs
+            .iter()
+            .filter(|s| !matches!(text(&s.status, "state"), "queued" | "waiting_quota"))
+            .map(|s| (s.id.as_str(), s.lease.as_str()))
+            .collect();
         let pending = i
             .jobs
-            .values()
+            .open()
             .filter(|r| {
                 r.worker.as_deref() == Some(worker)
                     && r.quota_held
                     && !terminal(r.state())
-                    && !w.report.jobs.iter().any(|s| {
-                        s.id == r.id
-                            && s.lease == r.lease
-                            && !matches!(text(&s.status, "state"), "queued" | "waiting_quota")
-                    })
+                    && !started.contains(&(r.id.as_str(), r.lease.as_str()))
             })
             .fold((0.0, 0.0), |(g, c), r| (g + r.gpus(), c + r.cpus()));
         let starting = i
             .commands
-            .values()
+            .open()
             .filter(|c| {
                 c.worker == worker
                     && !c.done
@@ -1188,7 +1229,7 @@ impl WorkloadController {
             let workers = i.workers.keys().cloned().collect::<Vec<_>>();
             let candidates = i
                 .jobs
-                .values()
+                .open()
                 .filter(|r| {
                     r.quota_held
                         && r.stop.is_none()
@@ -1247,13 +1288,13 @@ impl WorkloadController {
         Ok(true)
     }
     async fn dispatch(&self) -> anyhow::Result<()> {
-        let _ops = self.ops.lock().await;
+        let ops = self.ops.lock().await;
         self.advance_scales().await?;
         let held = {
             self.inner
                 .lock()
                 .jobs
-                .values()
+                .open()
                 .filter(|r| r.quota_held)
                 .cloned()
                 .collect::<Vec<_>>()
@@ -1274,7 +1315,7 @@ impl WorkloadController {
             self.inner
                 .lock()
                 .jobs
-                .values()
+                .open()
                 .filter(|r| r.stop.is_some() && r.worker.is_some())
                 .cloned()
                 .collect::<Vec<_>>()
@@ -1287,7 +1328,7 @@ impl WorkloadController {
             };
             let parameters = json!({"id":r.id,"lease":r.lease});
             let recorded = {
-                self.inner.lock().commands.values().any(|c| {
+                self.inner.lock().commands.about(&r.id).any(|c| {
                     c.worker == *r.worker.as_ref().unwrap()
                         && c.operation == operation as i32
                         && c.parameters == parameters
@@ -1301,7 +1342,7 @@ impl WorkloadController {
             self.inner
                 .lock()
                 .commands
-                .values()
+                .open()
                 .filter(|c| {
                     !c.done && !c.admitted && c.operation == NodeOperation::SetApp as i32
                 })
@@ -1420,19 +1461,19 @@ impl WorkloadController {
             self.save("commands", &c.id, &c)?;
             self.inner.lock().commands.insert(c.id.clone(), c);
         }
+        let waiting_job = |r: &Job| {
+            r.worker.is_none() && matches!(r.state(), "waiting_quota" | "waiting_dependency") && r.stop.is_none()
+        };
         let mut jobs = {
             self.inner
                 .lock()
                 .jobs
-                .values()
-                .filter(|r| {
-                    r.worker.is_none()
-                        && matches!(r.state(), "waiting_quota" | "waiting_dependency")
-                        && r.stop.is_none()
-                })
+                .open()
+                .filter(|r| waiting_job(r))
                 .cloned()
                 .collect::<Vec<_>>()
         };
+        drop(ops);
         jobs.sort_by(|a, b| {
             b.policy["priority"]
                 .as_i64()
@@ -1446,7 +1487,13 @@ impl WorkloadController {
                 )
                 .then(a.id.cmp(&b.id))
         });
-        for mut r in jobs {
+        for id in jobs.into_iter().map(|r| r.id) {
+            // Each job is placed under its own hold of the operation lock: a node's report
+            // or a request waiting for it goes between two jobs, not after the whole queue.
+            let _ops = self.ops.lock().await;
+            let Some(mut r) = self.inner.lock().jobs.get(&id).filter(|r| waiting_job(r)).cloned() else {
+                continue;
+            };
             let namespace = self
                 .fleet
                 .namespace(&r.namespace)
@@ -1522,6 +1569,26 @@ impl WorkloadController {
                 .await?;
                 continue;
             };
+            // One its namespace or tag cannot take yet waits as it is: assigning it only to have
+            // the reservation refused would write its record twice on every pass.
+            if !self.fleet.fits_quota(&r.namespace, r.tag.as_deref(), &format!("job:{}", r.id), r.gpus(), r.cpus()) {
+                if r.state() != "waiting_quota" {
+                    r.status["state"] = json!("waiting_quota");
+                    self.save("jobs", &r.id, &r)?;
+                    self.inner.lock().jobs.insert(r.id.clone(), r.clone());
+                }
+                self.preempt_for(
+                    &r.namespace,
+                    r.tag.as_deref(),
+                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.gpus(),
+                    r.cpus(),
+                    vec![Some(worker)],
+                    Some(format!("job:{}", r.id)),
+                )
+                .await?;
+                continue;
+            }
             r.quota_held = true;
             r.worker = Some(worker.clone());
             r.status["state"] = json!("queued");
@@ -1562,11 +1629,12 @@ impl WorkloadController {
         }
         // A durable assigned job whose process died before command persistence still
         // receives the same lease. Uncertain execution is never moved to another node.
+        let _ops = self.ops.lock().await;
         let assigned = {
             self.inner
                 .lock()
                 .jobs
-                .values()
+                .open()
                 .filter(|r| r.worker.is_some() && r.state() == "queued" && r.stop.is_none())
                 .cloned()
                 .collect::<Vec<_>>()
@@ -1614,7 +1682,7 @@ impl WorkerService for NodeControlService {
             .inner
             .lock()
             .commands
-            .values()
+            .open()
             .filter(|c| c.worker == r.worker_id && !c.done && c.admitted)
             .take(16)
             .map(|c| NodeCommand {
@@ -1957,7 +2025,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 || s.inner
                     .lock()
                     .jobs
-                    .values()
+                    .open()
                     .any(|r| r.batch == name && (!terminal(r.state()) || r.quota_held))
             {
                 return Err(fail(
@@ -2446,3 +2514,6 @@ mod scaling;
 
 #[path = "workloads_views.rs"]
 mod views;
+
+#[path = "workloads_records.rs"]
+mod records;

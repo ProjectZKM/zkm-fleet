@@ -163,7 +163,7 @@ impl WorkloadController {
         {
             let i = self.inner.lock();
             if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
-                || i.commands.values().any(|c| {
+                || i.commands.open().any(|c| {
                     !c.done
                         && c.admitted // one still waiting for capacity is replaced by this request
                         && c.worker == intent.worker
@@ -198,7 +198,7 @@ impl WorkloadController {
             let busy = {
                 let i = self.inner.lock();
                 intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
-                    || i.commands.values().any(|c| {
+                    || i.commands.open().any(|c| {
                         !c.done && c.admitted && c.worker == intent.worker
                             && c.operation == NodeOperation::SetApp as i32
                             && text(&c.parameters["app"], "name") == text(&intent.spec, "name")
@@ -685,7 +685,7 @@ impl WorkloadController {
                 .filter(|a| a.persistent && !a.removed && a.namespace == namespace).cloned() else {
                 return Ok(());
             };
-            let pending = self.inner.lock().commands.values()
+            let pending = self.inner.lock().commands.open()
                 .find(|c| !c.done && c.operation == NodeOperation::App as i32 && text(&c.parameters["create"], "name") == app)
                 .map(|c| (c.worker.clone(), c.id.clone()));
             match pending {
@@ -782,7 +782,7 @@ impl WorkloadController {
             self.start_on(start, &target)?;
             return Ok(true);
         }
-        let preempting = self.inner.lock().jobs.values().any(|r| {
+        let preempting = self.inner.lock().jobs.open().any(|r| {
             r.worker.as_deref() == Some(start.worker.as_str()) && r.stop.as_deref() == Some("preempt") && !terminal(r.state())
         });
         if fits || preempting {
