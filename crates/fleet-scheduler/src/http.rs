@@ -86,9 +86,21 @@ async fn authorize(
     if !token::allowed(Some(&c), need) {
         return (StatusCode::FORBIDDEN, format!("this token lacks the {} permission", need.name())).into_response();
     }
+    let changes = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let (method, uri) = (req.method().clone(), req.uri().clone());
+    let caller = (c.id.clone(), c.label.clone(), c.namespace.clone(), c.tag.clone());
     let principal = (!token::allowed(Some(&c), Permission::Admin)).then_some(c);
     req.extensions_mut().insert(principal);
-    next.run(req).await
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    // Who changed what: one line per request that can change state. Reads are not logged;
+    // the token travels in a header, so the line never holds it.
+    if changes {
+        let (token, label, namespace, tag) = caller;
+        tracing::info!(%method, %uri, status = response.status().as_u16(), took_ms = started.elapsed().as_millis() as u64,
+            token, label, namespace = namespace.as_deref().unwrap_or("-"), tag = tag.as_deref().unwrap_or("-"), "api request");
+    }
+    response
 }
 
 async fn access(State(s): State<HttpState>, headers: HeaderMap) -> Response {

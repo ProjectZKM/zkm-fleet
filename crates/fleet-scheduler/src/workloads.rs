@@ -1654,6 +1654,31 @@ impl WorkloadController {
     }
 }
 
+/// The commands one heartbeat hands `worker`: at most 16, purges after everything else. A
+/// purge only drops a finished job's node record, so thousands of them, as a bulk purge of
+/// history queues, must not hold back the launches, stops and app changes behind them.
+fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
+    const LIMIT: usize = 16;
+    let (mut work, mut purges) = (vec![], vec![]);
+    for c in i.commands.open().filter(|c| c.worker == worker && !c.done && c.admitted) {
+        if c.operation == NodeOperation::PurgeJob as i32 {
+            if purges.len() < LIMIT {
+                purges.push(c);
+            }
+        } else {
+            work.push(c);
+            if work.len() == LIMIT {
+                break;
+            }
+        }
+    }
+    work.into_iter()
+        .chain(purges)
+        .take(LIMIT)
+        .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
+        .collect()
+}
+
 pub struct NodeControlService(pub Arc<WorkloadController>);
 #[tonic::async_trait]
 impl WorkerService for NodeControlService {
@@ -1677,20 +1702,7 @@ impl WorkerService for NodeControlService {
             .await
             .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
         let r_worker = r.worker_id.clone();
-        let commands = self
-            .0
-            .inner
-            .lock()
-            .commands
-            .open()
-            .filter(|c| c.worker == r.worker_id && !c.done && c.admitted)
-            .take(16)
-            .map(|c| NodeCommand {
-                id: c.id.clone(),
-                operation: c.operation,
-                parameters: Some(c.parameters.clone()),
-            })
-            .collect();
+        let commands = heartbeat_commands(&self.0.inner.lock(), &r.worker_id);
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
@@ -2159,31 +2171,30 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 .and_then(|s| s.parse::<f64>().ok())
                 .filter(|v| v.is_finite() && *v >= 0.0)
                 .ok_or_else(|| fail(400, "older_than must be non-negative days"))?;
-            let _ops = s.ops.lock().await;
-            let jobs = {
-                s.inner
-                    .lock()
-                    .jobs
-                    .values()
-                    .filter(|r| {
-                        !r.purged
-                            && r.batch == batch
-                            && terminal(r.state())
-                            && !r.quota_held
-                            && r.status["finished_at"]
-                                .as_f64()
-                                .is_some_and(|v| v < now() - days * 86400.0)
-                            && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let cutoff = now() - days * 86400.0;
+            let purgeable = |r: &Job| {
+                !r.purged
+                    && r.batch == batch
+                    && terminal(r.state())
+                    && !r.quota_held
+                    && r.status["finished_at"].as_f64().is_some_and(|v| v < cutoff)
+                    && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
             };
-            return Ok(Json(
-                jobs.into_iter()
-                    .map(|r| s.purge(r))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            )
-            .into_response());
+            let ids: Vec<String> = s.inner.lock().jobs.values().filter(|r| purgeable(r)).map(|r| r.id.clone()).collect();
+            // A purge writes a record and a node command per job, so a bulk one of history can
+            // take minutes. Holding the operation lock for a chunk at a time lets node reports
+            // and dispatch through; each job is checked again under the lock.
+            let mut purged = Vec::with_capacity(ids.len());
+            for chunk in ids.chunks(64) {
+                let _ops = s.ops.lock().await;
+                for id in chunk {
+                    let r = s.inner.lock().jobs.get(id).filter(|r| purgeable(r)).cloned();
+                    if let Some(r) = r {
+                        purged.push(s.purge(r)?);
+                    }
+                }
+            }
+            return Ok(Json(purged).into_response());
         }
         if method == Method::POST && parts.len() == 3 {
             let body = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
