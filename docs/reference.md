@@ -92,7 +92,8 @@ reservation `deployment:{key}`. `fleetctl app logs` asks for an entry's log with
 Proof jobs, namespaces, tokens and quota reservations are in Postgres. Batch, app,
 deployment and command records are durable files in the control host's `data_dir`;
 back that up with Postgres. The scheduler holds a Postgres advisory lock while it
-runs, so only one process dispatches from a database. The schema is version 16;
+runs, so only one process dispatches from a database. A new database is created at
+schema 16, and the scheduler checks the version at startup;
 [maintenance](maintenance.md#database-schema-14-or-15-to-16) covers older ones.
 
 Through a scheduler restart or a lost connection, nodes keep running locally,
@@ -138,11 +139,14 @@ policy, sent as `proof`:
   (the default) on the smallest.
 - `--anchor` is `none` (default), `shared` or `exclusive`.
 - `--backend` is `cuda`, `cpu` or `mock`, repeatable (default any).
-- `--zkm-version` and `--max-queued` (default 64) are optional.
+- `--zkm-version` is optional.
+- `--max-queued` (default 64) caps the app's queued and running proofs; more are
+  refused.
 
 Only a prover takes a program, and proof policy without one is refused. A proof runs
 only on a prover bound to its app. A namespace has one proof app per program, so
-namespaces prove the same program independently. In the API:
+namespaces prove the same program independently, and disabling or deleting one leaves
+the others and their jobs intact. In the API:
 `POST /apps?namespace=alice` with
 `{"name":"eth","spec":{"image":"IMAGE","gpus":1},"proof":{"elf_id":"FULL_ELF_SHA256"}}`.
 
@@ -237,7 +241,8 @@ can also advertise batches in their `batches.yaml`.
 plus these settings, shown with their defaults: `max_gpus` 8, `default_gpu_mem_gb` 0,
 `shm_gb` 16, `priority` 0, `allow` `[]`, `env` `{}`, `disabled` false, `preemptible`
 true, `min_runtime_s` 300 and `stop_timeout_s` 30. Other fields are refused.
-`fleetctl batch update NAME --image ...` (`PUT /batches/NAME/settings`) changes them;
+`fleetctl batch update NAME --image ...` (`PUT /batches/NAME/settings`) changes them,
+except `priority` and `disabled`, which have their own commands;
 accepted jobs keep the settings they were submitted with. Only administrators set
 `allow` (the host paths jobs may mount) and `user`, so an owner's batch starts with no
 host mounts and the image's default user.
@@ -252,20 +257,22 @@ In the API, `POST /batches?namespace=alice` takes the batch JSON, or the namespa
 its `namespace` field; a name or an ID is accepted, and the ID is stored. A batch or
 `apps.yaml` entry configured on a node may name `namespace: alice`, which is checked
 before launch. Disabling a batch blocks new submissions and lets accepted jobs
-finish. A deleted batch stays listed, as `deleted`, while it has job records.
+finish. A deleted batch stays listed, as `deleted`, and readable while it has job
+records; its jobs keep their own lifecycle until they're purged.
 
 **Submissions.** A job takes `command`, a non-empty list of strings, and optionally:
 
 | Field | Meaning |
 |---|---|
-| `gpus`, `cpus` | Default 1 and 8. More than one GPU must be whole and at most the batch's `max_gpus`. |
-| `gpu_mem` | VRAM limit in GB; defaults to the batch's `default_gpu_mem_gb`, and a fractional GPU needs one |
+| `gpus`, `cpus` | Default 1 and 8. GPUs are at most the batch's `max_gpus`, and whole when more than one; CPUs are at least 1. |
+| `gpu_mem` | GiB of free VRAM each granted card must have before the job starts. Defaults to the batch's `default_gpu_mem_gb`; 0 means the whole card, so a fractional GPU needs one. |
 | `nodes` | Must be 1: a batch job runs on one machine |
 | `machine` | A list with at most one machine to run on |
 | `mount` | `PATH[:MODE]` entries, inside the batch's `allow` |
 | `env`, `workdir`, `name` | Its environment, working directory and job name |
-| `after` | A job to wait for |
-| `retry`, `restart_on_oom` | How many times to rerun it after a failure, or after it runs out of memory (default 0) |
+| `after` | A job that must succeed first; if it doesn't, this one fails |
+| `retry` | How many times to rerun it after a failure (default 0) |
+| `restart_on_oom` | How many times to rerun it after it runs out of memory, spent before `retry` (default 0) |
 | `vram_wait` | Seconds to wait for its VRAM to be free (default 1800) |
 | `log` | A log file of its own, for administrators only |
 
@@ -349,7 +356,8 @@ replicas on different machines. Fleet keeps admission, quotas, placement, retrie
 execution leases, and stores no proof inputs or outputs.
 
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
-loopback GPU proving, durable outputs and reporting) and needs no SDK endpoint. Its
+loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
+client or SDK endpoint. Its
 cursor advances one block at a time, once the block's output and report are
 committed.
 
@@ -468,7 +476,7 @@ proofs and batch jobs, which other tags in the namespace can't see; untagged tok
 share the untagged work. A workload created with a tag belongs to it: only that tag's
 tokens change it, and only they see or submit to a tagged batch. An administrator's
 job on a tagged batch takes the batch's tag. A record's tag is `null` when absent,
-except a proof record's, which is `""`.
+except a proof record's, which is `""`. There is no group resource.
 
 **Tokens.** A namespace token has an optional tag and some of the permissions `read`,
 `submit` and `manage` (default `read` and `submit`). A token without `manage` also
@@ -477,7 +485,8 @@ namespace authorizes nothing. An administrator's token has only `admin`, no name
 and may do everything. A token's namespace and tag never change: refreshing copies
 them, with its permissions, grants and label, to a new key, which keeps access to
 earlier work. Requests take their namespace and tag from the token: a selector must
-match them, and a submission body can't set them. Administrators select with `--namespace NAME --tag TAG`
+match them, and a submission body can't set them. An administrator's request names
+its namespace when it creates an app or batch. Administrators select with `--namespace NAME --tag TAG`
 (`?namespace=NAME&tag=TAG`). Records keep namespace IDs, tags and the submitting
 token for audit. Token IDs are opaque, and proof signer bindings aren't exposed.
 
@@ -491,7 +500,7 @@ accepted work: an administrator stops jobs explicitly.
 |---|---|
 | Read the own namespace, apps, batches, jobs, logs and scaling status | `read`, within the token's scope |
 | Submit proofs and batch jobs; cancel batch jobs | `submit`, within the token's scope |
-| Create, remove, enable, disable, prioritize, scale or update apps and batches; purge batch jobs | `manage`, with any app grants; a proof app also needs the tag it was created for and the tag of every node entry running it |
+| Create, remove, enable, disable, prioritize, scale or update apps and batches; purge batch jobs | `manage`, with any app grants. Removing, enabling, disabling or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
 | Batch `allow` and `user`; app `user`, `volumes` and `proof_storage_root`; changing an app's image, environment, command, user, workdir or volumes | `admin` |
 | Preempt batch jobs | `admin` |
 | Namespaces, tokens, quotas, suspension, allocations, the preemption plan, nodes and status | `admin` |
@@ -551,7 +560,8 @@ fleetctl namespace quota alice                                     # clear both 
 
 Each `quota` command replaces both caps: an omitted cap is unlimited, and zero allows
 none (`--gpus 0 --cpus 8` permits CPU-only jobs). New namespaces start unlimited.
-Fractional GPUs are supported, with each batch's VRAM limit for shared cards. With a
+Fractional GPUs are supported, with each job's VRAM requirement (`gpu_mem`) for shared
+cards. With a
 team cap of 8 GPUs, production holding 6 and research 2, neither can admit another
 GPU job.
 
@@ -580,7 +590,8 @@ infrastructure in the `system` namespace is counted there.
 
 Reservations are in Postgres and survive restarts; refreshing tokens doesn't touch
 them. If an admission can't be recorded, new batch jobs wait. Lowering a cap lets
-admitted work finish and holds new admissions until use fits; a waiting batch job
+admitted work finish, including work recovered during an upgrade, and holds new
+admissions until use fits; a waiting batch job
 that no longer fits fails with a reason. Administrators see the reservations, per tag,
 at `GET /namespaces/alice/allocations`.
 
@@ -636,7 +647,7 @@ only local `stdio` servers can't connect.
 | `fleet_app_logs` | `fleetctl app logs` |
 | `fleet_batch_create` | `fleetctl batch add`; non-empty `allow` needs an administrator |
 | `fleet_batches_list`, `fleet_batch_get` | `fleetctl batch`, `fleetctl batch NAME` |
-| `fleet_batch_jobs_list`, `fleet_batch_job_get` | `fleetctl job --type batch`, `fleetctl job ID` |
+| `fleet_batch_jobs_list`, `fleet_batch_job_get` | `fleetctl job --type batch` (optional `batch`), `fleetctl job ID` |
 | `fleet_batch_job_submit` | `fleetctl batch submit`: a `batch`, a command and optional `mounts` such as `["/data/models:ro"]` |
 | `fleet_batch_job_logs`, `fleet_batch_job_cancel` | `fleetctl batch logs`, `cancel`; `batch` is optional |
 | `fleet_jobs_list` | `fleetctl job`, with `kind: "batch"` or `kind: "app"` |

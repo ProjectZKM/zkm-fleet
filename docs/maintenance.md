@@ -143,7 +143,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 These are the node's total capacity, shared by every allocation, within its hardware;
 an empty `RAY_NUM_CPUS` detects CPUs automatically. Stop the agent with its
-supervisor: `sudo systemctl stop zkm-fleet-node.service`, or on cron, comment out the
+supervisor, of which each agent has exactly one: `sudo systemctl stop zkm-fleet-node.service`, or on cron, comment out the
 watchdog line and send `fleet-node` SIGTERM, waiting for it to exit. Then restart Ray
 while holding the watchdog lock, so the minute watchdog can't race the restart:
 
