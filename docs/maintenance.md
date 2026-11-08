@@ -246,14 +246,8 @@ Pin such an app again by restoring its node's entry (the bridge keeps the old
 `apps.yaml` as `apps.yaml.removed-<UTC time>`).
 
 Once the node a moved app left has removed it, the scheduler frees the app's room
-there. Up to v0.1.9 that room was never freed, so the app's quota and its old record
-stayed. For an integrated worker, the move's start then waited, and the scheduler log
-repeated `scale deferred to the next pass ... this app already has an integrated
-worker; clean up its owner before moving it`. If a move begun on v0.1.9 is still
-waiting like that, and the node it left is gone for good, free the room by hand with
-`DELETE /namespaces/<namespace id>/allocations/deployment:<node>-<app>`, but only once
-nothing of the app runs there. Up to v0.1.9 the start could also be sent back to the
-node the app had left, where it no longer was, which left the app on no node until
+there. Up to v0.1.9 it never did, so the app's quota stayed held, and the start could
+be sent back to the node the app had left, which left the app on no node until
 `fleetctl app enable` placed it again.
 
 ### Every node's heartbeat times out while jobs queue
