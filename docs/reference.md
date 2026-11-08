@@ -151,7 +151,7 @@ multiple tags shows their tags together. Batches show `enabled` or
 
 Apps and batch workloads share the scheduler’s configuration and lifecycle model: name, namespace, image, user, environment, mount policy, priority, and enable/disable state. A batch is that reusable configuration; each submission creates a batch job. Apps keep replicas running; batch workloads execute a command per submission. `batch submit --name` continues to name an individual job.
 
-Every app and batch belongs to an administrator-created namespace. Proof requests require a registered proof app, which the scheduler finds by the job's namespace and ELF ID; batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` remains a combined view of proof and batch execution records, including proof output fetching; `--app NAME` selects one app's or batch's jobs and `--type app|batch` one kind.
+Every app and batch belongs to an administrator-created namespace. Proof requests require a registered proof app, which the scheduler finds by the job's namespace and ELF ID; batch submissions require an existing batch. Jobs inherit their workload's namespace, tag and priority. `fleetctl job` lists what the scheduler queues: proofs submitted to a proof app (`--type app`) and batch jobs (`--type batch`); `--app NAME` selects one app's or batch's jobs. An app's own work in its replicas is not a job, so a plain app, or a proof app whose worker proves on its own GPU server, has none; `fleetctl app` and `fleetctl app logs APP` show it.
 
 App listings contain registered workloads. Rejected proof requests remain job
 records and do not create an app entry.

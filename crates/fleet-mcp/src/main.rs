@@ -107,7 +107,7 @@ impl FleetctlClient {
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 enum JobType {
-    /// Jobs of apps (proofs).
+    /// Proofs submitted to a proof app through the scheduler; an app's own work is not a job.
     App,
     Batch,
 }
@@ -402,7 +402,7 @@ impl FleetMcp {
 
     #[tool(
         name = "fleet_jobs_list",
-        description = "List jobs visible to the authenticated token. Results are scoped by the token, namespace, and tag.",
+        description = "List jobs visible to the authenticated token: batch jobs, and proofs submitted to proof apps through the scheduler. An app's own work in its replicas is not a job. Results are scoped by the token, namespace, and tag.",
         annotations(read_only_hint = true, destructive_hint = false)
     )]
     async fn jobs_list(
