@@ -1970,7 +1970,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-mcp"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-node"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "clap",
@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-proof-app"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-proto"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "prost 0.13.5",
@@ -2035,7 +2035,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-scheduler"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "anyhow",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-ziren-node"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "fleetctl"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "alloy-primitives",
  "anyhow",
