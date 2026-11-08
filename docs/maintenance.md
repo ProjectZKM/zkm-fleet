@@ -236,24 +236,25 @@ working, and stale starts are retired; on older releases, stop the scheduler, ba
 up and remove the stale `data/workloads/deployments/<node>-<app>.json` (and any
 undone command for it under `data/workloads/commands/`), then start it again.
 
-A start moves to another node only when its own node has no room for it, its replicas
-are gone from it, and the node's entry does not anchor it with `machine`. Up to v0.1.9
-a start also moved when its replicas were still being restarted there, or when it was
-anchored. In the anchored case the move rewrote the entry's `machine` to the new node.
+A start whose own node has no room for it moves to a node that has room, unless the
+node's entry anchors it with `machine`. An anchored start waits for room on its node,
+preempting lower-priority batch jobs of its namespace when it can. Every integrated
+worker (an app whose node runs its prover as a Fleet worker, such as goat's proof
+builder) is anchored, since the bridge requires `machine` for one. Up to v0.1.9 an
+anchored start moved too, and the move rewrote the entry's `machine` to the new node's.
 Pin such an app again by restoring its node's entry (the bridge keeps the old
 `apps.yaml` as `apps.yaml.removed-<UTC time>`).
 
-An app whose node runs its prover as a Fleet worker (goat's proof builder, for one)
-runs on one node at a time. When its start moves to a node with room, the scheduler
-log repeats `scale deferred to the next pass ... this app already has an integrated
-worker; clean up its owner before moving it` until the node it left has removed the
-app, which then frees its room. If that node is offline it waits for the node. If
-the node is gone for good, free the room by hand with
+Once the node a moved app left has removed it, the scheduler frees the app's room
+there. Up to v0.1.9 that room was never freed, so the app's quota and its old record
+stayed. For an integrated worker, the move's start then waited, and the scheduler log
+repeated `scale deferred to the next pass ... this app already has an integrated
+worker; clean up its owner before moving it`. If a move begun on v0.1.9 is still
+waiting like that, and the node it left is gone for good, free the room by hand with
 `DELETE /namespaces/<namespace id>/allocations/deployment:<node>-<app>`, but only once
-nothing of the app runs there. Up to v0.1.9 the room was never freed, even after the
-removal, so the start waited until someone made that call. Once the call was made,
-the start could be sent back to the node the app had left, which no longer had it,
-and the app ended up on no node until `fleetctl app enable` placed it again.
+nothing of the app runs there. Up to v0.1.9 the start could also be sent back to the
+node the app had left, where it no longer was, which left the app on no node until
+`fleetctl app enable` placed it again.
 
 ### Every node's heartbeat times out while jobs queue
 
