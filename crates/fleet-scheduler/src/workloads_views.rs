@@ -30,10 +30,10 @@ impl WorkloadController {
                 .deployments
                 .values()
                 .filter(|intent| {
-                    let entry = &intent.spec;
-                    text(entry, "kind").starts_with("ziren-")
+                    let entry = intent.entry();
+                    entry.is_prover()
                         && replica
-                            .strip_prefix(&format!("{}-", text(entry, "name")))
+                            .strip_prefix(&format!("{}-", entry.name()))
                             .is_some_and(|index| index.parse::<u32>().is_ok())
                 })
                 .map(|intent| intent.worker.clone())
@@ -64,11 +64,7 @@ impl WorkloadController {
         let deployments: Vec<_> = i
             .deployments
             .values()
-            .filter(|intent| {
-                let s = &intent.spec;
-                text(s, "namespace") == namespace
-                    && text(s, "app") == app
-            })
+            .filter(|intent| intent.entry().namespace() == namespace && intent.entry().app() == app)
             .collect();
         let mut gpus = 0.0;
         let mut cpus = 0.0;
@@ -83,29 +79,19 @@ impl WorkloadController {
                 .scale
                 .as_ref()
                 .filter(|s| s.pending())
-                .map(|s| s.target())
-                .unwrap_or(&intent.spec);
-            let count = s["replicas"].as_u64().unwrap_or(1);
+                .map(|s| s.target_entry())
+                .unwrap_or(intent.entry());
+            let count = s.replicas();
             replicas += count;
-            gpus += s["gpus"]
-                .as_f64()
-                .unwrap_or(if text(s, "kind") == "ziren-cpu" {
-                    0.0
-                } else {
-                    1.0
-                })
-                * count as f64;
-            cpus += s["cpus"].as_f64().unwrap_or(1.0) * count as f64;
+            gpus += s.gpus_or_default() * count as f64;
+            cpus += s.cpus() * count as f64;
             nodes.insert(intent.worker.clone());
-            tags.insert(s["tag"].as_str().unwrap_or("").to_owned());
-            if let Some(image) = s["image"].as_str().filter(|i| !i.is_empty()) {
-                images.insert(image.to_owned());
+            tags.insert(s.tag().unwrap_or("").to_owned());
+            if !s.image().is_empty() {
+                images.insert(s.image().to_owned());
             }
             let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
-            let observed = worker.and_then(|w| {
-                w.report.apps.iter()
-                .find(|s| text(s, "name") == text(&intent.spec, "name"))
-            });
+            let observed = worker.and_then(|w| w.report.entry(intent.entry().name()));
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
                 "failed"
             } else if worker.is_none() {
@@ -116,10 +102,8 @@ impl WorkloadController {
                 }
                 scale.phase().name()
             } else if intent.disabled {
-                if observed.is_some_and(|s| s["cleaned"].as_bool() == Some(true)) { "disabled" } else { "draining" }
-            } else if worker.is_some_and(|w| w.report.ready) && observed.is_some_and(|s| {
-                    s["ready"].as_bool() == Some(true) && s["disabled"].as_bool() != Some(true)
-                }) {
+                if observed.is_some_and(Entry::cleaned) { "disabled" } else { "draining" }
+            } else if worker.is_some_and(|w| w.report.ready) && observed.is_some_and(|s| s.ready() && !s.disabled()) {
                 "running"
             } else {
                 reasons.push(Self::starting_reason(&i.commands, intent, worker));
@@ -142,18 +126,10 @@ impl WorkloadController {
 
     /// Why an enabled app is not running yet, for `fleetctl app`'s DETAIL column.
     fn starting_reason(commands: &super::records::Records<CommandRecord>, intent: &AppDeployment, worker: Option<&NodeSession>) -> String {
-        let name = text(&intent.spec, "name");
-        let pending = commands.open().find(|c| {
-            !c.done
-                && c.worker == intent.worker
-                && c.operation == NodeOperation::SetApp as i32
-                && text(&c.parameters["app"], "name") == name
-        });
+        let pending = commands.open().find(|c| c.changes_entry(&intent.worker, intent.entry().name()));
         match pending {
             Some(c) if !c.admitted => {
-                let s = &c.parameters["app"];
-                let n = s["replicas"].as_f64().unwrap_or(1.0);
-                let (g, cpu) = (s["gpus"].as_f64().unwrap_or(0.0) * n, s["cpus"].as_f64().unwrap_or(1.0) * n);
+                let (g, cpu) = c.entry().total(0.0);
                 match worker {
                     Some(w) => format!("waiting for capacity: needs {g} GPU and {cpu} CPU, {} has {} GPU and {} CPU free",
                         intent.worker, w.report.free_gpus, w.report.free_cpus),
@@ -232,9 +208,9 @@ impl WorkloadController {
             }
             o.insert("workers".into(), json!(app.workers));
         }
-        let disabled = app.spec["disabled"].as_bool() == Some(true);
-        let fixed_tag = app.tag.as_deref().or_else(|| app.spec["tag"].as_str());
-        let mut v = self.app_view(&app.namespace, &app.name, fixed_tag, app.spec["priority"].clone(), disabled,
+        let disabled = app.disabled();
+        let fixed_tag = app.fixed_tag();
+        let mut v = self.app_view(&app.namespace, &app.name, fixed_tag, app.priority().clone(), disabled,
             jobs, tag, vec![("batch", settings)]);
         // A batch runs no app of its own: its state is whether it takes jobs, and its tag
         // is the one it was registered with.
@@ -259,8 +235,8 @@ impl WorkloadController {
     /// An app that proves no program, in the app shape.
     pub(crate) fn app_value(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
         let jobs = self.template_jobs(app, tag);
-        self.app_view(&app.namespace, &app.name, app.tag.as_deref().or_else(|| app.spec["tag"].as_str()),
-            app.spec["priority"].clone(), app.spec["disabled"].as_bool() == Some(true), jobs, tag,
+        self.app_view(&app.namespace, &app.name, app.fixed_tag(),
+            app.priority().clone(), app.disabled(), jobs, tag,
             vec![("spec", Self::spec_value(app))])
     }
 

@@ -29,17 +29,6 @@ fn waiting_for_capacity(i: &WorkloadState, intent: &AppDeployment) -> bool {
     })
 }
 
-pub(super) fn same_resources(a: &Value, b: &Value) -> bool {
-    ["gpus", "cpus", "replicas"].iter().all(|key| {
-        let default = if *key == "gpus" && text(b, "kind") == "ziren-cpu" {
-            0.0
-        } else {
-            1.0
-        };
-        (a[*key].as_f64().unwrap_or(default) - b[*key].as_f64().unwrap_or(default)).abs() < 1e-9
-    })
-}
-
 impl WorkloadController {
     pub(crate) async fn app_lifecycle_guard(
         &self,
@@ -53,9 +42,7 @@ impl WorkloadController {
 
     pub(super) fn ensure_not_scaling(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
         if self.inner.lock().deployments.values().any(|s| {
-            text(&s.spec, "namespace") == namespace
-                && text(&s.spec, "app") == app
-                && s.scale.as_ref().is_some_and(ScaleStatus::pending)
+            s.entry().namespace() == namespace && s.entry().app() == app && s.scale.as_ref().is_some_and(ScaleStatus::pending)
         }) {
             return Err(fail(409, "app scaling is already pending"));
         }
@@ -70,11 +57,11 @@ impl WorkloadController {
     ) -> anyhow::Result<(String, AppDeployment)> {
         let i = self.inner.lock();
         let mut deployments = i.deployments.iter().filter(|(_, intent)| {
-            let s = &intent.spec;
-            text(s, "namespace") == namespace
+            let s = intent.entry();
+            s.namespace() == namespace
                 && node.is_none_or(|n| n == intent.worker)
-                && matches!(text(s, "kind"), "ziren-gpu" | "app")
-                && text(s, "app") == app
+                && matches!(s.kind(), "ziren-gpu" | "app")
+                && s.app() == app
         });
         let first = deployments
             .next()
@@ -88,21 +75,12 @@ impl WorkloadController {
 
     fn scale_value(&self, intent: &AppDeployment) -> Value {
         let i = self.inner.lock();
-        let observed = i.workers.get(&intent.worker).and_then(|w| {
-            w.report
-                .apps
-                .iter()
-                .find(|s| text(s, "name") == text(&intent.spec, "name"))
-        });
-        let target = intent
-            .scale
-            .as_ref()
-            .map(|s| &s.target)
-            .unwrap_or(&intent.spec);
-        json!({"node":intent.worker,"entry":text(&intent.spec,"name"),
-            "namespace":text(&intent.spec,"namespace"),
-            "gpus":target["gpus"].as_f64().unwrap_or(1.0),"cpus":target["cpus"].as_f64().unwrap_or(1.0),
-            "replicas":target["replicas"].as_u64().unwrap_or(1),
+        let observed = i.workers.get(&intent.worker).and_then(|w| w.report.entry(intent.entry().name())).map(|e| e.0);
+        let target = intent.scale.as_ref().map(ScaleStatus::target_entry).unwrap_or(intent.entry());
+        json!({"node":intent.worker,"entry":intent.entry().name(),
+            "namespace":intent.entry().namespace(),
+            "gpus":target.gpus().unwrap_or(1.0),"cpus":target.cpus(),
+            "replicas":target.replicas(),
             "state":intent.scale.as_ref().map(|s| serde_json::to_value(&s.phase()).unwrap()).unwrap_or(json!("configured")),
             "disabled":intent.scale.as_ref().map(|s|s.disabled).unwrap_or(intent.disabled),
             "operation":intent.scale.as_ref().map(|s|s.id.clone()),
@@ -129,7 +107,7 @@ impl WorkloadController {
         let bytes = self
             .fleet
             .log_relay
-            .request(&deployment.worker, text(&deployment.spec, "name"), lines)
+            .request(&deployment.worker, deployment.entry().name(), lines)
             .await
             .map_err(|e| fail(fleet_proto::sdk::http_status_code(e.code()), e.message().to_owned()))?;
         Ok(bytes.into_response())
@@ -163,13 +141,8 @@ impl WorkloadController {
         {
             let i = self.inner.lock();
             if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
-                || i.commands.open().any(|c| {
-                    !c.done
-                        && c.admitted // one still waiting for capacity is replaced by this request
-                        && c.worker == intent.worker
-                        && c.operation == NodeOperation::SetApp as i32
-                        && text(&c.parameters["app"], "name") == text(&intent.spec, "name")
-                })
+                // one still waiting for capacity is replaced by this request
+                || i.commands.open().any(|c| c.admitted && c.changes_entry(&intent.worker, intent.entry().name()))
             {
                 return Err(fail(409, "an app operation is already pending"));
             }
@@ -198,11 +171,7 @@ impl WorkloadController {
             let busy = {
                 let i = self.inner.lock();
                 intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
-                    || i.commands.open().any(|c| {
-                        !c.done && c.admitted && c.worker == intent.worker
-                            && c.operation == NodeOperation::SetApp as i32
-                            && text(&c.parameters["app"], "name") == text(&intent.spec, "name")
-                    })
+                    || i.commands.open().any(|c| c.admitted && c.changes_entry(&intent.worker, intent.entry().name()))
             };
             if busy {
                 return Err(fail(409, "an app operation is already pending"));
@@ -219,13 +188,13 @@ impl WorkloadController {
     /// scheduler keeps (a proof app's record, or the app's template).
     pub(super) fn with_priority(&self, entry: impl Into<Value>) -> Value {
         let mut entry: Value = entry.into();
-        let (namespace, app) = (text(&entry, "namespace"), text(&entry, "app"));
+        let (namespace, app) = (Entry(&entry).namespace(), Entry(&entry).app());
         let priority = if self.fleet.app_known(namespace, app) {
             self.fleet.app_priority(namespace, app).into()
         } else {
-            self.inner.lock().apps.get(app).filter(|a| a.persistent).map_or(0, |a| a.spec["priority"].as_i64().unwrap_or(0))
+            self.inner.lock().apps.get(app).filter(|a| a.persistent).map_or(0, |a| a.entry().priority())
         };
-        entry["priority"] = json!(priority);
+        EntryMut(&mut entry).set_priority(priority);
         entry
     }
 
@@ -300,19 +269,10 @@ impl WorkloadController {
         }
         let (key, mut intent) = self.deployment_to_change(namespace, app, req.node.as_deref())?;
         let mut target = self.with_priority(intent.spec.clone());
-        if let Some(v) = req.gpus {
-            target["gpus"] = json!(v);
-        }
-        if let Some(v) = req.cpus {
-            target["cpus"] = json!(v);
-        }
-        if let Some(v) = req.replicas {
-            target["replicas"] = json!(v);
-        }
-        let g = target["gpus"].as_f64().unwrap_or(1.0);
-        let cpu = target["cpus"].as_f64().unwrap_or(1.0);
-        let replicas = target["replicas"].as_u64().unwrap_or(1);
-        if super::integrated_worker(&target) && replicas != 1 {
+        EntryMut(&mut target).set_resources(req.gpus, req.cpus, req.replicas);
+        let t = Entry(&target);
+        let (g, cpu, replicas) = (t.gpus().unwrap_or(1.0), t.cpus(), t.replicas());
+        if t.integrated_worker() && replicas != 1 {
             return Err(fail(400, "integrated app workers require one machine-pinned replica",
             ));
         }
@@ -325,7 +285,7 @@ impl WorkloadController {
         {
             return Err(fail(400,"gpus must be nonnegative, cpus positive, and replicas between 1 and 64; use app disable to stop all replicas"));
         }
-        if text(&target, "kind") == "ziren-gpu" && (g < 1.0 || g.fract() != 0.0) {
+        if t.kind() == "ziren-gpu" && (g < 1.0 || g.fract() != 0.0) {
             return Err(fail(
                 400,
                 "a proof server requires a positive integer GPU count",
@@ -365,14 +325,14 @@ impl WorkloadController {
         }
         // Container replicas reserve the whole app. Proof quota is charged
         // per assigned proof; extra replicas can remain idle while that quota is occupied.
-        let (quota_g, quota_cpu) = if text(&target, "kind") == "app" || super::integrated_worker(&target) {
+        let (quota_g, quota_cpu) = if t.holds_allocation() {
             (total_g, total_cpu)
         } else {
             (g, cpu)
         };
         let tag_quota = ns
             .tag_quotas
-            .get(target["tag"].as_str().unwrap_or(""))
+            .get(t.tag().unwrap_or(""))
             .cloned()
             .unwrap_or_default();
         if !ns.quota.fits(quota_g, quota_cpu) || !tag_quota.fits(quota_g, quota_cpu) {
@@ -381,7 +341,7 @@ impl WorkloadController {
                 "requested allocation exceeds namespace or tag GPU/CPU quota",
             ));
         }
-        if same_resources(&intent.spec, &target)
+        if intent.entry().same_resources(t)
             && intent
                 .scale
                 .as_ref()
@@ -410,8 +370,7 @@ impl WorkloadController {
         disabled: bool,
         phase: &str,
     ) -> anyhow::Result<String> {
-        let parameters = json!({"app":spec,"disabled":disabled,
-            "scale_id":intent.scale.as_ref().unwrap().id,"scale_phase":phase});
+        let parameters = message::scale_step(spec, disabled, &intent.scale.as_ref().unwrap().id, phase);
         // Completed commands are also reused after a crash between command and
         // phase persistence; the worker's command journal fences duplicate execution.
         if let Some(id) = self
@@ -420,9 +379,7 @@ impl WorkloadController {
             .commands
             .values()
             .find(|c| {
-                c.worker == intent.worker
-                    && c.operation == NodeOperation::SetApp as i32
-                    && c.parameters == parameters
+                c.worker == intent.worker && c.is(NodeOperation::SetApp) && c.parameters == parameters
             })
             .map(|c| c.id.clone())
         {
@@ -463,10 +420,10 @@ impl WorkloadController {
         let mut scale = intent.scale.clone().unwrap();
             if scale.phase() == Phase::Draining {
                 // A proof app refuses jobs while its prover is down; an app's template records it.
-                self.sync_app_record(&intent.spec, true).await?;
-                let template = self.inner.lock().apps.get(text(&intent.spec, "app")).filter(|a| a.persistent).cloned();
+                self.sync_app_record(intent.entry(), true).await?;
+                let template = self.inner.lock().apps.get(intent.entry().app()).filter(|a| a.persistent).cloned();
                 if let Some(mut app) = template {
-                    app.spec["disabled"] = json!(true);
+                    app.set_disabled(true);
                     self.save("apps", &app.name, &app)?;
                     self.inner.lock().apps.insert(app.name.clone(), app);
                 }
@@ -485,7 +442,7 @@ impl WorkloadController {
                 if !command.done {
                     return Ok(());
                 }
-                if command.error.is_some() || command.result["cleaned"].as_bool() != Some(true) {
+                if command.error.is_some() || !command.cleaned() {
                     scale.phase = Phase::Failed as i32;
                     scale.error = Some(
                         command
@@ -499,14 +456,13 @@ impl WorkloadController {
                 {
                     if scale.update.is_none() {
                         let mut set = scale.set.as_ref().map(|s| s.0.clone()).unwrap_or_else(|| json!({}));
-                        for k in ["gpus", "cpus", "replicas"] {
+                        for k in Entry::RESOURCES {
                             if !scale.target[k].is_null() {
                                 set[k] = scale.target[k].clone();
                             }
                         }
-                        set["disabled"] = json!(scale.disabled);
-                        let message = json!({"entry":{"name":text(&intent.spec, "name")}});
-                        let sent = self.tell_nodes([&intent.worker], message, json!({"set": set}))?;
+                        EntryMut(&mut set).set_disabled(scale.disabled);
+                        let sent = self.tell_nodes([&intent.worker], message::entry(intent.entry().name()), message::set(set))?;
                         scale.update = sent.into_iter().next();
                         self.save_scale(&key, scale.clone())?;
                     }
@@ -514,9 +470,7 @@ impl WorkloadController {
                     if !command.done {
                         return Ok(());
                     }
-                    let written = command.result["updated"].as_array()
-                        .is_some_and(|names| names.iter().any(|n| n.as_str() == Some(text(&intent.spec, "name"))));
-                    if command.error.is_some() || !written {
+                    if command.error.is_some() || !command.updated(intent.entry().name()) {
                         scale.phase = Phase::Failed as i32;
                         scale.error = Some(command.error.unwrap_or_else(|| "node did not write the new configuration".into()));
                         self.save_scale(&key, scale)?;
@@ -543,11 +497,7 @@ impl WorkloadController {
             }
             let first_ack = scale.ready_since.is_none();
             let ready_since = *scale.ready_since.get_or_insert_with(now);
-            let timeout = scale.target["ready_timeout_s"]
-                .as_f64()
-                .unwrap_or(600.0)
-                .clamp(1.0, 3600.0)
-                + 30.0;
+            let timeout = scale.target_entry().ready_timeout_s().clamp(1.0, 3600.0) + 30.0;
             let (connected, applied) = {
                 let i = self.inner.lock();
                 let worker = i
@@ -557,12 +507,12 @@ impl WorkloadController {
                 (
                     worker.is_some(),
                     worker.is_some_and(|w| {
-                        w.report.apps.iter().any(|s| {
-                            text(s, "name") == text(&scale.target, "name")
-                                && same_resources(s, &scale.target)
-                                && s["disabled"].as_bool().unwrap_or(false) == scale.disabled
-                                && s[if scale.disabled { "cleaned" } else { "ready" }].as_bool()
-                                    == Some(true)
+                        let target = scale.target_entry();
+                        w.report.entries().any(|s| {
+                            s.name() == target.name()
+                                && s.same_resources(target)
+                                && s.disabled() == scale.disabled
+                                && if scale.disabled { s.cleaned() } else { s.ready() }
                         })
                     }),
                 )
@@ -584,22 +534,22 @@ impl WorkloadController {
                 return Ok(());
             }
             if !scale.disabled {
-                self.sync_app_record(&scale.target, false).await?;
+                self.sync_app_record(scale.target_entry(), false).await?;
             }
             let app = self
                 .inner
                 .lock()
                 .apps
-                .get(text(&intent.spec, "app"))
+                .get(intent.entry().app())
                 .cloned();
             if let Some(mut app) = app.filter(|a| a.persistent) {
-                for k in ["gpus", "cpus", "replicas"] {
+                for k in Entry::RESOURCES {
                     app.spec[k] = scale.target[k].clone();
                 }
                 for (k, v) in scale.set.as_ref().and_then(|set| set.as_object()).into_iter().flatten() {
                     app.spec[k.as_str()] = v.clone();
                 }
-                app.spec["disabled"] = json!(scale.disabled);
+                app.set_disabled(scale.disabled);
                 self.save("apps", &app.name, &app)?;
                 self.inner.lock().apps.insert(app.name.clone(), app);
             }
@@ -628,7 +578,7 @@ impl WorkloadController {
         {
             let i = self.inner.lock();
             if i.apps.get(&name).is_some_and(|a| !a.removed)
-                || i.deployments.values().any(|d| text(&d.spec, "name") == name)
+                || i.deployments.values().any(|d| d.entry().name() == name)
                 || self.fleet.app_known(&namespace, &name)
             {
                 return Err(fail(409, format!("an app or batch named {name} exists")));
@@ -686,15 +636,14 @@ impl WorkloadController {
                 return Ok(());
             };
             let pending = self.inner.lock().commands.open()
-                .find(|c| !c.done && c.operation == NodeOperation::App as i32 && text(&c.parameters["create"], "name") == app)
+                .find(|c| !c.done && c.is(NodeOperation::App) && c.created().is_some_and(|e| e.name() == app))
                 .map(|c| (c.worker.clone(), c.id.clone()));
             match pending {
                 Some(pending) => pending,
                 None => {
-                    let (node, _) = self.place_app(&template.spec, &[])?;
-                    let mut message = self.app_message(namespace, app);
-                    message["create"] = template.spec.0.clone();
-                    let create = self.command(&node, NodeOperation::App, message)?;
+                    let (node, _) = self.place_app(template.entry(), &[])?;
+                    let create = message::with(self.app_message(namespace, app), &message::create(&template.spec));
+                    let create = self.command(&node, NodeOperation::App, create)?;
                     template.workers = vec![node.clone()];
                     self.save("apps", app, &template)?;
                     self.inner.lock().apps.insert(app.into(), template);
@@ -737,10 +686,8 @@ impl WorkloadController {
     /// fewest free GPUs among those, as a batch-class proof app is placed, so larger requests
     /// keep the larger gaps; otherwise the one with the most free GPUs, where the app waits for
     /// room. Whether it has the room now comes along. `except` are nodes not to pick.
-    fn place_app(&self, entry: &Value, except: &[String]) -> anyhow::Result<(String, bool)> {
-        let replicas = entry["replicas"].as_f64().unwrap_or(1.0);
-        let gpus = entry["gpus"].as_f64().unwrap_or(1.0) * replicas;
-        let cpus = entry["cpus"].as_f64().unwrap_or(1.0) * replicas;
+    fn place_app(&self, entry: Entry<'_>, except: &[String]) -> anyhow::Result<(String, bool)> {
+        let (gpus, cpus) = entry.total(1.0);
         let large: Vec<String> = self.inner.lock().workers.iter()
             .filter(|(id, w)| !except.contains(id) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
@@ -764,15 +711,14 @@ impl WorkloadController {
     /// Returns whether the start runs on another node, so it is not sent to its own. The caller
     /// holds the operation lock.
     pub(super) fn place_start(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
-        let s = &start.parameters["app"];
-        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let s = start.entry();
+        let (namespace, app, name) = (s.namespace(), s.app(), s.name());
         let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
-        if !placed || !text(s, "machine").is_empty() {
+        if !placed || !s.machine().is_empty() {
             return Ok(false);
         }
         let creates: Vec<CommandRecord> = self.inner.lock().commands.values()
-            .filter(|c| c.worker != start.worker && c.operation == NodeOperation::App as i32
-                && text(&c.parameters["create"], "name") == name)
+            .filter(|c| c.worker != start.worker && c.is(NodeOperation::App) && c.created().is_some_and(|e| e.name() == name))
             .cloned().collect();
         if creates.iter().any(|c| !c.done) {
             return Ok(true);
@@ -784,9 +730,8 @@ impl WorkloadController {
             let i = self.inner.lock();
             creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone()).find(|w| {
                 i.deployments.contains_key(&format!("{w}-{name}"))
-                    && i.workers.get(w).is_some_and(|node| node.report.apps.iter().any(|a| text(a, "name") == name))
-                    && !i.commands.open().any(|c| &c.worker == w && c.operation == NodeOperation::App as i32
-                        && c.parameters["remove"] == json!(true) && text(&c.parameters["app"], "name") == app)
+                    && i.workers.get(w).is_some_and(|node| node.report.entry(name).is_some())
+                    && !i.commands.open().any(|c| &c.worker == w && c.removes_app(app))
             })
         };
         if let Some(target) = created_on {
@@ -804,7 +749,7 @@ impl WorkloadController {
         let skip: Vec<String> = {
             let i = self.inner.lock();
             i.workers.iter()
-                .filter(|(id, w)| **id == start.worker || w.report.apps.iter().any(|a| text(a, "name") == name))
+                .filter(|(id, w)| **id == start.worker || w.report.entry(name).is_some())
                 .map(|(id, _)| id.clone())
                 .chain(creates.iter().filter(|c| c.error.is_some()).map(|c| c.worker.clone()))
                 .collect()
@@ -812,17 +757,11 @@ impl WorkloadController {
         let Ok((target, true)) = self.place_app(s, &skip) else {
             return Ok(false);
         };
-        let mut entry = s.clone();
-        if let Some(fields) = entry.as_object_mut() {
-            // What the old node reported about the entry, not its configuration.
-            for key in ["ready", "logs", "cleaned", "namespace_ref"] {
-                fields.remove(key);
-            }
-        }
-        entry["disabled"] = json!(true);
-        let mut message = self.app_message(namespace, app);
-        message["create"] = entry;
-        self.command(&target, NodeOperation::App, message)?;
+        // What the old node reported about the entry goes, its configuration comes along.
+        let mut entry = s.0.clone();
+        EntryMut(&mut entry).forget_report();
+        EntryMut(&mut entry).set_disabled(true);
+        self.command(&target, NodeOperation::App, message::with(self.app_message(namespace, app), &message::create(&entry)))?;
         tracing::info!(app, node = target, "placing an app's start on a node with room for it");
         Ok(true)
     }
@@ -832,8 +771,8 @@ impl WorkloadController {
     /// starts on `target`. Removing the entry stops what is left of the app there; its data
     /// stays where the app keeps it, which may be storage `target` shares.
     fn start_on(&self, start: &CommandRecord, target: &str) -> anyhow::Result<()> {
-        let s = &start.parameters["app"];
-        let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
+        let s = start.entry();
+        let (namespace, app, name) = (s.namespace(), s.app(), s.name());
         let old_key = format!("{}-{name}", start.worker);
         let old = self.inner.lock().deployments.get(&old_key).cloned();
         if let Some(mut old) = old {
@@ -849,7 +788,7 @@ impl WorkloadController {
         unsent.error = Some(format!("the app starts on {target}, which has room for it"));
         self.save("commands", &unsent.id, &unsent)?;
         self.inner.lock().commands.insert(unsent.id.clone(), unsent);
-        self.tell_nodes([&start.worker], self.app_message(namespace, app), json!({"remove": true}))?;
+        self.tell_nodes([&start.worker], self.app_message(namespace, app), message::remove())?;
         let template = self.inner.lock().apps.get(app).cloned();
         if let Some(mut template) = template {
             template.workers = vec![target.into()];

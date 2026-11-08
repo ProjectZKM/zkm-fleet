@@ -8,6 +8,7 @@ pub mod artifacts;
 pub mod json;
 pub mod models;
 pub mod sdk;
+pub mod workload;
 
 pub use fleet::model;
 
