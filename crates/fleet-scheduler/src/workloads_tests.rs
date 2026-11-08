@@ -1138,6 +1138,22 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(job["priority"], 17);
+    // Only those who can see the batch submit to it; another tag is told what another namespace is.
+    let submit = json!({"gpus":0,"cpus":1,"mount":["/data/models:ro"],"command":["env"]});
+    for token in [&foreign_tag, &foreign_ns] {
+        let status = scale_call(c.clone(), token, "POST", "/batches/training/jobs", submit.clone()).await.status();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(scale_call(c.clone(), &restricted, "POST", "/batches/training/jobs", submit.clone()).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/batches/training/jobs?namespace={ns}&tag=scope=research"),
+        submit.clone()).await.status(), StatusCode::NOT_FOUND);
+    // An admin's job on it is the batch's tag's, which its owner then sees and cancels.
+    let response = scale_call(c.clone(), "admin", "POST", &format!("/batches/training/jobs?namespace={ns}"), submit).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let admin_job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(c.job(text(&admin_job, "id"), None, &BTreeMap::new()).unwrap().tag.as_deref(), Some("scope=default"));
+    assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/training/jobs/{}/cancel", text(&admin_job, "id")),
+        Value::Null).await.status(), StatusCode::OK);
     assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batches/training/priority", json!({"priority":31})).await.status(), StatusCode::OK);
     assert_eq!(c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().policy["priority"], 17);
     assert_eq!(c.inner.lock().apps["training"].spec["allow"], json!(["/data/models"]));
@@ -1145,6 +1161,33 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
         json!({"gpus":0,"cpus":1,"mount":["/etc:ro"],"command":["true"]})).await.status(), StatusCode::FORBIDDEN);
     assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/training/jobs/{}/cancel", text(&job, "id")), Value::Null).await.status(), StatusCode::OK);
     assert_eq!(scale_call(c, &owner, "DELETE", "/batches/training", Value::Null).await.status(), StatusCode::OK);
+}
+
+/// A proof app is changed only by the tag it was created for, also before it is placed, when no
+/// deployment records that tag yet.
+#[tokio::test]
+async fn an_unplaced_proof_app_is_changed_only_by_its_own_tag() {
+    let (_dir, c, ns) = setup().await;
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
+    let body = json!({"name":"eth","namespace":ns,"spec":{"image":"ziren-gpu:1","gpus":1},
+        "proof":{"elf_id":"AB".repeat(32),"class":"latency"}});
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    for (method, path, body) in [
+        ("PUT", "/apps/eth/priority", json!({"priority":31})),
+        ("DELETE", "/apps/eth/disabled", Value::Null),
+        ("PUT", "/apps/eth/disabled", Value::Null),
+        ("DELETE", "/apps/eth", Value::Null),
+    ] {
+        let status = scale_call(c.clone(), &foreign_tag, method, path, body).await.status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    assert!(c.fleet.app_known(&ns, "eth") && !c.inner.lock().apps["eth"].removed, "the app is still there");
+    assert_eq!(c.fleet.app(&ns, "eth").unwrap().priority, 0);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/eth/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+    assert_eq!(c.fleet.app(&ns, "eth").unwrap().priority, 31);
+    assert_eq!(scale_call(c.clone(), &owner, "DELETE", "/apps/eth", Value::Null).await.status(), StatusCode::OK);
+    assert!(!c.fleet.app_known(&ns, "eth"));
 }
 
 #[tokio::test]

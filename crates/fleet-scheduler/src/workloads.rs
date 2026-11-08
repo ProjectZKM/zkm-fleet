@@ -576,6 +576,11 @@ impl WorkloadController {
             .filter(|a| !a.removed)
             .cloned()
             .ok_or_else(|| fail(404, "unknown batch"))?;
+        // Only those who can see a batch submit to it: a batch fixed to a tag takes that tag's
+        // jobs, which then run with its mounts, user and environment.
+        if !self.app_visible(&app, c, q) {
+            return Err(fail(404, "unknown batch"));
+        }
         if app.persistent || app.spec["disabled"].as_bool() == Some(true) {
             return Err(fail(409, "app does not accept batch jobs"));
         }
@@ -583,6 +588,10 @@ impl WorkloadController {
         selectors
             .entry("namespace".into())
             .or_insert(app.namespace.clone());
+        // An admin's job on a tagged batch is that tag's, so it counts against that tag's quota.
+        if let Some(tag) = app.tag.as_deref().or_else(|| app.spec["tag"].as_str()) {
+            selectors.entry("tag".into()).or_insert(tag.to_owned());
+        }
         let (namespace, tag) = self.scope(c, &selectors, Some(&app.namespace))?;
         if !request["command"]
             .as_array()
@@ -2343,6 +2352,13 @@ impl WorkloadController {
         if changes {
             if let Some(c) = c {
                 let i = self.inner.lock();
+                // So must the tag the app was created for: until the app is placed, no deployment
+                // records it.
+                let owner = i.apps.get(&name).filter(|t| !t.removed && t.namespace == namespace)
+                    .and_then(|t| t.tag.as_deref().or_else(|| t.spec["tag"].as_str()));
+                if owner.is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
+                    return Err(fail(403, "another tag owns this app"));
+                }
                 if i.deployments.values().any(|d| text(&d.spec, "namespace") == namespace && text(&d.spec, "app") == name
                     && d.spec["tag"].as_str().is_some_and(|tag| c.tag.as_deref() != Some(tag))) {
                     return Err(fail(403, "another tag's deployments run this app"));

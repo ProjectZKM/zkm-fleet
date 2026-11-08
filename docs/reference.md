@@ -256,6 +256,8 @@ New tags use `KEY=VALUE`, such as `scope=default` or `team=research`. The key
 starts with a letter; each part contains up to 63 letters, digits, dots,
 underscores or hyphens. Tags match exactly: `team=research` and `team=production`
 are separate scopes. Apps and batches use the same tag rules. Bare tags are rejected.
+An app or batch created with a tag belongs to that tag: only its tokens change it, and
+only they see or submit to a tagged batch. An administrator's job on a tagged batch gets its tag.
 Members can access that tag's existing jobs; another tag in the
 same namespace cannot. A namespace token holds some of the permissions `read`,
 `submit` and `manage` (default `read` and `submit`); a token without `manage`
