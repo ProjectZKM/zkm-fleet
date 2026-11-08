@@ -2,7 +2,7 @@
 use crate::fleet::v1::ProofKind;
 use crate::model::v1::*;
 use crate::stage::v1::Status as StageStatus;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 pub fn validate_tag(tag: &str) -> anyhow::Result<()> {
     let (key, value) = tag
@@ -228,35 +228,6 @@ impl serde::Serialize for ProofJob {
     }
 }
 
-impl Job {
-    pub fn value(&self) -> Value {
-        let mut v = self.status.0.clone();
-        for (k, x) in [
-            ("type", json!("batch")),
-            ("id", json!(self.id)),
-            ("batch", json!(self.batch)),
-            ("namespace", json!(self.namespace)),
-            ("tag", json!(self.tag)),
-            ("owner", json!(self.owner)),
-            ("priority", self.policy["priority"].clone()),
-            ("worker", json!(self.worker)),
-            ("node", json!(self.worker)),
-        ] {
-            v[k] = x;
-        }
-        v
-    }
-    pub fn state(&self) -> &str {
-        self.status["state"].as_str().unwrap_or("")
-    }
-    pub fn gpus(&self) -> f64 {
-        self.request["gpus"].as_f64().unwrap_or(0.0)
-    }
-    pub fn cpus(&self) -> f64 {
-        self.request["cpus"].as_f64().unwrap_or(1.0)
-    }
-}
-
 impl ProofJobFilter {
     pub fn matches(&self, j: &ProofJob) -> bool {
         self.namespace.as_ref().is_none_or(|n| &j.namespace == n)
@@ -359,6 +330,7 @@ impl RegisterAppRequest {
 mod tests {
     use super::*;
     use prost::Message;
+    use serde_json::json;
 
     #[test]
     fn an_app_is_its_container_and_a_prover_also_its_program() {

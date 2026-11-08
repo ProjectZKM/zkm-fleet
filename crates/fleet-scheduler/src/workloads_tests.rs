@@ -1046,6 +1046,44 @@ async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tag: &str, apps:
     secret
 }
 
+/// A submission's checks run in a fixed order, so a body with several faults gets the first
+/// one's status and message; a batch's request takes only its own settings.
+#[tokio::test]
+async fn submissions_and_new_batches_are_checked_field_by_field() {
+    let (_dir, c, ns) = setup().await;
+    let created = scale_call(c.clone(), "admin", "POST", &format!("/batches?namespace={ns}"), json!({"name":"training","image":"python:3"})).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let unknown = scale_call(c.clone(), "admin", "POST", &format!("/batches?namespace={ns}"),
+        json!({"name":"other","image":"python:3","gpus":1})).await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_bytes(unknown.into_body(), 1 << 20).await.unwrap(), "unknown batch fields");
+    let path = format!("/batches/training/jobs?namespace={ns}");
+    for (body, status, message) in [
+        (json!([]), 400, "expected object"),
+        (json!({"command":["true"],"priority":1}), 400, "unknown or server-side submission fields"),
+        (json!({"cpus":-1,"gpus":"one"}), 400, "cpus: expected non-negative integer"),
+        (json!({"retry":1.5}), 400, "retry: expected non-negative integer"),
+        (json!({"gpus":"one","mount":[1]}), 400, "gpus: expected number"),
+        (json!({"env":"A=1"}), 400, "env: expected string array"),
+        (json!({"machine":"gpu"}), 400, "machine: expected string array"),
+        (json!({"machine":["a","b"],"name":3}), 422, "one machine may be selected for a local job"),
+        (json!({"name":3,"after":4}), 400, "name: expected string"),
+        (json!({"workdir":["/"]}), 400, "workdir: expected string"),
+        (json!({"command":[]}), 400, "command: a non-empty list of strings"),
+        (json!({"command":["true"],"nodes":2}), 422, "cross-machine jobs are not supported by local Ray; use one node"),
+        (json!({"command":["true"],"gpus":0.5,"cpus":1}), 400, "fractional GPUs require a VRAM limit"),
+    ] {
+        let response = scale_call(c.clone(), "admin", "POST", &path, body.clone()).await;
+        assert_eq!(response.status().as_u16(), status, "{body}");
+        assert_eq!(to_bytes(response.into_body(), 1 << 20).await.unwrap(), message, "{body}");
+    }
+    let response = scale_call(c.clone(), "admin", "POST", &path, json!({"command":["true"],"gpus":0,"cpus":1,"machine":["gpu"]})).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let request = c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().request.0;
+    assert_eq!(request, json!({"command":["true"],"gpus":0.0,"cpus":1,"machine":["gpu"],"gpu_mem":0,"nodes":1}));
+}
+
 #[tokio::test]
 async fn scoped_managers_cannot_change_app_execution_or_batch_host_access() {
     for proof in [false, true] {

@@ -65,7 +65,7 @@ fn response_error(e: anyhow::Error) -> Response {
 }
 
 use fleet_proto::model::v1::{WorkloadTemplate, Job, CommandRecord, NodeReport, ScaleStatus, AppDeployment};
-use fleet_proto::workload::{command as message, Entry, EntryMut};
+use fleet_proto::workload::{command as message, Batch, Entry, EntryMut, Submission, SubmissionMut};
 
 use records::{Record, Records};
 
@@ -493,61 +493,7 @@ impl WorkloadController {
         q: &BTreeMap<String, String>,
     ) -> anyhow::Result<Value> {
         let _ops = self.ops.lock().await;
-        let body = request
-            .as_object_mut()
-            .ok_or_else(|| fail(400, "expected object"))?;
-        let allowed = [
-            "name",
-            "command",
-            "gpus",
-            "cpus",
-            "gpu_mem",
-            "vram_wait",
-            "machine",
-            "nodes",
-            "after",
-            "retry",
-            "restart_on_oom",
-            "mount",
-            "env",
-            "log",
-            "workdir",
-        ];
-        if body.keys().any(|k| !allowed.contains(&k.as_str())) {
-            return Err(fail(400, "unknown or server-side submission fields"));
-        }
-        for key in [
-            "cpus",
-            "nodes",
-            "gpu_mem",
-            "vram_wait",
-            "retry",
-            "restart_on_oom",
-        ] {
-            if !request[key].is_null() && request[key].as_u64().is_none() {
-                return Err(fail(400, format!("{key}: expected non-negative integer")));
-            }
-        }
-        if !request["gpus"].is_null() && request["gpus"].as_f64().is_none() {
-            return Err(fail(400, "gpus: expected number"));
-        }
-        for key in ["mount", "env", "machine"] {
-            if !request[key].is_null()
-                && !request[key]
-                    .as_array()
-                    .is_some_and(|a| a.iter().all(Value::is_string))
-            {
-                return Err(fail(400, format!("{key}: expected string array")));
-            }
-        }
-        if request["machine"].as_array().is_some_and(|a| a.len() > 1) {
-            return Err(fail(422, "one machine may be selected for a local job"));
-        }
-        for key in ["name", "after", "log", "workdir"] {
-            if !request[key].is_null() && !request[key].is_string() {
-                return Err(fail(400, format!("{key}: expected string")));
-            }
-        }
+        check_submission(&request)?;
         let name = batch.to_string();
         Self::require_grant(c, &name)?;
         let app = self
@@ -575,26 +521,22 @@ impl WorkloadController {
             selectors.entry("tag".into()).or_insert(tag.to_owned());
         }
         let (namespace, tag) = self.scope(c, &selectors, Some(&app.namespace))?;
-        if !request["command"]
-            .as_array()
-            .is_some_and(|cmd| !cmd.is_empty() && cmd.iter().all(Value::is_string))
-        {
+        let submission = Submission(&request);
+        if submission.command().is_none() {
             return Err(fail(400, "command: a non-empty list of strings"));
         }
-        let nodes = request["nodes"].as_u64().unwrap_or(1);
-        if nodes != 1 {
+        if submission.nodes() != 1 {
             return Err(fail(
                 422,
                 "cross-machine jobs are not supported by local Ray; use one node",
             ));
         }
-        let gpus = request["gpus"].as_f64().unwrap_or(1.0);
-        let cpus = request["cpus"].as_u64().unwrap_or(8);
+        let (gpus, cpus) = (submission.gpus(), submission.cpus());
         if !gpus.is_finite()
             || gpus < 0.0
             || cpus < 1
             || (gpus > 1.0 && gpus.fract() != 0.0)
-            || gpus > app.spec["max_gpus"].as_f64().unwrap_or(8.0)
+            || gpus > app.batch().max_gpus()
         {
             return Err(fail(
                 400,
@@ -610,31 +552,25 @@ impl WorkloadController {
         if !n.quota.fits(gpus, cpus as f64) || !tq.fits(gpus, cpus as f64) {
             return Err(fail(422, "job exceeds namespace/tag quota"));
         }
-        if let Some(after) = request["after"].as_str() {
+        if let Some(after) = submission.after() {
             self.job(after, c, &selectors)?;
         }
-        let gpu_mem = request["gpu_mem"]
-            .as_u64()
-            .unwrap_or_else(|| app.spec["default_gpu_mem_gb"].as_u64().unwrap_or(0));
+        let gpu_mem = submission.gpu_mem().unwrap_or_else(|| app.batch().default_gpu_mem_gb());
         if gpus > 0.0 && gpus < 1.0 && gpu_mem == 0 {
             return Err(fail(400, "fractional GPUs require a VRAM limit"));
         }
-        let mounts = request["mount"].as_array().cloned().unwrap_or_default();
-        let roots = app.spec["allow"].as_array().cloned().unwrap_or_default();
-        if mounts.iter().any(|m| {
+        if submission.mounts().iter().any(|m| {
             m.as_str()
-                .is_none_or(|m| !path_allowed(m.split(':').next().unwrap_or(""), &roots))
+                .is_none_or(|m| !path_allowed(m.split(':').next().unwrap_or(""), app.batch().allow()))
         }) {
             return Err(fail(403, "mount outside app allow roots"));
         }
-        if c.is_some() && request["log"].is_string() {
+        if c.is_some() && submission.names_log() {
             return Err(fail(403, "users must use job log storage"));
         }
-        request["gpus"] = json!(gpus);
-        request["cpus"] = json!(cpus);
-        request["gpu_mem"] = json!(gpu_mem);
-        request["nodes"] = json!(1);
-        let base = text(&request, "name");
+        let waits = submission.after().is_some();
+        SubmissionMut(&mut request).set_resources(gpus, cpus, gpu_mem);
+        let base = Submission(&request).name();
         let base = if base.is_empty() { name.as_str() } else { base };
         let base: String = base
             .chars()
@@ -648,11 +584,7 @@ impl WorkloadController {
             })
             .collect();
         let id = format!("{base}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-        let state = if request["after"].is_string() {
-            "waiting_dependency"
-        } else {
-            "waiting_quota"
-        };
+        let state = if waits { "waiting_dependency" } else { "waiting_quota" };
         let r = Job {
             id: id.clone(),
             lease: uuid::Uuid::new_v4().to_string(),
@@ -897,23 +829,19 @@ impl WorkloadController {
             let mut r = if let Some(r) = existing.clone() {
                 r
             } else {
-                let batch = text(&incoming.spec, "batch").to_string();
+                let batch = incoming.batch().to_string();
                 let Some(app) = self.inner.lock().apps.get(&batch).filter(|a| !a.removed).cloned() else {
                     continue;
                 };
-                let mut request = json!({"command":incoming.spec["command"],"gpus":incoming.spec["gpus"],"cpus":incoming.spec["cpus"],"nodes":1});
-                if request["gpus"].is_null() {
-                    request["gpus"] = json!(0);
-                }
                 Job {
                     id: incoming.id.clone(),
                     lease: incoming.lease.clone(),
-                    owner: incoming.spec["owner"].as_str().unwrap_or("admin").into(),
+                    owner: incoming.owner().into(),
                     namespace: app.namespace,
-                    tag: incoming.spec["tag"].as_str().map(str::to_owned),
+                    tag: incoming.tag().map(str::to_owned),
                     batch,
-                    policy: incoming.spec["policy"].clone().into(),
-                    request: request.into(),
+                    policy: incoming.policy().clone().into(),
+                    request: incoming.submission().into(),
                     worker: Some(worker_id.into()),
                     status: incoming.status.clone(),
                     quota_held: false,
@@ -937,7 +865,7 @@ impl WorkloadController {
                 "preempted",
                 "lost",
             ];
-            if !accepted.contains(&text(&incoming.status, "state")) {
+            if !accepted.contains(&incoming.state()) {
                 continue;
             }
             // A reconnect cannot regress terminal state or cancel/preemption intent.
@@ -957,11 +885,10 @@ impl WorkloadController {
                     r.lease = uuid::Uuid::new_v4().to_string();
                     r.worker = None;
                     r.logs_ready = false;
-                    r.status["state"] = json!("waiting_quota");
-                    r.status["finished_at"] = Value::Null;
+                    r.requeue();
                     r.stop = None;
                 } else if r.stop.as_deref() == Some("cancel") {
-                    r.status["state"] = json!("cancelled");
+                    r.set_state("cancelled");
                     r.stop = None;
                 }
             } else if !r.quota_held
@@ -1005,9 +932,7 @@ impl WorkloadController {
                         if r.lease == c.lease()
                             && r.worker.as_deref() == Some(worker_id)
                         {
-                            r.status["state"] = json!("failed");
-                            r.status["error"] = json!(c.error);
-                            r.status["finished_at"] = json!(now());
+                            r.fail(&c.error, now());
                             if c.cleaned() && r.quota_held {
                                 self.fleet.release_job(&r.namespace, &r.id).await?;
                                 r.quota_held = false;
@@ -1037,11 +962,9 @@ impl WorkloadController {
                             if r.stop.as_deref() == Some("preempt") {
                                 r.lease = uuid::Uuid::new_v4().to_string();
                                 r.worker = None;
-                                r.status["state"] = json!("waiting_quota");
-                                r.status["finished_at"] = Value::Null;
+                                r.requeue();
                             } else {
-                                r.status["state"] = json!("cancelled");
-                                r.status["finished_at"] = json!(now());
+                                r.finish("cancelled", now());
                             }
                             r.stop = None;
                             self.save("jobs", &r.id, &r)?;
@@ -1100,7 +1023,7 @@ impl WorkloadController {
             .report
             .jobs
             .iter()
-            .filter(|s| !matches!(text(&s.status, "state"), "queued" | "waiting_quota"))
+            .filter(|s| !matches!(s.state(), "queued" | "waiting_quota"))
             .map(|s| (s.id.as_str(), s.lease.as_str()))
             .collect();
         let pending = i
@@ -1164,8 +1087,7 @@ impl WorkloadController {
                 message::job(&r.id, &r.lease),
             )?;
         } else if !preempt {
-            r.status["state"] = json!("cancelled");
-            r.status["finished_at"] = json!(now());
+            r.finish("cancelled", now());
             r.logs_ready = true;
             self.save("jobs", &r.id, &r)?;
             self.inner.lock().jobs.insert(r.id.clone(), r.clone());
@@ -1197,13 +1119,13 @@ impl WorkloadController {
                     r.worker.as_ref().map(|w| PreemptionCandidate {
                         id: r.id.clone(),
                         namespace: r.namespace.clone(),
-                        priority: r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                        priority: r.policy().priority() as i32,
                         node_ip: w.clone(),
                         gpus: r.gpus(),
                         cpus: r.cpus(),
-                        started_at: r.status["started_at"].as_f64(),
-                        preemptible: r.policy["preemptible"].as_bool().unwrap_or(true),
-                        min_runtime_s: r.policy["min_runtime_s"].as_u64().unwrap_or(300),
+                        started_at: r.started_at(),
+                        preemptible: r.policy().preemptible(),
+                        min_runtime_s: r.policy().min_runtime_s(),
                     })
                 })
                 .collect::<Vec<_>>();
@@ -1423,16 +1345,8 @@ impl WorkloadController {
         };
         drop(ops);
         jobs.sort_by(|a, b| {
-            b.policy["priority"]
-                .as_i64()
-                .unwrap_or(0)
-                .cmp(&a.policy["priority"].as_i64().unwrap_or(0))
-                .then(
-                    a.status["submitted_at"]
-                        .as_f64()
-                        .unwrap_or(0.0)
-                        .total_cmp(&b.status["submitted_at"].as_f64().unwrap_or(0.0)),
-                )
+            b.policy().priority().cmp(&a.policy().priority())
+                .then(a.submitted_at().unwrap_or(0.0).total_cmp(&b.submitted_at().unwrap_or(0.0)))
                 .then(a.id.cmp(&b.id))
         });
         for id in jobs.into_iter().map(|r| r.id) {
@@ -1452,14 +1366,12 @@ impl WorkloadController {
                 .cloned()
                 .unwrap_or_default();
             if !namespace.quota.fits(r.gpus(), r.cpus()) || !tag_quota.fits(r.gpus(), r.cpus()) {
-                r.status["state"] = json!("failed");
-                r.status["error"] = json!("job exceeds current namespace/tag quota");
-                r.status["finished_at"] = json!(now());
+                r.fail("job exceeds current namespace/tag quota", now());
                 self.save("jobs", &r.id, &r)?;
                 self.inner.lock().jobs.insert(r.id.clone(), r);
                 continue;
             }
-            if let Some(after) = r.request["after"].as_str() {
+            if let Some(after) = r.submission().after() {
                 let state = self
                     .inner
                     .lock()
@@ -1468,9 +1380,7 @@ impl WorkloadController {
                     .map(|r| r.state().to_owned());
                 if state.as_deref() != Some("succeeded") {
                     if state.as_deref().is_some_and(terminal) {
-                        r.status["state"] = json!("failed");
-                        r.status["error"] = json!("dependency did not succeed");
-                        r.status["finished_at"] = json!(now());
+                        r.fail("dependency did not succeed", now());
                         self.save("jobs", &r.id, &r)?;
                         self.inner.lock().jobs.insert(r.id.clone(), r);
                     }
@@ -1483,10 +1393,7 @@ impl WorkloadController {
                 i.workers
                     .iter()
                     .filter(|(id, w)| {
-                        let pin = r.request["machine"]
-                            .as_array()
-                            .and_then(|m| m.first())
-                            .and_then(Value::as_str);
+                        let pin = r.submission().machine();
                         let app_ok =
                             app.is_none_or(|a| a.workers.is_empty() || a.workers.contains(*id));
                         app_ok && pin.is_none_or(|p| p == id.as_str() || p == w.report.machine)
@@ -1508,7 +1415,7 @@ impl WorkloadController {
                 self.preempt_for(
                     &r.namespace,
                     r.tag.as_deref(),
-                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.policy().priority() as i32,
                     r.gpus(),
                     r.cpus(),
                     allowed.into_iter().map(Some).take(1).collect(),
@@ -1521,14 +1428,14 @@ impl WorkloadController {
             // the reservation refused would write its record twice on every pass.
             if !self.fleet.fits_quota(&r.namespace, r.tag.as_deref(), &format!("job:{}", r.id), r.gpus(), r.cpus()) {
                 if r.state() != "waiting_quota" {
-                    r.status["state"] = json!("waiting_quota");
+                    r.set_state("waiting_quota");
                     self.save("jobs", &r.id, &r)?;
                     self.inner.lock().jobs.insert(r.id.clone(), r.clone());
                 }
                 self.preempt_for(
                     &r.namespace,
                     r.tag.as_deref(),
-                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.policy().priority() as i32,
                     r.gpus(),
                     r.cpus(),
                     vec![Some(worker)],
@@ -1539,8 +1446,8 @@ impl WorkloadController {
             }
             r.quota_held = true;
             r.worker = Some(worker.clone());
-            r.status["state"] = json!("queued");
-            r.status["detail"] = json!("assigned; awaiting node acknowledgement");
+            r.set_state("queued");
+            r.set_detail("assigned; awaiting node acknowledgement");
             self.save("jobs", &r.id, &r)?;
             if self
                 .fleet
@@ -1557,13 +1464,13 @@ impl WorkloadController {
             {
                 r.quota_held = false;
                 r.worker = None;
-                r.status["state"] = json!("waiting_quota");
+                r.set_state("waiting_quota");
                 self.save("jobs", &r.id, &r)?;
                 self.inner.lock().jobs.insert(r.id.clone(), r.clone());
                 self.preempt_for(
                     &r.namespace,
                     r.tag.as_deref(),
-                    r.policy["priority"].as_i64().unwrap_or(0) as i32,
+                    r.policy().priority() as i32,
                     r.gpus(),
                     r.cpus(),
                     vec![Some(worker)],
@@ -1573,7 +1480,7 @@ impl WorkloadController {
                 continue;
             }
             self.inner.lock().jobs.insert(r.id.clone(), r.clone());
-            self.command(&worker,NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"batch":r.batch,"policy":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.command(&worker, NodeOperation::LaunchJob, message::launch(&r))?;
         }
         // A durable assigned job whose process died before command persistence still
         // receives the same lease. Uncertain execution is never moved to another node.
@@ -1588,7 +1495,7 @@ impl WorkloadController {
                 .collect::<Vec<_>>()
         };
         for r in assigned {
-            self.command(r.worker.as_deref().unwrap(),NodeOperation::LaunchJob,json!({"id":r.id,"lease":r.lease,"namespace":r.namespace,"tag":r.tag,"owner":r.owner,"batch":r.batch,"policy":r.policy,"request":r.request,"submitted_at":r.status["submitted_at"]}))?;
+            self.command(r.worker.as_deref().unwrap(), NodeOperation::LaunchJob, message::launch(&r))?;
         }
         Ok(())
     }
@@ -1641,7 +1548,7 @@ impl WorkerService for NodeControlService {
         let reported = report
             .jobs
             .iter()
-            .filter(|r| r.cleaned && r.logs_ready && terminal(text(&r.status, "state")))
+            .filter(|r| r.cleaned && r.logs_ready && terminal(r.state()))
             .map(|r| (r.id.clone(), r.lease.clone()))
             .collect::<Vec<_>>();
         let ack = self
@@ -1715,6 +1622,53 @@ fn path_allowed(path: &str, roots: &[Value]) -> bool {
         })
 }
 
+/// What a batch job submission's field takes.
+enum Takes {
+    Count,
+    Number,
+    Strings,
+    /// A list of at most one machine.
+    Machine,
+    Text,
+    /// Checked once the batch is known: `command: a non-empty list of strings`.
+    Command,
+}
+
+/// A batch job submission's fields, in the order they are checked.
+const SUBMISSION: [(&str, Takes); 15] = [
+    ("cpus", Takes::Count), ("nodes", Takes::Count), ("gpu_mem", Takes::Count), ("vram_wait", Takes::Count),
+    ("retry", Takes::Count), ("restart_on_oom", Takes::Count), ("gpus", Takes::Number),
+    ("mount", Takes::Strings), ("env", Takes::Strings), ("machine", Takes::Machine),
+    ("name", Takes::Text), ("after", Takes::Text), ("log", Takes::Text), ("workdir", Takes::Text),
+    ("command", Takes::Command),
+];
+
+/// A submission has only the fields its owner may give, each of the type it takes.
+fn check_submission(request: &Value) -> anyhow::Result<()> {
+    let body = request.as_object().ok_or_else(|| fail(400, "expected object"))?;
+    if body.keys().any(|k| !SUBMISSION.iter().any(|(key, _)| key == k)) {
+        return Err(fail(400, "unknown or server-side submission fields"));
+    }
+    for (key, takes) in SUBMISSION {
+        let value = &request[key];
+        if value.is_null() {
+            continue;
+        }
+        let strings = || value.as_array().is_some_and(|a| a.iter().all(Value::is_string));
+        match takes {
+            Takes::Count if value.as_u64().is_none() => return Err(fail(400, format!("{key}: expected non-negative integer"))),
+            Takes::Number if value.as_f64().is_none() => return Err(fail(400, format!("{key}: expected number"))),
+            Takes::Strings | Takes::Machine if !strings() => return Err(fail(400, format!("{key}: expected string array"))),
+            Takes::Machine if value.as_array().is_some_and(|a| a.len() > 1) => {
+                return Err(fail(422, "one machine may be selected for a local job"));
+            }
+            Takes::Text if !value.is_string() => return Err(fail(400, format!("{key}: expected string"))),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The checks every batch's settings pass, on create and on update.
 fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
     if spec["priority"].as_i64().is_none_or(|p| i32::try_from(p).is_err())
@@ -1740,6 +1694,25 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
         return Err(fail(400, "invalid batch settings"));
     }
     Ok(())
+}
+
+/// What a new batch's request gives beside the settings that have a default.
+const BATCH_IDENTITY: [&str; 4] = ["name", "namespace", "image", "user"];
+
+/// A new batch's settings that have a default, with it.
+fn batch_defaults() -> [(&'static str, Value); 10] {
+    [
+        ("max_gpus", json!(8)),
+        ("default_gpu_mem_gb", json!(0)),
+        ("shm_gb", json!(16)),
+        ("priority", json!(0)),
+        ("allow", json!([])),
+        ("env", json!({})),
+        ("disabled", json!(false)),
+        ("preemptible", json!(true)),
+        ("min_runtime_s", json!(300)),
+        ("stop_timeout_s", json!(30)),
+    ]
 }
 
 /// Settings an update may change on a batch (its name, namespace, priority and enabled state
@@ -1885,46 +1858,19 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Err(fail(400, "image is required"));
         }
         WorkloadController::require_grant(c, &name)?;
-        let allowed = [
-            "name",
-            "namespace",
-            "image",
-            "user",
-            "max_gpus",
-            "default_gpu_mem_gb",
-            "shm_gb",
-            "allow",
-            "env",
-            "disabled",
-            "preemptible",
-            "min_runtime_s",
-            "stop_timeout_s",
-            "priority",
-        ];
-        if body
-            .as_object()
-            .is_none_or(|o| o.keys().any(|k| !allowed.contains(&k.as_str())))
-        {
+        let defaults = batch_defaults();
+        if body.as_object().is_none_or(|o| {
+            o.keys().any(|k| !BATCH_IDENTITY.contains(&k.as_str()) && !defaults.iter().any(|(key, _)| key == k))
+        }) {
             return Err(fail(400, "unknown batch fields"));
         }
-        for (key, default) in [
-            ("max_gpus", json!(8)),
-            ("default_gpu_mem_gb", json!(0)),
-            ("shm_gb", json!(16)),
-            ("priority", json!(0)),
-            ("allow", json!([])),
-            ("env", json!({})),
-            ("disabled", json!(false)),
-            ("preemptible", json!(true)),
-            ("min_runtime_s", json!(300)),
-            ("stop_timeout_s", json!(30)),
-        ] {
+        for (key, default) in defaults {
             if body[key].is_null() {
                 body[key] = default;
             }
         }
         check_batch_spec(&body)?;
-        if c.is_some() && (!body["allow"].as_array().unwrap().is_empty() || !body["user"].is_null()) {
+        if c.is_some() && (!Batch(&body).allow().is_empty() || Batch(&body).user().is_some()) {
             return Err(fail(403, "batch host mount roots and runtime user require administrator credentials"));
         }
         body["namespace"] = json!(namespace);
@@ -2096,12 +2042,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     .cloned()
                     .collect::<Vec<_>>()
             };
-            jobs.sort_by(|a, b| {
-                b.status["submitted_at"]
-                    .as_f64()
-                    .unwrap_or(0.0)
-                    .total_cmp(&a.status["submitted_at"].as_f64().unwrap_or(0.0))
-            });
+            jobs.sort_by(|a, b| b.submitted_at().unwrap_or(0.0).total_cmp(&a.submitted_at().unwrap_or(0.0)));
             return Ok(Json(
                 jobs.into_iter()
                     .take(limit)
@@ -2122,7 +2063,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                     && r.batch == batch
                     && terminal(r.state())
                     && !r.quota_held
-                    && r.status["finished_at"].as_f64().is_some_and(|v| v < cutoff)
+                    && r.finished_at().is_some_and(|v| v < cutoff)
                     && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
             };
             let ids: Vec<String> = s.inner.lock().jobs.values().filter(|r| purgeable(r)).map(|r| r.id.clone()).collect();

@@ -2,7 +2,7 @@
 //! JSON, as a node configured or reported them, so keys the scheduler does not know pass
 //! through untouched; these views read and write the keys it does know, each in one place.
 use crate::fleet::v1::NodeOperation;
-use crate::model::v1::{AppDeployment, CommandRecord, NodeReport, ScaleStatus, WorkloadTemplate};
+use crate::model::v1::{AppDeployment, CommandRecord, Job, JobReport, NodeReport, ScaleStatus, WorkloadTemplate};
 use serde_json::{json, Value};
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -216,6 +216,204 @@ impl WorkloadTemplate {
     }
 }
 
+/// A batch's settings, as its template keeps them and each of its jobs keeps them as its policy.
+#[derive(Clone, Copy, Debug)]
+pub struct Batch<'a>(pub &'a Value);
+
+impl<'a> Batch<'a> {
+    /// The most GPUs one job may ask for.
+    pub fn max_gpus(self) -> f64 {
+        self.0["max_gpus"].as_f64().unwrap_or(8.0)
+    }
+    /// The VRAM limit of a job that gives none.
+    pub fn default_gpu_mem_gb(self) -> u64 {
+        self.0["default_gpu_mem_gb"].as_u64().unwrap_or(0)
+    }
+    /// The host paths its jobs may mount.
+    pub fn allow(self) -> &'a [Value] {
+        self.0["allow"].as_array().map(Vec::as_slice).unwrap_or_default()
+    }
+    /// The user its jobs run as.
+    pub fn user(self) -> Option<&'a str> {
+        self.0["user"].as_str()
+    }
+    pub fn priority(self) -> i64 {
+        self.0["priority"].as_i64().unwrap_or(0)
+    }
+    /// Whether a higher-priority job may stop its running jobs.
+    pub fn preemptible(self) -> bool {
+        self.0["preemptible"].as_bool().unwrap_or(true)
+    }
+    /// How long a job runs before it may be preempted.
+    pub fn min_runtime_s(self) -> u64 {
+        self.0["min_runtime_s"].as_u64().unwrap_or(300)
+    }
+}
+
+impl WorkloadTemplate {
+    /// A batch's settings.
+    pub fn batch(&self) -> Batch<'_> {
+        Batch(&self.spec)
+    }
+}
+
+/// A batch job's submission, as its owner sent it and its record keeps it once checked.
+#[derive(Clone, Copy, Debug)]
+pub struct Submission<'a>(pub &'a Value);
+
+impl<'a> Submission<'a> {
+    /// The name its job's id starts with.
+    pub fn name(self) -> &'a str {
+        text(self.0, "name")
+    }
+    /// The GPUs it asks for: one where it gives none.
+    pub fn gpus(self) -> f64 {
+        self.0["gpus"].as_f64().unwrap_or(1.0)
+    }
+    /// The CPUs it asks for: eight where it gives none.
+    pub fn cpus(self) -> u64 {
+        self.0["cpus"].as_u64().unwrap_or(8)
+    }
+    /// The machines it runs on: one where it gives none.
+    pub fn nodes(self) -> u64 {
+        self.0["nodes"].as_u64().unwrap_or(1)
+    }
+    /// Its VRAM limit, when it gives one.
+    pub fn gpu_mem(self) -> Option<u64> {
+        self.0["gpu_mem"].as_u64()
+    }
+    /// Its command, when it is a non-empty list of strings.
+    pub fn command(self) -> Option<&'a [Value]> {
+        self.0["command"].as_array().filter(|cmd| !cmd.is_empty() && cmd.iter().all(Value::is_string)).map(Vec::as_slice)
+    }
+    /// The host paths it mounts, each `PATH[:MODE]`.
+    pub fn mounts(self) -> &'a [Value] {
+        self.0["mount"].as_array().map(Vec::as_slice).unwrap_or_default()
+    }
+    /// The machine it is pinned to.
+    pub fn machine(self) -> Option<&'a str> {
+        self.0["machine"].as_array().and_then(|m| m.first()).and_then(Value::as_str)
+    }
+    /// The job it waits for.
+    pub fn after(self) -> Option<&'a str> {
+        self.0["after"].as_str()
+    }
+    /// Whether it names its own log file.
+    pub fn names_log(self) -> bool {
+        self.0["log"].is_string()
+    }
+}
+
+/// A submission being completed with what its batch and the scheduler decide.
+pub struct SubmissionMut<'a>(pub &'a mut Value);
+
+impl SubmissionMut<'_> {
+    /// Records the resources it gets, on one machine.
+    pub fn set_resources(&mut self, gpus: f64, cpus: u64, gpu_mem: u64) {
+        self.0["gpus"] = json!(gpus);
+        self.0["cpus"] = json!(cpus);
+        self.0["gpu_mem"] = json!(gpu_mem);
+        self.0["nodes"] = json!(1);
+    }
+}
+
+impl Job {
+    /// The record as listings show it: its status with who and where.
+    pub fn value(&self) -> Value {
+        let mut v = self.status.0.clone();
+        for (k, x) in [
+            ("type", json!("batch")),
+            ("id", json!(self.id)),
+            ("batch", json!(self.batch)),
+            ("namespace", json!(self.namespace)),
+            ("tag", json!(self.tag)),
+            ("owner", json!(self.owner)),
+            ("priority", self.policy["priority"].clone()),
+            ("worker", json!(self.worker)),
+            ("node", json!(self.worker)),
+        ] {
+            v[k] = x;
+        }
+        v
+    }
+    pub fn state(&self) -> &str {
+        self.status["state"].as_str().unwrap_or("")
+    }
+    pub fn gpus(&self) -> f64 {
+        self.request["gpus"].as_f64().unwrap_or(0.0)
+    }
+    pub fn cpus(&self) -> f64 {
+        self.request["cpus"].as_f64().unwrap_or(1.0)
+    }
+    /// What it was submitted with.
+    pub fn submission(&self) -> Submission<'_> {
+        Submission(&self.request)
+    }
+    /// Its batch's settings when it was submitted.
+    pub fn policy(&self) -> Batch<'_> {
+        Batch(&self.policy)
+    }
+    pub fn submitted_at(&self) -> Option<f64> {
+        self.status["submitted_at"].as_f64()
+    }
+    pub fn started_at(&self) -> Option<f64> {
+        self.status["started_at"].as_f64()
+    }
+    pub fn finished_at(&self) -> Option<f64> {
+        self.status["finished_at"].as_f64()
+    }
+    pub fn set_state(&mut self, state: &str) {
+        self.status["state"] = json!(state);
+    }
+    pub fn set_detail(&mut self, detail: &str) {
+        self.status["detail"] = json!(detail);
+    }
+    /// Ends it in `state` at `at`.
+    pub fn finish(&mut self, state: &str, at: f64) {
+        self.set_state(state);
+        self.status["finished_at"] = json!(at);
+    }
+    /// Ends it failed with `error` at `at`.
+    pub fn fail(&mut self, error: impl serde::Serialize, at: f64) {
+        self.set_state("failed");
+        self.status["error"] = json!(error);
+        self.status["finished_at"] = json!(at);
+    }
+    /// Puts it back in the queue, unfinished.
+    pub fn requeue(&mut self) {
+        self.set_state("waiting_quota");
+        self.status["finished_at"] = Value::Null;
+    }
+}
+
+impl JobReport {
+    pub fn state(&self) -> &str {
+        text(&self.status, "state")
+    }
+    /// The batch of a job the node runs.
+    pub fn batch(&self) -> &str {
+        text(&self.spec, "batch")
+    }
+    pub fn owner(&self) -> &str {
+        self.spec["owner"].as_str().unwrap_or("admin")
+    }
+    pub fn tag(&self) -> Option<&str> {
+        self.spec["tag"].as_str()
+    }
+    pub fn policy(&self) -> &Value {
+        &self.spec["policy"]
+    }
+    /// The submission of a job the node runs that the scheduler has no record of: its command
+    /// and resources, on one machine.
+    pub fn submission(&self) -> Value {
+        let mut request = json!({"command": self.spec["command"], "gpus": self.spec["gpus"], "cpus": self.spec["cpus"], "nodes": 1});
+        if request["gpus"].is_null() {
+            request["gpus"] = json!(0);
+        }
+        request
+    }
+}
+
 impl CommandRecord {
     pub fn is(&self, operation: NodeOperation) -> bool {
         self.operation == operation as i32
@@ -300,6 +498,11 @@ pub mod command {
     pub fn scale_step(entry: &Value, disabled: bool, scale_id: &str, phase: &str) -> Value {
         json!({"app": entry, "disabled": disabled, "scale_id": scale_id, "scale_phase": phase})
     }
+    /// Runs `job`'s execution lease on the node it is assigned to.
+    pub fn launch(job: &Job) -> Value {
+        json!({"id": job.id, "lease": job.lease, "namespace": job.namespace, "tag": job.tag, "owner": job.owner,
+            "batch": job.batch, "policy": job.policy, "request": job.request, "submitted_at": job.status["submitted_at"]})
+    }
     /// Cancels, preempts or purges a job's execution `lease`.
     pub fn job(id: &str, lease: &str) -> Value {
         json!({"id": id, "lease": lease})
@@ -369,6 +572,31 @@ mod tests {
         assert!(Entry(&worker).integrated_worker() && Entry(&worker).holds_allocation());
         assert!(!Entry(&json!({"kind": "ziren-gpu", "worker_command": []})).holds_allocation());
         assert!(Entry(&json!({"kind": "app"})).holds_allocation());
+    }
+
+    #[test]
+    fn a_submission_and_a_batch_without_settings_take_the_documented_defaults() {
+        let bare = json!({"command": ["true"]});
+        let sub = Submission(&bare);
+        assert_eq!((sub.gpus(), sub.cpus(), sub.nodes(), sub.gpu_mem()), (1.0, 8, 1, None));
+        assert_eq!((sub.machine(), sub.after(), sub.names_log(), sub.mounts().len()), (None, None, false, 0));
+        assert!(sub.command().is_some());
+        assert!(Submission(&json!({"command": []})).command().is_none());
+        assert!(Submission(&json!({"command": ["a", 1]})).command().is_none());
+        let batch = Batch(&json!({}));
+        assert_eq!((batch.max_gpus(), batch.default_gpu_mem_gb(), batch.priority()), (8.0, 0, 0));
+        assert_eq!((batch.preemptible(), batch.min_runtime_s(), batch.user(), batch.allow().len()), (true, 300, None, 0));
+    }
+
+    #[test]
+    fn ending_and_requeueing_a_job_write_its_state_error_and_finish_time() {
+        let mut job = Job { status: json!({"state": "running", "submitted_at": 1.0}).into(), ..Default::default() };
+        job.fail("out of memory", 5.0);
+        assert_eq!(job.status.0, json!({"state": "failed", "submitted_at": 1.0, "error": "out of memory", "finished_at": 5.0}));
+        job.requeue();
+        assert_eq!((job.state(), job.finished_at()), ("waiting_quota", None));
+        job.finish("cancelled", 7.0);
+        assert_eq!((job.state(), job.finished_at(), job.submitted_at()), ("cancelled", Some(7.0), Some(1.0)));
     }
 
     #[test]

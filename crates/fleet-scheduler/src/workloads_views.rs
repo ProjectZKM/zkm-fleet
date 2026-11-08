@@ -192,7 +192,7 @@ impl WorkloadController {
             "active": count(&|r| !terminal(r.state())),
             "succeeded": count(&|r| r.state() == "succeeded"),
             "failed": count(&|r| matches!(r.state(), "failed" | "lost")),
-            "last_at": jobs.iter().filter_map(|r| r.status["submitted_at"].as_f64()).max_by(f64::total_cmp),
+            "last_at": jobs.iter().filter_map(|r| r.submitted_at()).max_by(f64::total_cmp),
         })
     }
 
