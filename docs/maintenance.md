@@ -236,6 +236,13 @@ working, and stale starts are retired; on older releases, stop the scheduler, ba
 up and remove the stale `data/workloads/deployments/<node>-<app>.json` (and any
 undone command for it under `data/workloads/commands/`), then start it again.
 
+A start moves to another node only when its own node has no room for it, its replicas
+are gone from it, and the node's entry does not anchor it with `machine`. Up to v0.1.9
+a start also moved when its replicas were still being restarted there, or when it was
+anchored. In the anchored case the move rewrote the entry's `machine` to the new node.
+Pin such an app again by restoring its node's entry (the bridge keeps the old
+`apps.yaml` as `apps.yaml.removed-<UTC time>`).
+
 An app whose node runs its prover as a Fleet worker (goat's proof builder, for one)
 runs on one node at a time. When its start moves to a node with room, the scheduler
 log repeats `scale deferred to the next pass ... this app already has an integrated

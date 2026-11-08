@@ -760,13 +760,14 @@ impl WorkloadController {
     /// reports it (`start_on`); a node whose create fails is not picked again. With no room
     /// anywhere the caller preempts on the start's own node, and the start keeps the room that
     /// frees. Nothing of what the app keeps on a node's disks is copied: that is the app's own.
+    /// An entry whose node configures its `machine` is anchored to that machine and stays.
     /// Returns whether the start runs on another node, so it is not sent to its own. The caller
     /// holds the operation lock.
     pub(super) fn place_start(&self, start: &CommandRecord, fits: bool) -> anyhow::Result<bool> {
         let s = &start.parameters["app"];
         let (namespace, app, name) = (text(s, "namespace"), text(s, "app"), text(s, "name"));
         let placed = self.inner.lock().apps.get(app).is_some_and(|a| a.persistent && !a.removed && a.namespace == namespace);
-        if !placed {
+        if !placed || !text(s, "machine").is_empty() {
             return Ok(false);
         }
         let creates: Vec<CommandRecord> = self.inner.lock().commands.values()
@@ -819,9 +820,6 @@ impl WorkloadController {
             }
         }
         entry["disabled"] = json!(true);
-        if !entry["machine"].is_null() {
-            entry["machine"] = json!(self.inner.lock().workers[&target].report.machine);
-        }
         let mut message = self.app_message(namespace, app);
         message["create"] = entry;
         self.command(&target, NodeOperation::App, message)?;

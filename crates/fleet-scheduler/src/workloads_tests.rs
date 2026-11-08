@@ -2418,10 +2418,10 @@ async fn an_app_start_is_placed_on_a_node_with_room() {
     assert!(!i.deployments.contains_key("gpu-model") && !i.deployments["big-model"].disabled);
 }
 
-/// An app whose node runs its prover as a Fleet worker stops on its own, and a job takes its
-/// card meanwhile, so its restart goes to a node with room (goat-proof-builder-v5 on
-/// 2026-11-08). The node it leaves frees its room once it removed the app, and the start runs
-/// where it was placed: it neither waits on the old node's record nor is sent back there.
+/// An app whose node runs its prover as a Fleet worker stops and is cleaned up, and a job
+/// takes its card meanwhile, so its restart goes to a node with room. The node it leaves frees
+/// its room once it removed the app, and the start runs where it was placed: it neither waits
+/// on the old node's record nor is sent back there (goat-proof-builder-v5 on 2026-11-08).
 #[tokio::test]
 async fn an_integrated_worker_restarted_on_another_node_runs_there() {
     let (_dir, c, ns) = setup().await;
@@ -2445,9 +2445,10 @@ async fn an_integrated_worker_restarted_on_another_node_runs_there() {
     assert!(running(&nodes, "gpu") && c.fleet.app_worker_owned(&ns, "eth"), "its node runs it: {:?}", nodes["gpu"].apps);
     assert_eq!(held(&c), ["deployment:gpu-eth"]);
 
-    // The prover stops; a job has its card by then, and another node has room.
+    // The prover stops and its replica is cleaned up; a job has its card by then, and another
+    // node has room.
     let gpu = nodes.get_mut("gpu").unwrap();
-    (gpu.apps[0]["ready"], gpu.free_gpus) = (json!(false), 0.0);
+    (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"], gpu.free_gpus) = (json!(false), json!(true), 0.0);
     let mut big = inventory(&ns);
     big.machine = "big".into();
     nodes.insert("big".into(), big);
@@ -2462,6 +2463,76 @@ async fn an_integrated_worker_restarted_on_another_node_runs_there() {
     // That node's record goes with its next report.
     c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
     assert!(!c.inner.lock().deployments.contains_key("gpu-eth"));
+}
+
+/// App `model` runs on node `gpu`, its entry anchored to `machine` when given; a job then has
+/// the node's other card, and node `big` has room.
+async fn running_on_a_full_node(machine: Option<&str>) -> (tempfile::TempDir, Arc<WorkloadController>, BTreeMap<String, NodeReport>) {
+    let (dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "gpu");
+    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone())]);
+    if let Some(machine) = machine {
+        nodes.get_mut("gpu").unwrap().apps[0]["machine"] = json!(machine);
+    }
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    c.begin_toggle(&["gpu-model".into()], false).unwrap();
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(nodes["gpu"].apps[0]["ready"], json!(true), "{:?}", nodes["gpu"].apps);
+    nodes.get_mut("gpu").unwrap().free_gpus = 0.0;
+    let mut big = inventory(&ns);
+    big.machine = "big".into();
+    nodes.insert("big".into(), big);
+    (dir, c, nodes)
+}
+
+/// The nodes ever sent a `create` of an app.
+fn created_on(c: &WorkloadController) -> Vec<String> {
+    c.inner.lock().commands.values().filter(|v| !v.parameters["create"].is_null()).map(|v| v.worker.clone()).collect()
+}
+
+/// A replica that fails while its node restarts it (it reports it not cleaned up) keeps its
+/// room there. Its start runs on its own node, not on one with room, which would remove the
+/// copy that is coming back up.
+#[tokio::test]
+async fn a_restarting_app_starts_again_in_the_room_it_holds() {
+    let (_dir, c, mut nodes) = running_on_a_full_node(None).await;
+    nodes.get_mut("gpu").unwrap().apps[0]["ready"] = json!(false);
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(created_on(&c), ["gpu"], "created once, on its own node");
+    assert_eq!(nodes["gpu"].apps[0]["ready"], json!(true), "{:?}", nodes["gpu"].apps);
+    assert!(nodes["big"].apps.is_empty());
+    assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
+}
+
+/// An entry its node anchors to the machine (`machine`) is never moved. Once its replica is
+/// gone and its node has no room, its start waits there, and runs once room frees.
+#[tokio::test]
+async fn an_app_anchored_to_its_machine_restarts_only_there() {
+    let (_dir, c, mut nodes) = running_on_a_full_node(Some("machine")).await;
+    let gpu = nodes.get_mut("gpu").unwrap();
+    (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"]) = (json!(false), json!(true));
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(created_on(&c), ["gpu"], "no other node is sent it");
+    let starts: Vec<(String, bool)> = c.inner.lock().commands.values()
+        .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| (v.worker.clone(), v.admitted)).collect();
+    assert_eq!(starts, [("gpu".to_string(), false)], "its start waits for room on its node");
+
+    nodes.get_mut("gpu").unwrap().free_gpus = 1.0;
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(nodes["gpu"].apps[0]["ready"], json!(true), "{:?}", nodes["gpu"].apps);
+    assert_eq!(nodes["gpu"].apps[0]["machine"], json!("machine"));
+    assert!(nodes["big"].apps.is_empty());
+    assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
 }
 
 #[tokio::test]

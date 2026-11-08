@@ -1427,11 +1427,14 @@ impl WorkloadController {
                 }
             }
             if !disabled {
-                let already_ready = {
+                // Replicas the node runs, or still has and restarts (it reports them not cleaned
+                // up), hold the room they need there: a start of the same size fits in it.
+                let holds_room = {
                     let i = self.inner.lock();
                     i.workers.get(&c.worker).is_some_and(|w| {
                         w.report.apps.iter().any(|v| {
-                            text(v, "name") == text(s, "name") && v["ready"].as_bool() == Some(true)
+                            text(v, "name") == text(s, "name")
+                                && (v["ready"].as_bool() == Some(true) || v["cleaned"].as_bool() == Some(false))
                                 && v["disabled"].as_bool() != Some(true)
                                 && scaling::same_resources(v, s)
                         })
@@ -1440,7 +1443,7 @@ impl WorkloadController {
                 let n = s["replicas"].as_f64().unwrap_or(1.0);
                 let g = s["gpus"].as_f64().unwrap_or(0.0) * n;
                 let cpu = s["cpus"].as_f64().unwrap_or(1.0) * n;
-                let fits = already_ready
+                let fits = holds_room
                     || self
                         .capacity(&c.worker)
                         .is_some_and(|(fg, fc)| fg + 1e-6 >= g && fc + 1e-6 >= cpu);
