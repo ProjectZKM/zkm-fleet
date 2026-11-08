@@ -776,8 +776,18 @@ impl WorkloadController {
         if creates.iter().any(|c| !c.done) {
             return Ok(true);
         }
-        let created_on = creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone())
-            .find(|w| self.inner.lock().deployments.contains_key(&format!("{w}-{name}")));
+        // A node the app was created on before and has since moved off keeps a disabled record
+        // until it reports again; a start sent there would find no entry. So the start follows
+        // only a create whose node still reports the entry and is not told to remove the app.
+        let created_on = {
+            let i = self.inner.lock();
+            creates.iter().filter(|c| c.error.is_none()).map(|c| c.worker.clone()).find(|w| {
+                i.deployments.contains_key(&format!("{w}-{name}"))
+                    && i.workers.get(w).is_some_and(|node| node.report.apps.iter().any(|a| text(a, "name") == name))
+                    && !i.commands.open().any(|c| &c.worker == w && c.operation == NodeOperation::App as i32
+                        && c.parameters["remove"] == json!(true) && text(&c.parameters["app"], "name") == app)
+            })
+        };
         if let Some(target) = created_on {
             self.start_on(start, &target)?;
             return Ok(true);

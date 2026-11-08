@@ -1113,6 +1113,27 @@ impl WorkloadController {
                         self.sync_app_record(entry, false).await?;
                     }
                 }
+                // A node removes an app's entries only once their containers are gone, so their
+                // room is free. It reports them no more and a stop sent after finds nothing, so
+                // nothing else releases it: a start placed on another node would wait on it.
+                if c.operation == NodeOperation::App as i32 && c.error.is_none()
+                    && c.parameters["remove"].as_bool() == Some(true)
+                {
+                    let target = &c.parameters["app"];
+                    if let Some(namespace) = self.fleet.namespace(text(target, "namespace")) {
+                        let keys: Vec<String> = {
+                            let i = self.inner.lock();
+                            c.result["removed"].as_array().into_iter().flatten().filter_map(Value::as_str)
+                                .map(|name| format!("{worker_id}-{name}"))
+                                .filter(|key| i.deployments.get(key).is_some_and(|d| d.worker == worker_id
+                                    && text(&d.spec, "app") == text(target, "name")))
+                                .collect()
+                        };
+                        for key in keys {
+                            self.fleet.release_job(&namespace.id, &format!("deployment:{key}")).await?;
+                        }
+                    }
+                }
                 self.save("commands", &c.id, &c)?;
                 self.inner.lock().commands.insert(c.id.clone(), c);
             }

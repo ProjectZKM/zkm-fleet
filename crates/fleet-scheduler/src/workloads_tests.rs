@@ -2323,10 +2323,14 @@ async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String,
         let mut error = None;
         let result = if command.operation == NodeOperation::SetApp as i32 {
             let disabled = p["disabled"].as_bool().unwrap();
+            let mut configured = false;
             for a in report.apps.iter_mut().filter(|a| a["name"] == p["app"]["name"]) {
-                (a["ready"], a["cleaned"]) = (json!(!disabled), json!(disabled));
+                (a["ready"], a["cleaned"], configured) = (json!(!disabled), json!(disabled), true);
             }
-            if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
+            if !configured {
+                error = Some(format!("{} is not configured on this node", text(&p["app"], "name")));
+                Value::Null
+            } else if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
         } else if !p["create"].is_null() {
             if failing_creates.contains(&command.worker.as_str()) {
                 error = Some("apps.yaml is not writable".to_string());
@@ -2338,8 +2342,10 @@ async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String,
                 json!({"created":[p["create"]["name"]]})
             }
         } else if p["remove"] == json!(true) {
+            // Like the bridge, it names the entries it removed.
+            let removed: Vec<Value> = report.apps.iter().filter(|a| a["app"] == p["app"]["name"]).map(|a| a["name"].clone()).collect();
             report.apps.retain(|a| a["app"] != p["app"]["name"]);
-            json!({"removed":[p["app"]["name"]]})
+            json!({"removed":removed})
         } else {
             for a in report.apps.iter_mut().filter(|a| a["name"] == p["entry"]["name"]) {
                 for (k, v) in p["set"].as_object().unwrap() {
@@ -2410,6 +2416,52 @@ async fn an_app_start_is_placed_on_a_node_with_room() {
     let i = c.inner.lock();
     assert_eq!(i.apps["model"].workers, ["big"]);
     assert!(!i.deployments.contains_key("gpu-model") && !i.deployments["big-model"].disabled);
+}
+
+/// An app whose node runs its prover as a Fleet worker stops on its own, and a job takes its
+/// card meanwhile, so its restart goes to a node with room (goat-proof-builder-v5 on
+/// 2026-11-08). The node it leaves frees its room once it removed the app, and the start runs
+/// where it was placed: it neither waits on the old node's record nor is sent back there.
+#[tokio::test]
+async fn an_integrated_worker_restarted_on_another_node_runs_there() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"eth","namespace":ns,"spec":{"image":"ziren-gpu:1","gpus":1,"cpus":2,"proof_storage_root":"/proofs"},
+        "proof":{"elf_id":"AB".repeat(32),"class":"latency"}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(deployed(&c, &ns, "eth").await.unwrap().0, "gpu");
+    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone())]);
+    nodes.get_mut("gpu").unwrap().apps[0]["worker_command"] = json!(["/opt/prover"]);
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    c.begin_toggle(&["gpu-eth".into()], false).unwrap();
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    let held = |c: &WorkloadController| {
+        let mut ids: Vec<String> = c.fleet.allocations(&ns).iter().map(|a| a.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    let running = |nodes: &BTreeMap<String, NodeReport>, id: &str| nodes[id].apps.iter()
+        .any(|a| a["name"] == "eth" && a["ready"] == json!(true) && a["disabled"] == json!(false));
+    assert!(running(&nodes, "gpu") && c.fleet.app_worker_owned(&ns, "eth"), "its node runs it: {:?}", nodes["gpu"].apps);
+    assert_eq!(held(&c), ["deployment:gpu-eth"]);
+
+    // The prover stops; a job has its card by then, and another node has room.
+    let gpu = nodes.get_mut("gpu").unwrap();
+    (gpu.apps[0]["ready"], gpu.free_gpus) = (json!(false), 0.0);
+    let mut big = inventory(&ns);
+    big.machine = "big".into();
+    nodes.insert("big".into(), big);
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert!(nodes["gpu"].apps.is_empty(), "the node it left removed it");
+    assert!(running(&nodes, "big"), "it runs on the node that had room: {:?}", nodes["big"].apps);
+    assert_eq!(c.inner.lock().apps["eth"].workers, ["big"]);
+    assert_eq!(held(&c), ["deployment:big-eth"], "the node it left freed its room");
+    // That node's record goes with its next report.
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    assert!(!c.inner.lock().deployments.contains_key("gpu-eth"));
 }
 
 #[tokio::test]

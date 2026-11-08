@@ -236,6 +236,18 @@ working, and stale starts are retired; on older releases, stop the scheduler, ba
 up and remove the stale `data/workloads/deployments/<node>-<app>.json` (and any
 undone command for it under `data/workloads/commands/`), then start it again.
 
+An app whose node runs its prover as a Fleet worker (goat's proof builder, for one)
+runs on one node at a time. When its start moves to a node with room, the scheduler
+log repeats `scale deferred to the next pass ... this app already has an integrated
+worker; clean up its owner before moving it` until the node it left has removed the
+app, which then frees its room. If that node is offline it waits for the node. If
+the node is gone for good, free the room by hand with
+`DELETE /namespaces/<namespace id>/allocations/deployment:<node>-<app>`, but only once
+nothing of the app runs there. Up to v0.1.9 the room was never freed, even after the
+removal, so the start waited until someone made that call. Once the call was made,
+the start could be sent back to the node the app had left, which no longer had it,
+and the app ended up on no node until `fleetctl app enable` placed it again.
+
 ### Every node's heartbeat times out while jobs queue
 
 The nodes log `node heartbeat rejected; local execution continues ... Timeout
