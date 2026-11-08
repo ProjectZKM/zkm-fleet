@@ -57,7 +57,7 @@ enum Cmd {
     App(AppArgs),
     /// Finite batch workloads and their jobs.
     Batch(BatchArgs),
-    /// Execution records: list or inspect app and batch jobs; fetch proof outputs.
+    /// Execution records: proofs submitted to proof apps, and batch jobs; fetch proof outputs.
     Job(JobArgs),
     /// Machine nodes: list their capacity, or drain / undrain a machine.
     Node(NodeArgs),
@@ -162,8 +162,10 @@ struct ListArgs {
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JobType {
-    /// Jobs of apps: the proofs an app runs.
+    /// Proofs submitted to a proof app through the scheduler. An app's own work in its replicas
+    /// is not a job: `fleetctl app` and `fleetctl app logs` show it.
     App,
+    /// Commands submitted to a batch.
     Batch,
 }
 

@@ -1046,6 +1046,44 @@ async fn user_token(c: &WorkloadController, ns: &str, seed: u8, tag: &str, apps:
     secret
 }
 
+/// A submission's checks run in a fixed order, so a body with several faults gets the first
+/// one's status and message; a batch's request takes only its own settings.
+#[tokio::test]
+async fn submissions_and_new_batches_are_checked_field_by_field() {
+    let (_dir, c, ns) = setup().await;
+    let created = scale_call(c.clone(), "admin", "POST", &format!("/batches?namespace={ns}"), json!({"name":"training","image":"python:3"})).await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let unknown = scale_call(c.clone(), "admin", "POST", &format!("/batches?namespace={ns}"),
+        json!({"name":"other","image":"python:3","gpus":1})).await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_bytes(unknown.into_body(), 1 << 20).await.unwrap(), "unknown batch fields");
+    let path = format!("/batches/training/jobs?namespace={ns}");
+    for (body, status, message) in [
+        (json!([]), 400, "expected object"),
+        (json!({"command":["true"],"priority":1}), 400, "unknown or server-side submission fields"),
+        (json!({"cpus":-1,"gpus":"one"}), 400, "cpus: expected non-negative integer"),
+        (json!({"retry":1.5}), 400, "retry: expected non-negative integer"),
+        (json!({"gpus":"one","mount":[1]}), 400, "gpus: expected number"),
+        (json!({"env":"A=1"}), 400, "env: expected string array"),
+        (json!({"machine":"gpu"}), 400, "machine: expected string array"),
+        (json!({"machine":["a","b"],"name":3}), 422, "one machine may be selected for a local job"),
+        (json!({"name":3,"after":4}), 400, "name: expected string"),
+        (json!({"workdir":["/"]}), 400, "workdir: expected string"),
+        (json!({"command":[]}), 400, "command: a non-empty list of strings"),
+        (json!({"command":["true"],"nodes":2}), 422, "cross-machine jobs are not supported by local Ray; use one node"),
+        (json!({"command":["true"],"gpus":0.5,"cpus":1}), 400, "fractional GPUs require a VRAM limit"),
+    ] {
+        let response = scale_call(c.clone(), "admin", "POST", &path, body.clone()).await;
+        assert_eq!(response.status().as_u16(), status, "{body}");
+        assert_eq!(to_bytes(response.into_body(), 1 << 20).await.unwrap(), message, "{body}");
+    }
+    let response = scale_call(c.clone(), "admin", "POST", &path, json!({"command":["true"],"gpus":0,"cpus":1,"machine":["gpu"]})).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    let request = c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().request.0;
+    assert_eq!(request, json!({"command":["true"],"gpus":0.0,"cpus":1,"machine":["gpu"],"gpu_mem":0,"nodes":1}));
+}
+
 #[tokio::test]
 async fn scoped_managers_cannot_change_app_execution_or_batch_host_access() {
     for proof in [false, true] {
@@ -1138,6 +1176,22 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
     assert_eq!(job["priority"], 17);
+    // Only those who can see the batch submit to it; another tag is told what another namespace is.
+    let submit = json!({"gpus":0,"cpus":1,"mount":["/data/models:ro"],"command":["env"]});
+    for token in [&foreign_tag, &foreign_ns] {
+        let status = scale_call(c.clone(), token, "POST", "/batches/training/jobs", submit.clone()).await.status();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(scale_call(c.clone(), &restricted, "POST", "/batches/training/jobs", submit.clone()).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/batches/training/jobs?namespace={ns}&tag=scope=research"),
+        submit.clone()).await.status(), StatusCode::NOT_FOUND);
+    // An admin's job on it is the batch's tag's, which its owner then sees and cancels.
+    let response = scale_call(c.clone(), "admin", "POST", &format!("/batches/training/jobs?namespace={ns}"), submit).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let admin_job: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(c.job(text(&admin_job, "id"), None, &BTreeMap::new()).unwrap().tag.as_deref(), Some("scope=default"));
+    assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/training/jobs/{}/cancel", text(&admin_job, "id")),
+        Value::Null).await.status(), StatusCode::OK);
     assert_eq!(scale_call(c.clone(), &owner, "PUT", "/batches/training/priority", json!({"priority":31})).await.status(), StatusCode::OK);
     assert_eq!(c.job(text(&job, "id"), None, &BTreeMap::new()).unwrap().policy["priority"], 17);
     assert_eq!(c.inner.lock().apps["training"].spec["allow"], json!(["/data/models"]));
@@ -1145,6 +1199,33 @@ async fn batch_metadata_belongs_to_scoped_owners_and_job_policy_is_inherited() {
         json!({"gpus":0,"cpus":1,"mount":["/etc:ro"],"command":["true"]})).await.status(), StatusCode::FORBIDDEN);
     assert_eq!(scale_call(c.clone(), &owner, "POST", &format!("/batches/training/jobs/{}/cancel", text(&job, "id")), Value::Null).await.status(), StatusCode::OK);
     assert_eq!(scale_call(c, &owner, "DELETE", "/batches/training", Value::Null).await.status(), StatusCode::OK);
+}
+
+/// A proof app is changed only by the tag it was created for, also before it is placed, when no
+/// deployment records that tag yet.
+#[tokio::test]
+async fn an_unplaced_proof_app_is_changed_only_by_its_own_tag() {
+    let (_dir, c, ns) = setup().await;
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let foreign_tag = user_token(&c, &ns, 4, "scope=research", None, true).await;
+    let body = json!({"name":"eth","namespace":ns,"spec":{"image":"ziren-gpu:1","gpus":1},
+        "proof":{"elf_id":"AB".repeat(32),"class":"latency"}});
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    for (method, path, body) in [
+        ("PUT", "/apps/eth/priority", json!({"priority":31})),
+        ("DELETE", "/apps/eth/disabled", Value::Null),
+        ("PUT", "/apps/eth/disabled", Value::Null),
+        ("DELETE", "/apps/eth", Value::Null),
+    ] {
+        let status = scale_call(c.clone(), &foreign_tag, method, path, body).await.status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+    }
+    assert!(c.fleet.app_known(&ns, "eth") && !c.inner.lock().apps["eth"].removed, "the app is still there");
+    assert_eq!(c.fleet.app(&ns, "eth").unwrap().priority, 0);
+    assert_eq!(scale_call(c.clone(), &owner, "PUT", "/apps/eth/priority", json!({"priority":31})).await.status(), StatusCode::OK);
+    assert_eq!(c.fleet.app(&ns, "eth").unwrap().priority, 31);
+    assert_eq!(scale_call(c.clone(), &owner, "DELETE", "/apps/eth", Value::Null).await.status(), StatusCode::OK);
+    assert!(!c.fleet.app_known(&ns, "eth"));
 }
 
 #[tokio::test]
@@ -2323,10 +2404,14 @@ async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String,
         let mut error = None;
         let result = if command.operation == NodeOperation::SetApp as i32 {
             let disabled = p["disabled"].as_bool().unwrap();
+            let mut configured = false;
             for a in report.apps.iter_mut().filter(|a| a["name"] == p["app"]["name"]) {
-                (a["ready"], a["cleaned"]) = (json!(!disabled), json!(disabled));
+                (a["ready"], a["cleaned"], configured) = (json!(!disabled), json!(disabled), true);
             }
-            if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
+            if !configured {
+                error = Some(format!("{} is not configured on this node", text(&p["app"], "name")));
+                Value::Null
+            } else if disabled { json!({"cleaned":true}) } else { json!({"ready":true}) }
         } else if !p["create"].is_null() {
             if failing_creates.contains(&command.worker.as_str()) {
                 error = Some("apps.yaml is not writable".to_string());
@@ -2338,8 +2423,10 @@ async fn nodes_run_commands(c: &WorkloadController, nodes: &mut BTreeMap<String,
                 json!({"created":[p["create"]["name"]]})
             }
         } else if p["remove"] == json!(true) {
+            // Like the bridge, it names the entries it removed.
+            let removed: Vec<Value> = report.apps.iter().filter(|a| a["app"] == p["app"]["name"]).map(|a| a["name"].clone()).collect();
             report.apps.retain(|a| a["app"] != p["app"]["name"]);
-            json!({"removed":[p["app"]["name"]]})
+            json!({"removed":removed})
         } else {
             for a in report.apps.iter_mut().filter(|a| a["name"] == p["entry"]["name"]) {
                 for (k, v) in p["set"].as_object().unwrap() {
@@ -2410,6 +2497,88 @@ async fn an_app_start_is_placed_on_a_node_with_room() {
     let i = c.inner.lock();
     assert_eq!(i.apps["model"].workers, ["big"]);
     assert!(!i.deployments.contains_key("gpu-model") && !i.deployments["big-model"].disabled);
+}
+
+/// App `model` runs on node `gpu`, its entry anchored to `machine` when given; a job then has
+/// the node's other card, and node `big` has room.
+async fn running_on_a_full_node(machine: Option<&str>) -> (tempfile::TempDir, Arc<WorkloadController>, BTreeMap<String, NodeReport>) {
+    let (dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "gpu");
+    let mut nodes = BTreeMap::from([("gpu".to_string(), c.inner.lock().workers["gpu"].report.clone())]);
+    if let Some(machine) = machine {
+        nodes.get_mut("gpu").unwrap().apps[0]["machine"] = json!(machine);
+    }
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    c.begin_toggle(&["gpu-model".into()], false).unwrap();
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(nodes["gpu"].apps[0]["ready"], json!(true), "{:?}", nodes["gpu"].apps);
+    nodes.get_mut("gpu").unwrap().free_gpus = 0.0;
+    let mut big = inventory(&ns);
+    big.machine = "big".into();
+    nodes.insert("big".into(), big);
+    (dir, c, nodes)
+}
+
+/// The nodes ever sent a `create` of an app.
+fn created_on(c: &WorkloadController) -> Vec<String> {
+    c.inner.lock().commands.values().filter(|v| !v.parameters["create"].is_null()).map(|v| v.worker.clone()).collect()
+}
+
+/// An app's replica stops and is cleaned up while a job fills its node, so its start moves to a
+/// node with room. The node it leaves frees its room once it removed the app, and the start
+/// runs where it was placed: it is not sent back to the node it left, where it no longer is.
+#[tokio::test]
+async fn an_app_moved_to_a_node_with_room_frees_the_old_one_and_runs_there() {
+    let (_dir, c, mut nodes) = running_on_a_full_node(None).await;
+    let ns = c.inner.lock().apps["model"].namespace.clone();
+    let held = |c: &WorkloadController| {
+        let mut ids: Vec<String> = c.fleet.allocations(&ns).iter().map(|a| a.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(held(&c), ["deployment:gpu-model"]);
+    let gpu = nodes.get_mut("gpu").unwrap();
+    (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"]) = (json!(false), json!(true));
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert!(nodes["gpu"].apps.is_empty(), "the node it left removed it");
+    let running = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true) && a["disabled"] == json!(false));
+    assert!(running, "it runs on the node that had room: {:?}", nodes["big"].apps);
+    assert_eq!(c.inner.lock().apps["model"].workers, ["big"]);
+    assert_eq!(held(&c), ["deployment:big-model"], "the node it left freed its room");
+    // That node's record goes with its next report.
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    assert!(!c.inner.lock().deployments.contains_key("gpu-model"));
+}
+
+/// An entry its node anchors to the machine (`machine`) is never moved. Once its replica is
+/// gone and its node has no room, its start waits there, and runs once room frees.
+#[tokio::test]
+async fn an_app_anchored_to_its_machine_restarts_only_there() {
+    let (_dir, c, mut nodes) = running_on_a_full_node(Some("machine")).await;
+    let gpu = nodes.get_mut("gpu").unwrap();
+    (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"]) = (json!(false), json!(true));
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(created_on(&c), ["gpu"], "no other node is sent it");
+    let starts: Vec<(String, bool)> = c.inner.lock().commands.values()
+        .filter(|v| !v.done && v.operation == NodeOperation::SetApp as i32).map(|v| (v.worker.clone(), v.admitted)).collect();
+    assert_eq!(starts, [("gpu".to_string(), false)], "its start waits for room on its node");
+
+    nodes.get_mut("gpu").unwrap().free_gpus = 1.0;
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert_eq!(nodes["gpu"].apps[0]["ready"], json!(true), "{:?}", nodes["gpu"].apps);
+    assert_eq!(nodes["gpu"].apps[0]["machine"], json!("machine"));
+    assert!(nodes["big"].apps.is_empty());
+    assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
 }
 
 #[tokio::test]
