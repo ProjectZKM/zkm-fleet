@@ -30,8 +30,11 @@ deploy/fleet-ctl.sh scheduler upgrade v0.1.6
 It downloads the release package and checks its SHA-256, pulls the image (a missing
 image changes nothing), backs up `fleetctl`, the Compose files and `compose.env`,
 records the new image, recreates `scheduler` (and `mcp` when enabled) and waits for
-`/healthz`. Recreating takes about 90 seconds while the scheduler finishes in-flight
-calls. `scheduler rollback` restores the backup. Keep site changes to the Compose
+`/healthz`. The old scheduler can take about 90 seconds to finish in-flight calls, and
+the new one reads every job and command record it keeps before it listens, a minute or
+more on a busy host. The script waits up to five minutes (`FLEET_CTL_HEALTH_WAIT`
+seconds), and gives up at once if the scheduler's container exits or restarts.
+`scheduler rollback` restores the backup. Keep site changes to the Compose
 file, such as another gateway or an existing Postgres volume, in
 `deploy/docker-compose.override.yml`: an upgrade replaces only `docker-compose.yml`,
 and every Compose call applies the override after it.

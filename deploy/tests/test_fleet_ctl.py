@@ -60,6 +60,56 @@ def test_a_failed_upgrade_leaves_no_stage_directory(tmp_path):
     assert list(tmpdir.iterdir()) == [], "the release stage directory leaked"
 
 
+def rollback(tmp_path, healthy_after, later_state="running 0", wait=None):
+    """`fleet-ctl.sh scheduler rollback` with stand-ins: healthz answers on curl's
+    `healthy_after`th call, and the scheduler's container reports "running 0" first and
+    `later_state` after that. Sleeps take no time."""
+    prefix, commands = tmp_path / "fleet", tmp_path / "commands"
+    backup = prefix / "backup/control-20260101T000000Z"
+    for name in ["fleetctl", "docker-compose.yml", "gateway.yaml.in", "compose.env"]:
+        executable(backup / name, "")
+    (prefix / "deploy").mkdir(parents=True)
+    (prefix / "bin").mkdir()
+    curls, inspects = tmp_path / "curls", tmp_path / "inspects"
+    executable(commands / "curl", f'n=$(($(cat {curls} 2>/dev/null || echo 0) + 1)); echo $n > {curls}\n'
+                                  f'[ "$n" -ge {healthy_after} ]\n')
+    executable(commands / "docker", f'case "$*" in\n'
+                                    f'  *" ps -aq scheduler") echo abc123 ;;\n'
+                                    f'  inspect*) n=$(($(cat {inspects} 2>/dev/null || echo 0) + 1)); echo $n > {inspects}\n'
+                                    f'    if [ "$n" = 1 ]; then echo "running 0"; else echo {shlex.quote(later_state)}; fi ;;\n'
+                                    f'esac\n')
+    executable(commands / "sleep", "")
+    environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+                   "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": ""}
+    if wait is not None:
+        environment["FLEET_CTL_HEALTH_WAIT"] = str(wait)
+    result = subprocess.run(["bash", str(ROOT / "deploy/fleet-ctl.sh"), "scheduler", "rollback"],
+                            env=environment, capture_output=True, text=True, timeout=60)
+    return result, int(curls.read_text())
+
+
+def test_a_scheduler_that_starts_slowly_is_waited_for(tmp_path):
+    # Forty checks two seconds apart is longer than the minute the script used to wait.
+    result, curls = rollback(tmp_path, healthy_after=40)
+    assert result.returncode == 0, result.stderr
+    assert curls == 40
+    assert result.stdout.count("waiting up to 300s for the scheduler") == 1
+    assert "restored" in result.stdout
+
+
+def test_a_scheduler_that_restarts_fails_at_once(tmp_path):
+    result, curls = rollback(tmp_path, healthy_after=10**6, later_state="restarting 1")
+    assert result.returncode != 0
+    assert "the scheduler container stopped (restarting 1)" in result.stderr
+    assert curls == 1
+
+
+def test_a_scheduler_that_never_answers_fails_at_the_deadline(tmp_path):
+    result, curls = rollback(tmp_path, healthy_after=10**6, wait=0)
+    assert result.returncode != 0
+    assert "scheduler is not healthy after rollback" in result.stderr
+    assert curls == 1
+
 def node_fixture(tmp_path):
     """A node prefix with the old binaries, bridge and launch scripts, plus fakes for sudo and friends."""
     prefix = tmp_path / "node"

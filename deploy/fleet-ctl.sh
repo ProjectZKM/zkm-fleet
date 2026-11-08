@@ -15,7 +15,8 @@
 # (ssh host of the node; node commands then run there), FLEET_NODE_PREFIX (its install
 # dir, default ~/app/fleet) and FLEET_RELEASE_REPO (default ProjectZKM/zkm-fleet).
 # FLEET_NODE_UNIT names the node's systemd unit; FLEET_PROOF_APP_UNITS the app endpoint
-# units a fleet-proof-app upgrade restarts. Every upgrade backs up what it replaces first.
+# units a fleet-proof-app upgrade restarts; FLEET_CTL_HEALTH_WAIT how many seconds to wait for
+# the scheduler to start listening (default 300). Every upgrade backs up what it replaces first.
 # Node upgrades and rollbacks require systemd; see docs/maintenance.md for cron nodes.
 set -euo pipefail
 SELF=$(readlink -f "$0")
@@ -97,10 +98,27 @@ COMPOSE=(docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFI
 compose() { run "${COMPOSE[@]}" "$@"; }
 # Naming a profiled service starts it, so recreate MCP only where install.sh enabled it.
 control_services() { echo scheduler; grep -q '^COMPOSE_PROFILES=.*mcp' "$PREFIX/compose.env" 2>/dev/null && echo mcp || true; }
+scheduler_container() { # STATUS RESTARTS of the scheduler's container, or nothing
+  local id; id=$("${COMPOSE[@]}" ps -aq scheduler 2>/dev/null) || return 0
+  [ -z "$id" ] || docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$id" 2>/dev/null || true
+}
+# A scheduler reads every job and command record it keeps before it listens, which takes a
+# minute or more on a busy control host. Wait up to FLEET_CTL_HEALTH_WAIT seconds for it, but
+# give up at once if its container exits or restarts: that is a crash, not a slow start.
 scheduler_healthy() {
   [ "$DRY" = 1 ] && return 0
-  for _ in $(seq 30); do curl -fs -o /dev/null http://127.0.0.1:9191/healthz && return 0; sleep 2; done
-  return 1
+  local wait=${FLEET_CTL_HEALTH_WAIT:-300} start=$SECONDS first now said=
+  first=$(scheduler_container)
+  until curl -fs -o /dev/null http://127.0.0.1:9191/healthz; do
+    now=$(scheduler_container)
+    if [ -n "$first" ] && { [ "${now%% *}" != running ] || [ "${now#* }" != "${first#* }" ]; }; then
+      echo "fleet-ctl: the scheduler container stopped (${now:-gone}); see docker logs zkm-fleet-scheduler-1" >&2
+      return 1
+    fi
+    [ $((SECONDS - start)) -lt "$wait" ] || return 1
+    [ -n "$said" ] || { echo "waiting up to ${wait}s for the scheduler to load its records and listen"; said=1; }
+    sleep 2
+  done
 }
 set_scheduler_image() { # compose.env names the image both services run
   [ "$DRY" = 1 ] && { echo "+ set FLEET_SCHEDULER_IMAGE=$1 in $PREFIX/compose.env"; return; }
