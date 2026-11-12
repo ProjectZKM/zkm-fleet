@@ -2086,6 +2086,49 @@ async fn deleting_a_batch_sends_remove_batch_and_keeps_its_jobs() {
     assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted batch imports no jobs");
 }
 
+/// Deleting an app and deleting a batch are one operation: refused while any of its work
+/// runs or may run, with what that is and how to stop it. A batch's work is its jobs; an app's
+/// is its replicas, which a node that no longer configures it doesn't have.
+#[tokio::test]
+async fn deleting_an_app_or_a_batch_is_refused_while_any_of_it_runs() {
+    let (_dir, c, ns) = setup().await;
+    let refusal = |c: Arc<WorkloadController>, path: String| async move {
+        let response = scale_call(c, "admin", "DELETE", &path, Value::Null).await;
+        let status = response.status();
+        (status, String::from_utf8_lossy(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).into_owned())
+    };
+    let (batch, app) = (format!("/batches/training?namespace={ns}"), format!("/apps/model?namespace={ns}"));
+
+    c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
+    let job = submit(&c).await;
+    let (status, body) = refusal(c.clone(), batch.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("batch training still runs: 1 job(s) queued or running: cancel them or let them finish"), "{body}");
+    let (status, body) = refusal(c.clone(), app.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("app model still runs: it is enabled: disable it first (fleetctl app disable model)"), "{body}");
+
+    c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"] = json!(true);
+    let (_, body) = refusal(c.clone(), app.clone()).await;
+    assert!(body.contains("its replicas on node gpu are still stopping"), "{body}");
+    c.inner.lock().workers.get_mut("gpu").unwrap().seen = 0.0;
+    let (_, body) = refusal(c.clone(), app.clone()).await;
+    assert!(body.contains("node gpu is offline, so it can't confirm its replicas stopped"), "{body}");
+
+    c.inner.lock().jobs.update(&job.id, |j| j.status["state"] = json!("cancelled"));
+    assert_eq!(refusal(c.clone(), batch).await.0, StatusCode::OK);
+
+    // A node the app was on that no longer configures it holds nothing of it: only a node
+    // that configures it does, until it has stopped it.
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    c.report("cpu", "session", inventory(&ns)).await.unwrap();
+    c.inner.lock().apps.get_mut("model").unwrap().workers.push("cpu".into());
+    c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"] = json!(true);
+    let (status, body) = refusal(c.clone(), format!("/apps/model?namespace={ns}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 fn command_where(c: &WorkloadController, pick: impl Fn(&CommandRecord) -> bool) -> Option<CommandRecord> {
     c.inner.lock().commands.values().find(|cmd| pick(cmd)).cloned()
 }

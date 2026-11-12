@@ -134,9 +134,10 @@ enum AppCmd {
         /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
     },
-    /// Delete an app, refused while any of its jobs is queued or running. A proof app goes
-    /// with its jobs' records, inputs and proofs, its anchor, and its ELF when no other app
-    /// uses it; a running app must be disabled first.
+    /// Delete an app and remove it from its nodes, like batch delete: refused while any of it
+    /// runs, so disable a running app first, and wait for a proof app's queued or running
+    /// jobs. Its past execution records stay; a proof app goes with its jobs' records, inputs
+    /// and proofs, its anchor, and its ELF when no other app uses it.
     /// Without --yes it only says what it would delete.
     Delete {
         name: String,
@@ -553,7 +554,9 @@ enum BatchCmd {
         /// K=V every batch job gets; repeat. Replaces the batch's environment.
         #[arg(long)] env: Vec<String>,
     },
-    /// Delete a batch after all accepted jobs finish; its job history stays until purged.
+    /// Delete a batch and remove it from its nodes, like app delete: refused while any of its
+    /// jobs is queued or running, so cancel them or let them finish first. Its job records
+    /// stay until purged. Without --yes it only says what it would delete.
     Delete { name: String, #[arg(long)] yes: bool },
     #[command(flatten)]
     Job(BatchJobCmd),
@@ -1209,6 +1212,20 @@ fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> any
     Ok(())
 }
 
+/// Deletes a batch (after showing what goes with it, until --yes), as `delete_app` deletes an app.
+fn delete_batch(a: &FleetClient, name: &str, batch: &Value, yes: bool, out: &OutputWriter) -> anyhow::Result<()> {
+    let (total, active) = (&batch["jobs"]["total"], &batch["jobs"]["active"]);
+    if !yes {
+        bail!(
+            "would delete batch {name} and remove it from its nodes; its {total} job record(s) stay until \
+             purged. Refused while any job is queued or running ({active} now). Pass --yes to delete"
+        );
+    }
+    let v = a.send(a.req(reqwest::Method::DELETE, &format!("/batches/{name}")))?;
+    out.done(&format!("deleted batch {name}; its {total} job record(s) stay until purged"), v);
+    Ok(())
+}
+
 /// Deletes an app (after showing what goes with it, until --yes).
 fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let a = FleetClient::new(conn)?;
@@ -1224,8 +1241,8 @@ fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWrite
             );
         }
         bail!(
-            "would remove app {name}; its {total} past execution record(s) \
-             stay ({active} queued or running: refused while any is). Pass --yes to delete"
+            "would delete app {name} and remove it from its nodes; its {total} past execution record(s) \
+             stay. Refused while it runs: disable it first. Pass --yes to delete"
         );
     }
     let v = a.send(a.req(reqwest::Method::DELETE, &format!("/apps/{name}")))?;
@@ -1338,17 +1355,14 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
                 | BatchCmd::Priority { name, .. } | BatchCmd::Delete { name, .. } => name,
                 _ => unreachable!(),
             };
-            batch_named(&a, name)?;
+            let batch = batch_named(&a, name)?;
             let path = format!("/batches/{name}");
             let request = match cmd {
                 BatchCmd::Disable { .. } => a.req(reqwest::Method::PUT, &format!("{path}/disabled")),
                 BatchCmd::Enable { .. } => a.req(reqwest::Method::DELETE, &format!("{path}/disabled")),
                 BatchCmd::Priority { priority, .. } => a.req(reqwest::Method::PUT, &format!("{path}/priority"))
                     .json(&json!({"priority": priority})),
-                BatchCmd::Delete { yes, .. } => {
-                    if !yes { bail!("would remove batch {name}; accepted jobs must finish first. Pass --yes to delete"); }
-                    a.req(reqwest::Method::DELETE, &path)
-                }
+                BatchCmd::Delete { yes, .. } => return delete_batch(&a, name, &batch, *yes, out),
                 _ => unreachable!(),
             };
             let value = a.send(request)?;

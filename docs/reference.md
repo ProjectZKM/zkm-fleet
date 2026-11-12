@@ -200,9 +200,20 @@ administrator, since an app can reach host networking, storage and prover
 credentials; an update mixing them with other fields is refused whole. Changing
 priority alone doesn't restart replicas.
 
-**Removing.** A proof app can't be removed while any of its proofs is queued or
-running. Removing it deletes its finished proof records and control-host artifacts;
-the app's own storage stays with its owner.
+**Deleting.** `fleetctl app delete NAME --yes` and `fleetctl batch delete NAME --yes`
+work the same way. Without `--yes` they only say what would go. A delete is refused
+while any of the app's or batch's work runs or may run, and the refusal says what that
+is and how to stop it:
+- An app's work is its replicas. Disable it first, and wait until every node that
+  configures it has stopped them; an offline node holds the delete until it's back.
+- A proof app's work also includes its queued or running proofs.
+- A batch's work is its queued or running jobs. Cancel them or let them finish.
+
+The delete then removes the record and has every node remove the app's entries or the
+batch from its configuration. The data on the nodes stays. A container app's past
+execution records and a batch's job records stay until purged. A proof app's finished
+proof records and control-host artifacts go with it, and the app's own storage stays
+with its owner.
 
 **Node entries.** Every `apps.yaml` entry has an `app`. A `ziren-gpu` entry binds its
 server to the one app it serves with `namespace`, `app: NAME` and
@@ -259,8 +270,10 @@ In the API, `POST /batches?namespace=alice` takes the batch JSON, or the namespa
 its `namespace` field; a name or an ID is accepted, and the ID is stored. A batch or
 `apps.yaml` entry configured on a node may name `namespace: alice`, which is checked
 before launch. Disabling a batch blocks new submissions and lets accepted jobs
-finish. A deleted batch stays listed, as `deleted`, and readable while it has job
-records; its jobs keep their own lifecycle until they're purged.
+finish. Deleting a batch works like deleting an app ([Deleting](#apps)): it is
+refused while any of its jobs is queued or running. A deleted batch stays listed, as
+`deleted`, and readable while it has job records; its jobs keep their own lifecycle
+until they're purged.
 
 **Submissions.** A job takes `command`, a non-empty list of strings, and optionally:
 

@@ -499,6 +499,38 @@ impl WorkloadController {
         keys.iter().filter(|k| i.deployments.get(*k).and_then(|d| i.workers.get(&d.worker)).is_some_and(|w| now() - w.seen < 30.0)).cloned().collect()
     }
 
+    /// What of app or batch `app` may still run, each with how to stop it; nothing when it can
+    /// be deleted. Deleting an app or a batch is the same operation: it is refused while any
+    /// of its work runs or may run. A batch's work is its jobs, queued or running. An app's
+    /// is its replicas: it is disabled first, and every node that configures it confirms them
+    /// stopped. An offline node can't, so it holds the delete until it's back.
+    fn still_running(&self, app: &WorkloadTemplate) -> Vec<String> {
+        let name = app.name.as_str();
+        let i = self.inner.lock();
+        let mut running = Vec::new();
+        let jobs = i.jobs.open().filter(|r| r.batch == name && (!terminal(r.state()) || r.quota_held)).count();
+        if jobs > 0 {
+            running.push(format!("{jobs} job(s) queued or running: cancel them or let them finish"));
+        }
+        if !app.persistent {
+            return running;
+        }
+        if !app.disabled() {
+            running.push(format!("it is enabled: disable it first (fleetctl app disable {name})"));
+            return running;
+        }
+        for worker in &app.workers {
+            match i.workers.get(worker).filter(|w| now() - w.seen < 30.0) {
+                None => running.push(format!("node {worker} is offline, so it can't confirm its replicas stopped")),
+                // A node that no longer configures it has nothing of it left.
+                Some(w) => if w.report.entries().any(|e| e.name() == name && !e.cleaned()) {
+                    running.push(format!("its replicas on node {worker} are still stopping"));
+                },
+            }
+        }
+        running
+    }
+
     /// Whether a batch still has job records (not purged).
     fn has_jobs(&self, batch: &str) -> bool {
         self.inner.lock().jobs.values().any(|r| r.batch == batch && !r.purged)
@@ -1963,24 +1995,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if method == Method::DELETE && parts.len() == 2 {
             let _ops = s.ops.lock().await;
             s.ensure_not_scaling(&app.namespace, name)?;
-            let persistent_ready_to_remove = !app.persistent
-                || (app.disabled()
-                    && app.workers.iter().all(|id| {
-                        s.inner.lock().workers.get(id).is_some_and(|w| {
-                            now() - w.seen < 30.0 && w.report.entries().any(|v| v.name() == name && v.cleaned())
-                        })
-                    }));
-            if !persistent_ready_to_remove
-                || s.inner
-                    .lock()
-                    .jobs
-                    .open()
-                    .any(|r| r.batch == name && (!terminal(r.state()) || r.quota_held))
-            {
-                return Err(fail(
-                    409,
-                    "disable the app or finish/cancel jobs before deleting",
-                ));
+            let running = s.still_running(&app);
+            if !running.is_empty() {
+                let kind = if batch { "batch" } else { "app" };
+                return Err(fail(409, format!("{kind} {name} still runs: {}; delete it once nothing of it does", running.join("; "))));
             }
             app.removed = true;
             s.save("apps", name, &app)?;

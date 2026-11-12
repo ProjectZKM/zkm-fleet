@@ -277,6 +277,28 @@ fn app_delete_says_what_goes_until_confirmed() {
     assert!(seen[2].line.starts_with("DELETE /apps/ethproofs?namespace=alice"), "{}", seen[2].line);
 }
 
+#[test]
+fn batch_delete_says_what_goes_until_confirmed_like_app_delete() {
+    let batch = r#"{"type":"batch","name":"training","persistent":false,"jobs":{"total":5,"active":1}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let token = token_file("batch-delete");
+    let server = stub(listener, 3, move |line, _| (200, if line.starts_with("GET") { batch.into() } else { r#"{"name":"training","removed":true}"#.into() }));
+    let refused = cli().args(["--namespace", "alice", "--url", &url, "--token-file"]).arg(&token)
+        .args(["batch", "delete", "training"]).output().unwrap();
+    assert!(!refused.status.success());
+    let preview = String::from_utf8_lossy(&refused.stderr);
+    assert!(preview.contains("would delete batch training and remove it from its nodes; its 5 job record(s) stay until purged"), "{preview}");
+    assert!(preview.contains("(1 now). Pass --yes to delete"), "{preview}");
+    let deleted = cli().args(["--namespace", "alice", "--url", &url, "--token-file"]).arg(&token)
+        .args(["batch", "delete", "training", "--yes"]).output().unwrap();
+    let seen = server.join().unwrap();
+    std::fs::remove_file(token).unwrap();
+    assert!(deleted.status.success(), "{}", String::from_utf8_lossy(&deleted.stderr));
+    assert!(String::from_utf8_lossy(&deleted.stdout).contains("deleted batch training; its 5 job record(s) stay until purged"));
+    assert!(seen[2].line.starts_with("DELETE /batches/training?namespace=alice"), "{}", seen[2].line);
+}
+
 /// Two batches as `GET /batches` returns them: the app record's shape, with the policy under `batch`.
 fn batch_list() -> String {
     serde_json::json!([
