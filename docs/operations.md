@@ -68,16 +68,24 @@ allocations further.
 
 ```bash
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 \
-  --gpus 5 --cpus 96 --replicas 1 --node gpu-1
+  --gpus 5 --cpus 96 --replicas 1
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4   # desired, observed, status
+fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 --node gpu-1   # that node's part
 ```
 
 Scaling needs `manage` on the app and an online, ready node. It runs in the
 background: check it until it's `complete` or `failed`. Omitted flags keep their
-values, a disabled app stays disabled, and `--node` picks the deployment when an app
-has several. Integrated EthProofs runs exactly one replica; other apps may run more,
-with resources per replica. The app's current allocation counts toward the room for
-its new one. Scaling never adds node capacity.
+values, and a disabled app stays disabled. Replicas, GPUs and CPUs are the app's
+settings, not a node's: `--replicas` is how many the app runs wherever the scheduler
+places them, so a scale takes no `--node` (it only narrows what a check shows). When
+an app runs on several nodes, each keeps the replicas it has up to the count, new
+ones join a node that runs it, and a node left with none stops them and
+removes the app from its `apps.yaml`, which frees its room; the app's data stays on
+that node. A node that comes back with a copy of an app whose replicas all run
+elsewhere removes it too, unless its entry is anchored to the machine (`machine`).
+Integrated EthProofs runs exactly one replica; other apps may run more, with
+resources per replica. The app's current allocation counts toward the room for its
+new one. Scaling never adds node capacity.
 
 A node's pool is `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in its `etc/watchdog.env`;
 empty means detect CPUs automatically, and no GPUs. Changing it restarts Ray, so

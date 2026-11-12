@@ -105,9 +105,11 @@ enum AppCmd {
         #[arg(long)] gpus: Option<f64>,
         /// CPU units per replica.
         #[arg(long)] cpus: Option<u32>,
-        /// Replicas on the selected node (positive; use app disable to stop all).
+        /// The app's replicas, wherever the scheduler places them (positive; use app disable to
+        /// stop all). Fewer than it runs: the scheduler stops the extra ones, and a node left with
+        /// none removes the app.
         #[arg(long)] replicas: Option<u32>,
-        /// Select a machine agent when the app runs on several nodes.
+        /// Inspect only the part of the app on this machine agent; scaling takes no node.
         #[arg(long)] node: Option<String>,
     },
     /// Change a proof or persistent app's settings. Image and environment changes require
@@ -1071,14 +1073,19 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     if let Some(v) = cpus { body["cpus"] = json!(v); }
     if let Some(v) = replicas { body["replicas"] = json!(v); }
     let write = !body.as_object().unwrap().is_empty();
-    if let Some(node) = node { body["node"] = json!(node); }
+    if write && node.is_some() {
+        bail!("replicas, GPUs and CPUs are the app's settings: scale it without --node, and the scheduler places its replicas");
+    }
     let method = if write { reqwest::Method::PUT } else { reqwest::Method::GET };
     let a = FleetClient::new(conn)?;
     let mut request = a.req(method, &format!("/apps/{name}/scale"));
     if write { request = request.json(&body); } else if let Some(node) = node { request = request.query(&[("node", node)]); }
     let v = a.send(request)?;
-    out.done(&format!("{name}: {} — {} replicas, {} GPUs and {} CPUs per replica on {}",
-        v["state"].as_str().unwrap_or("requested"), v["replicas"], v["gpus"], v["cpus"], v["node"].as_str().unwrap_or("?")),v);
+    // One node's part names its node; the app's names all of them.
+    let nodes = v["nodes"].as_array().map(|n| n.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+        .or_else(|| v["node"].as_str().map(str::to_owned)).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into());
+    out.done(&format!("{name}: {} — {} replicas, {} GPUs and {} CPUs per replica on {nodes}",
+        v["state"].as_str().unwrap_or("requested"), v["replicas"], v["gpus"], v["cpus"]),v);
     Ok(())
 }
 
