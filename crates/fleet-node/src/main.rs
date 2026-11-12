@@ -3,7 +3,8 @@ mod logs;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fleet_proto::fleet::v1::{
-    worker_service_client::WorkerServiceClient, LogRequest, ProofFetch, WorkerHeartbeatRequest,
+    worker_service_client::WorkerServiceClient, LogRequest, ProofFetch, WorkerEndSessionRequest,
+    WorkerHeartbeatRequest,
 };
 use serde_json::{json, Value};
 use std::{
@@ -74,6 +75,24 @@ fn outbound(mut report: Value, stale: bool, version: Option<&str>) -> Value {
         report["agent_version"] = json!(version);
     }
     report
+}
+/// Tells the control plane this agent's session is over, so the agent that replaces it (a
+/// restart, an upgrade) is admitted at once instead of after the session goes quiet. Best
+/// effort: a scheduler without the call, or one out of reach, waits it out as before.
+async fn end_session(endpoint: Endpoint, auth: tonic::metadata::MetadataValue<tonic::metadata::Ascii>, worker: &str, session: &str) {
+    let ended = async {
+        let mut client = connect(endpoint).await?;
+        let mut request = tonic::Request::new(WorkerEndSessionRequest { worker_id: worker.into(), session: session.into() });
+        request.metadata_mut().insert("authorization", auth);
+        request.set_timeout(Duration::from_secs(3));
+        client.end_session(request).await?;
+        anyhow::Ok(())
+    };
+    match tokio::time::timeout(Duration::from_secs(5), ended).await {
+        Ok(Ok(())) => tracing::info!(worker, "agent session ended"),
+        Ok(Err(error)) => tracing::warn!(%error, "could not end the agent session; the next agent waits until it goes quiet"),
+        Err(_) => tracing::warn!("ending the agent session timed out; the next agent waits until it goes quiet"),
+    }
 }
 async fn connect(endpoint: Endpoint) -> Result<WorkerServiceClient<Channel>> {
     Ok(WorkerServiceClient::new(endpoint.connect().await?)
@@ -298,6 +317,8 @@ async fn main() -> Result<()> {
     log_task.abort();
     reader.abort();
     let _ = child.kill().await;
+    // Stopped: nothing of this agent reports any more.
+    end_session(endpoint, auth, &a.name, &session).await;
     Ok(())
 }
 
@@ -547,5 +568,47 @@ mod tests {
         assert_eq!(stale["agent_version"], "0.1.5");
         let unnamed = outbound(json!({"version":3,"machine":"m","ready":true}), false, None);
         assert!(unnamed.get("agent_version").is_none());
+    }
+
+    /// A control plane that records the sessions agents end, with the token they sent.
+    struct Ends(Arc<Mutex<Vec<(String, String, String)>>>);
+    #[tonic::async_trait]
+    impl fleet_proto::fleet::v1::worker_service_server::WorkerService for Ends {
+        async fn heartbeat(&self, _: tonic::Request<WorkerHeartbeatRequest>,
+        ) -> Result<tonic::Response<fleet_proto::fleet::v1::WorkerHeartbeatResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not in this test"))
+        }
+        async fn end_session(&self, request: tonic::Request<WorkerEndSessionRequest>,
+        ) -> Result<tonic::Response<fleet_proto::fleet::v1::WorkerEndSessionResponse>, tonic::Status> {
+            let token = request.metadata().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+            let r = request.into_inner();
+            self.0.lock().await.push((r.worker_id, r.session, token));
+            Ok(tonic::Response::new(fleet_proto::fleet::v1::WorkerEndSessionResponse {}))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopping_agent_ends_its_own_session_with_its_token() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ends = Arc::new(Mutex::new(Vec::new()));
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        tokio::spawn(tonic::transport::Server::builder()
+            .add_service(fleet_proto::fleet::v1::worker_service_server::WorkerServiceServer::new(Ends(ends.clone())))
+            .serve_with_incoming(incoming));
+        let endpoint = Endpoint::from_shared(format!("http://{address}")).unwrap();
+        end_session(endpoint, "Bearer secret".parse().unwrap(), "gpu-1", "session-1").await;
+        assert_eq!(*ends.lock().await, [("gpu-1".to_string(), "session-1".to_string(), "Bearer secret".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn an_agent_stops_promptly_when_the_control_plane_is_out_of_reach() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener); // nothing listens there
+        let endpoint = Endpoint::from_shared(format!("http://{address}")).unwrap().connect_timeout(Duration::from_secs(5));
+        let started = Instant::now();
+        end_session(endpoint, "Bearer secret".parse().unwrap(), "gpu-1", "session-1").await;
+        assert!(started.elapsed() < Duration::from_secs(6), "{:?}", started.elapsed());
     }
 }

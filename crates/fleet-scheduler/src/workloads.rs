@@ -16,8 +16,8 @@ use axum::{
     Json, Router,
 };
 use fleet_proto::fleet::v1::{
-    worker_service_server::WorkerService, NodeCommand, NodeOperation, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse,
+    worker_service_server::WorkerService, NodeCommand, NodeOperation, WorkerEndSessionRequest,
+    WorkerEndSessionResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -95,6 +95,9 @@ struct NodeSession {
     seen: f64,
     report: NodeReport,
     draining: bool,
+    /// Its agent stopped and said so: the next agent's session takes over at once, without
+    /// waiting for this one to go quiet. The node counts as connected until then, as before.
+    ended: bool,
 }
 #[derive(Default)]
 struct WorkloadState {
@@ -622,6 +625,18 @@ impl WorkloadController {
         self.notify.notify_waiters();
         Ok(v)
     }
+    /// Ends `worker`'s agent session `session`, which its agent sends as it stops: the agent
+    /// that replaces it is admitted at once. Another session than the current one changes
+    /// nothing, so one agent can't end another's.
+    pub(crate) fn end_session(&self, worker: &str, session: &str) -> bool {
+        let mut i = self.inner.lock();
+        let Some(w) = i.workers.get_mut(worker).filter(|w| w.session == session) else {
+            return false;
+        };
+        w.ended = true;
+        tracing::info!(worker, "agent session ended; the next agent session takes over at once");
+        true
+    }
     async fn report(
         &self,
         worker_id: &str,
@@ -677,7 +692,7 @@ impl WorkloadController {
             let mut i = self.inner.lock();
             if i.workers
                 .get(worker_id)
-                .is_some_and(|w| w.session != session && now() - w.seen < 30.0)
+                .is_some_and(|w| w.session != session && !w.ended && now() - w.seen < 30.0)
             {
                 return Err(fail(409, "another agent session is active for this worker"));
             }
@@ -692,6 +707,7 @@ impl WorkloadController {
                     seen: now(),
                     report: report.clone(),
                     draining,
+                    ended: false,
                 },
             );
         }
@@ -1559,6 +1575,14 @@ fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
 pub struct NodeControlService(pub Arc<WorkloadController>);
 #[tonic::async_trait]
 impl WorkerService for NodeControlService {
+    async fn end_session(
+        &self,
+        request: tonic::Request<WorkerEndSessionRequest>,
+    ) -> Result<tonic::Response<WorkerEndSessionResponse>, tonic::Status> {
+        let r = request.into_inner();
+        self.0.end_session(&r.worker_id, &r.session);
+        Ok(tonic::Response::new(WorkerEndSessionResponse {}))
+    }
     async fn heartbeat(
         &self,
         request: tonic::Request<WorkerHeartbeatRequest>,

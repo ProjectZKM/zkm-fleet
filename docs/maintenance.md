@@ -65,6 +65,14 @@ Ray keeps running, and so do apps and batches, through the agent restart. The up
 touches neither `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`;
 leave app endpoints running when their programs are unchanged.
 
+One agent session at a time drives a node. A stopping agent ends its session, so the
+scheduler admits the restarted agent at once. An agent that crashed, or one stopped
+while the scheduler was out of reach, leaves its session open: the next agent is
+refused ("another agent session is active for this worker") until the open session
+has been quiet for 30 seconds. Ending a session needs a scheduler at least as new as
+the agent, so upgrade the control host first. A remote `-n` run ships nothing to the node,
+and the node's part of it prints the steps for the files it would have received.
+
 #### Cron-supervised nodes
 
 `node upgrade` and `node rollback` need a systemd unit. On a cron-supervised node,
