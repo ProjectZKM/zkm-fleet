@@ -156,7 +156,9 @@ scheduler_rollback() {
 
 node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR], or node upgrade RELEASE_TAG
   local bin=${1:-} bridge=${2:-} proof_app=${3:-} scripts=${4:-}
-  if [ -n "$bin" ] && [ ! -f "$bin" ]; then
+  # A release tag is a bare name. A path names local files, even ones a dry run never
+  # shipped to the node.
+  if [ -n "$bin" ] && [ ! -f "$bin" ] && [[ $bin != */* ]]; then
     local stage; stage=$(mktemp -d)
     prepare_release "$bin" "$stage"
     bin=$RELEASE_ROOT/bin/fleet-node

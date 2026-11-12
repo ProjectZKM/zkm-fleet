@@ -180,6 +180,25 @@ def test_watchdog_repairs_a_dead_ray_link(tmp_path):
     assert (tmp_path / "ray.log").exists(), "the repaired link let the watchdog start Ray"
 
 
+def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
+    """A remote dry run ships nothing, so the node sees paths to no files: it prints the local
+    upgrade of just those files, not a download of a release named after them."""
+    prefix, commands = node_fixture(tmp_path)
+    executable(commands / "curl", f"echo called >> {tmp_path / 'curl.log'}\nexit 1\n")
+    stage = tmp_path / "fleet-ctl-stage"  # never created
+    environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+                   "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_CTL_ON_NODE": "1", "FLEET_NODE_SSH": ""}
+    result = subprocess.run(
+        ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "-n", "node", "upgrade", f"{stage}/fleet-node", f"{stage}/bridge"],
+        env=environment, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "curl.log").exists() and "curl" not in result.stdout, result.stdout
+    assert f"+ install -m 755 {stage}/fleet-node {prefix}/bin/fleet-node.new" in result.stdout, result.stdout
+    assert f"+ cp -a {stage}/bridge/fleet_bridge/. {prefix}/bridge/fleet_bridge/" in result.stdout, result.stdout
+    assert "fleet-proof-app" not in result.stdout and "ray-start.sh" not in result.stdout, result.stdout
+    assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho old-node\n", "a dry run changes nothing"
+
+
 def test_remote_upgrade_preserves_scripts_position_without_a_proof_app(tmp_path):
     prefix, commands = node_fixture(tmp_path)
     newbin = tmp_path / "fleet-node"
