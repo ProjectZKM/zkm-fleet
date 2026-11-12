@@ -209,11 +209,28 @@ is and how to stop it:
 - A proof app's work also includes its queued or running proofs.
 - A batch's work is its queued or running jobs. Cancel them or let them finish.
 
-The delete then removes the record and has every node remove the app's entries or the
-batch from its configuration. The data on the nodes stays. A container app's past
-execution records and a batch's job records stay until purged. A proof app's finished
-proof records and control-host artifacts go with it, and the app's own storage stays
-with its owner.
+The app or batch then goes with everything Fleet holds of it:
+- On the control host: its job records with their logs, and the commands about them.
+  A proof app's job records and anchor go from Postgres.
+- On each node: its configuration, with what the node holds of it. A batch's jobs lose
+  their directories: record, logs and `out/`. An app's replicas' logs and its workers'
+  directories (`worker_workdir`) go, and so do its proof jobs' files in its proof
+  storage: each job's output directory, and the inputs and ELF that no other job or
+  app uses. An EthProofs worker's directory is its proof storage root, so its
+  checkpoints and proofs go with it.
+
+Volumes, batch mounts, env files, storage roots and images stay. So does whatever
+holds or lies in a path that another app or batch on any node uses, and anything at
+the top of the filesystem or around Fleet's own files; the node's result says what it
+kept and why, and the scheduler logs it. A container's `workdir` is the container's
+own: what it keeps on the host is in its volumes. Job history goes only with its
+batch; there is no separate purge.
+
+The record stays, hidden, until every node has removed it, so the name can't be
+reused before then. A node that is offline removes it once it's back; deleting it
+again retries a node that failed. A batch deleted by a release before this one kept
+its job records: it stays listed as `deleted` until it is deleted again, which removes
+them. A node with an older bridge removes only the configuration.
 
 **Node entries.** Every `apps.yaml` entry has an `app`. A `ziren-gpu` entry binds its
 server to the one app it serves with `namespace`, `app: NAME` and
@@ -246,7 +263,7 @@ fleetctl batch            # the batches, with their active and last jobs
 fleetctl batch NAME       # one batch and its newest jobs
 ```
 
-`fleetctl batch logs`, `cancel`, `preempt` and `purge` take a job ID and find its
+`fleetctl batch logs`, `cancel` and `preempt` take a job ID and find its
 batch; `--batch NAME` skips that lookup. `batch submit --name` names the job. Nodes
 can also advertise batches in their `batches.yaml`.
 
@@ -271,9 +288,7 @@ its `namespace` field; a name or an ID is accepted, and the ID is stored. A batc
 `apps.yaml` entry configured on a node may name `namespace: alice`, which is checked
 before launch. Disabling a batch blocks new submissions and lets accepted jobs
 finish. Deleting a batch works like deleting an app ([Deleting](#apps)): it is
-refused while any of its jobs is queued or running. A deleted batch stays listed, as
-`deleted`, and readable while it has job records; its jobs keep their own lifecycle
-until they're purged.
+refused while any of its jobs is queued or running, and its jobs go with it.
 
 **Submissions.** A job takes `command`, a non-empty list of strings, and optionally:
 
@@ -515,7 +530,7 @@ accepted work: an administrator stops jobs explicitly.
 |---|---|
 | Read the own namespace, apps, batches, jobs, logs and scaling status | `read`, within the token's scope |
 | Submit proofs and batch jobs; cancel batch jobs | `submit`, within the token's scope |
-| Create, remove, enable, disable, prioritize, scale or update apps and batches; purge batch jobs | `manage`, with any app grants. Removing, enabling, disabling or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
+| Create, remove, enable, disable, prioritize, scale or update apps and batches | `manage`, with any app grants. Removing, enabling, disabling or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
 | Batch `allow` and `user`; app `user`, `volumes` and `proof_storage_root`; changing an app's image, environment, command, user, workdir or volumes | `admin` |
 | Preempt batch jobs | `admin` |
 | Namespaces, tokens, quotas, suspension, allocations, the preemption plan, nodes and status | `admin` |
@@ -622,7 +637,7 @@ listener behind the HTTPS gateway. Administrators select a namespace with
 | Scaling | `PUT` / `GET /apps/NAME/scale` (the app's replicas over all its nodes; `GET ...?node=NODE` shows one node's part) |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
-| Batch jobs | `GET` / `POST /batches/NAME/jobs`, `DELETE /batches/NAME/jobs?older_than=DAYS`, `GET` / `DELETE /batches/NAME/jobs/ID`, `POST /batches/NAME/jobs/ID/cancel`, `POST /batches/NAME/jobs/ID/preempt`, `GET /batches/NAME/jobs/ID/logs` |
+| Batch jobs | `GET` / `POST /batches/NAME/jobs`, `GET /batches/NAME/jobs/ID`, `POST /batches/NAME/jobs/ID/cancel`, `POST /batches/NAME/jobs/ID/preempt`, `GET /batches/NAME/jobs/ID/logs` |
 
 | Namespaces and tokens | Action |
 |---|---|

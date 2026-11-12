@@ -764,9 +764,10 @@ impl WorkloadController {
         WorkloadController::require_grant(c, &name)?;
         WorkloadController::require_admin_settings(c, &spec, &Self::ADMIN_CREATE_SETTINGS)?;
         let _ops = self.ops.lock().await;
+        self.ensure_name_free(&name)?;
         {
             let i = self.inner.lock();
-            if i.apps.get(&name).is_some_and(|a| !a.removed)
+            if i.apps.contains_key(&name)
                 || i.deployments.values().any(|d| d.entry().name() == name)
                 || self.fleet.app_known(&namespace, &name)
             {

@@ -468,6 +468,18 @@ impl CommandRecord {
     pub fn removes_app(&self, app: &str) -> bool {
         self.removal().is_some_and(|(_, name)| name == app)
     }
+    /// The app or batch an app message removes, by name.
+    pub fn removes(&self) -> Option<&str> {
+        let p = &self.parameters;
+        (self.is(NodeOperation::App) && p["remove"] == json!(true))
+            .then(|| p["app"]["name"].as_str().or(p["batch"]["name"].as_str()))
+            .flatten()
+    }
+    /// The app or batch an app message deletes, by name: it is removed with what the node
+    /// holds of it. A removal that only takes it off one node keeps that.
+    pub fn deletes(&self) -> Option<&str> {
+        self.removes().filter(|_| self.parameters.get("delete").is_some())
+    }
     /// In its result: nothing of what it stopped is left running.
     pub fn cleaned(&self) -> bool {
         self.result["cleaned"].as_bool() == Some(true)
@@ -503,7 +515,7 @@ pub mod command {
         json!({"id": job.id, "lease": job.lease, "namespace": job.namespace, "tag": job.tag, "owner": job.owner,
             "batch": job.batch, "policy": job.policy, "request": job.request, "submitted_at": job.status["submitted_at"]})
     }
-    /// Cancels, preempts or purges a job's execution `lease`.
+    /// Cancels or preempts a job's execution `lease`.
     pub fn job(id: &str, lease: &str) -> Value {
         json!({"id": id, "lease": lease})
     }

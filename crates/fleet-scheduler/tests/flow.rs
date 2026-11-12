@@ -602,8 +602,9 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
     assert_eq!((gone["app"].as_str(), gone["jobs_deleted"].as_u64()), (Some(app_of(b"elf-d").as_str()), Some(1)), "{gone}");
     assert_eq!(get_job(&h, USER, &app_of(b"elf-d"), "job-d").await.0, 404, "the deleted app's job is gone");
-    let again = admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE", &url]);
-    assert_eq!(again, "404");
+    // Until its nodes have removed it, deleting it again retries that; nothing else is left.
+    let again: serde_json::Value = serde_json::from_str(&admin_curl(&h, &["-X", "DELETE", &url])).unwrap();
+    assert_eq!((again["removed"].as_bool(), again["jobs_deleted"].as_u64()), (Some(true), Some(0)), "{again}");
 }
 
 /// The API through curl as an administrator (what fleetctl does), as text.

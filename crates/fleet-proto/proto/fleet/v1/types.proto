@@ -55,6 +55,7 @@ enum NodeOperation {
   // Start or stop an app's replicas as the node's apps.yaml entry configures them
   // (runtime only; NODE_OPERATION_APP writes that configuration).
   NODE_OPERATION_SET_APP = 4;
+  // Sent by releases that purged a finished job; deleting its batch removes it now.
   NODE_OPERATION_PURGE_JOB = 5;
   reserved 6;
   reserved "NODE_OPERATION_STAGE_MODEL";
@@ -62,5 +63,9 @@ enum NodeOperation {
   // configuration (enabled state, resources, settings). Parameters: {"app": {namespace,
   // namespace_name, name}} or {"batch": {name}} with {"remove": true} or {"set": {...}}, or
   // {"entry": {name}} with {"set": {...}} for the one apps.yaml entry a change of an app stops.
+  // A deletion's removal, with {"delete": {...}}, also deletes what the node holds of it: a
+  // batch's jobs' directories ("jobs"); an app's replicas' logs, its workers' directories and
+  // its proof jobs' "files", but nothing that holds or lies in one of the paths to "keep". A
+  // removal without it, which takes an app off one node, keeps that.
   NODE_OPERATION_APP = 7;
 }

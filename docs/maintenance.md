@@ -263,8 +263,8 @@ at a full core with sqlx `slow_acquire` warnings although Postgres is idle.
 - **Up to v0.1.8**, a bulk purge of a busy batch's history (`fleetctl job purge
   --older-than DAYS`) does the same: it holds that lock while it writes a record and a
   node command for every job, minutes for tens of thousands, and its node commands
-  then crowd out launches for as long again, at 16 per heartbeat. Later releases purge
-  in chunks and send a node's purges after its other commands.
+  then crowd out launches for as long again, at 16 per heartbeat. Later releases
+  purged in chunks; now there is no purge, and a batch's jobs go when it is deleted.
 
 ### Who changed what
 
@@ -272,7 +272,7 @@ The scheduler logs an `api request` line for each API call that can change state
 method, path and query, status, duration, and the caller's token ID, label, namespace
 and tag (never the token itself).
 `docker logs zkm-fleet-scheduler-1 | grep 'api request'` shows who submitted,
-cancelled, purged or reconfigured what.
+cancelled, deleted or reconfigured what.
 
 ## Installed files and backups
 
