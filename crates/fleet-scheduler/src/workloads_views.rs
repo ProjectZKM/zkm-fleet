@@ -57,14 +57,16 @@ impl WorkloadController {
         v
     }
 
-    /// Configured totals across all deployments and replicas; disabled apps keep their settings.
-    /// Quotas are shared namespace limits, not independent limits for each app.
+    /// Configured totals across all deployments and replicas, but those being retired; disabled
+    /// apps keep their settings. Quotas are shared namespace limits, not independent limits for
+    /// each app.
     pub(crate) fn app_resources(&self, namespace: &str, app: &str, tag: Option<&str>) -> Value {
         let i = self.inner.lock();
         let deployments: Vec<_> = i
             .deployments
             .values()
-            .filter(|intent| intent.entry().namespace() == namespace && intent.entry().app() == app)
+            .filter(|intent| intent.entry().namespace() == namespace && intent.entry().app() == app
+                && !super::scaling::retiring(&i, intent))
             .collect();
         let mut gpus = 0.0;
         let mut cpus = 0.0;

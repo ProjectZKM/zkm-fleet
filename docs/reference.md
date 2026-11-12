@@ -189,7 +189,9 @@ stops its GPU server; queued proofs wait for the next enable, and its retained p
 stay fetchable.
 
 **Changing.** `fleetctl app scale` sets an app's GPUs, CPUs and replicas within its
-quotas ([operations](operations.md#configure-resources)); an active proof can't be
+quotas ([operations](operations.md#configure-resources)). They are the app's, not a
+node's: the replica count covers all its nodes, and a node the count leaves none
+removes the app. An active proof can't be
 resized ([issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3)).
 `fleetctl app update NAME` (`PUT /apps/NAME/settings`) changes the image,
 environment, command, user, workdir, volumes, shm and memory sizes, health path or
@@ -604,7 +606,7 @@ listener behind the HTTPS gateway. Administrators select a namespace with
 | Workload | Routes |
 |---|---|
 | Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs` |
-| Scaling | `PUT` / `GET /apps/NAME/scale` |
+| Scaling | `PUT` / `GET /apps/NAME/scale` (the app's replicas over all its nodes; `GET ...?node=NODE` shows one node's part) |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
 | Batch jobs | `GET` / `POST /batches/NAME/jobs`, `DELETE /batches/NAME/jobs?older_than=DAYS`, `GET` / `DELETE /batches/NAME/jobs/ID`, `POST /batches/NAME/jobs/ID/cancel`, `POST /batches/NAME/jobs/ID/preempt`, `GET /batches/NAME/jobs/ID/logs` |

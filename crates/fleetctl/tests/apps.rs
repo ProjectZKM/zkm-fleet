@@ -191,8 +191,8 @@ fn app_commands_address_every_app_by_its_name() {
         (vec!["disable", "ethproofs"], "PUT", "/disabled", serde_json::Value::Null,
             r#"{"name":"ethproofs","disabled":true,"resources":{"gpus":1},"proof":{"elf_id":"aaaa"}}"#),
         (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"name":"comfyui","disabled":false,"spec":{"image":"comfyui:1"}}"#),
-        (vec!["scale", "ethproofs", "--replicas", "2", "--node", "gpu-box"], "PUT", "/scale", serde_json::json!({"replicas":2,"node":"gpu-box"}),
-            r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"node":"gpu-box"}"#),
+        (vec!["scale", "ethproofs", "--replicas", "2"], "PUT", "/scale", serde_json::json!({"replicas":2}),
+            r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"nodes":["gpu-box"]}"#),
         (vec!["update", "comfyui", "--image", "comfyui:2"], "PUT", "/settings", serde_json::json!({"image":"comfyui:2"}),
             r#"{"state":"draining","node":"gpu-box"}"#),
     ] {
@@ -208,6 +208,28 @@ fn app_commands_address_every_app_by_its_name() {
         assert!(seen[0].line.starts_with(&format!("{method} /apps/{}{leaf}?namespace=alice", args[1])), "{args:?}: {}", seen[0].line);
         assert_eq!(seen[0].body, body, "{args:?}");
     }
+}
+
+/// An app's replicas and their resources are the app's: scaling names no node, and a node
+/// only narrows what is inspected.
+#[test]
+fn app_scale_takes_no_node_and_inspects_one_nodes_part() {
+    let token = token_file("app-scale-node");
+    let output = cli().args(["--namespace", "alice", "--url", "http://127.0.0.1:9", "--token-file"]).arg(&token)
+        .args(["app", "scale", "comfyui", "--replicas", "1", "--node", "gpu-box"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("scale it without --node"), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = stub(listener, 1, move |_, _| (200, r#"{"state":"complete","replicas":1,"gpus":1,"cpus":4,"node":"gpu-box"}"#.into()));
+    let output = cli().args(["--namespace", "alice", "--url", &url, "--token-file"]).arg(&token)
+        .args(["app", "scale", "comfyui", "--node", "gpu-box"]).output().unwrap();
+    let seen = server.join().unwrap();
+    std::fs::remove_file(token).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(seen[0].line.starts_with("GET /apps/comfyui/scale?namespace=alice&node=gpu-box"), "{}", seen[0].line);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("on gpu-box"), "{}", String::from_utf8_lossy(&output.stdout));
 }
 
 #[test]

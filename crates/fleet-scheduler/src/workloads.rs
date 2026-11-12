@@ -179,10 +179,25 @@ impl WorkloadController {
     /// Drops a deployment record, its allocation already released. Nothing else removes one, and a
     /// stale record can restart its app or claim its app's worker slot.
     fn forget_deployment(&self, key: &str) -> anyhow::Result<()> {
-        self.inner.lock().deployments.remove(key);
+        let Some(intent) = self.inner.lock().deployments.remove(key) else {
+            return Ok(());
+        };
         match std::fs::remove_file(self.dir.join("deployments").join(format!("{key}.json"))) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
+        }
+        // Its node no longer runs the app, unless it has another entry of it.
+        let (app, namespace) = (intent.entry().app().to_owned(), intent.entry().namespace().to_owned());
+        let template = {
+            let i = self.inner.lock();
+            let elsewhere = i.deployments.values()
+                .any(|d| d.worker == intent.worker && d.entry().app() == app && d.entry().namespace() == namespace);
+            i.apps.get(&app).filter(|a| a.persistent && a.namespace == namespace && !elsewhere && a.workers.contains(&intent.worker)).cloned()
+        };
+        if let Some(mut template) = template {
+            template.workers.retain(|w| *w != intent.worker);
+            self.save("apps", &app, &template)?;
+            self.inner.lock().apps.insert(app, template);
         }
         tracing::info!(deployment = key, "deployment record removed: its node no longer configures it");
         Ok(())
@@ -1282,6 +1297,13 @@ impl WorkloadController {
                 }
             }
             if !disabled {
+                // An app runs its replica count, wherever the replicas are: a start that would
+                // run more retires its deployment instead (a node back with a copy of an app
+                // that runs elsewhere since, say).
+                if self.beyond_replica_count(&c) {
+                    self.retire(&format!("{}-{}", c.worker, s.name()))?;
+                    continue;
+                }
                 let already_ready = {
                     let i = self.inner.lock();
                     i.workers.get(&c.worker).is_some_and(|w| {
@@ -2127,10 +2149,11 @@ async fn priority_of(request: Request) -> anyhow::Result<i32> {
 }
 
 impl WorkloadController {
-    /// The keys of `app`'s deployment records in `namespace`.
+    /// The keys of `app`'s deployment records in `namespace`, but those being retired.
     pub(crate) fn app_deployments(&self, namespace: &str, app: &str) -> Vec<String> {
-        self.inner.lock().deployments.iter()
-            .filter(|(_, d)| d.entry().app() == app && d.entry().namespace() == namespace)
+        let i = self.inner.lock();
+        i.deployments.iter()
+            .filter(|(_, d)| d.entry().app() == app && d.entry().namespace() == namespace && !scaling::retiring(&i, d))
             .map(|(k, _)| k.clone())
             .collect()
     }

@@ -29,6 +29,42 @@ fn waiting_for_capacity(i: &WorkloadState, intent: &AppDeployment) -> bool {
     })
 }
 
+/// Whether `intent` is leaving its node: disabled, and its node told to remove its app's
+/// entries, or no longer configuring it. It is no longer one of its app's deployments, and its
+/// record goes once nothing about it is open.
+pub(super) fn retiring(i: &WorkloadState, intent: &AppDeployment) -> bool {
+    intent.disabled
+        && (i.commands.open().any(|c| c.worker == intent.worker && c.removes_app(intent.entry().app()))
+            || i.workers.get(&intent.worker).is_some_and(|w| w.report.entry(intent.entry().name()).is_none()))
+}
+
+/// The entry `intent` has once the change under way, if any, is done.
+fn planned(intent: &AppDeployment) -> Entry<'_> {
+    intent.scale.as_ref().filter(|s| s.pending()).map(ScaleStatus::target_entry).unwrap_or(intent.entry())
+}
+
+/// Whether `intent`'s replicas are to run: its change under way starts them, or, without one,
+/// its node was last told to run them.
+fn wants_running(intent: &AppDeployment) -> bool {
+    intent.scale.as_ref().filter(|s| s.pending()).map_or(!intent.disabled, |s| !s.disabled)
+}
+
+/// Whether `intent`'s replicas are up, on a connected node.
+fn running_now(i: &WorkloadState, intent: &AppDeployment) -> bool {
+    !intent.disabled && i.workers.get(&intent.worker).is_some_and(|w| {
+        now() - w.seen < 30.0 && w.report.ready
+            && w.report.entry(intent.entry().name()).is_some_and(|e| e.ready() && !e.disabled())
+    })
+}
+
+/// Where deployment `key` comes in the order an app's replicas are kept in: those running now
+/// first, then those that are to run, then the rest, by node within each.
+fn rank(i: &WorkloadState, key: &str, intent: &AppDeployment) -> (bool, bool, String) {
+    (!running_now(i, intent), !wants_running(intent), key.to_owned())
+}
+
+const REPLICA_RANGE: &str = "gpus must be nonnegative, cpus positive, and replicas between 1 and 64; use app disable to stop all replicas";
+
 impl WorkloadController {
     pub(crate) async fn app_lifecycle_guard(
         &self,
@@ -49,23 +85,34 @@ impl WorkloadController {
         Ok(())
     }
 
+    /// `app`'s deployments in `namespace` (on `node`, when given) but those being retired, in
+    /// the order its replicas are kept in (`rank`).
+    fn app_deployment_list(&self, namespace: &str, app: &str, node: Option<&str>) -> Vec<(String, AppDeployment)> {
+        let i = self.inner.lock();
+        let mut list: Vec<(String, AppDeployment)> = i.deployments.iter()
+            .filter(|(_, intent)| {
+                let s = intent.entry();
+                s.namespace() == namespace
+                    && node.is_none_or(|n| n == intent.worker)
+                    && matches!(s.kind(), "ziren-gpu" | "app")
+                    && s.app() == app
+                    && !retiring(&i, intent)
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        list.sort_by_cached_key(|(key, intent)| rank(&i, key, intent));
+        list
+    }
+
     pub(super) fn app_deployment(
         &self,
         namespace: &str,
         app: &str,
         node: Option<&str>,
     ) -> anyhow::Result<(String, AppDeployment)> {
-        let i = self.inner.lock();
-        let mut deployments = i.deployments.iter().filter(|(_, intent)| {
-            let s = intent.entry();
-            s.namespace() == namespace
-                && node.is_none_or(|n| n == intent.worker)
-                && matches!(s.kind(), "ziren-gpu" | "app")
-                && s.app() == app
-        });
+        let mut deployments = self.app_deployment_list(namespace, app, node).into_iter();
         let first = deployments
             .next()
-            .map(|(k, v)| (k.clone(), v.clone()))
             .ok_or_else(|| fail(404, "the app runs on no node (enable it to place it), or not on that one"))?;
         if deployments.next().is_some() {
             return Err(fail(400, "the app runs on several nodes; select --node NODE"));
@@ -113,20 +160,59 @@ impl WorkloadController {
         Ok(bytes.into_response())
     }
 
+    /// The app's replicas and their resources, with each node's part; one node's part when
+    /// `node` is given.
     pub(super) fn scale_status(
         &self,
         namespace: &str,
         app: &str,
         node: Option<&str>,
     ) -> anyhow::Result<Value> {
-        let (_, deployment) = self.app_deployment(namespace, app, node)?;
-        Ok(self.scale_value(&deployment))
+        if node.is_some() {
+            let (_, deployment) = self.app_deployment(namespace, app, node)?;
+            return Ok(self.scale_value(&deployment));
+        }
+        let deployments = self.app_deployment_list(namespace, app, None);
+        if deployments.is_empty() {
+            return Err(fail(404, "the app runs on no node (enable it to place it)"));
+        }
+        Ok(self.app_scale_value(&deployments))
+    }
+
+    /// An app's scale: its replicas over all its deployments, their resources as the first
+    /// one has them, and its most pressing state, a failure first, then a change under way.
+    fn app_scale_value(&self, deployments: &[(String, AppDeployment)]) -> Value {
+        let parts: Vec<Value> = deployments.iter().map(|(_, d)| self.scale_value(d)).collect();
+        let state = parts.iter().map(|p| &p["state"]).find(|s| *s == "failed")
+            .or_else(|| parts.iter().map(|p| &p["state"]).find(|s| !matches!(s.as_str(), Some("complete" | "configured"))))
+            .unwrap_or(&parts[0]["state"]);
+        json!({"namespace": parts[0]["namespace"], "replicas": parts.iter().filter_map(|p| p["replicas"].as_u64()).sum::<u64>(),
+            "gpus": parts[0]["gpus"], "cpus": parts[0]["cpus"], "state": state,
+            "disabled": parts.iter().all(|p| p["disabled"] == json!(true)),
+            "error": parts.iter().find_map(|p| p["error"].as_str()),
+            "nodes": parts.iter().map(|p| p["node"].clone()).collect::<Vec<_>>(), "deployments": parts})
     }
 
     /// The deployment of `app` (on `node`, when it has several) that a scale or settings update
     /// changes: the app still exists and no other operation on the deployment is under way.
     fn deployment_to_change(&self, namespace: &str, app: &str, node: Option<&str>) -> anyhow::Result<(String, AppDeployment)> {
         let (key, intent) = self.app_deployment(namespace, app, node)?;
+        self.check_changeable(namespace, app, &[(key.clone(), intent.clone())])?;
+        Ok((key, intent))
+    }
+
+    /// Every deployment of `app` a scale changes, in the order its replicas are kept in.
+    fn deployments_to_change(&self, namespace: &str, app: &str) -> anyhow::Result<Vec<(String, AppDeployment)>> {
+        let deployments = self.app_deployment_list(namespace, app, None);
+        if deployments.is_empty() {
+            return Err(fail(404, "the app runs on no node (enable it to place it)"));
+        }
+        self.check_changeable(namespace, app, &deployments)?;
+        Ok(deployments)
+    }
+
+    /// The app still exists and no other operation on these deployments of it is under way.
+    fn check_changeable(&self, namespace: &str, app: &str, deployments: &[(String, AppDeployment)]) -> anyhow::Result<()> {
         // Recheck existence under the operation lock: deletion may have finished
         // after the HTTP handler resolved the app but before this request acquired it.
         let exists = self.fleet.app_known(namespace, app)
@@ -138,16 +224,16 @@ impl WorkloadController {
         if !exists {
             return Err(fail(404, "unknown app"));
         }
-        {
-            let i = self.inner.lock();
-            if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, &intent)
+        let i = self.inner.lock();
+        for (_, intent) in deployments {
+            if intent.scale.as_ref().is_some_and(ScaleStatus::pending) && !waiting_for_capacity(&i, intent)
                 // one still waiting for capacity is replaced by this request
                 || i.commands.open().any(|c| c.admitted && c.changes_entry(&intent.worker, intent.entry().name()))
             {
                 return Err(fail(409, "an app operation is already pending"));
             }
         }
-        Ok((key, intent))
+        Ok(())
     }
 
     /// Settings an update may change on an app. The rest is identity, placement or the
@@ -257,6 +343,11 @@ impl WorkloadController {
         Ok(self.scale_value(&intent))
     }
 
+    /// Sets an app's replica count, and its replicas' GPUs and CPUs: the app's settings, not any
+    /// node's. The count is split over the app's deployments in the order its replicas are kept
+    /// in: each keeps the replicas it has, up to the count; new ones go to the first, whose start
+    /// moves to a node with room for all of them when its own has none; one left with none is
+    /// retired. Without a count, each deployment keeps its own.
     pub(super) async fn request_scale(
         &self,
         namespace: &str,
@@ -267,55 +358,21 @@ impl WorkloadController {
         if req.gpus.is_none() && req.cpus.is_none() && req.replicas.is_none() {
             return Err(fail(400, "set at least one of gpus, cpus or replicas"));
         }
-        let (key, mut intent) = self.deployment_to_change(namespace, app, req.node.as_deref())?;
-        let mut target = self.with_priority(intent.spec.clone());
-        EntryMut(&mut target).set_resources(req.gpus, req.cpus, req.replicas);
-        let t = Entry(&target);
-        let (g, cpu, replicas) = (t.gpus().unwrap_or(1.0), t.cpus(), t.replicas());
-        if t.integrated_worker() && replicas != 1 {
-            return Err(fail(400, "integrated app workers require one machine-pinned replica",
-            ));
+        if req.node.is_some() {
+            return Err(fail(400, "replicas, GPUs and CPUs are the app's settings: scale it without a node, and the scheduler places its replicas"));
         }
-        if !g.is_finite()
-            || g < 0.0
-            || !cpu.is_finite()
-            || cpu <= 0.0
-            || replicas == 0
-            || replicas > 64
-        {
-            return Err(fail(400,"gpus must be nonnegative, cpus positive, and replicas between 1 and 64; use app disable to stop all replicas"));
+        if req.replicas.is_some_and(|r| r == 0 || r > 64) {
+            return Err(fail(400, REPLICA_RANGE));
         }
-        if t.kind() == "ziren-gpu" && (g < 1.0 || g.fract() != 0.0) {
-            return Err(fail(
-                400,
-                "a proof server requires a positive integer GPU count",
-            ));
-        }
-        let total_g = g * replicas as f64;
-        let total_cpu = cpu * replicas as f64;
-        {
-            let i = self.inner.lock();
-            let worker = i
-                .workers
-                .get(&intent.worker)
-                .filter(|w| now() - w.seen < 30.0 && w.report.ready && !w.draining)
-                .ok_or_else(|| fail(503, "node is offline, unready or draining"))?;
-            if total_g > worker.report.total_gpus + 1e-9
-                || total_cpu > worker.report.total_cpus + 1e-9
-            {
-                return Err(fail(
-                    422,
-                    format!(
-                        "requested allocation exceeds node {} capacity: requested {total_g} GPUs and {total_cpu} CPUs (replicas: {replicas}); node total {} GPUs and {} CPUs, currently free {} GPUs and {} CPUs",
-                        intent.worker,
-                        worker.report.total_gpus,
-                        worker.report.total_cpus,
-                        worker.report.free_gpus,
-                        worker.report.free_cpus,
-                    ),
-                ));
-            }
-        }
+        let deployments = self.deployments_to_change(namespace, app)?;
+        let count = req.replicas.map_or_else(|| deployments.iter().map(|(_, d)| d.entry().replicas()).sum(), u64::from);
+        let mut left = count;
+        let mut plan: Vec<(String, AppDeployment, u64)> = deployments.into_iter().map(|(key, intent)| {
+            let keep = intent.entry().replicas().min(left);
+            left -= keep;
+            (key, intent, keep)
+        }).collect();
+        plan[0].2 += left;
         let ns = self
             .fleet
             .namespace(namespace)
@@ -323,44 +380,174 @@ impl WorkloadController {
         if ns.suspended_ms.is_some() {
             return Err(fail(403, "namespace is suspended"));
         }
-        // Container replicas reserve the whole app. Proof quota is charged
-        // per assigned proof; extra replicas can remain idle while that quota is occupied.
-        let (quota_g, quota_cpu) = if t.holds_allocation() {
-            (total_g, total_cpu)
-        } else {
-            (g, cpu)
-        };
-        let tag_quota = ns
-            .tag_quotas
-            .get(t.tag().unwrap_or(""))
-            .cloned()
-            .unwrap_or_default();
+        let mut changes = Vec::new();
+        let mut retired = Vec::new();
+        let (mut quota_g, mut quota_cpu, mut tag) = (0.0, 0.0, None);
+        for (key, intent, replicas) in plan {
+            if replicas == 0 {
+                retired.push(key);
+                continue;
+            }
+            let mut target = self.with_priority(intent.spec.clone());
+            EntryMut(&mut target).set_resources(req.gpus, req.cpus, Some(replicas as u32));
+            let t = Entry(&target);
+            let (g, cpu) = (t.gpus().unwrap_or(1.0), t.cpus());
+            if t.integrated_worker() && replicas != 1 {
+                return Err(fail(400, "integrated app workers require one machine-pinned replica"));
+            }
+            if !g.is_finite() || g < 0.0 || !cpu.is_finite() || cpu <= 0.0 {
+                return Err(fail(400, REPLICA_RANGE));
+            }
+            if t.kind() == "ziren-gpu" && (g < 1.0 || g.fract() != 0.0) {
+                return Err(fail(400, "a proof server requires a positive integer GPU count"));
+            }
+            // Container replicas reserve the whole app. Proof quota is charged per assigned
+            // proof; extra replicas can remain idle while that quota is occupied.
+            if t.holds_allocation() {
+                (quota_g, quota_cpu) = (quota_g + g * replicas as f64, quota_cpu + cpu * replicas as f64);
+            } else {
+                (quota_g, quota_cpu) = (f64::max(quota_g, g), f64::max(quota_cpu, cpu));
+            }
+            tag.get_or_insert_with(|| t.tag().unwrap_or("").to_owned());
+            if intent.entry().same_resources(t) && intent.scale.as_ref().is_none_or(|s| s.phase() != Phase::Failed) {
+                continue;
+            }
+            self.check_node_room(&intent.worker, g * replicas as f64, cpu * replicas as f64, replicas)?;
+            changes.push((key, intent, target));
+        }
+        let tag_quota = ns.tag_quotas.get(tag.as_deref().unwrap_or("")).cloned().unwrap_or_default();
         if !ns.quota.fits(quota_g, quota_cpu) || !tag_quota.fits(quota_g, quota_cpu) {
             return Err(fail(
                 422,
                 "requested allocation exceeds namespace or tag GPU/CPU quota",
             ));
         }
-        if intent.entry().same_resources(t)
-            && intent
+        for (key, mut intent, target) in changes {
+            let disabled = intent
                 .scale
                 .as_ref()
-                .is_none_or(|s| s.phase() != Phase::Failed)
-        {
-            return Ok(self.scale_value(&intent));
+                .filter(|s| s.phase() == Phase::Failed)
+                .map(|s| s.disabled)
+                .unwrap_or(intent.disabled);
+            intent.scale = Some(new_scale(target, disabled));
+            // Persist the transition before changing admission or sending any command.
+            self.save("deployments", &key, &intent)?;
+            self.inner.lock().deployments.insert(key, intent);
         }
-        let disabled = intent
-            .scale
-            .as_ref()
-            .filter(|s| s.phase() == Phase::Failed)
-            .map(|s| s.disabled)
-            .unwrap_or(intent.disabled);
-        intent.scale = Some(new_scale(target, disabled));
-        // Persist the transition before changing admission or sending any command.
-        self.save("deployments", &key, &intent)?;
-        self.inner.lock().deployments.insert(key, intent.clone());
+        for key in &retired {
+            self.retire(key)?;
+        }
+        if req.replicas.is_some() {
+            self.set_app_replicas(namespace, app, count)?;
+        }
         self.notify.notify_waiters();
-        Ok(self.scale_value(&intent))
+        Ok(self.app_scale_value(&self.app_deployment_list(namespace, app, None)))
+    }
+
+    /// Refuses a change of `worker`'s deployment to `replicas` replicas of `gpus` GPUs and
+    /// `cpus` CPUs in all when the node can't take it: it is offline, unready or draining, or
+    /// smaller than that.
+    fn check_node_room(&self, worker: &str, gpus: f64, cpus: f64, replicas: u64) -> anyhow::Result<()> {
+        let i = self.inner.lock();
+        let node = i
+            .workers
+            .get(worker)
+            .filter(|w| now() - w.seen < 30.0 && w.report.ready && !w.draining)
+            .ok_or_else(|| fail(503, format!("node {worker} is offline, unready or draining")))?;
+        if gpus > node.report.total_gpus + 1e-9 || cpus > node.report.total_cpus + 1e-9 {
+            return Err(fail(
+                422,
+                format!(
+                    "requested allocation exceeds node {worker} capacity: requested {gpus} GPUs and {cpus} CPUs (replicas: {replicas}); node total {} GPUs and {} CPUs, currently free {} GPUs and {} CPUs",
+                    node.report.total_gpus,
+                    node.report.total_cpus,
+                    node.report.free_gpus,
+                    node.report.free_cpus,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records `count` as the replica count of the app the scheduler keeps a record of.
+    fn set_app_replicas(&self, namespace: &str, app: &str, count: u64) -> anyhow::Result<()> {
+        let template = self.inner.lock().apps.get(app).filter(|a| a.persistent && !a.removed && a.namespace == namespace).cloned();
+        if let Some(mut template) = template {
+            template.spec["replicas"] = json!(count);
+            self.save("apps", app, &template)?;
+            self.inner.lock().apps.insert(app.into(), template);
+        }
+        Ok(())
+    }
+
+    /// The replicas `app` has over its deployments once their changes are done.
+    fn app_replicas(&self, namespace: &str, app: &str) -> u64 {
+        self.app_deployment_list(namespace, app, None).iter().map(|(_, d)| planned(d).replicas()).sum()
+    }
+
+    /// Whether starting `start`'s entry would run more replicas of a container app than its
+    /// count: the app's other deployments, ahead of this one in the order its replicas are kept
+    /// in, already run them all on connected nodes. Only an app the scheduler keeps a record of
+    /// has a count; a prover's nodes configure their own replicas, and an entry its node anchors
+    /// to the machine (`machine`) is the node's own, so it always runs there.
+    pub(super) fn beyond_replica_count(&self, start: &CommandRecord) -> bool {
+        let s = start.entry();
+        if !s.is_container() || !s.machine().is_empty() {
+            return false;
+        }
+        let key = format!("{}-{}", start.worker, s.name());
+        let i = self.inner.lock();
+        let Some(count) = i.apps.get(s.app())
+            .filter(|a| a.persistent && !a.removed && a.namespace == s.namespace())
+            .map(|a| a.entry().replicas()) else {
+            return false;
+        };
+        let Some(this) = i.deployments.get(&key).filter(|d| d.entry().machine().is_empty()) else {
+            return false;
+        };
+        let own = rank(&i, &key, this);
+        let ahead: u64 = i.deployments.iter()
+            .filter(|(k, d)| **k != key && d.entry().app() == s.app() && d.entry().namespace() == s.namespace())
+            .filter(|(k, d)| running_now(&i, d) && !retiring(&i, d) && rank(&i, k, d) < own)
+            .map(|(_, d)| planned(d).replicas())
+            .sum();
+        ahead >= count
+    }
+
+    /// Retires deployment `key`, which its app's replica count leaves no replicas: it is
+    /// disabled at once, so it no longer counts and nothing starts it, and its node removes the
+    /// app's entries, stopping what is left of their replicas (once it is back, when it is
+    /// offline). That frees its room, and the record goes with the node's next report. The
+    /// app's data stays on the node.
+    pub(super) fn retire(&self, key: &str) -> anyhow::Result<()> {
+        let Some(mut intent) = self.inner.lock().deployments.get(key).cloned() else {
+            return Ok(());
+        };
+        let entry = intent.entry();
+        let (namespace, app, name, worker) =
+            (entry.namespace().to_owned(), entry.app().to_owned(), entry.name().to_owned(), intent.worker.clone());
+        intent.disabled = true;
+        if let Some(scale) = intent.scale.as_mut().filter(|s| s.pending()) {
+            scale.phase = Phase::Complete as i32;
+        }
+        self.save("deployments", key, &intent)?;
+        self.inner.lock().deployments.insert(key.into(), intent);
+        // A start or stop never sent there has nothing left to do.
+        let unsent: Vec<String> = self.inner.lock().commands.open()
+            .filter(|c| !c.admitted && c.changes_entry(&worker, &name)).map(|c| c.id.clone()).collect();
+        for id in unsent {
+            let dropped = self.inner.lock().commands.update(&id, |c| {
+                c.done = true;
+                c.error = Some("its app's replica count leaves this node none".into());
+                c.clone()
+            });
+            if let Some(c) = dropped {
+                self.save("commands", &id, &c)?;
+            }
+        }
+        self.tell_nodes([&worker], self.app_message(&namespace, &app), message::remove())?;
+        tracing::info!(deployment = key, app, "retiring a deployment its app's replica count leaves no replicas");
+        Ok(())
     }
 
     fn scale_command(
@@ -546,6 +733,8 @@ impl WorkloadController {
                 for k in Entry::RESOURCES {
                     app.spec[k] = scale.target[k].clone();
                 }
+                // The count is the app's, over all its nodes.
+                app.spec["replicas"] = json!(self.app_replicas(intent.entry().namespace(), intent.entry().app()));
                 for (k, v) in scale.set.as_ref().and_then(|set| set.as_object()).into_iter().flatten() {
                     app.spec[k.as_str()] = v.clone();
                 }

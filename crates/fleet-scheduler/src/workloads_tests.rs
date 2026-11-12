@@ -2581,6 +2581,108 @@ async fn an_app_anchored_to_its_machine_restarts_only_there() {
     assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
 }
 
+/// App `model` runs one replica on node `gpu`, anchored to `machine` when given, and one on node
+/// `big`, which also configures it, as a node that took it over while `gpu` was away would.
+async fn running_on_two_nodes(machine: Option<&str>) -> (tempfile::TempDir, Arc<WorkloadController>, BTreeMap<String, NodeReport>, String) {
+    let (dir, c, mut nodes) = running_on_a_full_node(machine).await;
+    let ns = c.inner.lock().apps["model"].namespace.clone();
+    let mut copy = nodes["gpu"].apps[0].clone();
+    copy.as_object_mut().unwrap().remove("machine");
+    let big = nodes.get_mut("big").unwrap();
+    (big.free_gpus, big.free_cpus) = (1.0, 6.0);
+    big.apps.push(copy);
+    for (id, report) in &nodes {
+        c.report(id, "session", report.clone()).await.unwrap();
+    }
+    assert!(!c.inner.lock().deployments["big-model"].disabled);
+    (dir, c, nodes, ns)
+}
+
+async fn json_of(response: Response) -> Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
+}
+
+/// An app's replicas are the app's, wherever they run: its scale counts them on all its nodes
+/// and takes no node, and scaling it down stops the extra ones. A node left with none removes
+/// the app, frees its room and drops out of the app; the app's data stays there.
+#[tokio::test]
+async fn an_apps_replicas_are_its_own_and_a_node_its_scale_leaves_none_removes_it() {
+    let (_dir, c, mut nodes, ns) = running_on_two_nodes(None).await;
+    let held = |c: &WorkloadController| {
+        let mut ids: Vec<String> = c.fleet.allocations(&ns).iter().map(|a| a.id.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(held(&c), ["deployment:big-model", "deployment:gpu-model"]);
+    let path = format!("/apps/model/scale?namespace={ns}");
+    let view = json_of(scale_call(c.clone(), "admin", "GET", &path, Value::Null).await).await;
+    assert_eq!((view["replicas"].clone(), view["nodes"].clone()), (json!(2), json!(["big", "gpu"])), "{view}");
+    let part = json_of(scale_call(c.clone(), "admin", "GET", &format!("{path}&node=gpu"), Value::Null).await).await;
+    assert_eq!((part["replicas"].clone(), part["node"].clone()), (json!(1), json!("gpu")), "{part}");
+    let refused = scale_call(c.clone(), "admin", "PUT", &path, json!({"replicas":1,"node":"gpu"})).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "a scale names no node");
+    for replicas in [0, 65] {
+        let refused = scale_call(c.clone(), "admin", "PUT", &path, json!({"replicas":replicas})).await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{replicas} replicas");
+    }
+
+    let scaled = scale_call(c.clone(), "admin", "PUT", &path, json!({"replicas":1})).await;
+    assert_eq!(scaled.status(), StatusCode::ACCEPTED);
+    let scaled = json_of(scaled).await;
+    assert_eq!((scaled["replicas"].clone(), scaled["nodes"].clone()), (json!(1), json!(["big"])), "{scaled}");
+    assert_eq!(c.inner.lock().apps["model"].entry().replicas(), 1, "the app's count");
+    assert_eq!(c.app_resources(&ns, "model", None)["resources"]["replicas"], json!(1));
+    assert!(c.inner.lock().deployments["big-model"].scale.is_none(), "the node that keeps its replica is not changed");
+    nodes_run_commands(&c, &mut nodes, &[]).await;
+    assert!(nodes["gpu"].apps.is_empty(), "the node left with none removed the app");
+    let running = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true) && a["disabled"] == json!(false));
+    assert!(running, "the other keeps running it: {:?}", nodes["big"].apps);
+    assert_eq!(held(&c), ["deployment:big-model"], "its room is free");
+    assert_eq!(c.app_resources(&ns, "model", None)["resources"]["replicas"], json!(1));
+    c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+    assert!(!c.inner.lock().deployments.contains_key("gpu-model"));
+    assert_eq!(c.inner.lock().apps["model"].workers, ["big"]);
+
+    // More replicas go to the node that runs it.
+    let scaled = scale_call(c.clone(), "admin", "PUT", &path, json!({"replicas":2})).await;
+    assert_eq!(scaled.status(), StatusCode::ACCEPTED);
+    let target = c.inner.lock().deployments["big-model"].scale.as_ref().map(|s| s.target_entry().replicas());
+    assert_eq!(target, Some(2));
+    assert_eq!(c.inner.lock().apps["model"].entry().replicas(), 2);
+}
+
+/// A node back with a copy of an app that runs all its replicas elsewhere since does not start
+/// it again: it removes it. An entry its node anchors to the machine is the node's own and
+/// starts there anyway.
+#[tokio::test]
+async fn a_node_back_with_a_copy_of_an_app_that_runs_its_replicas_elsewhere_removes_it() {
+    for machine in [None, Some("machine")] {
+        let (_dir, c, mut nodes, _ns) = running_on_two_nodes(machine).await;
+        // Its replica went with the node, which then reports its entry stopped.
+        let gpu = nodes.get_mut("gpu").unwrap();
+        (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"]) = (json!(false), json!(true));
+        c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+        nodes_run_commands(&c, &mut nodes, &[]).await;
+        let running = nodes["big"].apps.iter().any(|a| a["name"] == "model" && a["ready"] == json!(true));
+        assert!(running, "{machine:?}: {:?}", nodes["big"].apps);
+        let starts_sent = c.inner.lock().commands.values()
+            .filter(|v| v.worker == "gpu" && v.admitted && v.operation == NodeOperation::SetApp as i32 && v.starts())
+            .count();
+        if machine.is_none() {
+            assert!(nodes["gpu"].apps.is_empty(), "its node removed it");
+            assert_eq!(starts_sent, 1, "only the first start, before the node went away");
+            c.report("gpu", "session", nodes["gpu"].clone()).await.unwrap();
+            assert!(!c.inner.lock().deployments.contains_key("gpu-model"));
+            assert_eq!(c.inner.lock().apps["model"].workers, ["big"]);
+        } else {
+            assert_eq!(nodes["gpu"].apps.len(), 1, "an anchored entry stays");
+            let waiting = c.inner.lock().commands.values()
+                .any(|v| !v.done && v.worker == "gpu" && v.operation == NodeOperation::SetApp as i32 && v.starts());
+            assert!(waiting, "and its start waits for room there");
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_app_a_node_refuses_to_create_is_placed_again_on_the_next_enable() {
     let (_dir, c, ns) = setup().await;
