@@ -450,6 +450,24 @@ def test_append_entry_keeps_every_other_line(tmp_path, text):
             assert line in p.read_text()
 
 
+@pytest.mark.parametrize("text", [
+    'log_dir: /logs\napps:\n- name: web\n  kind: app\nscheduler_admin: https://fleet:8905\n',
+    'apps:\n- {"name": "web", "kind": "app"}\nscheduler_admin: https://fleet:8905\n',
+    'apps:\n  - {"name": "web", "kind": "app"}  # placed by the scheduler\n# admin\nscheduler_admin: https://fleet:8905\n',
+    'scheduler_admin: https://fleet:8905\napps:\n- {"name": "web", "kind": "app"}',
+])
+def test_appended_entries_stay_in_the_list_before_the_keys_after_it(tmp_path, text):
+    p=tmp_path/"apps.yaml";p.write_text(text)
+    for name in ("first","second"):
+        node.append_entry(p,"apps",{"name":name,"kind":"app","namespace":"zkm","disabled":True,"image":"web:1"})
+    config=yaml.safe_load(p.read_text())
+    assert [a["name"] for a in config["apps"]]==["web","first","second"]
+    assert config["scheduler_admin"]=="https://fleet:8905"
+    assert {k:v for k,v in config.items() if k!="apps"}=={k:v for k,v in yaml.safe_load(text).items() if k!="apps"}
+    for line in text.splitlines():
+        assert line in p.read_text()
+
+
 def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
     entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
     assert app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)

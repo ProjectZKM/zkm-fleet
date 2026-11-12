@@ -152,7 +152,8 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
 
 def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
     """Appends one entry to an `apps` list, keeping every other line as written. The entry
-    goes on one line in YAML flow style, under a block list, an empty list or a missing key."""
+    goes on one line in YAML flow style, under a block list, an empty list or a missing key.
+    It follows the list's last entry, so keys after the list stay after it."""
     text = path.read_text()
     root = yaml.compose(text)
     node = next((v for k, v in root.value if k.value == section), None) if root else None
@@ -165,7 +166,13 @@ def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
             if _is_content(line):
                 end = offset
         if not text[:end].endswith("\n"):
-            text, end = text + "\n", len(text) + 1
+            # The last entry ends mid-line, as a one-line flow entry does: the new one goes
+            # after the rest of that line, or after a newline added at the end of the file.
+            newline = text.find("\n", end)
+            if newline < 0:
+                text, end = text + "\n", len(text) + 1
+            else:
+                end = newline + 1
         text = text[:end] + " " * (last.start_mark.column - 2) + item + text[end:]
     elif isinstance(node, yaml.SequenceNode) and not node.value:
         text = text[:node.start_mark.index].rstrip(" ") + "\n  " + item + text[node.end_mark.index:]
