@@ -65,6 +65,14 @@ Ray keeps running, and so do apps and batches, through the agent restart. The up
 touches neither `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`;
 leave app endpoints running when their programs are unchanged.
 
+One agent session at a time drives a node. A stopping agent ends its session, so the
+scheduler admits the restarted agent at once. An agent that crashed, or one stopped
+while the scheduler was out of reach, leaves its session open: the next agent is
+refused ("another agent session is active for this worker") until the open session
+has been quiet for 30 seconds. Ending a session needs a scheduler at least as new as
+the agent, so upgrade the control host first. A remote `-n` run ships nothing to the node,
+and the node's part of it prints the steps for the files it would have received.
+
 #### Cron-supervised nodes
 
 `node upgrade` and `node rollback` need a systemd unit. On a cron-supervised node,
@@ -255,8 +263,8 @@ at a full core with sqlx `slow_acquire` warnings although Postgres is idle.
 - **Up to v0.1.8**, a bulk purge of a busy batch's history (`fleetctl job purge
   --older-than DAYS`) does the same: it holds that lock while it writes a record and a
   node command for every job, minutes for tens of thousands, and its node commands
-  then crowd out launches for as long again, at 16 per heartbeat. Later releases purge
-  in chunks and send a node's purges after its other commands.
+  then crowd out launches for as long again, at 16 per heartbeat. Later releases
+  purged in chunks; now there is no purge, and a batch's jobs go when it is deleted.
 
 ### Who changed what
 
@@ -264,7 +272,7 @@ The scheduler logs an `api request` line for each API call that can change state
 method, path and query, status, duration, and the caller's token ID, label, namespace
 and tag (never the token itself).
 `docker logs zkm-fleet-scheduler-1 | grep 'api request'` shows who submitted,
-cancelled, purged or reconfigured what.
+cancelled, deleted or reconfigured what.
 
 ## Installed files and backups
 

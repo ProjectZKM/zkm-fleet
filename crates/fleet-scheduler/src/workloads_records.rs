@@ -72,6 +72,12 @@ impl<T: Record> Records<T> {
         self.all.get(id)
     }
 
+    pub(super) fn remove(&mut self, id: &str) -> Option<T> {
+        let old = self.all.remove(id)?;
+        unindex(&mut self.open, &mut self.about, id, &old);
+        Some(old)
+    }
+
     /// Every record, history included, in id order.
     pub(super) fn values(&self) -> btree_map::Values<'_, String, T> {
         self.all.values()

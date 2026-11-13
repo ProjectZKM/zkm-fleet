@@ -320,7 +320,7 @@ async fn batch_policy_and_job_lifecycle_use_batch_routes() {
     assert_eq!(scale_call(c.clone(), "admin", "DELETE", "/batches/training", Value::Null)
         .await.status(), StatusCode::OK);
     assert_eq!(scale_call(c.clone(), "admin", "GET", &format!("/batches/training/jobs/{}", text(&job,"id")), Value::Null)
-        .await.status(), StatusCode::OK);
+        .await.status(), StatusCode::NOT_FOUND, "its jobs go with it");
 }
 
 #[tokio::test]
@@ -465,30 +465,6 @@ async fn a_job_its_quota_cannot_take_waits_without_rewriting_its_record() {
     assert_eq!(fs::metadata(&path).unwrap().ino(), written, "a pass that cannot place it leaves its record alone");
     assert_eq!(placed(&c), 2);
 }
-#[tokio::test]
-async fn a_backlog_of_purges_does_not_hold_back_a_launch() {
-    let (_dir, c, ns) = setup().await;
-    c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    // A bulk purge of history: more purges than one heartbeat carries, all ahead in id order.
-    for n in 0..20 {
-        let id = format!("0000-{n:02}");
-        c.inner.lock().commands.insert(id.clone(), CommandRecord {
-            id, worker: "gpu".into(), operation: NodeOperation::PurgeJob as i32,
-            parameters: json!({"id": format!("old-{n}"), "lease": "lease"}).into(),
-            done: false, result: Value::Null.into(), error: None, admitted: true,
-        });
-    }
-    let job = submit(&c).await;
-    c.dispatch().await.unwrap();
-    let launch = c.inner.lock().commands.about(&job.id).next().unwrap().id.clone();
-
-    let sent = heartbeat_commands(&c.inner.lock(), "gpu");
-    assert_eq!(sent.len(), 16);
-    assert_eq!(sent[0].id, launch, "the launch goes first");
-    assert!(sent[1..].iter().all(|c| c.operation == NodeOperation::PurgeJob as i32));
-    assert_eq!(sent[1].id, "0000-00", "purges keep their order");
-    assert!(heartbeat_commands(&c.inner.lock(), "other").is_empty());
-}
 /// Everything the tests log, from a process-wide subscriber: a scoped one can miss events
 /// while tests on other threads run the same log lines.
 fn test_logs() -> &'static parking_lot::Mutex<Vec<u8>> {
@@ -512,75 +488,21 @@ fn test_logs() -> &'static parking_lot::Mutex<Vec<u8>> {
 }
 
 #[tokio::test]
-async fn a_bulk_purge_takes_every_finished_job_in_chunks_and_records_who_asked() {
+async fn a_change_is_on_record_with_who_asked_and_a_read_is_not() {
     let logs = test_logs();
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let template = submit(&c).await;
-    // More finished jobs than one chunk holds, and one that finished just now.
-    for n in 0..150 {
-        let mut r = template.clone();
-        r.id = format!("old-{n:03}");
-        r.worker = Some("gpu".into());
-        r.status = json!({"state":"succeeded","submitted_at":1,"finished_at":(now() - 7200.0)}).into();
-        c.inner.lock().jobs.insert(r.id.clone(), r);
-    }
-    let mut recent = template.clone();
-    recent.id = "recent".into();
-    recent.status = json!({"state":"succeeded","submitted_at":1,"finished_at":now()}).into();
-    c.inner.lock().jobs.insert(recent.id.clone(), recent);
-
-    let response = scale_call(c.clone(), "admin", "DELETE", "/batches/training/jobs?older_than=0.0517", json!(null)).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
-    assert_eq!(body.as_array().unwrap().len(), 150);
-    {
-        let i = c.inner.lock();
-        assert!((0..150).all(|n| i.jobs[&format!("old-{n:03}")].purged));
-        assert!(!i.jobs["recent"].purged && !i.jobs[&template.id].purged);
-        let purges: HashSet<&str> = i.commands.open()
-            .filter(|c| c.worker == "gpu" && c.operation == NodeOperation::PurgeJob as i32)
-            .filter_map(|c| c.parameters["id"].as_str())
-            .collect();
-        assert_eq!(purges.len(), 150, "each purged job's node drops its copy");
-    }
-
-    // The request is on record with its caller; a read is not.
-    scale_call(c.clone(), "admin", "GET", "/batches/training/jobs", json!(null)).await;
+    let uri = format!("/batches/training?namespace={ns}");
+    assert_eq!(scale_call(c.clone(), "admin", "DELETE", &uri, json!(null)).await.status(), StatusCode::OK);
+    scale_call(c.clone(), "admin", "GET", "/batches", json!(null)).await;
     let logs = String::from_utf8(logs.lock().clone()).unwrap();
-    let lines: Vec<&str> = logs.lines().filter(|l| l.contains("api request") && l.contains("older_than=0.0517")).collect();
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains("api request") && l.contains(&format!("uri={uri}"))).collect();
     assert_eq!(lines.len(), 1, "{logs}");
     assert!(!logs.lines().any(|l| l.contains("api request") && l.contains("method=GET")), "reads are not logged");
-    for part in ["method=DELETE", "uri=/batches/training/jobs?older_than=0.0517", "status=200", &format!("token=\"{}\"", "ad".repeat(16)), "label=\"admin\""] {
+    for part in ["method=DELETE", "status=200", &format!("token=\"{}\"", "ad".repeat(16)), "label=\"admin\""] {
         assert!(lines[0].contains(part), "{part} in {}", lines[0]);
     }
     assert!(!lines[0].contains(ADMIN), "the token itself is never logged");
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bulk_purge_lets_node_reports_in_between_its_chunks() {
-    let (_dir, c, ns) = setup().await;
-    c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let template = submit(&c).await;
-    for n in 0..400 {
-        let mut r = template.clone();
-        r.id = format!("old-{n:03}");
-        r.worker = Some("gpu".into());
-        r.status = json!({"state":"succeeded","submitted_at":1,"finished_at":1}).into();
-        c.inner.lock().jobs.insert(r.id.clone(), r);
-    }
-    let purged = |c: &WorkloadController| c.inner.lock().jobs.values().filter(|r| r.purged).count();
-    let purge = tokio::spawn(scale_call(c.clone(), "admin", "DELETE", "/batches/training/jobs?older_than=0", json!(null)));
-    while purged(&c) == 0 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    // What a node report waits for: it gets the lock before the purge has finished.
-    let during = {
-        let _ops = c.ops.lock().await;
-        purged(&c)
-    };
-    assert_eq!(purge.await.unwrap().status(), StatusCode::OK);
-    assert!(during < 400, "the report waited for the whole purge");
-    assert_eq!(purged(&c), 400);
 }
 #[tokio::test]
 async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
@@ -608,7 +530,7 @@ async fn offline_worker_and_terminal_without_cleanup_keep_reservations() {
     assert!(c.fleet.allocations(&ns).is_empty());
 }
 #[tokio::test]
-async fn stale_lease_is_ignored_and_purged_history_cannot_be_imported_again() {
+async fn stale_lease_is_ignored_and_a_purged_record_is_not_imported_again() {
     let (_dir, c, ns) = setup().await;
     c.report("gpu", "session", inventory(&ns)).await.unwrap();
     let job = submit(&c).await;
@@ -622,8 +544,8 @@ async fn stale_lease_is_ignored_and_purged_history_cannot_be_imported_again() {
     assert_eq!(c.fleet.allocations(&ns).len(), 1);
     report.jobs[0] = incoming(&job, "succeeded", true);
     c.report("gpu", "session", report.clone()).await.unwrap();
-    c.purge(c.job(&job.id, None, &BTreeMap::new()).unwrap())
-        .unwrap();
+    // A record an earlier release purged: its node's copy may be reported still.
+    c.inner.lock().jobs.update(&job.id, |r| r.purged = true);
     c.report("gpu", "session", report).await.unwrap();
     assert!(c.job(&job.id, None, &BTreeMap::new()).is_err());
 }
@@ -2052,9 +1974,9 @@ async fn deleting_a_registered_app_tells_every_node_which_app_was_deleted() {
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     c.report("cpu","session",inventory(&ns)).await.unwrap();
     let app=PROOF.to_string();
-    c.remove_app(&ns,&app).unwrap();
-    c.remove_app(&ns,&app).unwrap();
-    let expected=json!({"app":{"namespace":ns,"namespace_name":"test","name":app},"remove":true});
+    c.remove_app(&ns,&app,&[]).unwrap();
+    c.remove_app(&ns,&app,&[]).unwrap();
+    let expected=json!({"app":{"namespace":ns,"namespace_name":"test","name":app},"remove":true,"delete":{"keep":[],"files":[]}});
     assert_eq!(remove_commands(&c,NodeOperation::App),vec![("cpu".to_string(),expected.clone()),("gpu".to_string(),expected)]);
 }
 
@@ -2064,11 +1986,20 @@ async fn deleting_an_app_tells_its_nodes() {
     c.report("gpu","session",scale_inventory(&ns,false,true)).await.unwrap();
     c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"]=json!(true);
     assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/apps/model?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},"remove":true}))]);
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),
+        json!({"app":{"namespace":ns,"namespace_name":"test","name":"model"},"remove":true,"delete":{"keep":[],"files":[]}}))]);
 }
 
+/// The body of a response, as JSON.
+async fn body(response: Response) -> Value {
+    serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap()
+}
+
+/// Deleting a batch deletes its job records with their logs, and the commands about them, at once,
+/// and tells each node which of its jobs' directories to remove. Its own record stays until its node
+/// has removed it: a report before then brings back neither it nor its jobs, and its name stays taken.
 #[tokio::test]
-async fn deleting_a_batch_sends_remove_batch_and_keeps_its_jobs() {
+async fn deleting_a_batch_deletes_its_jobs_and_goes_once_its_node_removed_it() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     let job=submit(&c).await;
@@ -2077,13 +2008,171 @@ async fn deleting_a_batch_sends_remove_batch_and_keeps_its_jobs() {
     let mut report=inventory(&ns);
     report.jobs.push(incoming(&job,"succeeded",true));
     c.report("gpu","session",report).await.unwrap();
-    assert_eq!(scale_call(c.clone(),"admin","DELETE",&format!("/batches/training?namespace={ns}"),Value::Null).await.status(),StatusCode::OK);
-    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"batch":{"name":"training"},"remove":true}))]);
-    assert!(c.job(&job.id,None,&BTreeMap::new()).is_ok(),"job history and outputs follow the job's own lifecycle");
+    let logs=c.dir.join("artifacts").join(&job.id).join(&job.lease).join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let launch=c.inner.lock().commands.about(&job.id).next().unwrap().id.clone();
+    let deleted=scale_call(c.clone(),"admin","DELETE",&format!("/batches/training?namespace={ns}"),Value::Null).await;
+    assert_eq!(deleted.status(),StatusCode::OK);
+    let deleted=body(deleted).await;
+    assert_eq!((&deleted["jobs_deleted"],&deleted["nodes"]),(&json!(1),&json!(["gpu"])),"{deleted}");
+    assert_eq!(remove_commands(&c,NodeOperation::App),vec![("gpu".to_string(),json!({"batch":{"name":"training"},"remove":true,"delete":{"jobs":[job.id]}}))]);
+    assert!(c.job(&job.id,None,&BTreeMap::new()).is_err());
+    assert!(!c.dir.join("jobs").join(format!("{}.json",job.id)).exists() && !c.dir.join("artifacts").join(&job.id).exists());
+    assert!(c.inner.lock().commands.get(&launch).is_none() && !c.dir.join("commands").join(format!("{launch}.json")).exists());
+
     let mut late=incoming(&job,"succeeded",true);late.id="other-job".into();
-    let mut report=inventory(&ns);report.jobs.push(late);
+    let mut report=inventory(&ns);report.jobs.extend([incoming(&job,"succeeded",true),late]);
     c.report("gpu","session",report).await.unwrap();
-    assert!(c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted batch imports no jobs");
+    assert!(c.job(&job.id,None,&BTreeMap::new()).is_err() && c.job("other-job",None,&BTreeMap::new()).is_err(),"a deleted batch imports no jobs");
+    assert_eq!(scale_call(c.clone(),"admin","GET",&format!("/batches/training?namespace={ns}"),Value::Null).await.status(),StatusCode::NOT_FOUND);
+    let batches=format!("/batches?namespace={ns}");
+    let create=|c: Arc<WorkloadController>| scale_call(c,"admin","POST",&batches,json!({"name":"training","image":"test"}));
+    let refused=create(c.clone()).await;
+    assert_eq!(refused.status(),StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&to_bytes(refused.into_body(),1<<20).await.unwrap()).contains("training is deleted, but not gone yet"));
+
+    let removal=c.inner.lock().commands.open().find(|v|v.removes()==Some("training")).unwrap().id.clone();
+    let mut report=inventory(&ns);report.batches.clear();
+    report.results=vec![CommandResult{id:removal.clone(),result:json!({"removed":["training"],"jobs_deleted":1,"kept":[]}).into(),error:None}];
+    c.report("gpu","session",report).await.unwrap();
+    assert!(!c.inner.lock().apps.contains_key("training") && !c.dir.join("apps/training.json").exists(),"gone once its node removed it");
+    assert!(c.inner.lock().commands.get(&removal).is_none() && !c.dir.join("commands").join(format!("{removal}.json")).exists());
+    assert_eq!(create(c.clone()).await.status(),StatusCode::CREATED,"and its name is free");
+}
+
+/// A node that fails to remove a deleted batch leaves its record there; deleting it again retries.
+#[tokio::test]
+async fn a_deleted_batch_a_node_failed_to_remove_is_deleted_again() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    let path=format!("/batches/training?namespace={ns}");
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&path,Value::Null).await.status(),StatusCode::OK);
+    let removal=c.inner.lock().commands.open().find(|v|v.removes()==Some("training")).unwrap().id.clone();
+    let mut report=inventory(&ns);
+    report.results=vec![CommandResult{id:removal.clone(),result:json!({"cleaned":false}).into(),error:Some("batches.yaml: not a mapping".into())}];
+    c.report("gpu","session",report).await.unwrap();
+    assert!(c.inner.lock().apps["training"].removed,"stays while not removed");
+    assert_eq!(scale_call(c.clone(),"admin","DELETE",&path,Value::Null).await.status(),StatusCode::OK);
+    let retry=c.inner.lock().commands.open().find(|v|v.removes()==Some("training")).unwrap().id.clone();
+    assert_ne!(retry,removal);
+    assert!(c.inner.lock().commands.get(&removal).is_none(),"the failed one goes with the retry");
+    let mut report=inventory(&ns);report.batches.clear();
+    report.results=vec![CommandResult{id:retry,result:json!({"removed":["training"],"jobs_deleted":0,"kept":[]}).into(),error:None}];
+    c.report("gpu","session",report).await.unwrap();
+    assert!(!c.inner.lock().apps.contains_key("training"));
+}
+
+/// A batch an earlier release deleted kept its job records: it stays listed as deleted until it is
+/// deleted again, which deletes them. One whose jobs that release purged goes at the next start.
+#[tokio::test]
+async fn a_batch_an_earlier_release_deleted_goes_with_its_jobs() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    assert_eq!(scale_call(c.clone(),"admin","POST",&format!("/batches?namespace={ns}"),json!({"name":"render","image":"test"})).await.status(),StatusCode::CREATED);
+    let kept=submit(&c).await;
+    let purged=c.submit("render",json!({"command":["true"],"gpus":1,"cpus":1}),None,&BTreeMap::new()).await.unwrap();
+    let purged=c.job(text(&purged,"id"),None,&BTreeMap::new()).unwrap();
+    for (mut r,flag) in [(kept.clone(),false),(purged.clone(),true)] {
+        r.status=json!({"state":"succeeded","submitted_at":1,"finished_at":2}).into();
+        r.quota_held=false;
+        r.purged=flag;
+        c.save("jobs",&r.id,&r).unwrap();
+    }
+    for name in ["training","render"] {
+        let mut t=c.inner.lock().apps[name].clone();
+        t.removed=true;
+        c.save("apps",name,&t).unwrap();
+    }
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap());
+    assert!(!c.inner.lock().apps.contains_key("render") && !c.dir.join("apps/render.json").exists());
+    assert!(!c.inner.lock().jobs.values().any(|r|r.id==purged.id) && !c.dir.join("jobs").join(format!("{}.json",purged.id)).exists());
+    let listed=body(scale_call(c.clone(),"admin","GET",&format!("/batches?namespace={ns}"),Value::Null).await).await;
+    assert_eq!(listed.as_array().unwrap().iter().map(|b|(b["name"].clone(),b["state"].clone())).collect::<Vec<_>>(),vec![(json!("training"),json!("deleted"))]);
+    let deleted=body(scale_call(c.clone(),"admin","DELETE",&format!("/batches/training?namespace={ns}"),Value::Null).await).await;
+    assert_eq!(deleted["jobs_deleted"],1,"{deleted}");
+    assert!(!c.dir.join("jobs").join(format!("{}.json",kept.id)).exists());
+    assert_eq!(body(scale_call(c.clone(),"admin","GET",&format!("/batches?namespace={ns}"),Value::Null).await).await,json!([]));
+}
+
+/// Deleting a proof app deletes its jobs and tells every node which files they left in its storage:
+/// each job's output directory, and the inputs and ELF that no other job or app uses.
+#[tokio::test]
+async fn deleting_a_proof_app_tells_its_nodes_the_files_its_jobs_left() {
+    use crate::store::{ProofJob,ProofJobState};
+    use fleet_proto::fleet::v1::{ArtifactRef,ProofInputs,ProofKind};
+    use fleet_proto::stage::v1::Status as StageStatus;
+    let (_dir,c,ns)=setup().await;
+    let other_elf="c".repeat(64);
+    register(&c,&ns,PROOF,&proof_elf()).await;
+    register(&c,&ns,"other",&other_elf).await;
+    let second=c.fleet.create_namespace("second",Quota{gpus:Some(1.0),cpus:Some(1.0)}).await.unwrap().id;
+    register(&c,&second,"twin",&proof_elf()).await;
+    c.report("gpu","session",inventory(&ns)).await.unwrap();
+    let file=|path:&str,sha:&str| ArtifactRef{uri:format!("file:///store/{path}"),sha256:sha.into(),size:1};
+    for (id,app,elf,input) in [("p1",PROOF,proof_elf(),"inputs/a"),("p2",PROOF,proof_elf(),"inputs/shared"),("o1","other",other_elf.clone(),"inputs/shared")] {
+        c.fleet.store.upsert(&ProofJob{
+            inputs:Some(ProofInputs{input:Some(file(input,&"1".repeat(64))),elf:Some(file(&format!("elf/{elf}"),&elf)),output_root:"file:///store/outputs/".into()}),
+            outputs:None,id:id.into(),app:app.into(),owner:"b".repeat(40),namespace:ns.clone(),tag:String::new(),client_id:id.into(),elf_id:elf.clone(),
+            kind:ProofKind::Compressed as i32,priority:0,state:ProofJobState::Failed as i32,fail_status:Some(StageStatus::InternalError as i32),
+            error:String::new(),node:None,attempts:1,failed_on:vec![],cycles:0,prove_ms:0,created_ms:1,started_ms:Some(1),finished_ms:Some(2),
+        }).await.unwrap();
+    }
+    let files=|c: &WorkloadController, app: &str| {
+        let i=c.inner.lock();
+        let removal=i.commands.open().find(|v|v.removes()==Some(app)).expect("removal");
+        let mut files: Vec<String>=removal.parameters["delete"]["files"].as_array().unwrap().iter().map(|f|f.as_str().unwrap().to_owned()).collect();
+        files.sort();
+        files
+    };
+    let deleted=body(scale_call(c.clone(),"admin","DELETE",&format!("/apps/other?namespace={ns}"),Value::Null).await).await;
+    assert_eq!((&deleted["jobs_deleted"],&deleted["nodes"]),(&json!(1),&json!(["gpu"])),"{deleted}");
+    assert_eq!(files(&c,"other"),vec![format!("/store/elf/{other_elf}"),"/store/outputs/o1".into()],"its ELF is its own; the input is p2's too");
+    let deleted=body(scale_call(c.clone(),"admin","DELETE",&format!("/apps/{PROOF}?namespace={ns}"),Value::Null).await).await;
+    assert_eq!(deleted["jobs_deleted"],2,"{deleted}");
+    assert_eq!(files(&c,PROOF),vec!["/store/inputs/a","/store/inputs/shared","/store/outputs/p1","/store/outputs/p2"],"twin proves its ELF");
+}
+
+/// Deleting an app and deleting a batch are one operation: refused while any of its work
+/// runs or may run, with what that is and how to stop it. A batch's work is its jobs; an app's
+/// is its replicas, which a node that no longer configures it doesn't have.
+#[tokio::test]
+async fn deleting_an_app_or_a_batch_is_refused_while_any_of_it_runs() {
+    let (_dir, c, ns) = setup().await;
+    let refusal = |c: Arc<WorkloadController>, path: String| async move {
+        let response = scale_call(c, "admin", "DELETE", &path, Value::Null).await;
+        let status = response.status();
+        (status, String::from_utf8_lossy(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).into_owned())
+    };
+    let (batch, app) = (format!("/batches/training?namespace={ns}"), format!("/apps/model?namespace={ns}"));
+
+    c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
+    let job = submit(&c).await;
+    let (status, body) = refusal(c.clone(), batch.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("batch training still runs: 1 job(s) queued or running: cancel them or let them finish"), "{body}");
+    let (status, body) = refusal(c.clone(), app.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("app model still runs: it is enabled: disable it first (fleetctl app disable model)"), "{body}");
+
+    c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"] = json!(true);
+    let (_, body) = refusal(c.clone(), app.clone()).await;
+    assert!(body.contains("its replicas on node gpu are still stopping"), "{body}");
+    c.inner.lock().workers.get_mut("gpu").unwrap().seen = 0.0;
+    let (_, body) = refusal(c.clone(), app.clone()).await;
+    assert!(body.contains("node gpu is offline, so it can't confirm its replicas stopped"), "{body}");
+
+    c.inner.lock().jobs.update(&job.id, |j| j.status["state"] = json!("cancelled"));
+    assert_eq!(refusal(c.clone(), batch).await.0, StatusCode::OK);
+
+    // A node the app was on that no longer configures it holds nothing of it: only a node
+    // that configures it does, until it has stopped it.
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    c.report("cpu", "session", inventory(&ns)).await.unwrap();
+    c.inner.lock().apps.get_mut("model").unwrap().workers.push("cpu".into());
+    c.inner.lock().apps.get_mut("model").unwrap().spec["disabled"] = json!(true);
+    let (status, body) = refusal(c.clone(), format!("/apps/model?namespace={ns}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 fn command_where(c: &WorkloadController, pick: impl Fn(&CommandRecord) -> bool) -> Option<CommandRecord> {

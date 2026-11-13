@@ -16,8 +16,8 @@ use axum::{
     Json, Router,
 };
 use fleet_proto::fleet::v1::{
-    worker_service_server::WorkerService, NodeCommand, NodeOperation, WorkerHeartbeatRequest,
-    WorkerHeartbeatResponse,
+    worker_service_server::WorkerService, NodeCommand, NodeOperation, WorkerEndSessionRequest,
+    WorkerEndSessionResponse, WorkerHeartbeatRequest, WorkerHeartbeatResponse,
 };
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -48,6 +48,41 @@ fn fail(code: u16, message: impl Into<String>) -> anyhow::Error {
         message: message.into(),
     })
 }
+/// The files of the job records and commands a deletion dropped.
+type RecordFiles = (Vec<String>, Vec<String>);
+
+/// Whether command `c` changes app or batch `name` of `namespace`, or one of its entries.
+fn about(c: &CommandRecord, namespace: &str, name: &str) -> bool {
+    let p = &c.parameters;
+    if c.is(NodeOperation::SetApp) {
+        return c.entry().app() == name && c.entry().namespace() == namespace;
+    }
+    c.is(NodeOperation::App)
+        && (p["batch"]["name"] == name
+            || p["app"]["name"] == name && p["app"]["namespace"] == namespace
+            || c.created().is_some_and(|e| e.app() == name && e.namespace() == namespace))
+}
+
+/// An outcome of removing a file, gone already counting as done.
+fn gone(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Removes deleted job records with their logs, and deleted commands.
+fn remove_records(dir: &Path, jobs: &[String], commands: &[String]) -> anyhow::Result<()> {
+    for id in jobs {
+        gone(fs::remove_file(dir.join("jobs").join(format!("{id}.json"))))?;
+        gone(fs::remove_dir_all(dir.join("artifacts").join(id)))?;
+    }
+    for id in commands {
+        gone(fs::remove_file(dir.join("commands").join(format!("{id}.json"))))?;
+    }
+    Ok(())
+}
+
 fn response_error(e: anyhow::Error) -> Response {
     if e.downcast_ref::<serde_json::Error>().is_some() {
         return (StatusCode::BAD_REQUEST, "invalid JSON request").into_response();
@@ -95,6 +130,9 @@ struct NodeSession {
     seen: f64,
     report: NodeReport,
     draining: bool,
+    /// Its agent stopped and said so: the next agent's session takes over at once, without
+    /// waiting for this one to go quiet. The node counts as connected until then, as before.
+    ended: bool,
 }
 #[derive(Default)]
 struct WorkloadState {
@@ -143,14 +181,16 @@ impl WorkloadController {
                 .insert(format!("{}-{}", v.worker, v.entry().name()), v);
         }
         fleet.set_worker_owned_apps(worker_owned(&inner));
-        Ok(Self {
+        let controller = Self {
             fleet,
             cluster,
             dir,
             inner: Mutex::new(inner),
             ops: tokio::sync::Mutex::new(()),
             notify: tokio::sync::Notify::new(),
-        })
+        };
+        controller.forget_deleted()?;
+        Ok(controller)
     }
     pub(crate) fn fleet(&self) -> &Arc<Scheduler> {
         &self.fleet
@@ -241,11 +281,158 @@ impl WorkloadController {
         workers.into_iter().map(|worker| self.command(worker, NodeOperation::App, message.clone())).collect()
     }
 
-    /// Tells every node that `app` was deleted from `namespace`; each removes the entries it
-    /// configures for it.
-    pub(crate) fn remove_app(&self, namespace: &str, app: &str) -> anyhow::Result<()> {
-        let workers: Vec<String> = self.inner.lock().workers.keys().cloned().collect();
-        self.tell_nodes(&workers, self.app_message(namespace, app), message::remove())?;
+    /// Tells every node that `app` was deleted from `namespace`. Each removes the entries it
+    /// configures for it with what they hold on it, and `files`, which the app's proof jobs
+    /// left in its storage, but keeps what the nodes' other apps and batches use. Returns the
+    /// nodes told.
+    pub(crate) fn remove_app(&self, namespace: &str, app: &str, files: &[String]) -> anyhow::Result<Vec<String>> {
+        // Its nodes, and every other connected since the scheduler started: one that is offline
+        // gets the message when it is back.
+        let workers: Vec<String> = {
+            let i = self.inner.lock();
+            let mine = i.apps.get(app).filter(|a| a.namespace == namespace).map(|a| a.workers.clone()).unwrap_or_default();
+            i.workers.keys().cloned().chain(mine).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+        };
+        let change = json!({"remove": true, "delete": {"keep": self.paths_in_use(app), "files": files}});
+        self.tell_nodes(&workers, self.app_message(namespace, app), change)?;
+        Ok(workers)
+    }
+
+    /// The host paths that the apps and batches its nodes report use, but `name`'s. Deleting
+    /// `name` keeps them on every node, and what holds or lies in one of them.
+    fn paths_in_use(&self, name: &str) -> Vec<String> {
+        let i = self.inner.lock();
+        let mut paths = std::collections::BTreeSet::new();
+        for w in i.workers.values() {
+            for e in w.report.entries().filter(|e| e.app() != name) {
+                for key in ["workdir", "worker_workdir", "proof_storage_root", "worker_env_file"] {
+                    paths.extend(e.0[key].as_str().map(str::to_owned));
+                }
+                for volume in e.0["volumes"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    paths.insert(volume.split(':').next().unwrap_or(volume).to_owned());
+                }
+            }
+            for (_, spec) in w.report.batches.iter().filter(|(batch, _)| batch.as_str() != name) {
+                paths.extend(spec["allow"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    /// Deletes app or batch `name` of `namespace`, once nothing of it runs. What the control
+    /// host holds of it goes at once: its job records with their logs, and the commands about
+    /// them and it. Its own record stays, marked deleted, until its nodes have removed it
+    /// (`forget_deleted`), so that a node report sent before then can't bring it back. Each
+    /// node removes its configuration and what it holds of it: a batch's job directories; an
+    /// app's replicas, their logs, its workers' directories and `files`, which its proof jobs
+    /// left in its storage. Returns what it deleted and the nodes it told, and the files of
+    /// the records, to remove once the operation lock is released.
+    fn delete(&self, namespace: &str, name: &str, files: Vec<String>) -> anyhow::Result<(Value, RecordFiles)> {
+        let template = self.inner.lock().apps.get(name).filter(|a| a.namespace == namespace).cloned();
+        let batch = template.as_ref().is_some_and(|a| !a.persistent);
+        if let Some(mut t) = template.clone() {
+            t.removed = true;
+            self.save("apps", name, &t)?;
+            self.inner.lock().apps.insert(name.into(), t);
+        }
+        // Its deployments go once their nodes report them no more, which needs them disabled.
+        let enabled: Vec<(String, AppDeployment)> = self.inner.lock().deployments.iter()
+            .filter(|(_, d)| !d.disabled && d.entry().app() == name && d.entry().namespace() == namespace)
+            .map(|(key, d)| (key.clone(), d.clone()))
+            .collect();
+        for (key, mut d) in enabled {
+            d.disabled = true;
+            self.save("deployments", &key, &d)?;
+            self.inner.lock().deployments.insert(key, d);
+        }
+        let (jobs, commands, shown, on) = {
+            let mut i = self.inner.lock();
+            let jobs: Vec<String> = i.jobs.values().filter(|r| r.batch == name).map(|r| r.id.clone()).collect();
+            let ids: HashSet<&str> = jobs.iter().map(String::as_str).collect();
+            let commands: Vec<String> = i.commands.values()
+                .filter(|c| c.job_id().is_some_and(|id| ids.contains(id)) || c.done && about(c, namespace, name))
+                .map(|c| c.id.clone())
+                .collect();
+            // Where each job's directory is; an earlier release's purge removed it already.
+            let (mut shown, mut on) = (0, BTreeMap::<String, Vec<String>>::new());
+            for id in &jobs {
+                let r = i.jobs.remove(id).expect("listed above");
+                if !r.purged {
+                    shown += 1;
+                    if let Some(worker) = r.worker {
+                        on.entry(worker).or_default().push(r.id);
+                    }
+                }
+            }
+            for id in &commands {
+                i.commands.remove(id);
+            }
+            (jobs, commands, shown, on)
+        };
+        let nodes = if batch {
+            let mut workers: std::collections::BTreeSet<String> = template.iter().flat_map(|t| t.workers.clone()).collect();
+            workers.extend(on.keys().cloned());
+            for worker in &workers {
+                let jobs = on.get(worker).cloned().unwrap_or_default();
+                let change = json!({"remove": true, "delete": {"jobs": jobs}});
+                self.command(worker, NodeOperation::App, message::with(message::batch(name), &change))?;
+            }
+            workers.into_iter().collect()
+        } else {
+            self.remove_app(namespace, name, &files)?
+        };
+        tracing::info!(name, jobs = shown, ?nodes, "deleted; its nodes remove what they hold of it");
+        Ok((json!({"name": name, "removed": true, "jobs_deleted": shown, "nodes": nodes}), (jobs, commands)))
+    }
+
+    /// Removes the files of records `delete` dropped.
+    async fn remove_files(&self, (jobs, commands): RecordFiles) -> anyhow::Result<()> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || remove_records(&dir, &jobs, &commands)).await?
+    }
+
+    /// Forgets the deleted apps and batches that their nodes have removed: the record of each,
+    /// and the commands about it. One that a node failed to remove stays until it is deleted
+    /// again, and so does a batch deleted by an earlier release, while the job records that
+    /// release left are there (it goes with the ones that release purged).
+    fn forget_deleted(&self) -> anyhow::Result<()> {
+        let (names, jobs, commands) = {
+            let mut i = self.inner.lock();
+            let deleted: Vec<(String, String)> = i.apps.values().filter(|a| a.removed)
+                .map(|a| (a.namespace.clone(), a.name.clone())).collect();
+            if deleted.is_empty() {
+                return Ok(());
+            }
+            let shown: HashSet<&str> = i.jobs.values().filter(|r| !r.purged).map(|r| r.batch.as_str()).collect();
+            let gone: Vec<(String, String)> = deleted.into_iter()
+                .filter(|(namespace, name)| !shown.contains(name.as_str())
+                    && !i.commands.values().any(|c| about(c, namespace, name) && (!c.done || c.deletes().is_some() && c.error.is_some())))
+                .collect();
+            let names: HashSet<&str> = gone.iter().map(|(_, name)| name.as_str()).collect();
+            let jobs: Vec<String> = i.jobs.values().filter(|r| names.contains(r.batch.as_str())).map(|r| r.id.clone()).collect();
+            let ids: HashSet<&str> = jobs.iter().map(String::as_str).collect();
+            let commands: Vec<String> = i.commands.values()
+                .filter(|c| c.job_id().is_some_and(|id| ids.contains(id)) || gone.iter().any(|(namespace, name)| about(c, namespace, name)))
+                .map(|c| c.id.clone())
+                .collect();
+            for id in &jobs {
+                i.jobs.remove(id);
+            }
+            for id in &commands {
+                i.commands.remove(id);
+            }
+            for (_, name) in &gone {
+                i.apps.remove(name);
+            }
+            (gone.into_iter().map(|(_, name)| name).collect::<Vec<_>>(), jobs, commands)
+        };
+        for name in &names {
+            gone(fs::remove_file(self.dir.join("apps").join(format!("{name}.json"))))?;
+        }
+        remove_records(&self.dir, &jobs, &commands)?;
+        if !names.is_empty() {
+            tracing::info!(?names, "deleted apps and batches forgotten: their nodes removed them");
+        }
         Ok(())
     }
 
@@ -496,6 +683,48 @@ impl WorkloadController {
         keys.iter().filter(|k| i.deployments.get(*k).and_then(|d| i.workers.get(&d.worker)).is_some_and(|w| now() - w.seen < 30.0)).cloned().collect()
     }
 
+    /// What of app or batch `app` may still run, each with how to stop it; nothing when it can
+    /// be deleted. Deleting an app or a batch is the same operation: it is refused while any
+    /// of its work runs or may run. A batch's work is its jobs, queued or running. An app's
+    /// is its replicas: it is disabled first, and every node that configures it confirms them
+    /// stopped. An offline node can't, so it holds the delete until it's back.
+    fn still_running(&self, app: &WorkloadTemplate) -> Vec<String> {
+        let name = app.name.as_str();
+        let i = self.inner.lock();
+        let mut running = Vec::new();
+        let jobs = i.jobs.open().filter(|r| r.batch == name && (!terminal(r.state()) || r.quota_held)).count();
+        if jobs > 0 {
+            running.push(format!("{jobs} job(s) queued or running: cancel them or let them finish"));
+        }
+        if !app.persistent {
+            return running;
+        }
+        // A deleted app's nodes stop it as they remove it.
+        if !app.disabled() && !app.removed {
+            running.push(format!("it is enabled: disable it first (fleetctl app disable {name})"));
+            return running;
+        }
+        for worker in &app.workers {
+            match i.workers.get(worker).filter(|w| now() - w.seen < 30.0) {
+                None => running.push(format!("node {worker} is offline, so it can't confirm its replicas stopped")),
+                // A node that no longer configures it has nothing of it left.
+                Some(w) => if w.report.entries().any(|e| e.name() == name && !e.cleaned()) {
+                    running.push(format!("its replicas on node {worker} are still stopping"));
+                },
+            }
+        }
+        running
+    }
+
+    /// Refuses `name` while a deleted app or batch of that name is not gone yet.
+    pub(super) fn ensure_name_free(&self, name: &str) -> anyhow::Result<()> {
+        if self.inner.lock().apps.get(name).is_some_and(|a| a.removed) {
+            return Err(fail(409, format!("{name} is deleted, but not gone yet: its nodes are still removing it, \
+                or it keeps job records from an earlier release. Delete it again to finish, then reuse the name")));
+        }
+        Ok(())
+    }
+
     /// Whether a batch still has job records (not purged).
     fn has_jobs(&self, batch: &str) -> bool {
         self.inner.lock().jobs.values().any(|r| r.batch == batch && !r.purged)
@@ -622,6 +851,18 @@ impl WorkloadController {
         self.notify.notify_waiters();
         Ok(v)
     }
+    /// Ends `worker`'s agent session `session`, which its agent sends as it stops: the agent
+    /// that replaces it is admitted at once. Another session than the current one changes
+    /// nothing, so one agent can't end another's.
+    pub(crate) fn end_session(&self, worker: &str, session: &str) -> bool {
+        let mut i = self.inner.lock();
+        let Some(w) = i.workers.get_mut(worker).filter(|w| w.session == session) else {
+            return false;
+        };
+        w.ended = true;
+        tracing::info!(worker, "agent session ended; the next agent session takes over at once");
+        true
+    }
     async fn report(
         &self,
         worker_id: &str,
@@ -677,7 +918,7 @@ impl WorkloadController {
             let mut i = self.inner.lock();
             if i.workers
                 .get(worker_id)
-                .is_some_and(|w| w.session != session && now() - w.seen < 30.0)
+                .is_some_and(|w| w.session != session && !w.ended && now() - w.seen < 30.0)
             {
                 return Err(fail(409, "another agent session is active for this worker"));
             }
@@ -692,6 +933,7 @@ impl WorkloadController {
                     seen: now(),
                     report: report.clone(),
                     draining,
+                    ended: false,
                 },
             );
         }
@@ -752,6 +994,11 @@ impl WorkloadController {
             };
             let key = format!("{worker_id}-{name}");
             let existing = { self.inner.lock().deployments.get(&key).cloned() };
+            // An entry of a deleted app, which its node is about to remove.
+            if existing.is_none() && self.inner.lock().apps.get(observed.app())
+                .is_some_and(|a| a.removed && a.namespace == namespace.id) {
+                continue;
+            }
             let intent = if let Some(mut intent) = existing {
                 // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
@@ -928,7 +1175,7 @@ impl WorkloadController {
             self.save("jobs", &r.id, &r)?;
             self.inner.lock().jobs.insert(r.id.clone(), r);
         }
-        let mut acknowledged = vec![];
+        let (mut acknowledged, mut removals) = (vec![], false);
         for result in &report.results {
             let Some(mut c) = self.inner.lock().commands.get(&result.id).cloned() else {
                 acknowledged.push(result.id.clone());
@@ -1019,10 +1266,23 @@ impl WorkloadController {
                         }
                     }
                 }
+                if let Some(name) = c.deletes() {
+                    removals = true;
+                    let kept = c.result["kept"].as_array().filter(|k| !k.is_empty());
+                    if c.error.is_some() || kept.is_some() {
+                        tracing::warn!(worker = worker_id, name, error = ?c.error, ?kept,
+                            "a node did not remove all of a deleted app or batch; delete it again to retry");
+                    } else {
+                        tracing::info!(worker = worker_id, name, deleted = %c.result["deleted"], "a node removed a deleted app or batch");
+                    }
+                }
                 self.save("commands", &c.id, &c)?;
                 self.inner.lock().commands.insert(c.id.clone(), c);
             }
             acknowledged.push(result.id.clone());
+        }
+        if removals {
+            self.forget_deleted()?;
         }
         self.notify.notify_waiters();
         Ok(acknowledged)
@@ -1063,26 +1323,6 @@ impl WorkloadController {
             (w.report.free_gpus - pending.0 - starting.0).max(0.0),
             (w.report.free_cpus - pending.1 - starting.1).max(0.0),
         ))
-    }
-    fn purge(&self, mut r: Job) -> anyhow::Result<Value> {
-        if !terminal(r.state()) || r.quota_held {
-            return Err(fail(409, "wait for confirmed cleanup before purging"));
-        }
-        r.purged = true;
-        self.save("jobs", &r.id, &r)?;
-        self.inner.lock().jobs.insert(r.id.clone(), r.clone());
-        if let Some(worker) = &r.worker {
-            self.command(
-                worker,
-                NodeOperation::PurgeJob,
-                message::job(&r.id, &r.lease),
-            )?;
-        }
-        let path = self.dir.join("artifacts").join(&r.id);
-        if path.exists() {
-            fs::remove_dir_all(path)?;
-        }
-        Ok(json!({"id":r.id,"purged":true}))
     }
     async fn stop_job(&self, mut r: Job, preempt: bool) -> anyhow::Result<Job> {
         if terminal(r.state()) && (preempt || !r.quota_held) {
@@ -1531,27 +1771,11 @@ impl WorkloadController {
     }
 }
 
-/// The commands one heartbeat hands `worker`: at most 16, purges after everything else. A
-/// purge only drops a finished job's node record, so thousands of them, as a bulk purge of
-/// history queues, must not hold back the launches, stops and app changes behind them.
+/// The commands one heartbeat hands `worker`: at most 16.
 fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
-    const LIMIT: usize = 16;
-    let (mut work, mut purges) = (vec![], vec![]);
-    for c in i.commands.open().filter(|c| c.worker == worker && !c.done && c.admitted) {
-        if c.is(NodeOperation::PurgeJob) {
-            if purges.len() < LIMIT {
-                purges.push(c);
-            }
-        } else {
-            work.push(c);
-            if work.len() == LIMIT {
-                break;
-            }
-        }
-    }
-    work.into_iter()
-        .chain(purges)
-        .take(LIMIT)
+    i.commands.open()
+        .filter(|c| c.worker == worker && !c.done && c.admitted)
+        .take(16)
         .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
         .collect()
 }
@@ -1559,6 +1783,14 @@ fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
 pub struct NodeControlService(pub Arc<WorkloadController>);
 #[tonic::async_trait]
 impl WorkerService for NodeControlService {
+    async fn end_session(
+        &self,
+        request: tonic::Request<WorkerEndSessionRequest>,
+    ) -> Result<tonic::Response<WorkerEndSessionResponse>, tonic::Status> {
+        let r = request.into_inner();
+        self.0.end_session(&r.worker_id, &r.session);
+        Ok(tonic::Response::new(WorkerEndSessionResponse {}))
+    }
     async fn heartbeat(
         &self,
         request: tonic::Request<WorkerHeartbeatRequest>,
@@ -1898,7 +2130,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");
         let _ops = s.ops.lock().await;
-        if s.inner.lock().apps.get(&name).is_some_and(|a| !a.removed) || s.fleet.app_known(&namespace, &name) {
+        s.ensure_name_free(&name)?;
+        if s.inner.lock().apps.contains_key(&name) || s.fleet.app_known(&namespace, &name) {
             return Err(fail(409, format!("an app or batch named {name} exists")));
         }
         let app = WorkloadTemplate {
@@ -1917,8 +2150,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     }
     if parts.first() == Some(&"apps") && parts.len() >= 2 {
         let name = parts[1];
-        // A deleted batch stays readable while it has job records: they are its history.
-        let readable_deleted = batch && method == Method::GET && parts.len() == 2 && s.has_jobs(name);
+        // A batch an earlier release deleted stays readable while it has job records; deleting
+        // a deleted app or batch again removes those and retries its nodes' removal.
+        let readable_deleted = batch && method == Method::GET && parts.len() == 2 && s.has_jobs(name)
+            || method == Method::DELETE && parts.len() == 2;
         let mut app = s
             .inner
             .lock()
@@ -1937,36 +2172,17 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             return Ok(Json(view(&s, &app)).into_response());
         }
         if method == Method::DELETE && parts.len() == 2 {
-            let _ops = s.ops.lock().await;
+            let ops = s.ops.lock().await;
             s.ensure_not_scaling(&app.namespace, name)?;
-            let persistent_ready_to_remove = !app.persistent
-                || (app.disabled()
-                    && app.workers.iter().all(|id| {
-                        s.inner.lock().workers.get(id).is_some_and(|w| {
-                            now() - w.seen < 30.0 && w.report.entries().any(|v| v.name() == name && v.cleaned())
-                        })
-                    }));
-            if !persistent_ready_to_remove
-                || s.inner
-                    .lock()
-                    .jobs
-                    .open()
-                    .any(|r| r.batch == name && (!terminal(r.state()) || r.quota_held))
-            {
-                return Err(fail(
-                    409,
-                    "disable the app or finish/cancel jobs before deleting",
-                ));
+            let running = s.still_running(&app);
+            if !running.is_empty() {
+                let kind = if batch { "batch" } else { "app" };
+                return Err(fail(409, format!("{kind} {name} still runs: {}; delete it once nothing of it does", running.join("; "))));
             }
-            app.removed = true;
-            s.save("apps", name, &app)?;
-            s.inner.lock().apps.insert(name.into(), app.clone());
-            if app.persistent {
-                s.remove_app(&app.namespace, name)?;
-            } else {
-                s.tell_nodes(&app.workers, json!({"batch":{"name":name}}), json!({"remove":true}))?;
-            }
-            return Ok(Json(json!({"name":name,"removed":true})).into_response());
+            let (deleted, files) = s.delete(&app.namespace, name, vec![])?;
+            drop(ops);
+            s.remove_files(files).await?;
+            return Ok(Json(deleted).into_response());
         }
         if batch && parts.len() == 3 && parts[2] == "settings" && method == Method::PUT {
             let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
@@ -2073,37 +2289,6 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             )
             .into_response());
         }
-        if method == Method::DELETE && parts.len() == 3 {
-            let days = q
-                .get("older_than")
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v >= 0.0)
-                .ok_or_else(|| fail(400, "older_than must be non-negative days"))?;
-            let cutoff = now() - days * 86400.0;
-            let purgeable = |r: &Job| {
-                !r.purged
-                    && r.batch == batch
-                    && terminal(r.state())
-                    && !r.quota_held
-                    && r.finished_at().is_some_and(|v| v < cutoff)
-                    && s.visible(&r.namespace, r.tag.as_deref(), c, &q)
-            };
-            let ids: Vec<String> = s.inner.lock().jobs.values().filter(|r| purgeable(r)).map(|r| r.id.clone()).collect();
-            // A purge writes a record and a node command per job, so a bulk one of history can
-            // take minutes. Holding the operation lock for a chunk at a time lets node reports
-            // and dispatch through; each job is checked again under the lock.
-            let mut purged = Vec::with_capacity(ids.len());
-            for chunk in ids.chunks(64) {
-                let _ops = s.ops.lock().await;
-                for id in chunk {
-                    let r = s.inner.lock().jobs.get(id).filter(|r| purgeable(r)).cloned();
-                    if let Some(r) = r {
-                        purged.push(s.purge(r)?);
-                    }
-                }
-            }
-            return Ok(Json(purged).into_response());
-        }
         if method == Method::POST && parts.len() == 3 {
             let body = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
             return Ok((StatusCode::CREATED, Json(s.submit(batch, body, c, &q).await?)).into_response());
@@ -2125,11 +2310,6 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
                 let _ops = s.ops.lock().await;
                 let r = job(&s)?;
                 return Ok(Json(s.stop_job(r, preempt).await?.value()).into_response());
-            }
-            if method == Method::DELETE && parts.len() == 4 {
-                let _ops = s.ops.lock().await;
-                let r = job(&s)?;
-                return Ok(Json(vec![s.purge(r)?]).into_response());
             }
             if method == Method::GET && parts.len() == 5 && parts[4] == "logs" {
                 return log_response(&s, &r, &q).await;
@@ -2246,15 +2426,12 @@ impl WorkloadController {
         match (method, rest) {
             (&Method::GET, []) => Ok(Json(self.stored_proof_app(&namespace, &name, tag.as_deref()).await?).into_response()),
             (&Method::DELETE, []) => {
-                let _guard = self.app_lifecycle_guard(&namespace, &name).await?;
-                let deleted = self.fleet.delete_app(&namespace, &name).await?;
-                let template = self.inner.lock().apps.get(&name).filter(|a| a.namespace == namespace).cloned();
-                if let Some(mut template) = template {
-                    template.removed = true;
-                    self.save("apps", &name, &template)?;
-                    self.inner.lock().apps.insert(name.clone(), template);
-                }
-                self.remove_app(&namespace, &name)?;
+                let guard = self.app_lifecycle_guard(&namespace, &name).await?;
+                let (mut deleted, files) = self.fleet.delete_app(&namespace, &name).await?;
+                let (removed, records) = self.delete(&namespace, &name, files)?;
+                drop(guard);
+                self.remove_files(records).await?;
+                deleted["nodes"] = removed["nodes"].clone();
                 Ok(Json(deleted).into_response())
             }
             (&Method::PUT, ["priority"]) => {

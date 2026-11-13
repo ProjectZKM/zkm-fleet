@@ -134,10 +134,12 @@ enum AppCmd {
         /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
     },
-    /// Delete an app, refused while any of its jobs is queued or running. A proof app goes
-    /// with its jobs' records, inputs and proofs, its anchor, and its ELF when no other app
-    /// uses it; a running app must be disabled first.
-    /// Without --yes it only says what it would delete.
+    /// Delete an app and everything of it, like batch delete: its configuration and replicas on
+    /// its nodes, their logs and its workers' directories; a proof app's job records, with their
+    /// inputs and proofs, its anchor, and its ELF unless another app uses it. Its volumes, env
+    /// files, storage roots and image stay, and so does what another app or batch uses. Refused
+    /// while any of it runs, so disable a running app first, and wait for a proof app's queued
+    /// or running jobs. Without --yes it only says what it would delete.
     Delete {
         name: String,
         #[arg(long)]
@@ -447,15 +449,6 @@ enum BatchJobCmd {
     /// Stop a batch job as an app needing its cards would: it queues again (same id and
     /// out/, FLEET_ATTEMPT counting on) and spends no --retry.
     Preempt { id: String, #[arg(long)] batch: Option<String> },
-    /// Delete a finished batch job's record (out/ included), or every finished batch job older than --older-than days.
-    Purge {
-        id: Option<String>,
-        /// Only this batch's jobs (with --older-than), or the job's batch (found from the id when omitted).
-        #[arg(long)]
-        batch: Option<String>,
-        #[arg(long)]
-        older_than: Option<f64>,
-    },
 }
 
 #[derive(Subcommand)]
@@ -553,7 +546,10 @@ enum BatchCmd {
         /// K=V every batch job gets; repeat. Replaces the batch's environment.
         #[arg(long)] env: Vec<String>,
     },
-    /// Delete a batch after all accepted jobs finish; its job history stays until purged.
+    /// Delete a batch and everything of it, like app delete: its configuration on its nodes,
+    /// and its jobs' records, logs and outputs on the control host and its nodes. Its mounts
+    /// stay. Refused while any of its jobs is queued or running, so cancel them or let them
+    /// finish first. Without --yes it only says what it would delete.
     Delete { name: String, #[arg(long)] yes: bool },
     #[command(flatten)]
     Job(BatchJobCmd),
@@ -838,8 +834,6 @@ const NODE_COLS: &[out::TableColumn] = &[
 ];
 const TOKEN_COLS: &[out::TableColumn] =
     &[col("TOKEN ID", "id"), col("NAMESPACE","namespace"), col("TAG","tag"), col("PERMISSIONS", "permissions"), col("LABEL", "label"), col("STATE", "state"), col("CREATED", "created_ms")];
-const PURGE_COLS: &[out::TableColumn] =
-    &[col("RUN", "id"), col("PURGED", "purged"), col("STATE", "state"), col("SIZE", "bytes"), col("REASON", "reason")];
 
 /// Tokens as rows: a STATE column (active / revoked); proof identity stays internal.
 fn token_rows(v: &Value) -> Vec<Value> {
@@ -1209,33 +1203,51 @@ fn describe_app(name: &str, conn: &ConnectionOptions, out: &OutputWriter) -> any
     Ok(())
 }
 
+/// What a deletion's nodes still remove, after its record and what the control host held went.
+fn removing(deleted: &Value) -> String {
+    let nodes: Vec<&str> = deleted["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    if nodes.is_empty() { String::new() } else { format!("; its nodes remove what they hold of it: {}", nodes.join(", ")) }
+}
+
+/// Deletes a batch (after showing what goes with it, until --yes), as `delete_app` deletes an app.
+fn delete_batch(a: &FleetClient, name: &str, batch: &Value, yes: bool, out: &OutputWriter) -> anyhow::Result<()> {
+    let (total, active) = (&batch["jobs"]["total"], &batch["jobs"]["active"]);
+    if !yes {
+        bail!(
+            "would delete batch {name} with its {total} job(s): their records, logs and outputs, on the control \
+             host and its nodes. Its mounts stay. Refused while any job is queued or running ({active} now). \
+             Pass --yes to delete"
+        );
+    }
+    let v = a.send(a.req(reqwest::Method::DELETE, &format!("/batches/{name}")))?;
+    out.done(&format!("deleted batch {name} and its {} job(s){}", v["jobs_deleted"], removing(&v)), v);
+    Ok(())
+}
+
 /// Deletes an app (after showing what goes with it, until --yes).
 fn delete_app(name: &str, yes: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let a = FleetClient::new(conn)?;
     let app = app_named(&a, name)?;
     let (total, active) = (&app["jobs"]["total"], &app["jobs"]["active"]);
     let proof = app["proof"].is_object();
+    let nodes = "its configuration and replicas on its nodes, their logs and its workers' directories";
     if !yes {
         if proof {
             bail!(
-                "would delete app {name}: {total} job record(s) with their inputs and proofs, its anchor, and its ELF {} \
-                 unless another app uses it ({active} queued or running: refused while any is). Pass --yes to delete",
+                "would delete app {name}: {total} job record(s) with their inputs and proofs, {nodes}, its anchor, \
+                 and its ELF {} unless another app uses it. Its volumes, env files, storage roots and image stay \
+                 ({active} job(s) queued or running: refused while any is). Pass --yes to delete",
                 app["proof"]["elf_id"].as_str().unwrap_or("")
             );
         }
         bail!(
-            "would remove app {name}; its {total} past execution record(s) \
-             stay ({active} queued or running: refused while any is). Pass --yes to delete"
+            "would delete app {name}: {nodes}. Its volumes, env files and image stay. Refused while it runs: \
+             disable it first. Pass --yes to delete"
         );
     }
     let v = a.send(a.req(reqwest::Method::DELETE, &format!("/apps/{name}")))?;
-    let text = if proof {
-        format!("deleted app {name}: {} job(s), ELF {}", v["jobs_deleted"],
-            if v["elf_removed"].as_bool() == Some(true) { "removed" } else { "kept (in use or absent)" })
-    } else {
-        format!("deleted app {name}; its {total} past execution record(s) stay")
-    };
-    out.done(&text, v);
+    let jobs = if proof { format!(" and its {} job(s)", v["jobs_deleted"]) } else { String::new() };
+    out.done(&format!("deleted app {name}{jobs}{}", removing(&v)), v);
     Ok(())
 }
 
@@ -1338,17 +1350,14 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
                 | BatchCmd::Priority { name, .. } | BatchCmd::Delete { name, .. } => name,
                 _ => unreachable!(),
             };
-            batch_named(&a, name)?;
+            let batch = batch_named(&a, name)?;
             let path = format!("/batches/{name}");
             let request = match cmd {
                 BatchCmd::Disable { .. } => a.req(reqwest::Method::PUT, &format!("{path}/disabled")),
                 BatchCmd::Enable { .. } => a.req(reqwest::Method::DELETE, &format!("{path}/disabled")),
                 BatchCmd::Priority { priority, .. } => a.req(reqwest::Method::PUT, &format!("{path}/priority"))
                     .json(&json!({"priority": priority})),
-                BatchCmd::Delete { yes, .. } => {
-                    if !yes { bail!("would remove batch {name}; accepted jobs must finish first. Pass --yes to delete"); }
-                    a.req(reqwest::Method::DELETE, &path)
-                }
+                BatchCmd::Delete { yes, .. } => return delete_batch(&a, name, &batch, *yes, out),
                 _ => unreachable!(),
             };
             let value = a.send(request)?;
@@ -1474,22 +1483,6 @@ fn batch_action(cmd: &BatchJobCmd, conn: &ConnectionOptions, out: &OutputWriter)
         BatchJobCmd::Preempt { id, batch } => {
             let path = batch_job_path(&a, batch.as_deref(), id)?;
             out.record(&a.send(a.req(M::POST, &format!("{path}/preempt")))?)
-        }
-        BatchJobCmd::Purge { id, batch, older_than } => {
-            let purged = match (id, older_than) {
-                (Some(id), _) => a.send(a.req(M::DELETE, &batch_job_path(&a, batch.as_deref(), id)?))?,
-                (None, Some(days)) => {
-                    let batches = match batch { Some(batch) => vec![batch.clone()], None => batch_names(&a)? };
-                    let mut purged = Vec::new();
-                    for batch in batches {
-                        let v = a.send(a.req(M::DELETE, &format!("/batches/{batch}/jobs?older_than={days}")))?;
-                        purged.extend(v.as_array().cloned().unwrap_or_default());
-                    }
-                    Value::Array(purged)
-                }
-                (None, None) => bail!("purge ID, or purge --older-than DAYS"),
-            };
-            out.table(purged.as_array().map(Vec::as_slice).unwrap_or_default(), PURGE_COLS, Some(&purged));
         }
         BatchJobCmd::Logs { id, batch, follow, lines } => {
             let path = batch_job_path(&a, batch.as_deref(), id)?;

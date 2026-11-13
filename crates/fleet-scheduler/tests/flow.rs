@@ -602,8 +602,9 @@ async fn an_app_is_deleted_with_its_jobs_once_none_is_running() {
     let gone: serde_json::Value = serde_json::from_str(&gone).unwrap();
     assert_eq!((gone["app"].as_str(), gone["jobs_deleted"].as_u64()), (Some(app_of(b"elf-d").as_str()), Some(1)), "{gone}");
     assert_eq!(get_job(&h, USER, &app_of(b"elf-d"), "job-d").await.0, 404, "the deleted app's job is gone");
-    let again = admin_curl(&h, &["-o", "/dev/null", "-w", "%{http_code}", "-X", "DELETE", &url]);
-    assert_eq!(again, "404");
+    // Until its nodes have removed it, deleting it again retries that; nothing else is left.
+    let again: serde_json::Value = serde_json::from_str(&admin_curl(&h, &["-X", "DELETE", &url])).unwrap();
+    assert_eq!((again["removed"].as_bool(), again["jobs_deleted"].as_u64()), (Some(true), Some(0)), "{again}");
 }
 
 /// The API through curl as an administrator (what fleetctl does), as text.
@@ -1472,6 +1473,42 @@ async fn machine_heartbeat_requires_cluster_token_and_populates_control_plane_no
     let status = admin_curl(&h,&[&format!("{}/status",h.http)]);
     let status: serde_json::Value = serde_json::from_str(&status).unwrap();
     assert!(status["nodes"].as_array().unwrap().iter().any(|n| n["name"]=="gpu-1" && n["backend"]=="ray-local"));
+}
+
+/// One agent session at a time drives a worker. An agent that stops ends its own session, and
+/// the agent that replaces it is admitted at once; no one else can end it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_that_ends_its_session_hands_its_worker_to_the_next_at_once() {
+    use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerEndSessionRequest,
+        WorkerHeartbeatRequest,
+    };
+    let h = start().await;
+    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port)).unwrap().connect().await.unwrap();
+    let mut agent = WorkerServiceClient::with_interceptor(channel.clone(),
+        fleet_scheduler::token::BearerTokenInterceptor::new(TOKEN).unwrap());
+    let report = serde_json::from_value::<fleet_proto::model::v1::NodeReport>(serde_json::json!({
+        "version": 3, "machine": "gpu-machine", "ready": true,
+        "total_gpus": 8, "total_cpus": 48, "free_gpus": 8, "free_cpus": 48,
+    })).unwrap();
+    let heartbeat = |session: &str| WorkerHeartbeatRequest { worker_id: "gpu-1".into(), session: session.into(),
+        report: Some(report.clone()), proof_fetch_ready: false,
+    };
+    let end = |session: &str| WorkerEndSessionRequest { worker_id: "gpu-1".into(), session: session.into() };
+    agent.heartbeat(heartbeat("old")).await.unwrap();
+    let refused = agent.heartbeat(heartbeat("new")).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(refused.message().contains("another agent session is active"), "{}", refused.message());
+    // Another session than the active one ends nothing, and the call needs the cluster token.
+    agent.end_session(end("new")).await.unwrap();
+    assert_eq!(agent.heartbeat(heartbeat("new")).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    let mut anonymous = WorkerServiceClient::new(channel);
+    assert_eq!(anonymous.end_session(end("old")).await.unwrap_err().code(), tonic::Code::Unauthenticated);
+    assert_eq!(agent.heartbeat(heartbeat("new")).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+
+    agent.end_session(end("old")).await.unwrap();
+    agent.heartbeat(heartbeat("new")).await.unwrap();
+    assert_eq!(agent.heartbeat(heartbeat("old")).await.unwrap_err().code(), tonic::Code::FailedPrecondition,
+        "the ended session doesn't come back while the new one is active");
 }
 
 #[tokio::test(flavor = "multi_thread")]

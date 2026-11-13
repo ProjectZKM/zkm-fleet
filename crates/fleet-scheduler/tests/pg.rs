@@ -160,6 +160,22 @@ async fn check_registered_app_inventory(store: &dyn Store) {
     assert_eq!((registered.jobs, registered.failed, registered.created_ms), (1, 1, 3000));
     store.delete_app(SYSTEM_NAMESPACE, &rejected.app).await.unwrap();
     assert!(!store.apps().await.unwrap().iter().any(|a| a.name == rejected.app));
+    check_referenced_files(store).await;
+}
+
+/// A job's input and ELF are the files `referenced` names; its outputs and other files aren't.
+async fn check_referenced_files(store: &dyn Store) {
+    use fleet_proto::fleet::v1::{ArtifactRef, ProofInputs};
+    let file = |path: &str, sha: &str| ArtifactRef { uri: format!("file:///store/{path}"), sha256: sha.into(), size: 1 };
+    let mut j = job("with-files", ProofJobState::Failed);
+    j.inputs = Some(ProofInputs { input: Some(file("inputs/i1", &"1".repeat(64))), elf: Some(file("elf/e", &j.elf_id)),
+        output_root: "file:///store/outputs".into() });
+    store.upsert(&j).await.unwrap();
+    let asked = ["inputs/i1", "elf/e", "inputs/i2", "outputs"].map(|p| format!("file:///store/{p}"));
+    let mut found: Vec<String> = store.referenced(&asked).await.unwrap().into_iter().collect();
+    found.sort();
+    assert_eq!(found, vec!["file:///store/elf/e", "file:///store/inputs/i1"]);
+    assert!(store.referenced(&[]).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -212,7 +228,7 @@ async fn fresh_schema_requires_complete_job_identity() {
         assert!(store.apps().await.unwrap().iter().find(|a| a.name == "goat").unwrap().disabled);
         store.set_app_disabled(SYSTEM_NAMESPACE, "goat", false, 7).await.unwrap();
         assert!(!store.apps().await.unwrap().iter().find(|a| a.name == "goat").unwrap().disabled);
-        assert_eq!(store.delete_app(SYSTEM_NAMESPACE, "goat").await.unwrap(), vec!["g2".to_string()], "the running one stays");
+        assert_eq!(store.delete_app(SYSTEM_NAMESPACE, "goat").await.unwrap().iter().map(|j| j.id.as_str()).collect::<Vec<_>>(), vec!["g2"], "the running one stays");
         assert!(!store.apps().await.unwrap().iter().any(|a| a.name == "goat"), "the app is gone");
         assert_eq!(store.incomplete().await.unwrap().iter().filter(|j| j.id == "g1").count(), 1);
     }

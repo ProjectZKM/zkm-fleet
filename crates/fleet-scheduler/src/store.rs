@@ -1,6 +1,6 @@
 //! ProofJob metadata. A proof job references its inputs and outputs in app-owned storage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -39,8 +39,10 @@ pub trait Store: Send + Sync {
     async fn recent(&self, f: &ProofJobFilter, limit: usize) -> anyhow::Result<Vec<ProofJob>>;
     /// Every registered app with its job counts, most recently used first.
     async fn apps(&self) -> anyhow::Result<Vec<App>>;
-    /// Deletes an app and its finished jobs; returns the jobs' ids.
-    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>>;
+    /// Deletes an app and its finished jobs; returns the jobs.
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<ProofJob>>;
+    /// Which of `uris` a job's input or ELF still references.
+    async fn referenced(&self, uris: &[String]) -> anyhow::Result<HashSet<String>>;
     /// Registers an app; false when its name or program is one of the namespace's already.
     async fn add_app(&self, app: &App) -> anyhow::Result<bool>;
     async fn set_app_priority(&self, namespace: &str, name: &str, priority: i32) -> anyhow::Result<()>;
@@ -153,18 +155,26 @@ impl Store for MemoryStore {
         Ok(v)
     }
 
-    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<ProofJob>> {
         let mut jobs = self.jobs.lock();
         let ids: Vec<String> = jobs
             .values()
             .filter(|j| j.namespace == namespace && j.app == name && j.state().is_terminal())
             .map(|j| j.id.clone())
             .collect();
-        for id in &ids {
-            jobs.remove(id);
-        }
+        let gone = ids.iter().filter_map(|id| jobs.remove(id)).collect();
         self.apps.lock().remove(&(namespace.to_string(), name.to_string()));
-        Ok(ids)
+        Ok(gone)
+    }
+
+    async fn referenced(&self, uris: &[String]) -> anyhow::Result<HashSet<String>> {
+        Ok(self.jobs.lock().values()
+            .filter_map(|j| j.inputs.as_ref())
+            .flat_map(|i| [i.input.as_ref(), i.elf.as_ref()])
+            .flatten()
+            .filter(|r| uris.contains(&r.uri))
+            .map(|r| r.uri.clone())
+            .collect())
     }
 
     async fn add_app(&self, app: &App) -> anyhow::Result<bool> {
@@ -659,17 +669,29 @@ impl Store for PgStore {
             .collect()
     }
 
-    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<String>> {
+    async fn delete_app(&self, namespace: &str, name: &str) -> anyhow::Result<Vec<ProofJob>> {
         let rows = sqlx::query(
-            "WITH gone AS (DELETE FROM fleet_jobs WHERE namespace = $1 AND app = $2 AND state IN ('succeeded', 'failed') RETURNING id), \
+            "WITH gone AS (DELETE FROM fleet_jobs WHERE namespace = $1 AND app = $2 AND state IN ('succeeded', 'failed') RETURNING *), \
                   app AS (DELETE FROM fleet_apps WHERE namespace = $1 AND name = $2) \
-             SELECT id FROM gone",
+             SELECT * FROM gone",
         )
             .bind(namespace)
             .bind(name)
             .fetch_all(&self.pool)
             .await?;
-        rows.iter().map(|r| Ok(r.try_get("id")?)).collect()
+        rows.iter().map(Self::row_to_job).collect()
+    }
+
+    async fn referenced(&self, uris: &[String]) -> anyhow::Result<HashSet<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT uri FROM fleet_jobs, \
+                 LATERAL (VALUES (inputs->'input'->>'uri'), (inputs->'elf'->>'uri')) AS r(uri) \
+             WHERE uri = ANY($1)",
+        )
+            .bind(uris)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().collect())
     }
 
     async fn add_app(&self, a: &App) -> anyhow::Result<bool> {

@@ -15,7 +15,7 @@ pub enum Permission {
     Read,
     /// Submit proof and batch jobs; cancel a batch job.
     Submit,
-    /// Register, delete, update, scale, enable and disable apps and batches; purge jobs.
+    /// Register, delete, update, scale, enable and disable apps and batches.
     Manage,
     /// Namespaces, quotas, tokens, allocations, preemption and nodes, in any namespace.
     Admin,

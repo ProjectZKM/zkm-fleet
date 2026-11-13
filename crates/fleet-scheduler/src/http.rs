@@ -55,7 +55,7 @@ pub fn router(state: HttpState) -> Router {
 
 /// The permission an API route needs. Reading apps, batches, their jobs and the caller's own
 /// namespace needs read; submitting a job (or cancelling a batch job) submit; changing an app
-/// or batch, or purging its jobs, manage; everything else (namespaces and their quotas,
+/// or batch manage; everything else (namespaces and their quotas,
 /// tokens, allocations, preemption, nodes, the fleet's status) admin.
 pub fn required(method: &Method, path: &str) -> Permission {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();

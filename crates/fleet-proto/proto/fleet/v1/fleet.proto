@@ -124,6 +124,8 @@ message DeregisterResponse {}
 // Machine agents use their own local Ray instance. No Ray cluster crosses machines.
 service WorkerService {
   rpc Heartbeat(WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+  // A stopping agent ends its session, so the agent that replaces it is admitted at once.
+  rpc EndSession(WorkerEndSessionRequest) returns (WorkerEndSessionResponse);
 }
 
 message NodeCommand {
@@ -147,6 +149,14 @@ message WorkerHeartbeatRequest {
   // Inputs, logs and outputs remain outside the heartbeat. Report version is 2.
   fleet.model.v1.NodeReport report = 5;
 }
+
+// Only the session itself can end: another agent's session stays until it is quiet.
+message WorkerEndSessionRequest {
+  string worker_id = 1;
+  string session = 2;
+}
+
+message WorkerEndSessionResponse {}
 
 message WorkerHeartbeatResponse {
   uint32 heartbeat_secs = 1;

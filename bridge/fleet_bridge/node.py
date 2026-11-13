@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -183,6 +184,11 @@ def append_entry(path: Path, section: str, entry: dict[str, Any]) -> None:
         raise ValueError(f"{section}: must be a list to add an entry to")
     _replace(path, text)
 
+def _holds(outer: str, inner: str) -> bool:
+    """Whether directory `outer` is `inner` or holds it."""
+    return os.path.commonpath([outer, inner]) == outer
+
+
 class NodeExecutor:
     def __init__(self, apps: str, batches: str, jobs_dir: str) -> None:
         self.apps_file, self.batches, self.jobs_dir = Path(apps), batches, Path(jobs_dir)
@@ -239,20 +245,11 @@ class NodeExecutor:
                 elif operation == 4:
                     with self.apps_lock:
                         result = self.set_app(params)
-                elif operation == 5:
-                    directory = self.jobs_dir / params["id"]
-                    if directory.exists():
-                        current = read_json(directory / ".fleet-lease.json", {"lease": "imported"})["lease"]
-                        if current != params["lease"]:
-                            raise ValueError("stale purge lease")
-                        job = jobs.JobDirectory(str(self.jobs_dir), params["id"])
-                        if not self.cleanup(job):
-                            raise ValueError("job cleanup is not confirmed")
-                        shutil.rmtree(job.path)
-                    result = {"cleaned": True}
                 elif operation == 7:
                     with self.apps_lock:
-                        result = self.app(params)
+                        result, then = self.app(params)
+                    # Deleting files can take long; other app changes needn't wait for it.
+                    result.update(then())
                 else:
                     raise ValueError("unsupported node operation")
         except BaseException as e:
@@ -410,15 +407,24 @@ class NodeExecutor:
             if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
                 raise ValueError(f"{name}: app container cleanup is uncertain")
 
-    def app(self, p: dict[str, Any]) -> dict[str, Any]:
+    def app(self, p: dict[str, Any]) -> tuple[dict[str, Any], Any]:
         """An app-level change from the scheduler, for an app (`p["app"]`: the entries that
         run the app of that name, in a namespace given by id and by name), a batch (`p["batch"]`, by name), or the one entry a change of an app stopped
         (`p["entry"]`, by name, set only): `remove` it, or `set` some of its configuration.
-        A removed entry has what is left of its replicas cleaned up the way disabling does;
-        app data stays (storage roots, workdirs, env files and images belong to the operator).
         Settings are written to the configuration only: the scheduler drains and stops an
         app first and starts it again afterwards. `p["create"]` adds a new app's
-        entry to the configuration, disabled until the app is enabled."""
+        entry to the configuration, disabled until the app is enabled.
+
+        A removed entry has what is left of its replicas cleaned up the way disabling does.
+        Removing an app from this node alone (a scale left it no replicas here) keeps its
+        data. Deleting it (`p["delete"]`) removes what this node holds of it too: its
+        replicas' logs, its worker's directory and the files of its proof jobs
+        (`delete["files"]`) in its proof storage. A deleted batch's jobs (`delete["jobs"]`)
+        lose their directories: record, logs and outputs. Volumes, mounts, env files,
+        storage roots and images stay, and so does whatever holds or lies in a path another
+        app or batch uses, here or (by `delete["keep"]`) on another node. Returns the
+        result, and what deletes the files, for after the configuration lock."""
+        nothing = lambda: {}
         if "create" in p:
             entry = p["create"]
             AppSpec.load(entry)
@@ -426,26 +432,29 @@ class NodeExecutor:
             if any(e.get("name") == entry["name"] for e in entries):
                 raise ValueError(f"{entry['name']} is already configured on this node")
             append_entry(self.apps_file, "apps", entry)
-            return {"created": [entry["name"]]}
+            return {"created": [entry["name"]]}, nothing
         if "batch" in p:
             name, path = p["batch"]["name"], Path(self.batches)
             if p.get("remove"):
-                return {"removed": [name] if remove_entry(path, "batches", name) else []}
+                removed = [name] if remove_entry(path, "batches", name) else []
+                if "delete" not in p:
+                    return {"removed": removed}, nothing
+                return {"removed": removed}, lambda: self._delete_jobs(name, p["delete"].get("jobs") or [])
             entry = (yaml.safe_load(path.read_text()) or {}).get("batches", {}).get(name)
             if entry is None:
-                return {"updated": []}
+                return {"updated": []}, nothing
             Batch.load({**entry, **p["set"]})
             set_fields(path, "batches", name, p["set"])
-            return {"updated": [name]}
+            return {"updated": [name]}, nothing
         if "entry" in p:
             # The one entry a change of an app stopped: its configuration only.
             name = p["entry"]["name"]
             entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
             if p.get("remove") or name not in entries:
-                return {"updated": []}
+                return {"updated": []}, nothing
             AppSpec.load({**entries[name], **p["set"]})
             set_fields(self.apps_file, "apps", name, p["set"])
-            return {"updated": [name]}
+            return {"updated": [name]}, nothing
         target = p["app"]
         namespaces = {target["namespace"], target.get("namespace_name") or target["namespace"]}
         entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
@@ -457,13 +466,123 @@ class NodeExecutor:
                 AppSpec.load({**entries[app.name], **p["set"]})
             for app in apps:
                 set_fields(self.apps_file, "apps", app.name, p["set"])
-            return {"updated": [a.name for a in apps]}
+            return {"updated": [a.name for a in apps]}, nothing
         removed = []
         for app in apps:
             self._remove_replicas([f"{app.name}-{index}" for index in range(app.replicas)])
             if remove_entry(self.apps_file, "apps", app.name):
-                removed.append(app.name)
-        return {"removed": removed}
+                removed.append(app)
+        if "delete" not in p:
+            return {"removed": [a.name for a in removed]}, nothing
+        # What the node's other apps and batches use, read under the lock.
+        in_use = self._paths_in_use(p["delete"].get("keep") or [], removed)
+        log_dir = cfg.cluster.log_dir
+        return ({"removed": [a.name for a in removed]},
+                lambda: self._delete_app_files(removed, log_dir, in_use, p["delete"].get("files") or []))
+
+    def _paths_in_use(self, keep: list[str], removed: list[AppSpec]) -> list[str]:
+        """The host paths that a deletion keeps, with what holds or lies in one: those of
+        the apps and batches this node still configures, `keep` (the ones on other nodes),
+        and the volumes and env files of the `removed` entries."""
+        paths = list(keep)
+        for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []:
+            paths += [e.get(k) for k in ("workdir", "worker_workdir", "proof_storage_root", "worker_env_file")]
+            paths += [str(v).split(":")[0] for v in e.get("volumes") or []]
+        for b in ((yaml.safe_load(Path(self.batches).read_text()) or {}).get("batches") or {}).values():
+            paths += list((b or {}).get("allow") or [])
+        for a in removed:
+            paths += [v.split(":")[0] for v in a.volumes] + [a.worker_env_file]
+        return [os.path.realpath(p) for p in paths if isinstance(p, str) and os.path.isabs(p)]
+
+    def _refusal(self, path: str, in_use: list[str], log_dir: str, *, inside_ok: bool = False) -> str | None:
+        """Why `path` must stay, or None when it can go. Fleet's own directories stay, with
+        what holds or lies in one; so do the filesystem's top level and what holds the home
+        directory, and what holds a path in use or (unless `inside_ok`) lies in one."""
+        if not os.path.isabs(path) or ".." in Path(path).parts:
+            return "not an absolute path"
+        if os.path.islink(path):
+            return "a symbolic link"
+        real = os.path.realpath(path)
+        if len(Path(real).parts) < 3 or _holds(real, os.path.realpath(Path.home())):
+            return "too close to the root of the filesystem"
+        for own in (self.jobs_dir, self.apps_file.parent, Path(self.batches).parent, log_dir, Path.cwd()):
+            own = os.path.realpath(own)
+            if _holds(real, own) or _holds(own, real):
+                return f"holds or lies in fleet's own {own}"
+        for used in in_use:
+            if _holds(real, used) or not inside_ok and _holds(used, real):
+                return f"another app or batch uses {used}"
+        return None
+
+    def _delete(self, path: str, reason: str | None, deleted: list[str], kept: list[dict[str, str]]) -> None:
+        if reason is None:
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+                deleted.append(path)
+                return
+            except OSError as e:
+                reason = f"{type(e).__name__}: {e.strerror or e}"
+        kept.append({"path": path, "reason": reason})
+
+    def _delete_app_files(self, removed: list[AppSpec], log_dir: str, in_use: list[str], files: list[str]) -> dict[str, Any]:
+        """Deletes what the `removed` entries of a deleted app held: the files of its proof
+        jobs in their proof storage, their replicas' logs and their workers' directories."""
+        deleted: list[str] = []
+        kept: list[dict[str, str]] = []
+        roots = [os.path.realpath(a.proof_storage_root) for a in removed if a.proof_storage_root]
+        for path in files if roots else []:
+            if not os.path.lexists(path):
+                continue
+            real = os.path.realpath(path)
+            if not any(real != root and _holds(root, real) for root in roots):
+                kept.append({"path": path, "reason": "not in the app's proof storage on this node"})
+                continue
+            self._delete(path, self._refusal(path, in_use, log_dir, inside_ok=True), deleted, kept)
+        logs = sorted(os.listdir(log_dir)) if os.path.isdir(log_dir) else []
+        for a in removed:
+            pattern = re.compile(rf"{re.escape(a.name)}-\d+\.node\.log")
+            for name in filter(pattern.fullmatch, logs):
+                self._delete(os.path.join(log_dir, name), None, deleted, kept)
+            if a.worker_workdir and os.path.lexists(a.worker_workdir):
+                self._delete(a.worker_workdir, self._refusal(a.worker_workdir, in_use, log_dir), deleted, kept)
+        if deleted or kept:
+            log.info("deleted app's files: %d deleted, kept %s", len(deleted), kept)
+        return {"deleted": deleted, "kept": kept}
+
+    def _delete_jobs(self, batch: str, ids: list[str]) -> dict[str, Any]:
+        """Deletes the directories of the jobs `ids` of deleted batch `batch`: each one's
+        record, logs and outputs. One whose container may still be there stays."""
+        deleted, kept = 0, []
+        for ident in ids:
+            try:
+                job = jobs.JobDirectory(str(self.jobs_dir), ident)
+            except jobs.NotFound:
+                continue
+            directory = Path(job.path)
+            try:
+                try:
+                    owner = job.spec().batch
+                except Exception:
+                    owner = batch  # a record half written: the scheduler lists it as the batch's
+                if owner != batch:
+                    kept.append({"path": job.path, "reason": f"a job of batch {owner}"})
+                    continue
+                lease = read_json(directory / ".fleet-lease.json", {"lease": "imported"})["lease"]
+                if not (directory / f".fleet-cleaned-{lease}").exists() and not self.cleanup(job):
+                    kept.append({"path": job.path, "reason": "its container may still be there"})
+                    continue
+                shutil.rmtree(directory)
+                for stop in (self.jobs_dir / ".node" / "stops").glob(f"{ident}-*.json"):
+                    stop.unlink(missing_ok=True)
+                deleted += 1
+            except Exception as e:
+                kept.append({"path": job.path, "reason": f"{type(e).__name__}: {e}"})
+        if deleted or kept:
+            log.info("deleted batch %s: %d job directories deleted, kept %s", batch, deleted, kept)
+        return {"jobs_deleted": deleted, "kept": kept}
 
     def report(self) -> dict[str, Any]:
         nodes = alive_nodes()

@@ -1,4 +1,5 @@
 """Local execution fences are independent of user authentication and admission."""
+import os
 from unittest.mock import Mock
 import pytest
 import yaml
@@ -91,14 +92,6 @@ def test_start_uses_local_executor_and_no_admin_token(executor,monkeypatch):
     assert executor.set_app({"app":app,"disabled":False})["ready"]
     assert start.call_count==2
     assert all(not c.kwargs for c in start.call_args_list)
-
-
-def test_purge_refuses_an_old_execution_lease(executor):
-    c=command(5);path=executor.jobs_dir/c["parameters"]["id"];path.mkdir(parents=True)
-    node.write_json(path/".fleet-lease.json",{"lease":"new-lease"})
-    executor.execute(c)
-    assert path.exists()
-    assert "stale purge" in node.read_json(executor.journal/"command-1.json")["error"]
 
 
 def test_local_ray_must_contain_only_this_machine(executor,monkeypatch):
@@ -295,7 +288,7 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     executor.apps_file.write_text(yaml.safe_dump(apps))
     assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["proof"]},None)
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
-    assert app_message(executor,"remove-2",{"remove":True},app="eth")==({"removed":[]},None)
+    assert app_message(executor,"remove-2",{"remove":True,"delete":{}},app="eth")==({"removed":[],"deleted":[],"kept":[]},None)
     assert app_message(executor,"remove-3",{"remove":True},app="web",ns="1"*32,ns_name="zkm")==({"removed":["web"]},None)
     assert [s["name"] for s in yaml.safe_load(executor.apps_file.read_text())["apps"]]==["other-ns"]
     (executor.apps_file.parent/"batches.yaml").write_text("batches:\n  old: {image: a}\n  kept: {image: b}\n")
@@ -303,21 +296,120 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     assert list(yaml.safe_load((executor.apps_file.parent/"batches.yaml").read_text())["batches"])==["kept"]
 
 
-def test_removing_an_app_keeps_its_data(executor,monkeypatch,tmp_path):
-    """A start placed on another node has its own node remove the entry; the app's storage is its own."""
+def removable(monkeypatch):
+    """Replicas that stop at once and leave no container."""
     monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
     monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:True)
-    data={name:tmp_path/"data"/name for name in ("storage","workdir","models")}
-    for d in data.values():
-        d.mkdir(parents=True);(d/"cursor").write_text("42")
-    env=tmp_path/"data"/"worker.env";env.write_text("RPC=x\n")
+
+
+def files(root, *paths):
+    for path in paths:
+        (root/path).parent.mkdir(parents=True,exist_ok=True);(root/path).write_text("x")
+
+
+def configure(executor, *entries, log_dir=None):
     apps=yaml.safe_load(executor.apps_file.read_text())
-    apps["apps"]=[{"name":"eth-worker","kind":"ziren-gpu","namespace":"a"*32,"app":"eth","elf_id":"b"*64,"image":"ziren-gpu:1",
-        "machine":"m1","worker_command":["/opt/eth-proofs"],"worker_env_file":str(env),"worker_workdir":str(data["workdir"]),
-        "proof_storage_root":str(data["storage"]),"volumes":[f"{data['models']}:ro"]}]
+    apps["apps"]=list(entries)
+    if log_dir:
+        apps["log_dir"]=str(log_dir)
     executor.apps_file.write_text(yaml.safe_dump(apps))
+
+
+def worker(name, app, data, **more):
+    """An entry with an integrated worker, which works in data/<app>/run and keeps proofs in data/<app>/store."""
+    return {"name":name,"kind":"ziren-gpu","namespace":"a"*32,"app":app,"elf_id":"b"*64,"image":"ziren-gpu:1",
+        "machine":"m1","worker_command":["/opt/worker"],"worker_workdir":str(data/app/"run"),
+        "proof_storage_root":str(data/app/"store"),**more}
+
+
+def test_removing_an_app_from_one_node_keeps_its_data(executor,monkeypatch,tmp_path_factory):
+    """A scale that leaves a node no replicas has it remove the app's entries; the app runs on elsewhere."""
+    removable(monkeypatch)
+    data=tmp_path_factory.mktemp("data")
+    files(data,"eth/run/checkpoint","eth/store/outputs/job-1/lease/proof.json","logs/eth-worker-0.node.log")
+    configure(executor,worker("eth-worker","eth",data),log_dir=data/"logs")
     assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["eth-worker"]},None)
-    assert all((d/"cursor").read_text()=="42" for d in data.values()) and env.read_text()=="RPC=x\n"
+    assert len([f for f in data.rglob("*") if f.is_file()])==3
+
+
+def test_deleting_an_app_deletes_what_its_entries_held(executor,monkeypatch,tmp_path_factory):
+    """A deleted app's node deletes its replicas' logs, its worker's directory and the files of its proof
+    jobs in its proof storage. Its storage root, volumes and env file stay, and so does what isn't its own."""
+    removable(monkeypatch)
+    data=tmp_path_factory.mktemp("data")
+    files(data,"eth/run/checkpoint","eth/store/outputs/job-1/lease/proof.json","eth/store/outputs/job-2/lease/proof.json",
+          "eth/store/inputs/i1","eth/store/elf/e1","models/weights","worker.env","elsewhere/proof.json",
+          "logs/eth-worker-0.node.log","logs/eth-worker-11.node.log","logs/eth-worker-db-0.node.log","logs/node.log")
+    configure(executor,worker("eth-worker","eth",data,worker_env_file=str(data/"worker.env"),volumes=[f"{data/'models'}:ro"]),
+              log_dir=data/"logs")
+    listed=[str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1","eth/store/inputs/gone",
+                                    "eth/store","elsewhere/proof.json")]
+    result,error=app_message(executor,"remove-1",{"remove":True,"delete":{"keep":[],"files":listed}},app="eth")
+    assert error is None and result["removed"]==["eth-worker"]
+    assert sorted(result["deleted"])==sorted(str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1",
+        "logs/eth-worker-0.node.log","logs/eth-worker-11.node.log","eth/run"))
+    assert result["kept"]==[{"path":str(data/p),"reason":"not in the app's proof storage on this node"} for p in ("eth/store","elsewhere/proof.json")]
+    left=sorted(str(f.relative_to(data)) for f in data.rglob("*") if f.is_file())
+    assert left==["elsewhere/proof.json","eth/store/outputs/job-2/lease/proof.json","logs/eth-worker-db-0.node.log","logs/node.log",
+                  "models/weights","worker.env"]
+
+
+def test_deleting_an_app_keeps_what_another_app_or_batch_uses(executor,monkeypatch,tmp_path_factory):
+    """Its worker's directory stays when it holds or lies in a path that another app or batch uses: on this
+    node, as its configuration says, or on another, as the scheduler says. So does one that is too close to
+    the root or holds fleet's own files."""
+    removable(monkeypatch)
+    data=tmp_path_factory.mktemp("data")
+    files(data,"web/run/state","shared/run/state")
+    cases=[
+        ({}, [worker("web-db","db",data,volumes=[str(data/"web")])], "batches: {}\n", f"another app or batch uses {data/'web'}"),
+        ({"keep":[str(data/"web/run/state")]}, [], "batches: {}\n", f"another app or batch uses {data/'web/run/state'}"),
+        ({}, [], f"batches:\n  render: {{image: a, allow: [{data}]}}\n", f"another app or batch uses {data}"),
+    ]
+    for n,(change,others,batches,reason) in enumerate(cases):
+        configure(executor,worker("web-gpu","web",data),*others)
+        (executor.apps_file.parent/"batches.yaml").write_text(batches)
+        result,error=app_message(executor,f"remove-{n}",{"remove":True,"delete":change},app="web")
+        assert error is None and result["kept"]==[{"path":str(data/"web/run"),"reason":reason}], result
+        assert (data/"web/run/state").exists()
+    (executor.apps_file.parent/"batches.yaml").write_text("batches: {}\n")
+    for n,(workdir,reason) in enumerate([("/opt","too close to the root of the filesystem"),
+                                         (str(executor.jobs_dir.parent),f"holds or lies in fleet's own {executor.jobs_dir}")]):
+        configure(executor,{**worker("web-gpu","web",data),"worker_workdir":workdir})
+        executor.jobs_dir.mkdir(exist_ok=True)
+        result,error=app_message(executor,f"root-{n}",{"remove":True,"delete":{}},app="web")
+        assert result["kept"]==[{"path":workdir,"reason":reason}], result
+    assert os.path.isdir("/opt") and executor.apps_file.exists()
+
+
+def job_directory(executor, ident, batch, *, cleaned=True):
+    directory=executor.jobs_dir/ident
+    (directory/"out").mkdir(parents=True)
+    (directory/"out/frame.png").write_text("output")
+    JobSpec(id=ident, batch=batch, policy=Batch(image="render:1"), command=["true"], gpus=0, cpus=1,
+            out=str(directory/"out")).write(str(directory/"spec.json"))
+    node.write_json(directory/".fleet-lease.json", {"lease": "lease-1"})
+    if cleaned:
+        (directory/".fleet-cleaned-lease-1").touch()
+    stops=executor.jobs_dir/".node"/"stops";stops.mkdir(parents=True,exist_ok=True)
+    node.write_json(stops/f"{ident}-lease-1.json", {"operation": 2})
+    return directory
+
+
+def test_deleting_a_batch_deletes_its_jobs_directories(executor,monkeypatch):
+    """Each listed job of the deleted batch loses its directory: record, logs and outputs. One of another
+    batch stays, and so does one whose container may still be there."""
+    (executor.apps_file.parent/"batches.yaml").write_text("batches:\n  render: {image: a}\n")
+    done=job_directory(executor,"job-done","render")
+    unsure=job_directory(executor,"job-unsure","render",cleaned=False)
+    other=job_directory(executor,"job-other","train")
+    monkeypatch.setattr(jobs,"_going",lambda _:False);monkeypatch.setattr(node,"container_gone",lambda _:False)
+    result,error=app_message(executor,"remove-1",{"remove":True,"delete":{"jobs":["job-done","job-unsure","job-other","job-gone","../etc"]}},batch="render")
+    assert error is None
+    assert result=={"removed":["render"],"jobs_deleted":1,"kept":[
+        {"path":str(unsure),"reason":"its container may still be there"},{"path":str(other),"reason":"a job of batch train"}]}
+    assert not done.exists() and unsure.exists() and other.exists()
+    assert sorted(p.name for p in (executor.jobs_dir/".node"/"stops").iterdir())==["job-other-lease-1.json","job-unsure-lease-1.json"]
 
 
 def test_an_app_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):

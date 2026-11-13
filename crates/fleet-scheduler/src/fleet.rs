@@ -754,11 +754,12 @@ impl Scheduler {
         }).collect())
     }
 
-    /// Deletes an app, its terminal job records and their inputs and outputs, and its
-    /// anchor. Removes the ELF only when no other app or job uses it. Refused while any of
-    /// its jobs is queued or running.
+    /// Deletes an app with every job record of it, and its anchor. Refused while any of its
+    /// jobs is queued or running. Also returns the files its jobs left in its nodes' app
+    /// storage, for them to remove: each job's output directory, and the inputs and ELF no
+    /// other job or app uses.
     pub async fn delete_app(&self, namespace: &str, name: &str,
-    ) -> anyhow::Result<serde_json::Value> {
+    ) -> anyhow::Result<(serde_json::Value, Vec<String>)> {
         let _ops = self.app_ops.write().await;
         let apps = self.store.apps().await?;
         let app = apps
@@ -782,12 +783,12 @@ impl Scheduler {
                 app.active.max(live)
             )));
         }
-        let ids = self.store.delete_app(namespace, name).await?;
+        let jobs = self.store.delete_app(namespace, name).await?;
         self.apps.lock().remove(&(namespace.to_string(), name.to_string()));
         {
             let mut inner = self.inner.lock();
-            for id in &ids {
-                inner.jobs.remove(id);
+            for j in &jobs {
+                inner.jobs.remove(&j.id);
             }
             if let Some(node) = inner.anchors.remove(&(namespace.to_string(), name.to_string())) {
                 if inner.reserved.get(&node) == Some(&placement::app_key(namespace, name)) {
@@ -795,8 +796,23 @@ impl Scheduler {
                 }
             }
         }
-        tracing::info!(app = %name, jobs = ids.len(), "app deleted");
-        Ok(serde_json::json!({"app": name, "jobs_deleted": ids.len()}))
+        let elf_shared = apps.iter().any(|a| a.elf_id == app.elf_id && !(a.namespace == namespace && a.name == name));
+        let inputs: Vec<&fleet_proto::fleet::v1::ProofInputs> = jobs.iter().filter_map(|j| j.inputs.as_ref()).collect();
+        let mut shared: Vec<String> = inputs.iter()
+            .flat_map(|i| [i.input.as_ref(), i.elf.as_ref().filter(|_| !elf_shared)])
+            .flatten()
+            .map(|r| r.uri.clone())
+            .collect();
+        shared.sort();
+        shared.dedup();
+        let used = self.store.referenced(&shared).await?;
+        let files = jobs.iter()
+            .filter_map(|j| Some(format!("{}/{}", j.inputs.as_ref()?.output_root.trim_end_matches('/'), j.id)))
+            .chain(shared.into_iter().filter(|uri| !used.contains(uri)))
+            .filter_map(|uri| uri.strip_prefix("file://").map(str::to_owned))
+            .collect();
+        tracing::info!(app = %name, jobs = jobs.len(), "app deleted");
+        Ok((serde_json::json!({"app": name, "jobs_deleted": jobs.len()}), files))
     }
 
     /// The newest jobs (the store has every one) that the filter selects.

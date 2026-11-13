@@ -168,6 +168,7 @@ message Job {
   required bool quota_held = 11;
   optional string stop = 12;
   required bool logs_ready = 13;
+  // Purged by an earlier release: hidden, and gone with its batch.
   required bool purged = 14;
 }
 
