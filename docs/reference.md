@@ -129,7 +129,7 @@ the app's `apps.yaml` entry; unknown or mistyped settings are refused.
 |---|---|
 | `kind`: `app` by default, `ziren-gpu` by default for a prover, or `ziren-cpu` | Every app |
 | `image` (required), `replicas`, `gpus`, `cpus`, `shm_gb`, `memory_gb`, `env`, `volumes`, `ready_timeout_s`, `stop_timeout_s` | Every app |
-| `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user`, `machine` (anchors it: see [Moves](#apps)) | A `kind: app` container |
+| `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user` | A `kind: app` container |
 | `proof_storage_root`, `backend`, `rust_log` | A prover |
 
 A prover also takes its program, `--elf-id ID` or `--elf FILE`, and a placement
@@ -151,8 +151,7 @@ the others and their jobs intact. In the API:
 `{"name":"eth","spec":{"image":"IMAGE","gpus":1},"proof":{"elf_id":"FULL_ELF_SHA256"}}`.
 
 **Placement.** An app is created disabled and on no node. Its first `app enable`
-places it; users never choose the node, though an app anchored to a `machine` goes to
-that machine's node only. Candidates are live, ready, undrained nodes
+places it; users never choose the node. Candidates are live, ready, undrained nodes
 whose total capacity holds the GPUs and CPUs of all its replicas. The scheduler
 prefers a node where they're free now, and among those the one with the fewest free
 GPUs; otherwise it takes the one with the most free GPUs, where the app waits for
@@ -177,10 +176,8 @@ that frees. A start whose entry is anchored with `machine` never moves; every
 integrated worker's entry is. It waits for room on its node, preempting
 lower-priority batch jobs of its namespace when it can. Fleet copies nothing an app
 keeps on a node's disks: the app looks after its own storage. Anchor an app that keeps
-data there, or runs from it: with `machine` in its spec, or with
-`fleetctl app update NAME --machine MACHINE` (`{"machine":"MACHINE"}`), which anchors it
-to the machine it runs on (`fleetctl node` lists it) without restarting it. `""` lifts
-the anchor; give `--node` when the app runs on several nodes.
+data there, or runs from it, by setting `machine` in its entry in that node's
+`apps.yaml` to the node's machine, as `fleetctl node` lists it.
 
 **States.** An app is `configured`, `starting`, `running`, `draining`, `disabled`,
 `offline` or `failed`; a proof app without provers is `registered`. The table shows
@@ -200,8 +197,7 @@ removes the app. An active proof can't be
 resized ([issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3)).
 `fleetctl app update NAME` (`PUT /apps/NAME/settings`) changes the image,
 environment, command, user, workdir, volumes, shm and memory sizes, health path or
-timeouts, and drains and restarts the app to do so; `--machine` (see Moves) is set on
-its own and restarts nothing. The image, environment, command, user, workdir and volumes need an
+timeouts. The image, environment, command, user, workdir and volumes need an
 administrator, since an app can reach host networking, storage and prover
 credentials; an update mixing them with other fields is refused whole. Changing
 priority alone doesn't restart replicas.

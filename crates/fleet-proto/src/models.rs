@@ -262,9 +262,8 @@ impl RegisterAppRequest {
     /// priority and program, and creates it disabled.
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
-    /// Settings only a container app's spec (`kind: app`) may give. `machine` anchors it to
-    /// that machine: it is placed there, and never moved to another node.
-    pub const CONTAINER_SETTINGS: [&'static str; 6] = ["command", "port_base", "health_path", "workdir", "user", "machine"];
+    /// Settings only a container app's spec (`kind: app`) may give.
+    pub const CONTAINER_SETTINGS: [&'static str; 5] = ["command", "port_base", "health_path", "workdir", "user"];
     /// Settings only a prover's spec (`kind: ziren-gpu` or `ziren-cpu`) may give.
     pub const PROVER_SETTINGS: [&'static str; 3] = ["proof_storage_root", "backend", "rust_log"];
 
@@ -312,9 +311,8 @@ impl RegisterAppRequest {
         }
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
-        let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log", "machine"].into_iter()
+        let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()
                 .find(|k| set(k).is_some_and(|v| !v.is_string()))
-            .or_else(|| set("machine").and_then(Value::as_str).is_some_and(str::is_empty).then_some("machine"))
             .or_else(|| ["cpus", "shm_gb", "port_base", "stop_timeout_s"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
             .or_else(|| ["memory_gb", "ready_timeout_s"].into_iter().find(|k| set(k).is_some_and(positive)))
             .or_else(|| ["command", "volumes"].into_iter().find(|k| set(k).is_some_and(strings)))
@@ -341,10 +339,7 @@ mod tests {
         };
         let container = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
         app(json!({"name":"model","spec":container})).unwrap();
-        let mut anchored = container.clone();
-        anchored["machine"] = json!("gpu-box");
-        app(json!({"name":"model","spec":anchored})).unwrap();
-        for (key, value) in [("machine", json!("")), ("machine", json!(1)), ("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
+        for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
             ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("vm")),
             ("proof_storage_root", json!("/proofs")), ("name", json!("x"))] {
             let mut spec = container.clone();
@@ -359,8 +354,6 @@ mod tests {
         assert!(app(json!({"name":"model","spec":container,"proof":proof})).is_err(), "a container app proves none");
         assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","port_base":1},"proof":proof})).is_err(),
             "a prover takes no container settings");
-        assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","machine":"gpu-box"},"proof":proof})).is_err(),
-            "a prover's node configures its machine");
         assert!(app(json!({"name":"eth","elf_id":"ab".repeat(32)})).is_err(), "an app is created from its spec");
         assert!(app(json!({"name":"model","node":"gpu","spec":container})).is_err(), "the scheduler picks the node");
     }

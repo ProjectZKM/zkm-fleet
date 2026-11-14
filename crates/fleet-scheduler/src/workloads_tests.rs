@@ -2588,69 +2588,6 @@ async fn an_app_start_is_placed_on_a_node_with_room() {
     assert!(!i.deployments.contains_key("gpu-model") && !i.deployments["big-model"].disabled);
 }
 
-/// An app created anchored to a machine is placed on that machine's node only, though another
-/// fits it better; one anchored to a machine no node is on is placed nowhere.
-#[tokio::test]
-async fn an_app_created_with_a_machine_is_placed_on_that_machine_only() {
-    let (_dir, c, ns) = setup().await;
-    c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let mut big = inventory(&ns);
-    (big.machine, big.total_gpus, big.free_gpus) = ("big".into(), 4.0, 4.0);
-    c.report("big", "session", big).await.unwrap();
-    let create = |name: &str, machine: Option<&str>| {
-        let mut spec = json!({"image":"serve:1","gpus":1,"cpus":2,"port_base":50100});
-        if let Some(machine) = machine {
-            spec["machine"] = json!(machine);
-        }
-        scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":name,"namespace":ns,"spec":spec}))
-    };
-    for (name, machine, node) in [("free", None, "gpu"), ("pinned", Some("big"), "big")] {
-        assert_eq!(create(name, machine).await.status(), StatusCode::CREATED);
-        let (placed, entry) = deployed(&c, &ns, name).await.unwrap();
-        assert_eq!((placed.as_str(), entry.get("machine").and_then(Value::as_str)), (node, machine), "{name}");
-    }
-    assert_eq!(create("empty", Some("")).await.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(create("nowhere", Some("gone")).await.status(), StatusCode::CREATED);
-    let refused = deployed(&c, &ns, "nowhere").await.unwrap_err();
-    assert!(refused.to_string().contains("no ready node on machine gone has 1 GPUs"), "{refused}");
-}
-
-/// Anchoring a running app to the machine it runs on has its node write the anchor, with no
-/// restart; a start of the app then waits for room on that node instead of moving to another.
-#[tokio::test]
-async fn an_app_anchored_by_an_update_restarts_only_on_its_machine() {
-    let (_dir, c, mut nodes) = running_on_a_full_node(None).await;
-    let ns = c.inner.lock().apps["model"].namespace.clone();
-    let settings = format!("/apps/model/settings?namespace={ns}");
-    for (body, status) in [(json!({"machine":"big"}), StatusCode::CONFLICT),
-        (json!({"machine":"machine","image":"serve:2"}), StatusCode::BAD_REQUEST), (json!({"machine":1}), StatusCode::BAD_REQUEST)] {
-        let response = scale_call(c.clone(), "admin", "PUT", &settings, body.clone()).await;
-        assert_eq!(response.status(), status, "{body}");
-    }
-    let open = |c: &WorkloadController| c.inner.lock().commands.values().filter(|v| !v.done)
-        .map(|v| (v.worker.clone(), v.operation, v.parameters.0.clone())).collect::<Vec<_>>();
-    assert!(open(&c).is_empty(), "a refused anchor sends nothing");
-    assert_eq!(scale_call(c.clone(), "admin", "PUT", &settings, json!({"machine":"machine"})).await.status(), StatusCode::ACCEPTED);
-    assert_eq!(open(&c), [("gpu".to_string(), NodeOperation::App as i32, json!({"entry":{"name":"model"},"set":{"machine":"machine"}}))],
-        "only the anchor is written: the app isn't drained or restarted");
-    assert_eq!(c.inner.lock().apps["model"].spec["machine"], json!("machine"), "placing it anew follows the anchor");
-    nodes_run_commands(&c, &mut nodes, &[]).await;
-    assert_eq!((nodes["gpu"].apps[0]["machine"].clone(), nodes["gpu"].apps[0]["ready"].clone()), (json!("machine"), json!(true)));
-    assert_eq!(c.inner.lock().deployments["gpu-model"].entry().machine(), "machine");
-
-    // Its replica stops while a job fills its node, and node `big` has room.
-    let gpu = nodes.get_mut("gpu").unwrap();
-    (gpu.apps[0]["ready"], gpu.apps[0]["cleaned"]) = (json!(false), json!(true));
-    for (id, report) in &nodes {
-        c.report(id, "session", report.clone()).await.unwrap();
-    }
-    nodes_run_commands(&c, &mut nodes, &[]).await;
-    assert_eq!(created_on(&c), ["gpu"], "no other node is sent it");
-    assert!(nodes["big"].apps.is_empty());
-    assert_eq!(scale_call(c.clone(), "admin", "PUT", &settings, json!({"machine":""})).await.status(), StatusCode::ACCEPTED);
-    assert!(open(&c).iter().any(|(w, _, p)| w == "gpu" && p["set"] == json!({"machine":""})), "\"\" lifts the anchor: {:?}", open(&c));
-}
-
 /// App `model` runs on node `gpu`, its entry anchored to `machine` when given; a job then has
 /// the node's other card, and node `big` has room.
 async fn running_on_a_full_node(machine: Option<&str>) -> (tempfile::TempDir, Arc<WorkloadController>, BTreeMap<String, NodeReport>) {

@@ -238,9 +238,8 @@ impl WorkloadController {
 
     /// Settings an update may change on an app. The rest is identity, placement or the
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
-    /// `machine` anchors a container app to the machine it runs on, and changes nothing else.
-    pub(super) const APP_SETTINGS: [&'static str; 12] = ["image", "env", "command", "user", "workdir", "volumes",
-        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "machine"];
+    pub(super) const APP_SETTINGS: [&'static str; 11] = ["image", "env", "command", "user", "workdir", "volumes",
+        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s"];
     // Apps can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
     pub(super) const ADMIN_APP_SETTINGS: [&'static str; 6] = ["image", "env", "command", "user", "workdir", "volumes"];
@@ -311,13 +310,6 @@ impl WorkloadController {
         let _ops = self.ops.lock().await;
         let set = set.as_object().filter(|o| !o.is_empty()).cloned()
             .ok_or_else(|| fail(400, "set at least one setting"))?;
-        if let Some(machine) = set.get("machine") {
-            if set.len() > 1 {
-                return Err(fail(400, "set machine on its own: anchoring an app changes nothing else and doesn't restart it"));
-            }
-            let machine = machine.as_str().ok_or_else(|| fail(400, "machine: invalid value"))?;
-            return self.anchor(namespace, app, node, machine);
-        }
         for (key, value) in &set {
             let valid = match key.as_str() {
                 "image" => value.as_str().is_some_and(|v| !v.is_empty() && !v.starts_with('-')),
@@ -348,40 +340,6 @@ impl WorkloadController {
         self.save("deployments", &key, &intent)?;
         self.inner.lock().deployments.insert(key, intent.clone());
         self.notify.notify_waiters();
-        Ok(self.scale_value(&intent))
-    }
-
-    /// Anchors `app`'s deployment on `node` (its only one, without a node) to `machine`, the
-    /// machine it runs on, or lifts the anchor with "". A start of an anchored app waits for
-    /// room on its node and is never moved to another, so an app that keeps its data on its
-    /// node's disks stays with it. Only the node's configuration changes: the app runs on.
-    /// The caller holds the operation lock.
-    fn anchor(&self, namespace: &str, app: &str, node: Option<&str>, machine: &str) -> anyhow::Result<Value> {
-        let (key, mut intent) = self.deployment_to_change(namespace, app, node)?;
-        if !intent.entry().is_container() {
-            return Err(fail(400, "only a container app is anchored this way: a prover's node configures its own machine"));
-        }
-        let on = self.inner.lock().workers.get(&intent.worker).map(|w| w.report.machine.clone()).unwrap_or_default();
-        if !machine.is_empty() && machine != on {
-            return Err(fail(409, format!(
-                "{app} runs on node {} (machine {on}): it can be anchored only to the machine it runs on", intent.worker)));
-        }
-        if intent.entry().machine() == machine {
-            return Ok(self.scale_value(&intent));
-        }
-        let name = intent.entry().name().to_owned();
-        self.tell_nodes([&intent.worker], message::entry(&name), message::set(json!({"machine": machine})))?;
-        intent.spec["machine"] = json!(machine);
-        self.save("deployments", &key, &intent)?;
-        self.inner.lock().deployments.insert(key, intent.clone());
-        // Placing the app anew follows the anchor too.
-        let template = self.inner.lock().apps.get(app).filter(|a| a.persistent && !a.removed && a.namespace == namespace).cloned();
-        if let Some(mut template) = template {
-            template.spec["machine"] = json!(machine);
-            self.save("apps", app, &template)?;
-            self.inner.lock().apps.insert(app.into(), template);
-        }
-        tracing::info!(app, node = intent.worker, machine, "anchoring an app to the machine it runs on");
         Ok(self.scale_value(&intent))
     }
 
@@ -917,14 +875,11 @@ impl WorkloadController {
     /// and CPUs of all its replicas. One that has them free now is preferred, the one with the
     /// fewest free GPUs among those, as a batch-class proof app is placed, so larger requests
     /// keep the larger gaps; otherwise the one with the most free GPUs, where the app waits for
-    /// room. Whether it has the room now comes along. `except` are nodes not to pick. An entry
-    /// anchored to a `machine` goes to that machine's node only.
+    /// room. Whether it has the room now comes along. `except` are nodes not to pick.
     fn place_app(&self, entry: Entry<'_>, except: &[String]) -> anyhow::Result<(String, bool)> {
         let (gpus, cpus) = entry.total(1.0);
-        let machine = entry.machine();
         let large: Vec<String> = self.inner.lock().workers.iter()
-            .filter(|(id, w)| !except.contains(id) && (machine.is_empty() || w.report.machine == machine)
-                && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .filter(|(id, w)| !except.contains(id) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
         let sizes: Vec<(String, f64, f64)> = large.into_iter()
             .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))
@@ -933,11 +888,7 @@ impl WorkloadController {
         sizes.iter().filter(fits).min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.total_cmp(&b.2)))
             .map(|(id, _, _)| (id.clone(), true))
             .or_else(|| sizes.iter().max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0))).map(|(id, _, _)| (id.clone(), false)))
-            .ok_or_else(|| fail(503, if machine.is_empty() {
-                format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")
-            } else {
-                format!("no ready node on machine {machine} has {gpus} GPUs and {cpus} CPUs for this app")
-            }))
+            .ok_or_else(|| fail(503, format!("no ready node has {gpus} GPUs and {cpus} CPUs for this app")))
     }
 
     /// Places a queued `start` of an app the scheduler placed, as `place_app` places a new

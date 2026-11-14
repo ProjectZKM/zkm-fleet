@@ -195,8 +195,6 @@ fn app_commands_address_every_app_by_its_name() {
             r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"nodes":["gpu-box"]}"#),
         (vec!["update", "comfyui", "--image", "comfyui:2"], "PUT", "/settings", serde_json::json!({"image":"comfyui:2"}),
             r#"{"state":"draining","node":"gpu-box"}"#),
-        (vec!["update", "sam3", "--machine", "10-60-85-215"], "PUT", "/settings", serde_json::json!({"machine":"10-60-85-215"}),
-            r#"{"state":"running","node":"gpu-box"}"#),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
