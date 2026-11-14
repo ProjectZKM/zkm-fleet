@@ -873,13 +873,7 @@ impl WorkloadController {
             match pending {
                 Some(pending) => pending,
                 None => {
-                    // A node that refused to create it, as one without its volumes does, is
-                    // picked again only when no other can take it.
-                    let refused: Vec<String> = self.inner.lock().commands.values()
-                        .filter(|c| c.is(NodeOperation::App) && c.error.is_some() && c.created().is_some_and(|e| e.name() == app))
-                        .map(|c| c.worker.clone()).collect();
-                    let (node, _) = self.place_app(template.entry(), &refused)
-                        .or_else(|_| self.place_app(template.entry(), &[]))?;
+                    let (node, _) = self.place_app(template.entry(), &[])?;
                     let create = message::with(self.app_message(namespace, app), &message::create(&template.spec));
                     let create = self.command(&node, NodeOperation::App, create)?;
                     template.workers = vec![node.clone()];

@@ -159,10 +159,9 @@ GPUs; otherwise it takes the one with the most free GPUs, where the app waits fo
 room. With no node big enough, enabling answers 503.
 
 The chosen node gets a `create`, which writes the entry into its `apps.yaml`,
-disabled. A node refuses the create when a host path of the app's `volumes` isn't
-there: Docker would mount an empty directory in its place. Once the node reports it, within 120 seconds, the scheduler enables it and
+disabled. Once the node reports it, within 120 seconds, the scheduler enables it and
 admits it against the namespace quota. A failed create clears the placement, so the
-next enable places the app again, on another node when one can take it. If the node hasn't reported the entry in time,
+next enable places the app again. If the node hasn't reported the entry in time,
 enabling answers 503, and enabling again waits for the same create. An app that a
 node's `apps.yaml` already runs, such as an integrated worker's prover bound with
 `app: NAME`, isn't placed again.

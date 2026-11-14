@@ -2858,35 +2858,6 @@ async fn an_app_a_node_refuses_to_create_is_placed_again_on_the_next_enable() {
     let refused = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("enabling answers").unwrap().unwrap_err();
     assert!(refused.to_string().contains("could not create the app: apps.yaml is not writable"), "{refused}");
     assert!(c.inner.lock().apps["model"].workers.is_empty());
-    // A node that fits it less tightly takes it next, as one with the volumes it lacks there would.
-    let mut big = inventory(&ns);
-    (big.machine, big.total_gpus, big.free_gpus) = ("big".into(), 4.0, 4.0);
-    c.report("big", "session", big).await.unwrap();
-    assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "big");
-}
-
-#[tokio::test]
-async fn a_node_that_refused_an_app_is_picked_again_when_no_other_can_take_it() {
-    let (_dir, c, ns) = setup().await;
-    c.report("gpu", "session", inventory(&ns)).await.unwrap();
-    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"port_base":50100}});
-    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
-    let task = tokio::spawn({
-        let (c, ns) = (c.clone(), ns.clone());
-        async move { c.deploy(&ns, "model").await }
-    });
-    let create = loop {
-        let sent = c.inner.lock().commands.values().find(|v| !v.done && !v.parameters["create"].is_null()).cloned();
-        if let Some(sent) = sent {
-            break sent;
-        }
-        tokio::task::yield_now().await;
-    };
-    let mut report = inventory(&ns);
-    report.results = vec![CommandResult { id: create.id, result: Value::Null.into(), error: Some("apps.yaml is not writable".into()) }];
-    c.report("gpu", "session", report).await.unwrap();
-    assert!(task.await.unwrap().is_err());
-    assert_eq!(deployed(&c, &ns, "model").await.unwrap().0, "gpu", "a failure may pass");
 }
 
 #[tokio::test]
