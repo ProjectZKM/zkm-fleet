@@ -69,7 +69,7 @@ def set_fields(path: Path, section: str, name: str, fields: dict[str, Any]) -> N
         entry = _entry(yaml.compose(text), section, name)
         if not isinstance(entry, yaml.MappingNode):
             raise ValueError(f"{section}: no entry {name}")
-        value = next((v for k, v in entry.value if k.value == key), None)
+        name_node, value = next(((k, v) for k, v in entry.value if k.value == key), (None, None))
         written = json.dumps(setting)
         if value is not None:
             # A block value runs on to the next key; it ends with its last line of content.
@@ -78,13 +78,30 @@ def set_fields(path: Path, section: str, name: str, fields: dict[str, Any]) -> N
                 offset += len(line)
                 if _is_content(line):
                     end = offset - (1 if line.endswith("\n") else 0)
-            text = text[:value.start_mark.index] + written + text[end:]
+            start = value.start_mark.index
+            if isinstance(value, yaml.CollectionNode) and not value.flow_style:
+                # A block list or map starts on the next line, and a list's items may sit at
+                # the key's own indentation, so the new value goes right after the key's colon.
+                colon = text.index(":", name_node.end_mark.index) + 1
+                rest = text[colon:text.index("\n", colon)].strip()
+                written = " " + written + (f"  {rest}" if rest else "")
+                start = colon
+            text = text[:start] + written + text[end:]
         elif entry.flow_style:
             position = entry.end_mark.index - 1
             text = text[:position] + f", {key}: {written}" + text[position:]
         else:
             position = entry.start_mark.index
             text = text[:position] + f"{key}: {written}\n" + " " * entry.start_mark.column + text[position:]
+    # The file is replaced only with text that reads back as the values asked for.
+    try:
+        data = (yaml.safe_load(text) or {}).get(section)
+    except yaml.YAMLError as error:
+        raise ValueError(f"{section}: writing {', '.join(fields)} into {name} would break {path.name}: {error}")
+    got = (next((e for e in data if isinstance(e, dict) and e.get("name") == name), None)
+           if isinstance(data, list) else (data or {}).get(name))
+    if not isinstance(got, dict) or any(got.get(k) != v for k, v in fields.items()):
+        raise ValueError(f"{section}: {name} doesn't read back {', '.join(fields)} as written")
     _replace(path, text)
 
 

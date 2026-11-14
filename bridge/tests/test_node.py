@@ -222,6 +222,30 @@ def test_resource_update_preserves_comments_and_handles_flow_yaml(tmp_path):
         assert data["image"]=="image:latest" and "# machine config" in p.read_text()
 
 
+@pytest.mark.parametrize("lists",["- ","  - "])
+def test_settings_update_replaces_block_lists_and_maps_however_indented(tmp_path,lists):
+    p=tmp_path/"apps.yaml"
+    p.write_text(f"apps:\n- name: app\n  kind: app\n  volumes:   # mounts\n  {lists}/old/a\n  {lists}/old/b:ro\n"
+                 f"  env:\n    HOME: /home/old\n  command:\n  {lists}python\n  {lists}main.py\n  image: image:latest\n"
+                 "- name: other\n  kind: app\n  volumes:\n  - /keep\n")
+    for fields in [{"volumes":["/new/a"]},{"command":["/new/python","main.py"]},{"env":{"HOME":"/home/new"}},
+                   {"volumes":["/new/b"],"command":["/new/b/python"],"workdir":"/new/b"}]:
+        node.set_fields(p,"apps","app",fields)
+        apps=yaml.safe_load(p.read_text())["apps"]
+        assert {k:apps[0][k] for k in fields}==fields and apps[0]["image"]=="image:latest"
+        assert apps[1]=={"name":"other","kind":"app","volumes":["/keep"]}
+    assert "# mounts" in p.read_text()
+
+
+def test_settings_update_never_writes_a_file_that_does_not_read_back(tmp_path,monkeypatch):
+    p=tmp_path/"apps.yaml";p.write_text("apps:\n- name: app\n  kind: app\n  volumes:\n  - /old\n")
+    before=p.read_bytes()
+    monkeypatch.setattr(node.json,"dumps",lambda value:"[unclosed")
+    with pytest.raises(ValueError,match="would break"):
+        node.set_fields(p,"apps","app",{"volumes":["/new"]})
+    assert p.read_bytes()==before and not list(tmp_path.glob("*.node-tmp"))
+
+
 
 
 APPS = """# machine config
