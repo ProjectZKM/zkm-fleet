@@ -413,7 +413,9 @@ class NodeExecutor:
         (`p["entry"]`, by name, set only): `remove` it, or `set` some of its configuration.
         Settings are written to the configuration only: the scheduler drains and stops an
         app first and starts it again afterwards. `p["create"]` adds a new app's
-        entry to the configuration, disabled until the app is enabled.
+        entry to the configuration, disabled until the app is enabled. It is refused when a
+        host path of its volumes isn't here: what an app keeps on a node's disks stays on
+        that node, and Docker would mount a missing path as a new, empty directory.
 
         A removed entry has what is left of its replicas cleaned up the way disabling does.
         Removing an app from this node alone (a scale left it no replicas here) keeps its
@@ -427,10 +429,15 @@ class NodeExecutor:
         nothing = lambda: {}
         if "create" in p:
             entry = p["create"]
-            AppSpec.load(entry)
+            spec = AppSpec.load(entry)
             entries = (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []
             if any(e.get("name") == entry["name"] for e in entries):
                 raise ValueError(f"{entry['name']} is already configured on this node")
+            missing = [path for path in (v.split(":")[0] for v in spec.volumes)
+                       if path.startswith("/") and not os.path.exists(path)]
+            if missing:
+                raise ValueError(f"{entry['name']} can't run on this node: {', '.join(missing)} isn't here, "
+                                 "and Fleet copies nothing an app keeps on a node's disks")
             append_entry(self.apps_file, "apps", entry)
             return {"created": [entry["name"]]}, nothing
         if "batch" in p:
@@ -585,6 +592,11 @@ class NodeExecutor:
         return {"jobs_deleted": deleted, "kept": kept}
 
     def report(self) -> dict[str, Any]:
+        # The results first: a command finished by then has changed the configuration read
+        # below, so the scheduler never sees a create done before the node reports its entry.
+        with self.lock:
+            results = [{"id": p.stem, "result": v["result"], "error": v["error"]}
+                for p in self.journal.glob("*.json") if (v := read_json(p)).get("done")]
         nodes = alive_nodes()
         ready = len(nodes) == 1
         total, free = resources()
@@ -635,9 +647,6 @@ class NodeExecutor:
                     "logs_ready": (entry / f".fleet-logs-{lease}").exists()})
             except (OSError, ValueError, SystemExit):
                 log.exception("reading local job %s", entry.name)
-        with self.lock:
-            results = [{"id": p.stem, "result": v["result"], "error": v["error"]}
-                for p in self.journal.glob("*.json") if (v := read_json(p)).get("done")]
         return {"version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),

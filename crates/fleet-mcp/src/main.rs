@@ -218,8 +218,9 @@ struct CreateApp {
     /// The app's container settings, the keys of its apps.yaml entry: kind (app, the default,
     /// or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus, shm_gb, memory_gb, env,
     /// volumes, ready_timeout_s, stop_timeout_s; for an app also command, port_base, health_path,
-    /// workdir, user; for a prover proof_storage_root, backend, rust_log. image is required, and
-    /// port_base for an app; user, volumes and proof_storage_root require administrator credentials.
+    /// workdir, user, machine (anchors it to that machine: placed there, never moved); for a
+    /// prover proof_storage_root, backend, rust_log. image is required, and port_base for an app;
+    /// user, volumes and proof_storage_root require administrator credentials.
     spec: serde_json::Map<String, Value>,
     /// Priority inherited by the app's replicas and jobs (default 0; higher values run first).
     priority: Option<i32>,

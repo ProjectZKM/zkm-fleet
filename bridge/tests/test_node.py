@@ -568,6 +568,41 @@ def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
     assert error and "already configured" in str(error)
 
 
+def test_create_refuses_an_app_whose_volumes_are_not_on_this_node(executor,tmp_path):
+    """Its data stays on the node it ran on; Docker would mount an empty directory in its place."""
+    here=tmp_path/"models";here.mkdir()
+    gone=tmp_path/"ComfyUI"
+    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,
+           "volumes":[f"{here}:ro",str(gone)]}
+    before=executor.apps_file.read_text()
+    result,error=app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)
+    assert error and f"web can't run on this node: {gone} isn't here" in str(error), error
+    assert executor.apps_file.read_text()==before and not gone.exists()
+    gone.symlink_to(tmp_path/"elsewhere")
+    result,error=app_message(executor,"create-2",{"create":entry},app="web",ns="a"*32)
+    assert error and "isn't here" in str(error), "a link to nothing is not there either"
+    gone.unlink();gone.mkdir()
+    assert app_message(executor,"create-3",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)
+
+
+def test_a_report_carries_a_create_done_only_with_its_entry(executor,monkeypatch):
+    """A create that finishes while a report is read is reported with its entry, in the next one."""
+    monkeypatch.setattr(node.ray,"cluster_resources",lambda:{"GPU":8,"CPU":48})
+    monkeypatch.setattr(node.ray,"available_resources",lambda:{"GPU":8,"CPU":48})
+    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100}
+    def running():
+        # The create runs after this report read the configuration.
+        if not (executor.journal/"create-1.json").exists():
+            app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)
+        return {}
+    monkeypatch.setattr(reconcile,"running",running)
+    for report in [executor.report(),executor.report()]:
+        done=[r["id"] for r in report["results"]]
+        if "create-1" in done:
+            assert "web" in [a["name"] for a in report["apps"]], report
+    assert "create-1" in done
+
+
 def test_create_adds_a_prover_and_refuses_an_invalid_entry(executor):
     prover={"name":"proofs","kind":"ziren-gpu","namespace":"a"*32,"disabled":True,"image":"ziren-gpu:1","elf_id":"b"*64}
     assert app_message(executor,"create-1",{"create":prover},app="proofs",ns="a"*32)==({"created":["proofs"]},None)

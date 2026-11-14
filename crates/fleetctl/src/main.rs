@@ -114,9 +114,14 @@ enum AppCmd {
     },
     /// Change a proof or persistent app's settings. Image and environment changes require
     /// administrator credentials. The app drains, stops,
-    /// takes the new settings on its node and starts again, like a scale.
+    /// takes the new settings on its node and starts again, like a scale; --machine alone
+    /// doesn't restart it.
     Update {
         name: String,
+        /// Anchor a container app to MACHINE, the machine it runs on (`fleetctl node` lists
+        /// it), so that its start waits there and never moves it to another node, as for an
+        /// app that keeps its data on that node's disks. "" lifts the anchor. Set on its own.
+        #[arg(long, value_name = "MACHINE")] machine: Option<String>,
         /// Container image.
         #[arg(long)] image: Option<String>,
         /// K=V; repeat. Replaces the app's whole environment.
@@ -469,9 +474,9 @@ struct AddApp {
     /// A JSON file with the app's container settings, the keys of its apps.yaml entry: kind
     /// (app, the default, or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus,
     /// shm_gb, memory_gb, env, volumes, ready_timeout_s, stop_timeout_s; for an app also command,
-    /// port_base, health_path, workdir, user; for a prover proof_storage_root, backend, rust_log.
-    /// image is required, and port_base for an app; user, volumes and proof_storage_root need
-    /// administrator credentials.
+    /// port_base, health_path, workdir, user, machine (anchors it to that machine: placed there,
+    /// never moved); for a prover proof_storage_root, backend, rust_log. image is required, and
+    /// port_base for an app; user, volumes and proof_storage_root need administrator credentials.
     #[arg(long)]
     spec: PathBuf,
     /// A prover's program: its full ELF SHA-256.
@@ -1261,8 +1266,9 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
-        Some(AppCmd::Update { name, image, env, shm_gb, node }) => {
+        Some(AppCmd::Update { name, machine, image, env, shm_gb, node }) => {
             let mut set = json!({});
+            if let Some(v) = machine { set["machine"] = json!(v); }
             if let Some(v) = image { set["image"] = json!(v); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
             if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }

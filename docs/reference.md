@@ -129,7 +129,7 @@ the app's `apps.yaml` entry; unknown or mistyped settings are refused.
 |---|---|
 | `kind`: `app` by default, `ziren-gpu` by default for a prover, or `ziren-cpu` | Every app |
 | `image` (required), `replicas`, `gpus`, `cpus`, `shm_gb`, `memory_gb`, `env`, `volumes`, `ready_timeout_s`, `stop_timeout_s` | Every app |
-| `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user` | A `kind: app` container |
+| `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user`, `machine` (anchors it: see [Moves](#apps)) | A `kind: app` container |
 | `proof_storage_root`, `backend`, `rust_log` | A prover |
 
 A prover also takes its program, `--elf-id ID` or `--elf FILE`, and a placement
@@ -151,16 +151,18 @@ the others and their jobs intact. In the API:
 `{"name":"eth","spec":{"image":"IMAGE","gpus":1},"proof":{"elf_id":"FULL_ELF_SHA256"}}`.
 
 **Placement.** An app is created disabled and on no node. Its first `app enable`
-places it; users never choose the node. Candidates are live, ready, undrained nodes
+places it; users never choose the node, though an app anchored to a `machine` goes to
+that machine's node only. Candidates are live, ready, undrained nodes
 whose total capacity holds the GPUs and CPUs of all its replicas. The scheduler
 prefers a node where they're free now, and among those the one with the fewest free
 GPUs; otherwise it takes the one with the most free GPUs, where the app waits for
 room. With no node big enough, enabling answers 503.
 
 The chosen node gets a `create`, which writes the entry into its `apps.yaml`,
-disabled. Once the node reports it, within 120 seconds, the scheduler enables it and
+disabled. A node refuses the create when a host path of the app's `volumes` isn't
+there: Docker would mount an empty directory in its place. Once the node reports it, within 120 seconds, the scheduler enables it and
 admits it against the namespace quota. A failed create clears the placement, so the
-next enable places the app again. If the node hasn't reported the entry in time,
+next enable places the app again, on another node when one can take it. If the node hasn't reported the entry in time,
 enabling answers 503, and enabling again waits for the same create. An app that a
 node's `apps.yaml` already runs, such as an integrated worker's prover bound with
 `app: NAME`, isn't placed again.
@@ -175,7 +177,11 @@ anywhere, the start preempts lower-priority work on its own node and keeps the r
 that frees. A start whose entry is anchored with `machine` never moves; every
 integrated worker's entry is. It waits for room on its node, preempting
 lower-priority batch jobs of its namespace when it can. Fleet copies nothing an app
-keeps on a node's disks: the app looks after its own storage.
+keeps on a node's disks: the app looks after its own storage. Anchor an app that keeps
+data there, or runs from it: with `machine` in its spec, or with
+`fleetctl app update NAME --machine MACHINE` (`{"machine":"MACHINE"}`), which anchors it
+to the machine it runs on (`fleetctl node` lists it) without restarting it. `""` lifts
+the anchor; give `--node` when the app runs on several nodes.
 
 **States.** An app is `configured`, `starting`, `running`, `draining`, `disabled`,
 `offline` or `failed`; a proof app without provers is `registered`. The table shows
@@ -195,7 +201,8 @@ removes the app. An active proof can't be
 resized ([issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3)).
 `fleetctl app update NAME` (`PUT /apps/NAME/settings`) changes the image,
 environment, command, user, workdir, volumes, shm and memory sizes, health path or
-timeouts. The image, environment, command, user, workdir and volumes need an
+timeouts, and drains and restarts the app to do so; `--machine` (see Moves) is set on
+its own and restarts nothing. The image, environment, command, user, workdir and volumes need an
 administrator, since an app can reach host networking, storage and prover
 credentials; an update mixing them with other fields is refused whole. Changing
 priority alone doesn't restart replicas.
