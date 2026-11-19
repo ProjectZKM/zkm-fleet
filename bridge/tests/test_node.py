@@ -222,6 +222,30 @@ def test_resource_update_preserves_comments_and_handles_flow_yaml(tmp_path):
         assert data["image"]=="image:latest" and "# machine config" in p.read_text()
 
 
+@pytest.mark.parametrize("lists",["- ","  - "])
+def test_settings_update_replaces_block_lists_and_maps_however_indented(tmp_path,lists):
+    p=tmp_path/"apps.yaml"
+    p.write_text(f"apps:\n- name: app\n  kind: app\n  volumes:   # mounts\n  {lists}/old/a\n  {lists}/old/b:ro\n"
+                 f"  env:\n    HOME: /home/old\n  command:\n  {lists}python\n  {lists}main.py\n  image: image:latest\n"
+                 "- name: other\n  kind: app\n  volumes:\n  - /keep\n")
+    for fields in [{"volumes":["/new/a"]},{"command":["/new/python","main.py"]},{"env":{"HOME":"/home/new"}},
+                   {"volumes":["/new/b"],"command":["/new/b/python"],"workdir":"/new/b"}]:
+        node.set_fields(p,"apps","app",fields)
+        apps=yaml.safe_load(p.read_text())["apps"]
+        assert {k:apps[0][k] for k in fields}==fields and apps[0]["image"]=="image:latest"
+        assert apps[1]=={"name":"other","kind":"app","volumes":["/keep"]}
+    assert "# mounts" in p.read_text()
+
+
+def test_settings_update_never_writes_a_file_that_does_not_read_back(tmp_path,monkeypatch):
+    p=tmp_path/"apps.yaml";p.write_text("apps:\n- name: app\n  kind: app\n  volumes:\n  - /old\n")
+    before=p.read_bytes()
+    monkeypatch.setattr(node.json,"dumps",lambda value:"[unclosed")
+    with pytest.raises(ValueError,match="would break"):
+        node.set_fields(p,"apps","app",{"volumes":["/new"]})
+    assert p.read_bytes()==before and not list(tmp_path.glob("*.node-tmp"))
+
+
 
 
 APPS = """# machine config
@@ -566,6 +590,24 @@ def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
     assert yaml.safe_load(executor.apps_file.read_text())["apps"][-1]==entry
     result,error=app_message(executor,"create-2",{"create":entry},app="web",ns="a"*32)
     assert error and "already configured" in str(error)
+
+
+def test_a_report_carries_a_create_done_only_with_its_entry(executor,monkeypatch):
+    """A create that finishes while a report is read is reported with its entry, in the next one."""
+    monkeypatch.setattr(node.ray,"cluster_resources",lambda:{"GPU":8,"CPU":48})
+    monkeypatch.setattr(node.ray,"available_resources",lambda:{"GPU":8,"CPU":48})
+    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100}
+    def running():
+        # The create runs after this report read the configuration.
+        if not (executor.journal/"create-1.json").exists():
+            app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)
+        return {}
+    monkeypatch.setattr(reconcile,"running",running)
+    for report in [executor.report(),executor.report()]:
+        done=[r["id"] for r in report["results"]]
+        if "create-1" in done:
+            assert "web" in [a["name"] for a in report["apps"]], report
+    assert "create-1" in done
 
 
 def test_create_adds_a_prover_and_refuses_an_invalid_entry(executor):

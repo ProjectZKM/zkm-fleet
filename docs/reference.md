@@ -175,7 +175,9 @@ anywhere, the start preempts lower-priority work on its own node and keeps the r
 that frees. A start whose entry is anchored with `machine` never moves; every
 integrated worker's entry is. It waits for room on its node, preempting
 lower-priority batch jobs of its namespace when it can. Fleet copies nothing an app
-keeps on a node's disks: the app looks after its own storage.
+keeps on a node's disks: the app looks after its own storage. Anchor an app that keeps
+data there, or runs from it, by setting `machine` in its entry in that node's
+`apps.yaml` to the node's machine, as `fleetctl node` lists it.
 
 **States.** An app is `configured`, `starting`, `running`, `draining`, `disabled`,
 `offline` or `failed`; a proof app without provers is `registered`. The table shows

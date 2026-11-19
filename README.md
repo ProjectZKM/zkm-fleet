@@ -19,8 +19,11 @@ Kubernetes' jobs, deployments and controllers, without needing Kubernetes.
 
 Namespace owners create apps and batches and manage their priority, enabled state and
 scaling, within their namespace's and tag's quotas; the scheduler picks each app's
-node. Administrators manage namespaces, quotas, access, host storage for batches and
-apps' execution settings.
+node, and moves an app's start to a node with room when its own has none. Fleet copies
+nothing an app keeps on a node's disks, so an app that keeps data there, or runs from
+it, is anchored to that node with `machine` in its entry in the node's `apps.yaml`.
+Administrators manage namespaces, quotas, access, host storage for batches and apps'
+execution settings.
 
 Two integrated app workers prove on their node's own GPU server:
 
