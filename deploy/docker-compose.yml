@@ -18,6 +18,7 @@ services:
   scheduler:
     image: ${FLEET_SCHEDULER_IMAGE:?set FLEET_SCHEDULER_IMAGE in compose.env}
     restart: unless-stopped
+    init: true   # PID 1 reaps the processes it inherits; the scheduler does not
     # The user that owns ${FLEET_ETC}: the secrets there are mode 600.
     user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
     depends_on:
