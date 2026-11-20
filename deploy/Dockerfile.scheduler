@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /src/target/release/fleet-scheduler /src/target/release/fleetctl /src/target/release/fleet-mcp /usr/local/bin/
 USER fleet
 EXPOSE 51001 9191
-HEALTHCHECK --interval=15s --timeout=3s CMD curl -sf http://127.0.0.1:9191/healthz || exit 1
+# Exec form, and curl gives up before Docker does: a shell-form check that times out leaves its curl to PID 1,
+# which never reaps it (one zombie per slow check).
+HEALTHCHECK --interval=15s --timeout=3s CMD ["curl", "-sf", "--max-time", "2", "http://127.0.0.1:9191/healthz"]
 ENTRYPOINT ["fleet-scheduler"]
 CMD ["-c", "/etc/zkm-fleet/fleet.yaml"]
