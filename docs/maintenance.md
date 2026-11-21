@@ -58,12 +58,50 @@ It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scr
 of the agent's unit, after checking that the new bridge imports in the node's venv,
 and waits for the node to reconnect. `node rollback` restores everything the last
 upgrade replaced. In the local form, the last two arguments are optional: the proof
-app, whose endpoint units in `FLEET_PROOF_APP_UNITS` restart too, and the launch
-scripts' directory.
+app binary staged for its next explicit endpoint restart, and the launch scripts'
+directory. Running proof endpoints keep their current processes; node upgrades
+and rollbacks no longer restart `FLEET_PROOF_APP_UNITS`.
 
 Ray keeps running, and so do apps and batches, through the agent restart. The upgrade
 touches neither `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`;
 leave app endpoints running when their programs are unchanged.
+
+On a node installed with `--with-shim`, shim and its connectors are supervised by
+`zkm-fleet-shim.service`, independently of the node and Ray units. Before stopping
+the agent, upgrade and rollback use the candidate Python adapter to negotiate
+protocol version 1 with the running daemon. An unavailable or incompatible daemon,
+or a rollback adapter without daemon support, rejects the operation while the old
+node continues running. Set `FLEET_ETC` (or `FLEET_ENV`) when configuration lives
+outside the default `$FLEET_PREFIX/etc`.
+
+These commands do not change the configured shim executable, restart its service,
+release existing Ray reservations, or change allocation/lease/generation identities.
+Do not add `PartOf=zkm-fleet-node.service` or `BindsTo` from shim/Ray to the node;
+keep separate cgroups with normal `KillMode=control-group` cleanup. Detached Ray
+actors alone cannot protect processes that share a service's stopping cgroup.
+
+During the brief agent restart, scheduling/control operations can be unavailable.
+Existing runtime streams continue through shim and the relay. Registration leases
+renew on the same transport with a compatible relay; application Access credentials
+still expire/revoke normally. A prolonged node outage can prevent new registration
+grants because Fleet no longer has a live observation, and is not covered by the
+node-upgrade continuity guarantee. Shim/Ray/Docker/host upgrades are separate
+operations and must not be bundled into this restart.
+
+Run the real systemd acceptance against local, isolated services (no local prover):
+
+```sh
+RUN_FLEET_NODE_UPGRADE=1 \
+TRUSTED_FLEET_TEST_BIN=/absolute/fleet/bin \
+TRUSTED_SHIM_TEST_BINARY=/absolute/trusted-shim-runtime \
+TRUSTED_ROUTER_TEST_BINARY=/absolute/trusted-data-router \
+PYTHONPATH=bridge python -m pytest -q -s deploy/tests/test_node_upgrade_cluster.py
+```
+
+It requires Docker with `python:3.12-slim`, the bridge/Ray environment, and
+passwordless sudo for uniquely named test units. It checks upgrade, rollback,
+incompatible-candidate rejection, unchanged container/PID/allocation, continuous
+SSE/WebSocket traffic, business authorization, and an unreplayed application job.
 
 One agent session at a time drives a node. A stopping agent ends its session, so the
 scheduler admits the restarted agent at once. An agent that crashed, or one stopped

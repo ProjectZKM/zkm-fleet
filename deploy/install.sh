@@ -3,11 +3,12 @@
 # control --public-url https://fleet.example:8905 [--tls-names stage,fleet.example] [--no-mcp]
 # node --scheduler https://fleet.example:8905 --cluster-token FILE [--cuda 0,1]
 # Common: --prefix DIR --etc DIR --bin DIR --workdir DIR --no-cron
-# Node: --name NAME --cpus N --jobs-dir DIR --scheduler-ca FILE
+# Node: --name NAME --cpus N --jobs-dir DIR --scheduler-ca FILE --with-shim
 set -euo pipefail
 ROLE=${1:-}; shift || true
 PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; WORKDIR=""; JOBS_DIR=""
 CUDA=""; CPUS=""; NAME=$(hostname); SCHEDULER=""; TOKEN=""; CA=""; PUBLIC_URL=""; TLS_NAMES=""; CRON=1; PROOF_ROOTS=""; MCP=1
+WITH_SHIM=0
 SUBNET=172.28.250.0/24; IP=$(hostname -I | awk '{print $1}')
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -19,6 +20,7 @@ while [ $# -gt 0 ]; do
     --public-url) PUBLIC_URL=$2; shift 2;; --tls-names) TLS_NAMES=$2; shift 2;;
     --subnet) SUBNET=$2; shift 2;; --ip) IP=$2; shift 2;; --no-cron) CRON=0; shift;;
     --no-mcp) MCP=0; shift;;
+    --with-shim) WITH_SHIM=1; CRON=0; shift;;
     *) echo "unknown option $1" >&2; exit 2;;
   esac
 done
@@ -40,9 +42,14 @@ else
   command -v python3 >/dev/null || die "Python >= 3.10 is required on execution machines"
   python3 -c 'import sys; sys.exit(sys.version_info < (3,10))' || die "Python >= 3.10 is required"
   [ -x "$BIN/fleet-node" ] || die "build fleet-node for this machine first"
+  if [ "$WITH_SHIM" = 1 ]; then
+    [ -x "$BIN/trusted-shim-runtime" ] || die "--with-shim requires the bundled trusted-shim-runtime"
+    command -v systemctl >/dev/null || die "--with-shim requires systemd"
+  fi
   [ -z "$PROOF_ROOTS" ] || [ -x "$BIN/fleet-ziren-node" ] || [ -x "$PREFIX/bin/fleet-ziren-node" ] \
     || die "--proof-storage-roots requires the optional fleet-ziren-node storage handler"
-  install -m 755 "$BIN/fleet-node" "$PREFIX/bin/"
+  install -m 755 "$BIN/fleet-node" "$PREFIX/bin/fleet-node.new"
+  mv "$PREFIX/bin/fleet-node.new" "$PREFIX/bin/fleet-node"
   # Only SDK proof actors and their storage handler need the native prover.
   # Ordinary apps, batches and integrated workers carry their own application code.
   for b in fleet-ziren-node fleet-proof-app; do
@@ -113,6 +120,7 @@ EOF
   echo "[install] HTTPS gateway: $PUBLIC_URL; MCP: $PUBLIC_URL/mcp"
 else
   cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh} "$PREFIX/deploy/"
+  cp "$SRC"/deploy/{shim-start.sh,install-node-services.sh} "$PREFIX/deploy/"
   # The node holds the cluster token, never the administrator or user tokens.
   [ "$(readlink -f "$TOKEN")" = "$(readlink -m "$ETC/cluster.token")" ] || install -m 600 "$TOKEN" "$ETC/cluster.token"
   if [ -n "$CA" ]; then
@@ -149,8 +157,13 @@ EOF
     printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_JOBS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$JOBS_DIR" "$CA"
     [ ! -f "$ETC/proof-storage-roots" ] || printf 'FLEET_PROOF_STORAGE_ROOTS_FILE=%q\n' "$ETC/proof-storage-roots"
     printf 'RAY_NUM_CPUS=%q\nCUDA_VISIBLE_DEVICES=%q\n' "$CPUS" "$CUDA"
+    [ "$WITH_SHIM" != 1 ] || printf 'FLEET_NODE_SUPERVISED=1\n'
   } > "$ETC/watchdog.env"
-  FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh"
+  if [ "$WITH_SHIM" = 1 ]; then
+    bash "$PREFIX/deploy/install-node-services.sh" "$PREFIX" "$ETC" "$WORKDIR" "$BIN/trusted-shim-runtime"
+  else
+    FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh"
+  fi
   if [ "$CRON" = 1 ]; then
     command -v crontab >/dev/null || die "install cron or supervise node-start.sh yourself with --no-cron"
     LINE="* * * * * FLEET_ENV=$ETC/watchdog.env $PREFIX/deploy/fleet-watchdog.sh >> $WORKDIR/logs/watchdog.log 2>&1"

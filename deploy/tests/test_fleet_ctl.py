@@ -124,8 +124,8 @@ def node_fixture(tmp_path):
         (prefix / "deploy" / name).write_text(body + "\n")
     commands = tmp_path / "bin"
     executable(commands / "sudo", "exec \"$@\"\n")
-    executable(commands / "systemctl", "exit 0\n")
-    executable(commands / "journalctl", "echo 'node connected to control plane'\nexit 0\n")
+    executable(commands / "systemctl", 'case "$*" in *"--property=MainPID"*) echo 42;; esac\nexit 0\n')
+    executable(commands / "journalctl", 'case "$*" in *"_PID=42"*) echo "node connected to control plane";; *) exit 1;; esac\n')
     return prefix, commands
 
 
@@ -178,6 +178,28 @@ def test_watchdog_repairs_a_dead_ray_link(tmp_path):
         pytest.skip("a live fleet watchdog on this machine held the lock; nothing ran")
     assert link.is_symlink() and link.resolve() == (work / "ray").resolve()
     assert (tmp_path / "ray.log").exists(), "the repaired link let the watchdog start Ray"
+
+
+def test_node_upgrade_and_rollback_do_not_restart_proof_endpoints(tmp_path):
+    prefix, commands = node_fixture(tmp_path)
+    calls = tmp_path / "systemctl.calls"
+    executable(commands / "systemctl", f'echo "$*" >> {calls}\ncase "$*" in *"--property=MainPID"*) echo 42;; esac\n')
+    old_proof = prefix / "bin/fleet-proof-app"
+    executable(old_proof, "echo old-proof\n")
+    new_proof = tmp_path / "new-proof"
+    executable(new_proof, "echo new-proof\n")
+    new_node = tmp_path / "new-node"
+    executable(new_node, "echo new-node\n")
+    new_bridge = tmp_path / "bridge"
+    (new_bridge / "fleet_bridge").mkdir(parents=True)
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_PROOF_APP_UNITS": "active-proof.service"}
+    ctl = ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node"]
+    subprocess.run([*ctl, "upgrade", str(new_node), str(new_bridge), str(new_proof)], env=env, check=True, capture_output=True)
+    assert old_proof.read_text() == new_proof.read_text()
+    subprocess.run([*ctl, "rollback"], env=env, check=True, capture_output=True)
+    assert "old-proof" in old_proof.read_text()
+    assert "active-proof" not in calls.read_text() and "restart" not in calls.read_text()
 
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):

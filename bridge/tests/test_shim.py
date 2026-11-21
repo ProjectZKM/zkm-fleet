@@ -35,6 +35,45 @@ def test_installing_shim_does_not_change_legacy_hash_or_execution(tmp_path):
     assert not book.root.exists()
 
 
+def test_daemon_transport_is_persisted_and_never_silently_migrated(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    book = shim.RuntimeBook(tmp_path / "runtimes")
+    first = book.bind(s, "launch")
+    daemon_spec = replace(s, cluster=replace(s.cluster, shim_daemon=True))
+    with pytest.raises(ValueError, match="active shim allocation"):
+        book.bind(daemon_spec, "upgrade")
+    assert book.read(s.name).execution == first.execution
+    call = Mock(return_value={"cleaned": True})
+    monkeypatch.setattr(shim, "invoke", call)
+    book.cleanup(s.name)
+    assert call.call_args.kwargs["daemon"] is False
+    book.bind(daemon_spec, "new-allocation")
+    assert book.read(s.name).daemon is True
+    book.cleanup(s.name)
+    assert call.call_args.kwargs["daemon"] is True
+
+
+def test_missing_daemon_never_falls_back_to_executable(tmp_path, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(shim.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="no legacy fallback"):
+        shim.invoke("/unused/binary", str(tmp_path), socket.gethostname(), {"operation":"capabilities"}, daemon=True)
+    run.assert_not_called()
+
+
+def test_daemon_network_is_owned_by_service_not_ray_subprocess(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, services=["http"]), cluster=replace(s.cluster, shim_daemon=True))
+    actor = object.__new__(shim._ShimApp)
+    actor.spec = s
+    actor.call = Mock(return_value={"connected_worker":True})
+    spawn = Mock()
+    monkeypatch.setattr(shim.subprocess, "Popen", spawn)
+    actor.start_network()
+    spawn.assert_not_called()
+    assert actor.call.call_args.args[0]["operation"] == "network"
+
+
 @pytest.mark.parametrize("runtime", [None, {"executor":"unknown"}, {"executor":"shim", "driver":"openshell"},
     {"executor":"shim", "driver":"docker", "policy_proof":"required"}])
 def test_unsupported_or_misspelled_runtime_is_not_ignored(tmp_path, runtime):

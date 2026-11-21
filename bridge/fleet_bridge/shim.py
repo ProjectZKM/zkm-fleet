@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 import socket
+import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -50,18 +52,54 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
     if not config.shim_binary or not config.shim_state_dir:
         return []
     try:
-        result = subprocess.run([config.shim_binary, "--capabilities"], capture_output=True, timeout=5, check=True)
-        value = json.loads(result.stdout)
+        if config.shim_daemon:
+            value = daemon_call(config.shim_state_dir, socket.gethostname(), {"operation": "capabilities"}, timeout=5)
+        else:
+            result = subprocess.run([config.shim_binary, "--capabilities"], capture_output=True, timeout=5, check=True)
+            value = json.loads(result.stdout)
         if value.get("protocol") != 1 or "docker" not in value.get("drivers", []):
             return []
         modern = "data-plane-v1" in value.get("features", [])
         management = "runtime-management-v1" in value.get("features", [])
         return (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
-    except (OSError, ValueError, subprocess.SubprocessError):
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
 
 
-def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any]) -> dict[str, Any]:
+def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
+    """No TCP listener or credentials in argv. Never fall back to direct Docker."""
+    path = Path(state_dir) / "control.sock"
+    try:
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("untrusted shim socket")
+        payload = json.dumps({"protocol": 1, "node_id": node_id, "command": to_dict(command)}).encode()
+        if len(payload) > 1024 * 1024:
+            raise ValueError("oversize request")
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(timeout)
+            connection.connect(str(path))
+            _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            if uid != os.geteuid():
+                raise ValueError("untrusted shim peer")
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            data = bytearray()
+            while chunk := connection.recv(65536):
+                data.extend(chunk)
+                if len(data) > 1024 * 1024:
+                    raise ValueError("oversize response")
+        response = json.loads(data)
+        if not isinstance(response, dict) or response.get("protocol") != 1 or not isinstance(response.get("result"), dict) or "error" in response:
+            raise ValueError("shim rejected operation")
+        return response["result"]
+    except (OSError, ValueError, TypeError):
+        raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
+
+
+def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False) -> dict[str, Any]:
+    if daemon:
+        return daemon_call(state_dir, node_id, command)
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
         result = subprocess.run([binary, "--state-dir", state_dir, "--node-id", node_id],
@@ -78,6 +116,7 @@ class Allocation(Record):
     spec: str
     binary: str
     state_dir: str
+    daemon: bool = False
     cleaned: bool = False
 
 
@@ -122,7 +161,7 @@ class RuntimeBook:
             raise ValueError("shim launch requires a durable command id")
         if previous and not previous.cleaned:
             if (previous.spec != binding_hash(spec) or previous.binary != spec.cluster.shim_binary
-                    or previous.state_dir != spec.cluster.shim_state_dir):
+                    or previous.state_dir != spec.cluster.shim_state_dir or previous.daemon != spec.cluster.shim_daemon):
                 raise ValueError("active shim allocation differs; drain and clean it before changing settings")
             return replace(spec, execution=previous.execution)
         if previous and previous.execution.lease_id == command_id:
@@ -134,7 +173,8 @@ class RuntimeBook:
         if not spec.cluster.shim_binary or not spec.cluster.shim_state_dir:
             raise ValueError("shim is not configured")
         self.write(spec.name, Allocation(executor=ExecutorKind.SHIM, execution=execution,
-            spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir))
+            spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir,
+            daemon=spec.cluster.shim_daemon))
         return replace(spec, execution=execution)
 
     def cleanup(self, name: str) -> None:
@@ -142,7 +182,7 @@ class RuntimeBook:
         if not record or record.cleaned:
             return
         result = invoke(record.binary, record.state_dir, socket.gethostname(),
-            {"operation": "delete", "execution": record.execution})
+            {"operation": "delete", "execution": record.execution}, daemon=record.daemon)
         if result.get("cleaned") is not True:
             raise RuntimeError("shim cleanup is not confirmed")
         record.cleaned = True
@@ -202,6 +242,9 @@ class _ShimApp:
     def start_network(self) -> None:
         spec = self.spec
         if spec.app.services:
+            if spec.cluster.shim_daemon:
+                self.call({"operation": "network", "execution": spec.execution, "config": spec.cluster.shim_network})
+                return
             # The Rust shim owns endpoints, grant verification, reconnect and
             # stream drain. Ray supervises only this local process.
             self.network = subprocess.Popen([spec.cluster.shim_binary, "--state-dir", spec.cluster.shim_state_dir,
@@ -211,11 +254,13 @@ class _ShimApp:
             self.network.stdin.close()
 
     def call(self, command: dict[str, Any]) -> dict[str, Any]:
-        return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command)
+        return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command,
+            daemon=self.spec.cluster.shim_daemon)
 
     def health(self) -> dict[str, Any]:
         status = self.call({"operation": "inspect", "execution": self.spec.execution})
-        if status.get("state") == "ready" and self.network is not None and self.network.poll() is not None:
+        if status.get("state") == "ready" and (self.spec.cluster.shim_daemon or
+                self.network is not None and self.network.poll() is not None):
             self.start_network()
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
@@ -225,3 +270,39 @@ class _ShimApp:
 
 
 ShimApp = ray.remote(_ShimApp)
+
+
+def main() -> None:
+    """Installer/service entry points use the existing apps.yaml exclusively."""
+    import argparse
+    import yaml
+    from .model import AppsConfig
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("operation", choices=["check", "serve"])
+    parser.add_argument("--apps", required=True)
+    parser.add_argument("--wait-seconds", type=float, default=0)
+    args = parser.parse_args()
+    config = AppsConfig.parse(yaml.safe_load(Path(args.apps).read_text())).cluster
+    if not config.shim_daemon:
+        if args.operation == "serve":
+            parser.error("shim_daemon must be enabled in apps.yaml")
+        return
+    if args.operation == "serve":
+        os.execv(config.shim_binary, [config.shim_binary, "--serve", "--state-dir", config.shim_state_dir,
+            "--node-id", socket.gethostname()])
+    deadline = time.monotonic() + args.wait_seconds
+    while True:
+        try:
+            value = daemon_call(config.shim_state_dir, socket.gethostname(), {"operation": "capabilities"}, timeout=5)
+            break
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.2)
+    if value.get("protocol") != 1 or "runtime-daemon-v1" not in value.get("features", []):
+        raise RuntimeError("running shim has an incompatible protocol; node was not changed")
+
+
+if __name__ == "__main__":
+    main()
