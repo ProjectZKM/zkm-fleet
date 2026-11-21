@@ -4,6 +4,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".fleet.model.v1.Json", "crate::json::Json");
     for name in [
         "StringList",
+        "RouterAccessPolicy",
+        "RouterSubjectRevocation",
+        "RouterAuthorization",
+        "RouterAuthorizeRequest",
+        "RouterAccessBinding",
         "RouterEnrollment",
         "RouterControl",
         "RouterSyncRequest",
@@ -51,6 +56,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for name in [
+        "RouterAccessPolicy",
+        "RouterSubjectRevocation",
+        "RouterAuthorization",
+        "RouterAuthorizeRequest",
+        "RouterAccessBinding",
         "RouterEnrollment",
         "RouterControl",
         "RouterSyncRequest",
@@ -105,6 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PreemptionRequest.candidates",
     ] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default)]");
+    }
+    for path in ["RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization"] {
+        build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
     build = build
         .type_attribute(".fleet.model.v1.NodePin", "#[serde(transparent)]")

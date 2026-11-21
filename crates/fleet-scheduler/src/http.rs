@@ -61,6 +61,7 @@ pub fn router(state: HttpState) -> Router {
 pub fn required(method: &Method, path: &str) -> Permission {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
+        (&Method::POST, ["routers", _, "authorize" | "revoke-subject"]) => Permission::RouterDelegate,
         (&Method::POST, ["routers", _, "sync"]) => Permission::RouterSync,
         (&Method::GET, ["namespaces"] | ["namespaces", _]) => Permission::Read,
         (&Method::GET, ["apps" | "batches", ..]) => Permission::Read,

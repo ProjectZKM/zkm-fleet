@@ -923,3 +923,42 @@ feature and outbound network configuration are present. Older ingress rules omit
 the new field on the shim wire, preserving existing launch hashes and runtimes.
 The shim persists request consumption and rejects replay after reconnect/restart.
 This application admission setting does not enable PolicyEngine or TEE proofs.
+
+
+### Data-router access authorization
+
+Schema 18 adds the `router_delegate` permission; existing jobs and allocations are
+not migrated or restarted. An administrator may issue a namespace-wide backend
+token with `read,router_delegate`, no tag/app restrictions or other permissions.
+Only this explicit delegation permission can call `POST /routers/:id/authorize`
+and revoke subjects in its own namespace. Administrators may revoke subjects but
+cannot use `/authorize` to assert business identities. Only the reserved `control`
+service accepts administrator authorization, under its own enabled exact service
+policy; namespace delegates cannot obtain control-service bindings. Application backends still
+must check user ownership before requesting an access binding.
+
+An administrator's `PUT /routers/:id/access-policy` accepts an exact namespace ID,
+workload, service, monotonic version, SHA-256 digest and enabled flag. This
+activates identity enforcement for all access through that router. The policy is
+an approved reference, not a proof or an executable rule evaluation. Backends
+sign the returned principal/session/policy binding; runtime connector identity
+and execution policy remain separate. `POST /routers/:id/revoke-subject` takes
+`{namespace, principal, session}`; null session permanently revokes the principal.
+Principal and session are opaque 64-character lowercase hex IDs, never raw tokens.
+
+Sync includes a bounded full `authorization` snapshot with its own revision,
+independent of the route tombstone cursor. Router status exposes delivered and
+applied authorization revisions. Persistence precedes delivery; relay SQLite
+commit and affected-stream cancellation precede applied ACK. Healthy propagation
+is one five-second poll plus latency; an unavailable control plane expires the
+relay's lease within 30 seconds. A mutation response acknowledges durable intent,
+not completed enforcement or a cryptographic proof.
+
+Upgrade Fleet, relay and shim before issuing identity-bound grants; old shim
+parsers reject them. Enable all needed service policies before switching a shared
+router's clients. Unconfigured routers and legacy tasks retain their behavior.
+The initial authorization snapshot caps policies plus permanent revocations at
+1024 records and returns 507 at capacity. Collection/pagination, key rotation and
+automatic app-lifecycle revocation remain follow-up work; do not discard records
+to recover capacity. See trusted-data-router `crates/transport/CONTROL.md` for the
+complete rollout and credential boundaries.

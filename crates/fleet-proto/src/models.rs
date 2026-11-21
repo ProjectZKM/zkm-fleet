@@ -13,6 +13,9 @@ pub fn valid_route_id(id: &str) -> bool {
 }
 impl RouterControl {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(auth) = &self.authorization { auth.validate()?; }
+        anyhow::ensure!(self.delivered_authorization_revision.is_none_or(|r| self.authorization.as_ref().is_some_and(|a| r <= a.revision))
+            && self.applied_authorization_revision.is_none_or(|r| self.delivered_authorization_revision.is_some_and(|d| r <= d)), "invalid authorization acknowledgment");
         anyhow::ensure!(valid_router_id(&self.router_id) && !self.issuer.is_empty() && self.issuer.len() <= 256
             && !self.issuer.chars().any(char::is_control) && self.epoch.len() == 32
             && self.epoch.bytes().all(|b| b.is_ascii_hexdigit()) && !self.token_id.is_empty()
@@ -24,6 +27,59 @@ impl RouterControl {
             && self.applied_revision.is_none_or(|r| r <= self.delivered_revision)
             && self.applied_revision.is_some() == self.applied_ms.is_some(), "invalid router control state");
         Ok(())
+    }
+}
+
+pub const MAX_ROUTER_AUTHORIZATION_RECORDS: usize = 1024;
+fn router_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+fn router_namespace(s: &str) -> bool { s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+impl RouterAccessPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && router_name(&self.workload) && router_name(&self.service)
+            && self.version > 0 && valid_route_id(&self.sha256), "invalid router access policy");
+        Ok(())
+    }
+}
+impl RouterSubjectRevocation {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && valid_route_id(&self.principal)
+            && self.session.as_ref().is_none_or(|s| valid_route_id(s)), "invalid subject revocation");
+        Ok(())
+    }
+}
+impl RouterAuthorizeRequest {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && router_name(&self.workload) && router_name(&self.service)
+            && valid_route_id(&self.principal) && valid_route_id(&self.session), "invalid access identity");
+        Ok(())
+    }
+}
+impl RouterAuthorization {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
+            "authorization state capacity exceeded");
+        let mut policies = std::collections::HashSet::new();
+        for p in &self.policies {
+            p.validate()?;
+            anyhow::ensure!(policies.insert((&p.namespace, &p.workload, &p.service)), "duplicate access policy");
+        }
+        let mut subjects = std::collections::HashSet::new();
+        for r in &self.revoked_subjects {
+            r.validate()?;
+            anyhow::ensure!(subjects.insert((&r.namespace, &r.principal, &r.session)), "duplicate subject revocation");
+        }
+        Ok(())
+    }
+    pub fn authorize(&self, request: &RouterAuthorizeRequest) -> anyhow::Result<RouterAccessBinding> {
+        request.validate()?;
+        anyhow::ensure!(!self.revoked_subjects.iter().any(|r| r.namespace == request.namespace && r.principal == request.principal
+            && r.session.as_ref().is_none_or(|s| s == &request.session)), "subject revoked");
+        let policy = self.policies.iter().find(|p| p.namespace == request.namespace && p.workload == request.workload
+            && p.service == request.service && p.enabled).ok_or_else(|| anyhow::anyhow!("service not authorized"))?;
+        Ok(RouterAccessBinding {principal: request.principal.clone(), session: request.session.clone(),
+            policy_version: policy.version, policy_sha256: policy.sha256.clone()})
     }
 }
 

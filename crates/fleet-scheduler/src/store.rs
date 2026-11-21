@@ -305,7 +305,7 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 17;
+const SCHEMA_VERSION: i32 = 18;
 const ROUTERS: &str = "CREATE TABLE fleet_routers (id TEXT PRIMARY KEY, state JSONB NOT NULL);";
 const TAG_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_.-]{0,62}=[A-Za-z0-9_.-]{1,63}$";
 
@@ -416,7 +416,7 @@ COMMENT ON COLUMN fleet_tokens.permissions IS '{PERMISSIONS_COMMENT}';
 }
 
 /// The tokens' permissions, and that an administrator's token alone has no namespace.
-const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','router_sync','admin']::text[])";
+const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','router_sync','router_delegate','admin']::text[])";
 const ADMIN_UNSCOPED: &str = "CONSTRAINT fleet_tokens_admin_unscoped CHECK (('admin' = ANY(permissions)) = (namespace IS NULL))";
 const PERMISSIONS_COMMENT: &str = "What the token may do: some of read, submit, manage within its scope; or admin, alone and with no namespace.";
 
@@ -527,7 +527,7 @@ impl PgStore {
             (Some(SCHEMA_VERSION), true) => Ok(()),
             // Every migration from the database's schema on, in one transaction.
             (Some(from @ 14..), true) if from < SCHEMA_VERSION => {
-                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15()), (16, format!("{ROUTERS} ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};"))];
+                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15()), (16, format!("{ROUTERS} ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};")), (17, format!("ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};"))];
                 let sql: String = steps.into_iter().filter(|(v, _)| *v >= from).map(|(_, sql)| sql + "\n").collect();
                 sqlx::raw_sql(&format!("BEGIN;\n{sql}{stamp}\nCOMMIT;")).execute(pool).await?;
                 tracing::info!(from, schema = SCHEMA_VERSION, "database migrated");

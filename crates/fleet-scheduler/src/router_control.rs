@@ -1,6 +1,6 @@
 //! Durable control stream for independently deployed data routers. Fleet never
 //! proxies application bytes. An enrolled router can only read and acknowledge
-//! its own stream; mutations require the existing administrator permission.
+//! its own stream. Admins own policies; namespace delegates may revoke subjects.
 use crate::{fleet::now_ms, http::HttpState, store::Token};
 use axum::{
     extract::{Path, State},
@@ -10,7 +10,11 @@ use axum::{
     Extension, Json, Router,
 };
 use fleet_proto::{
-    model::v1::{RouterControl, RouterEnrollment, RouterSyncRequest, RouterSyncResponse},
+    model::v1::{
+        RouterAccessBinding, RouterAccessPolicy, RouterAuthorization, RouterAuthorizeRequest,
+        RouterControl, RouterEnrollment, RouterSubjectRevocation, RouterSyncRequest,
+        RouterSyncResponse,
+    },
     models::{valid_route_id, valid_router_id, MAX_ROUTER_REVOCATIONS},
 };
 
@@ -19,6 +23,9 @@ pub fn router(state: HttpState) -> Router {
         .route("/routers/:id", get(status).put(enroll))
         .route("/routers/:id/sync", post(sync))
         .route("/routers/:id/routes/:route", delete(revoke))
+        .route("/routers/:id/access-policy", axum::routing::put(set_policy))
+        .route("/routers/:id/authorize", post(authorize_access))
+        .route("/routers/:id/revoke-subject", post(revoke_subject))
         .with_state(state)
 }
 
@@ -164,7 +171,9 @@ async fn sync(
         let revision = previous.revoked_routes.len() as u64;
         if request.epoch.as_ref().is_some_and(|e| e != &previous.epoch)
             || request.epoch.is_none()
-                && (request.after_revision != 0 || request.applied_revision.is_some())
+                && (request.after_revision != 0
+                    || request.applied_revision.is_some()
+                    || request.applied_authorization_revision.is_some())
             || request.after_revision > revision
             || request
                 .applied_revision
@@ -174,6 +183,19 @@ async fn sync(
         }
         let mut next = previous.clone();
         next.delivered_revision = revision;
+        if let Some(applied) = request.applied_authorization_revision {
+            if previous
+                .delivered_authorization_revision
+                .is_none_or(|d| applied > d)
+                || previous
+                    .applied_authorization_revision
+                    .is_some_and(|r| applied < r)
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+            next.applied_authorization_revision = Some(applied);
+        }
+        next.delivered_authorization_revision = next.authorization.as_ref().map(|a| a.revision);
         if let Some(applied) = request.applied_revision {
             if previous.applied_revision.is_some_and(|r| applied < r) {
                 return Err(StatusCode::CONFLICT);
@@ -195,7 +217,145 @@ async fn sync(
                 revision,
                 revoked_routes: next.revoked_routes[request.after_revision as usize..].to_vec(),
                 lease_seconds: 30,
+                authorization: next.authorization,
             }));
+        }
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn namespace_scope(s: &HttpState, caller: Option<&Token>, namespace: &str) -> Result<()> {
+    if caller.is_some_and(|c| c.namespace.as_deref() != Some(namespace))
+        || !s
+            .fleet
+            .namespace(namespace)
+            .is_some_and(|n| n.suspended_ms.is_none())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+async fn authorize_access(
+    State(s): State<HttpState>,
+    Path(id): Path<String>,
+    Extension(caller): Extension<Option<Token>>,
+    Json(request): Json<RouterAuthorizeRequest>,
+) -> Result<Json<RouterAccessBinding>> {
+    // Business identities require a namespace delegate. The reserved control
+    // service retains the separately authenticated administrator path.
+    if (request.service == "control") != caller.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    namespace_scope(&s, caller.as_ref(), &request.namespace)?;
+    let state = s
+        .fleet
+        .store
+        .router_control(&id)
+        .await
+        .map_err(unavailable)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let auth = state.authorization.ok_or(StatusCode::FORBIDDEN)?;
+    Ok(Json(
+        auth.authorize(&request)
+            .map_err(|_| StatusCode::FORBIDDEN)?,
+    ))
+}
+
+async fn set_policy(
+    State(s): State<HttpState>,
+    Path(id): Path<String>,
+    Json(policy): Json<RouterAccessPolicy>,
+) -> Result<Json<RouterAuthorization>> {
+    policy.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    namespace_scope(&s, None, &policy.namespace)?;
+    for _ in 0..16 {
+        let previous = s
+            .fleet
+            .store
+            .router_control(&id)
+            .await
+            .map_err(unavailable)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let mut next = previous.clone();
+        let auth = next
+            .authorization
+            .get_or_insert_with(RouterAuthorization::default);
+        if let Some(old) = auth.policies.iter_mut().find(|p| {
+            p.namespace == policy.namespace
+                && p.workload == policy.workload
+                && p.service == policy.service
+        }) {
+            if *old == policy {
+                return Ok(Json(auth.clone()));
+            }
+            if policy.version <= old.version {
+                return Err(StatusCode::CONFLICT);
+            }
+            *old = policy.clone();
+        } else {
+            auth.policies.push(policy.clone());
+        }
+        auth.revision = auth
+            .revision
+            .checked_add(1)
+            .ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+        auth.validate()
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        if s.fleet
+            .store
+            .save_router_control(Some(&previous), &next)
+            .await
+            .map_err(unavailable)?
+        {
+            return Ok(Json(next.authorization.unwrap()));
+        }
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+async fn revoke_subject(
+    State(s): State<HttpState>,
+    Path(id): Path<String>,
+    Extension(caller): Extension<Option<Token>>,
+    Json(revocation): Json<RouterSubjectRevocation>,
+) -> Result<Json<RouterAuthorization>> {
+    revocation.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    namespace_scope(&s, caller.as_ref(), &revocation.namespace)?;
+    for _ in 0..16 {
+        let previous = s
+            .fleet
+            .store
+            .router_control(&id)
+            .await
+            .map_err(unavailable)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        let mut next = previous.clone();
+        let auth = next.authorization.as_mut().ok_or(StatusCode::FORBIDDEN)?;
+        if !auth
+            .policies
+            .iter()
+            .any(|p| p.namespace == revocation.namespace)
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if auth.revoked_subjects.contains(&revocation) {
+            return Ok(Json(auth.clone()));
+        }
+        auth.revoked_subjects.push(revocation.clone());
+        auth.revision = auth
+            .revision
+            .checked_add(1)
+            .ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+        auth.validate()
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        if s.fleet
+            .store
+            .save_router_control(Some(&previous), &next)
+            .await
+            .map_err(unavailable)?
+        {
+            return Ok(Json(next.authorization.unwrap()));
         }
     }
     Err(StatusCode::SERVICE_UNAVAILABLE)
