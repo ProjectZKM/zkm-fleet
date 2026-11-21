@@ -25,6 +25,43 @@ fn in_schema(url: &str, schema: &str) -> String {
     format!("{url}{sep}options=-c%20search_path%3D{schema}")
 }
 
+#[tokio::test]
+async fn router_control_survives_restart_and_serializes_concurrent_changes() {
+    use fleet_proto::model::v1::RouterControl;
+    let Some(url) = url() else { return; };
+    let admin = PgPool::connect(&url).await.unwrap();
+    fresh_schema(&admin, "router_sync").await;
+    let db = in_schema(&url, "router_sync");
+    let store = PgStore::connect(&db).await.unwrap();
+    // Exercise the production 16 -> 17 migration without touching old jobs,
+    // tokens or allocations. Reuse the existing schema compatibility checks.
+    sqlx::raw_sql("DROP TABLE router_sync.fleet_routers;
+        DELETE FROM router_sync.fleet_schema; INSERT INTO router_sync.fleet_schema VALUES(16,0);
+        ALTER TABLE router_sync.fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known,
+        ADD CONSTRAINT fleet_tokens_permissions_known CHECK(permissions <@ ARRAY['read','submit','manage','admin']::text[]);")
+        .execute(&admin).await.unwrap();
+    drop(store);
+    let store = PgStore::connect(&db).await.unwrap();
+    let state = RouterControl {router_id:"edge-a".into(),issuer:"gateway".into(),epoch:"ab".repeat(16),
+        token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),..Default::default()};
+    assert!(store.save_router_control(None,&state).await.unwrap());
+    assert!(!store.save_router_control(None,&state).await.unwrap());
+    let mut left = state.clone(); left.revoked_routes.push("ab".repeat(32));
+    let mut right = state.clone(); right.revoked_routes.push("cd".repeat(32));
+    let (a,b) = tokio::join!(store.save_router_control(Some(&state),&left),store.save_router_control(Some(&state),&right));
+    assert_ne!(a.unwrap(),b.unwrap(), "only one writer may replace a given version");
+    let saved = store.router_control("edge-a").await.unwrap().unwrap();
+    assert_eq!(saved.revoked_routes.len(),1);
+    drop(store);
+    let recovered = PgStore::connect(&db).await.unwrap();
+    assert_eq!(recovered.router_control("edge-a").await.unwrap(),Some(saved.clone()));
+    let mut acknowledged = saved.clone();
+    acknowledged.delivered_revision=1; acknowledged.applied_revision=Some(1); acknowledged.applied_ms=Some(123);
+    assert!(recovered.save_router_control(Some(&saved),&acknowledged).await.unwrap());
+    assert!(!recovered.save_router_control(Some(&saved),&saved).await.unwrap());
+    admin.execute("DROP SCHEMA router_sync CASCADE").await.unwrap();
+}
+
 async fn fresh_schema(admin: &PgPool, name: &str) {
     admin.execute(format!("DROP SCHEMA IF EXISTS {name} CASCADE; CREATE SCHEMA {name}").as_str()).await.unwrap();
 }
@@ -199,7 +236,7 @@ async fn fresh_schema_requires_complete_job_identity() {
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![16]);
+    assert_eq!(versions, vec![17]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
@@ -447,7 +484,7 @@ async fn schema_14_migrates_to_the_current_schema_and_keeps_its_records() {
     PgStore::connect(&in_schema(&url, "current")).await.unwrap();
     assert_eq!(ddl(&admin, "v14").await, ddl(&admin, "current").await, "a migrated database has the schema a new one has");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM v14.fleet_schema ORDER BY 1").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![14, 16]);
+    assert_eq!(versions, vec![14, 17]);
 
     let apps = store.apps().await.unwrap();
     let named = |n: &str| apps.iter().find(|a| a.name == n).unwrap_or_else(|| panic!("no app {n}: {apps:?}"));

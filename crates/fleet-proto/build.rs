@@ -4,6 +4,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".fleet.model.v1.Json", "crate::json::Json");
     for name in [
         "StringList",
+        "RouterEnrollment",
+        "RouterControl",
+        "RouterSyncRequest",
+        "RouterSyncResponse",
         "Quota",
         "Allocation",
         "Usage",
@@ -47,6 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for name in [
+        "RouterEnrollment",
+        "RouterControl",
+        "RouterSyncRequest",
+        "RouterSyncResponse",
         "Quota",
         "NodeReport",
         "RuntimeExecutionIdentity",

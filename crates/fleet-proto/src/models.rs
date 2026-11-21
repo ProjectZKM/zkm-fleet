@@ -4,6 +4,29 @@ use crate::model::v1::*;
 use crate::stage::v1::Status as StageStatus;
 use serde_json::Value;
 
+pub const MAX_ROUTER_REVOCATIONS: usize = 4096;
+pub fn valid_router_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+pub fn valid_route_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+impl RouterControl {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(valid_router_id(&self.router_id) && !self.issuer.is_empty() && self.issuer.len() <= 256
+            && !self.issuer.chars().any(char::is_control) && self.epoch.len() == 32
+            && self.epoch.bytes().all(|b| b.is_ascii_hexdigit()) && !self.token_id.is_empty()
+            && !self.namespace.is_empty(), "invalid router enrollment");
+        anyhow::ensure!(self.revoked_routes.len() <= MAX_ROUTER_REVOCATIONS
+            && self.revoked_routes.iter().all(|r| valid_route_id(r))
+            && self.revoked_routes.iter().collect::<std::collections::HashSet<_>>().len() == self.revoked_routes.len()
+            && self.delivered_revision <= self.revoked_routes.len() as u64
+            && self.applied_revision.is_none_or(|r| r <= self.delivered_revision)
+            && self.applied_revision.is_some() == self.applied_ms.is_some(), "invalid router control state");
+        Ok(())
+    }
+}
+
 impl NodeReport {
     pub fn validate_native_provers(&self) -> anyhow::Result<()> {
         for entry in self.entries() {

@@ -600,7 +600,10 @@ job on a tagged batch takes the batch's tag. A record's tag is `null` when absen
 except a proof record's, which is `""`. There is no group resource.
 
 **Tokens.** A namespace token has an optional tag and some of the permissions `read`,
-`submit` and `manage` (default `read` and `submit`). A token without `manage` also
+`submit` and `manage` (default `read` and `submit`). An infrastructure token may
+instead hold the exclusive `router_sync` permission: an API token with a namespace,
+no tag or app grants, and access only to its explicitly enrolled router stream.
+An ordinary app token without `manage` also
 needs `--app` grants, by app or batch name. Grants are explicit, and one from another
 namespace authorizes nothing. An administrator's token has only `admin`, no namespace,
 and may do everything. A token's namespace and tag never change: refreshing copies
@@ -744,6 +747,48 @@ A scoped token reads only its own namespace, by name or ID, and only its own tag
 caps and use; another namespace or tag selector is refused. Token registration takes
 a namespace name or ID, an optional `tag` and its `permissions`; refreshing is a CLI
 operation built on lookup and registration.
+
+### Independent data-router control
+
+The Router initiates outbound HTTPS requests to Fleet; node heartbeats and Fleet
+never carry application streams. Shared JSON records come from `RouterControl`,
+`RouterEnrollment`, `RouterSyncRequest` and `RouterSyncResponse` in `model.proto`.
+
+| Endpoint | Authorization and effect |
+|---|---|
+| `PUT /routers/ID` | Administrator enrolls `{"issuer":"gateway-issuer","token_id":"..."}`. Token must hold only `router_sync`. Re-enrollment rotates credentials within the same issuer/namespace, preserving epoch and revocations. |
+| `GET /routers/ID` | Administrator reads desired revocations, last delivered revision and reported `applied_revision`/`applied_ms`. |
+| `DELETE /routers/ID/routes/ROUTE_ID` | Administrator permanently revokes one exact execution/service route. Idempotent; does not stop or migrate its workload. |
+| `POST /routers/ID/sync` | Only that enrolled token ID, holding `router_sync`, may fetch and acknowledge this stream. Administrator and other router/app credentials are rejected. |
+
+Initial request: `{"epoch":null,"after_revision":0,"applied_revision":null}`.
+Response: `router_id`, `issuer`, stable random `epoch`, `from_revision`, `revision`,
+`revoked_routes`, `lease_seconds:30`. Revisions count the append-only tombstones.
+Reconnects send the persisted epoch and last applied cursor; the response contains
+the contiguous suffix after that cursor. Acknowledgments cannot exceed a delivered
+revision or go backwards. An epoch mismatch or cursor ahead of Fleet returns 409;
+the Router must fail closed instead of silently resetting its state.
+
+The Router polls every five seconds, durably applies the whole response and
+cancels revoked sessions before acknowledging it on its next request. The ACK is
+a local enforcement report, not a ZK proof. Control freshness expires after 30
+seconds: active streams close and new access fails. Revoking its sync token or
+suspending its namespace blocks renewal; explicit denial suspends access sooner.
+The Router requires fresh synchronization after restart. Production requires
+Fleet's durable PostgreSQL store; memory-only Fleet remains for local tests.
+Schema 17 adds only the router table and permission; existing apps, allocations,
+node heartbeats and running tasks retain their behavior.
+
+This initial bounded stream supports 4096 permanent route tombstones per router;
+further new revocations return 507 without dropping old entries. Provision another
+router with a fresh grant issuer/key before this limit, withdraw the old router
+and reissue grants; resetting state under the old issuer would revive old grants.
+Revoking the sync token can suspend the entire router.
+Policy/key updates, end-user/session revocation and automatic app lifecycle
+revocation are follow-up work. Application ownership checks remain mandatory.
+Configure the existing relay environment with `TRUSTED_ROUTER_FLEET_URL`,
+`TRUSTED_ROUTER_ID`, `TRUSTED_ROUTER_TOKEN_FILE`; see trusted-data-router's
+`crates/transport/CONTROL.md` for deployment and binary acceptance instructions.
 
 ## MCP
 
