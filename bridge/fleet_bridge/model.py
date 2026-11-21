@@ -474,6 +474,9 @@ class AppSpec(Record):
     # GPU prover, optional for a CPU one.
     elf_id: str = ""
     proof_storage_root: str | None = None
+    # Administrator-owned node config: match this app's SDK to its GPU image.
+    # Not accepted through user app registration or settings APIs.
+    prover_binary: str | None = None
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
@@ -501,6 +504,10 @@ class AppSpec(Record):
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
+        if self.prover_binary is not None:
+            if (self.kind is AppRuntime.APP or self.worker_command
+                    or not os.path.isabs(self.prover_binary) or "\x00" in self.prover_binary):
+                raise ModelError("prover_binary requires an absolute path on a native prover without worker_command")
         if self.worker_command:
             if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):

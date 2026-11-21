@@ -207,6 +207,8 @@ def _granted_gpus() -> list[str]:
 
 
 def _node_binary(spec: AppReplicaSpec) -> str:
+    if spec.app.prover_binary:
+        return spec.app.prover_binary
     if not spec.cluster.node_binary:
         raise RuntimeError(f"{spec.name}: apps.yaml needs node_binary for a prover")
     return spec.cluster.node_binary

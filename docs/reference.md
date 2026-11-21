@@ -387,6 +387,19 @@ storage path: references are `file://`, with owner-managed shared mounts for
 replicas on different machines. Fleet keeps admission, quotas, placement, retries and
 execution leases, and stores no proof inputs or outputs.
 
+The generic `fleet-ziren-node` SDK and CUDA client are pinned together to Ziren
+2.0 revision `c9988a098d92bc55a85ca9307c470d1f97be3337`, matching GPU image
+`ziren-gpu:c9988a0-8f3c7fb6`. Pin the guest and its receipt verifier to that same
+revision. The circuit label `v2.0.0` alone does not establish CUDA wire compatibility:
+older 2.0 clients can fail decoding the newer server's compressed proof. Upgrade
+the client binary with the image; do not mix their proof representations. CI
+compiles the full SDK/CUDA adapter as well as testing storage without the runtime.
+For a staged upgrade, an administrator can set `prover_binary` to an absolute
+path in that prover's existing node-owned `apps.yaml` entry. Other apps retain
+the shared `node_binary`. This override is not accepted through user app creation
+or settings APIs. It keeps the native prover's SDK input path; `worker_command`
+instead denotes an integrated app that owns its inputs and rejects SDK submission.
+
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
 client or SDK endpoint. Its

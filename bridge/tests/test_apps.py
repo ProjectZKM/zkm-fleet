@@ -3,6 +3,25 @@ from unittest.mock import Mock
 import pytest
 from fleet_bridge import reconcile
 
+def test_native_prover_version_can_be_pinned_without_changing_other_apps():
+    from fleet_bridge import actors
+    cfg = reconcile.load_apps({"node_binary": "/opt/fleet/prover-old", "apps": [
+        {"name": "old", "kind": "ziren-gpu", "elf_id": "a" * 64},
+        {"name": "new", "kind": "ziren-gpu", "elf_id": "b" * 64,
+         "prover_binary": "/opt/fleet/prover-v2"},
+    ]})
+    specs = reconcile.replica_specs(cfg)
+    assert actors._node_binary(specs["old-0"]) == "/opt/fleet/prover-old"
+    assert actors._node_binary(specs["new-0"]) == "/opt/fleet/prover-v2"
+    assert not specs["new-0"].app.worker_command  # Still accepts SDK input.
+    for invalid in ("relative/prover", "", "/opt/prover\x00"):
+        with pytest.raises(ValueError, match="prover_binary"):
+            reconcile.load_apps({"apps": [{"name": "bad", "kind": "ziren-gpu",
+                "elf_id": "b" * 64, "prover_binary": invalid}]})
+    with pytest.raises(ValueError, match="prover_binary"):
+        reconcile.load_apps({"apps": [{"name": "bad", "kind": "app",
+            "image": "serve", "port_base": 8000, "prover_binary": "/opt/prover"}]})
+
 @pytest.mark.parametrize("gpus", [[], ["2", "3"]])
 def test_apps_use_nvidia_only_when_ray_grants_gpus(gpus):
     from fleet_bridge import actors

@@ -354,6 +354,8 @@ mod tests {
         assert!(app(json!({"name":"model","spec":container,"proof":proof})).is_err(), "a container app proves none");
         assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","port_base":1},"proof":proof})).is_err(),
             "a prover takes no container settings");
+        assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","prover_binary":"/tmp/agent-supplied"},"proof":proof})).is_err(),
+            "prover binary selection belongs to administrator-owned node configuration");
         assert!(app(json!({"name":"eth","elf_id":"ab".repeat(32)})).is_err(), "an app is created from its spec");
         assert!(app(json!({"name":"model","node":"gpu","spec":container})).is_err(), "the scheduler picks the node");
     }
