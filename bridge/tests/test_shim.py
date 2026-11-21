@@ -172,6 +172,14 @@ def test_management_ingress_and_automatic_port_require_modern_shim(tmp_path):
     assert request['command']==['serve','18789']
     assert [s['endpoint_ref'] for s in request['services']]==['ingress:chat','control']
     assert shim.required_capability(replica)=='shim-management-v1'
+    assert 'single_use' not in request['driver_options']['ingress']['chat']
+    app['ingress']['chat']['single_use']=True
+    single=reconcile.replica_specs(reconcile.load_apps(raw))['web-0']
+    assert shim.required_capability(single)=='shim-single-use-ingress-v1'
+    app['ingress']['chat']['single_use']='true'
+    with pytest.raises(ValueError):reconcile.load_apps(raw)
+    del app['ingress']['chat']['single_use']
+
     app['ingress']['chat']['paths']=['/../exec']
     with pytest.raises(ValueError):reconcile.load_apps(raw)
     app['ingress']['chat']['paths']=['/v1/chat/completions']

@@ -841,3 +841,11 @@ The explicit Docker shim executor can declare the reserved `control` service for
 `port_base: 0` plus an explicit `container_port` asks the shim to reserve a host loopback port per allocation. `{port}` in shim command/environment templates denotes `container_port` when one is set; readiness and node reports use the actual host port returned by the shim. The reservation survives restart and is released only after confirmed cleanup. Runtime management/ingress requires `shim-management-v1`; automatic ports require `shim-automatic-port-v1`. Older nodes are ineligible. The bridge supervises a failed connector process without replacing the runtime. These capabilities require trusted-shim #5 and trusted-data-router #4.
 
 Installing this support does not select it for legacy apps. Proof-required policy/TEE execution and the OpenShell driver are still not accepted by this Docker lifecycle path; requesting unsupported trust modes fails validation.
+
+Shim HTTP ingress rules accept `single_use: true` to require an exact HTTP request
+capability from the application's central gateway. Scheduler placement then
+requires `shim-single-use-ingress-v1`; nodes advertise it only when both the shim
+feature and outbound network configuration are present. Older ingress rules omit
+the new field on the shim wire, preserving existing launch hashes and runtimes.
+The shim persists request consumption and rejects replay after reconnect/restart.
+This application admission setting does not enable PolicyEngine or TEE proofs.
