@@ -2216,6 +2216,53 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
 }
 
 #[tokio::test]
+async fn shim_capability_does_not_migrate_existing_apps() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,false,false);
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let before=c.inner.lock().deployments["gpu-model"].clone();
+    let commands=c.inner.lock().commands.len();
+    let set=json!({"runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.request_update(&ns,"model",None,set.clone()).await.is_err(), "old nodes cannot select shim");
+    let mut upgraded=report;
+    upgraded.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("gpu","session",upgraded.clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(c.inner.lock().commands.len(),commands,"installation alone sends no replacement command");
+    assert_eq!(c.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let restarted=WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap();
+    assert_eq!(restarted.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let owner=user_token(&c,&ns,0x79,"scope=default",Some(vec!["model".into()]),true).await;
+    assert_eq!(scale_call(c.clone(),&owner,"PUT",&format!("/apps/model/settings?namespace={ns}"),set.clone()).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(c.request_update(&ns,"model",None,set).await.unwrap()["state"],"draining");
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
+    assert!(stop.parameters["app"].get("runtime").is_none(), "drain uses the old executor");
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none());
+}
+
+#[tokio::test]
+async fn shim_placement_and_pending_commands_require_explicit_node_capability() {
+    let (_dir,c,ns)=setup().await;
+    c.report("old","old-session",inventory(&ns)).await.unwrap();
+    let entry=json!({"name":"web","app":"web","namespace":ns,"kind":"app","gpus":0,"cpus":1,"replicas":1,
+        "runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.place_app(Entry(&entry),&[]).is_err());
+    assert!(c.command("old",NodeOperation::SetApp,message::set_app(&entry,false)).is_err());
+    let mut capable=inventory(&ns);capable.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("new","new-session",capable).await.unwrap();
+    assert_eq!(c.place_app(Entry(&entry),&[]).unwrap().0,"new");
+    let id=c.command("new",NodeOperation::SetApp,message::set_app(&entry,false)).unwrap();
+    {
+        let mut i=c.inner.lock();let mut command=i.commands[&id].clone();command.admitted=true;i.commands.insert(id.clone(),command);
+        assert_eq!(heartbeat_commands(&i,"new").len(),1);
+        i.workers.get_mut("new").unwrap().report.runtime_capabilities.clear();
+        assert!(heartbeat_commands(&i,"new").is_empty(), "downgrade cannot execute a queued shim command as legacy");
+        assert!(!i.commands[&id].done, "retain the original command and allocation");
+    }
+}
+
+#[tokio::test]
 async fn an_update_the_node_cannot_write_fails_and_leaves_the_app_stopped() {
     let (_dir,c,ns)=setup().await;
     c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();

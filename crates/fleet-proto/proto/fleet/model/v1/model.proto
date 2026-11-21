@@ -198,6 +198,8 @@ message NodeReport {
   repeated CommandResult results = 11;
   // The release the agent was built from (the tag CI passes at build time); absent on older agents.
   optional string agent_version = 12;
+  // Explicit opt-in execution capabilities; empty on older nodes.
+  repeated string runtime_capabilities = 13;
 }
 
 message JobReport {

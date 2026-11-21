@@ -263,9 +263,16 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 5] = ["command", "port_base", "health_path", "workdir", "user"];
+    pub const CONTAINER_SETTINGS: [&'static str; 6] = ["command", "port_base", "health_path", "workdir", "user", "runtime"];
     /// Settings only a prover's spec (`kind: ziren-gpu` or `ziren-cpu`) may give.
     pub const PROVER_SETTINGS: [&'static str; 3] = ["proof_storage_root", "backend", "rust_log"];
+
+    pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
+        anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
+            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"}),
+            "runtime must select legacy or shim with driver docker; trust options are not supported here");
+        Ok(())
+    }
 
     /// The runtime of the app's container: `app` unless it proves a program, which a Ziren GPU
     /// prover does unless the spec asks for a CPU one.
@@ -309,6 +316,9 @@ impl RegisterAppRequest {
         if kind == "app" {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
+        if let Some(runtime) = spec.get("runtime") {
+            Self::validate_runtime(runtime)?;
+        }
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
         let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()
@@ -331,6 +341,21 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+
+    #[test]
+    fn runtime_selection_is_explicit_and_rejects_unsupported_trust_options() {
+        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"})] {
+            RegisterAppRequest::validate_runtime(&runtime).unwrap();
+        }
+        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"openshell"}),
+            json!({"executor":"shim","driver":"docker","policy_proof":"required"})] {
+            assert!(RegisterAppRequest::validate_runtime(&runtime).is_err());
+        }
+        let legacy: NodeReport=serde_json::from_value(json!({"version":3,"machine":"m","ready":true,
+            "total_gpus":0,"total_cpus":1,"free_gpus":0,"free_cpus":1})).unwrap();
+        assert!(legacy.supports_runtime(crate::workload::Entry(&json!({}))));
+        assert!(!legacy.supports_runtime(crate::workload::Entry(&json!({"runtime":{"executor":"shim","driver":"docker"}}))));
+    }
 
     #[test]
     fn an_app_is_its_container_and_a_prover_also_its_program() {

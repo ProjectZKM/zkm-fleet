@@ -407,15 +407,52 @@ Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.
 
-Future shim integration must remain opt-in through the existing runtime settings.
-An entry or durable execution record without a shim selection retains its existing
-executor. Installing shim or upgrading Fleet must not rewrite existing app specs,
-change their deployment hashes, replace live replicas, or replay completed launch
-commands. Persist the executor selection with each new execution and recover that
-selection with its original node and lease. Switching an app affects new executions
-after an explicit drain; existing apps do not require configuration, image, or data
-migration. A shim failure must not fall back to an executor that bypasses policy
-verification. These are integration requirements; this PR adds no shim executor.
+Ordinary container apps can opt in to trusted-shim without migrating existing
+workloads. Add `shim_binary` (the absolute `trusted-shim-runtime` executable path)
+and `shim_state_dir` (an absolute private persistent directory) to the existing
+node-owned `apps.yaml`. These shared settings do not enter legacy deployment
+hashes. Upgrade the scheduler and `fleet-node` before the Python bridge: node report
+v3 gains the optional `runtime_capabilities` field, with no database migration.
+An older node advertises none and cannot receive a shim launch or acknowledge its
+cleanup. A supported node advertises `shim-docker-v1` after probing the binary.
+
+Keep old app entries unchanged. Only an administrator explicitly selecting
+`runtime: {executor: shim, driver: docker}` on an ordinary app activates shim.
+Use the existing app settings API to switch an app; its normal drain, stop,
+confirmed cleanup and apply sequence runs first. Selection changes require
+administrator credentials. `{executor: legacy}` selects the existing executor.
+Batch jobs and Ziren prover apps retain their existing execution paths and durable
+leases. No existing configuration, image or data migration is needed.
+
+The machine adapter persists the selected binary, request binding, node, allocation,
+lease and generation under its existing jobs state before dispatching to Ray.
+Recovery keeps that identity; cleanup follows the persisted executor even if
+configuration changes. Healthy unchanged legacy replicas are preserved. Directly
+editing a live app's executor cannot replace its actor. An uncertain shim launch or
+cleanup retains its reservation and never falls back to Docker directly. A stopped
+or lost shim execution needs explicit cleanup and a new generation to run again.
+Keep the allocation and shim journals across upgrades and restarts.
+
+Shim delegates lifecycle to upstream Docker, applies CPU/memory hard limits and
+checks effective limits before start. Its service port is published only on local
+loopback; independent router integration is a later step. GPU ids are Ray's assigned
+ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
+it makes no shell-policy enforcement claim. OpenShell/TEE and proof-required
+lifecycle requests are unsupported and rejected. The existing separate proof-required
+action admission path in trusted-shim is unchanged.
+
+For local acceptance, build the companion `trusted-shim-runtime`, preload
+`python:3.12-slim`, then run from this repository:
+
+```sh
+PYTHONPATH=bridge TRUSTED_SHIM_TEST_BINARY=/absolute/path/trusted-shim-runtime \
+  python -m pytest -q -s bridge/tests/test_shim_cluster.py
+```
+
+The test starts an isolated local Ray cluster, runs legacy and shim apps together,
+checks container ids/start times across adapter recovery, verifies Docker hard
+limits and loopback-only publication, and confirms cleanup. No live Fleet node or
+proof network is contacted. Without the explicit binary path this test is skipped.
 
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
