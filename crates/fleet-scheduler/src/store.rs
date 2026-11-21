@@ -10,7 +10,7 @@ use crate::quota::{Allocation, Quota};
 use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
 
-pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, App, Token};
+pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, App, Token, RouterControl};
 pub use fleet_proto::models::{kind_name, status_name};
 
 fn kind_from_name(n: &str) -> ProofKind {
@@ -31,6 +31,9 @@ pub fn normalize_address(a: &str) -> String {
 
 #[async_trait]
 pub trait Store: Send + Sync {
+    async fn router_control(&self, id: &str) -> anyhow::Result<Option<RouterControl>>;
+    /// Compare-and-swap the complete durable record; None creates without overwriting.
+    async fn save_router_control(&self, previous: Option<&RouterControl>, next: &RouterControl) -> anyhow::Result<bool>;
     async fn upsert(&self, job: &ProofJob) -> anyhow::Result<()>;
     async fn get(&self, id: &str) -> anyhow::Result<Option<ProofJob>>;
     /// Queued and running jobs, oldest first, for recovery after a restart.
@@ -68,6 +71,7 @@ pub use fleet_proto::model::v1::ProofJobFilter;
 
 #[derive(Default)]
 pub struct MemoryStore {
+    routers: Mutex<HashMap<String, RouterControl>>,
     allocations: Mutex<HashMap<String, Allocation>>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     jobs: Mutex<HashMap<String, ProofJob>>,
@@ -78,6 +82,17 @@ pub struct MemoryStore {
 
 #[async_trait]
 impl Store for MemoryStore {
+    async fn router_control(&self, id: &str) -> anyhow::Result<Option<RouterControl>> {
+        Ok(self.routers.lock().get(id).cloned())
+    }
+    async fn save_router_control(&self, previous: Option<&RouterControl>, next: &RouterControl) -> anyhow::Result<bool> {
+        next.validate()?;
+        let mut routers = self.routers.lock();
+        if routers.get(&next.router_id) != previous { return Ok(false); }
+        routers.insert(next.router_id.clone(), next.clone());
+        Ok(true)
+    }
+
     async fn upsert(&self, job: &ProofJob) -> anyhow::Result<()> {
         job.validate()?;
         let mut jobs = self.jobs.lock();
@@ -290,7 +305,8 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 16;
+const SCHEMA_VERSION: i32 = 17;
+const ROUTERS: &str = "CREATE TABLE fleet_routers (id TEXT PRIMARY KEY, state JSONB NOT NULL);";
 const TAG_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_.-]{0,62}=[A-Za-z0-9_.-]{1,63}$";
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
@@ -299,7 +315,7 @@ fn quoted(names: impl IntoIterator<Item = String>) -> String {
 
 /// Create the current schema directly; development databases are reset, not backfilled.
 fn schema() -> String {
-    format!("{}{}{}", namespace_schema(), jobs_and_tokens(), apps())
+    format!("{}{}{}{}", namespace_schema(), jobs_and_tokens(), apps(), ROUTERS)
 }
 
 fn namespace_schema() -> String {
@@ -400,7 +416,7 @@ COMMENT ON COLUMN fleet_tokens.permissions IS '{PERMISSIONS_COMMENT}';
 }
 
 /// The tokens' permissions, and that an administrator's token alone has no namespace.
-const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','admin']::text[])";
+const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','router_sync','admin']::text[])";
 const ADMIN_UNSCOPED: &str = "CONSTRAINT fleet_tokens_admin_unscoped CHECK (('admin' = ANY(permissions)) = (namespace IS NULL))";
 const PERMISSIONS_COMMENT: &str = "What the token may do: some of read, submit, manage within its scope; or admin, alone and with no namespace.";
 
@@ -511,7 +527,7 @@ impl PgStore {
             (Some(SCHEMA_VERSION), true) => Ok(()),
             // Every migration from the database's schema on, in one transaction.
             (Some(from @ 14..), true) if from < SCHEMA_VERSION => {
-                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15())];
+                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15()), (16, format!("{ROUTERS} ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};"))];
                 let sql: String = steps.into_iter().filter(|(v, _)| *v >= from).map(|(_, sql)| sql + "\n").collect();
                 sqlx::raw_sql(&format!("BEGIN;\n{sql}{stamp}\nCOMMIT;")).execute(pool).await?;
                 tracing::info!(from, schema = SCHEMA_VERSION, "database migrated");
@@ -563,6 +579,25 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
+    async fn router_control(&self, id: &str) -> anyhow::Result<Option<RouterControl>> {
+        let state: Option<serde_json::Value> = sqlx::query_scalar("SELECT state FROM fleet_routers WHERE id=$1")
+            .bind(id).fetch_optional(&self.pool).await?;
+        state.map(serde_json::from_value).transpose().map_err(Into::into)
+    }
+    async fn save_router_control(&self, previous: Option<&RouterControl>, next: &RouterControl) -> anyhow::Result<bool> {
+        next.validate()?;
+        let state = serde_json::to_value(next)?;
+        let result = if let Some(previous) = previous {
+            anyhow::ensure!(previous.router_id == next.router_id, "router identity changed");
+            sqlx::query("UPDATE fleet_routers SET state=$2 WHERE id=$1 AND state=$3")
+                .bind(&next.router_id).bind(state).bind(serde_json::to_value(previous)?).execute(&self.pool).await?
+        } else {
+            sqlx::query("INSERT INTO fleet_routers(id,state) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                .bind(&next.router_id).bind(state).execute(&self.pool).await?
+        };
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn upsert(&self, j: &ProofJob) -> anyhow::Result<()> {
         j.validate()?;
         sqlx::query(

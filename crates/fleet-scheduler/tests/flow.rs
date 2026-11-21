@@ -153,6 +153,57 @@ const TEST_ELFS: &[&[u8]] =
     &[b"elf-one", b"something else", b"elf", b"elf-r", b"eth-guest", b"elf-c", b"elf-m", b"elf-f", b"elf-d", b"elf-e",
 ];
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
+    use serde_json::json;
+    let h = start().await;
+    let router_token = "ac".repeat(48);
+    let other_token = "bc".repeat(48);
+    for (id, secret) in [("ac", &router_token), ("bc", &other_token)] {
+        let body = json!({"id":id.repeat(16),"address":id.repeat(20),"namespace":PROOFS,
+            "permissions":["router_sync"],"token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))});
+        assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&body).send().await.unwrap().status(),201);
+    }
+    let base = format!("{}/routers/relay-a",h.http);
+    let enrolled: fleet_proto::model::v1::RouterControl = h.client.put(&base).bearer_auth(&h.admin)
+        .json(&json!({"issuer":"gateway", "token_id":"ac".repeat(16)})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let poll = |secret: &str, body: &serde_json::Value| h.client.post(format!("{base}/sync")).bearer_auth(secret).json(&body);
+    let initial = json!({"epoch":null,"after_revision":0,"applied_revision":null});
+    assert_eq!(poll(&other_token,&initial).send().await.unwrap().status(),403);
+    assert_eq!(poll(USER,&initial).send().await.unwrap().status(),403);
+    assert_eq!(poll(&h.admin,&initial).send().await.unwrap().status(),403);
+    assert_eq!(h.client.get(format!("{}/apps",h.http)).bearer_auth(&router_token).send().await.unwrap().status(),403);
+    let route = "ab".repeat(32);
+    assert_eq!(h.client.delete(format!("{base}/routes/{route}")).bearer_auth(&router_token).send().await.unwrap().status(),403);
+    for _ in 0..2 { // idempotent revocation does not manufacture new revisions
+        h.client.delete(format!("{base}/routes/{route}")).bearer_auth(&h.admin).send().await.unwrap().error_for_status().unwrap();
+    }
+    let snapshot: fleet_proto::model::v1::RouterSyncResponse = poll(&router_token,&initial).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(serde_json::to_value(&snapshot).unwrap(), json!({"router_id":"relay-a","issuer":"gateway","epoch":enrolled.epoch,
+        "from_revision":0,"revision":1,"revoked_routes":[route],"lease_seconds":30}));
+    let ack = json!({"epoch":snapshot.epoch,"after_revision":1,"applied_revision":1});
+    let delta: fleet_proto::model::v1::RouterSyncResponse = poll(&router_token,&ack).send().await.unwrap().json().await.unwrap();
+    assert!(delta.revoked_routes.is_empty());
+    assert_eq!((delta.from_revision,delta.revision),(1,1));
+    for bad in [json!({"epoch":"00".repeat(16),"after_revision":1,"applied_revision":1}),
+        json!({"epoch":snapshot.epoch,"after_revision":2,"applied_revision":2}),
+        json!({"epoch":snapshot.epoch,"after_revision":0,"applied_revision":1})] {
+        assert_eq!(poll(&router_token,&bad).send().await.unwrap().status(),409);
+    }
+    let state: fleet_proto::model::v1::RouterControl = h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(state.applied_revision,Some(1));
+    assert!(state.applied_ms.is_some());
+    // Token rotation preserves the exact authority, cursor and tombstones.
+    h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"bc".repeat(16)}))
+        .send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(poll(&router_token,&ack).send().await.unwrap().status(),403);
+    assert_eq!(poll(&other_token,&ack).send().await.unwrap().status(),200);
+    assert_eq!(h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"other","token_id":"bc".repeat(16)}))
+        .send().await.unwrap().status(),409);
+    h.client.delete(format!("{}/tokens/{}",h.http,"bc".repeat(16))).bearer_auth(&h.admin).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(poll(&other_token,&ack).send().await.unwrap().status(),401);
+}
+
 /// The tests' name for the app of program `elf_id` in `namespace`: app names are unique across
 /// the fleet.
 fn app_in(namespace: &str, elf_id: &str) -> String {

@@ -56,8 +56,41 @@ message Token {
   optional string namespace = 8;
   optional string tag = 9;
   // What the token may do: some of read, submit, manage within its namespace, tag and app
-  // grants; or admin, over every namespace (an admin token has no namespace).
+  // grants; exclusive router_sync for an enrolled router; or admin, over every
+  // namespace (an admin token has no namespace).
   repeated string permissions = 10;
+}
+
+// Fleet-owned revocation stream. Revisions index the append-only route list.
+// These records are separate from node heartbeats and carry no application data.
+message RouterEnrollment {
+  required string issuer = 1;
+  required string token_id = 2;
+}
+message RouterControl {
+  required string router_id = 1;
+  required string issuer = 2;
+  required string epoch = 3;
+  required string token_id = 4;
+  required string namespace = 5;
+  repeated string revoked_routes = 6;
+  required uint64 delivered_revision = 7;
+  optional uint64 applied_revision = 8;
+  optional uint64 applied_ms = 9;
+}
+message RouterSyncRequest {
+  optional string epoch = 1;
+  required uint64 after_revision = 2;
+  optional uint64 applied_revision = 3;
+}
+message RouterSyncResponse {
+  required string router_id = 1;
+  required string issuer = 2;
+  required string epoch = 3;
+  required uint64 from_revision = 4;
+  required uint64 revision = 5;
+  repeated string revoked_routes = 6;
+  required uint32 lease_seconds = 7;
 }
 
 enum ProofJobState {

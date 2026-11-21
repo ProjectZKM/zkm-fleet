@@ -588,6 +588,12 @@ impl Scheduler {
     ) -> anyhow::Result<Token> {
         use crate::token::Permission;
         let permissions: Vec<String> = if permissions.is_empty() { vec!["read".into(), "submit".into()] } else { permissions };
+        let router_sync = permissions.iter().any(|p| p == Permission::RouterSync.name());
+        if router_sync {
+            anyhow::ensure!(permissions.len() == 1 && token_hash.is_some()
+                && tag.is_none() && apps.as_ref().is_none_or(Vec::is_empty),
+                "router_sync must be exclusive, with an API token and no tag/app grants");
+        }
         let admin = permissions.iter().any(|p| p == Permission::Admin.name());
         if admin {
             anyhow::ensure!(permissions.iter().all(|p| p == Permission::Admin.name()), "an admin token holds admin alone: it may do everything");
@@ -595,7 +601,7 @@ impl Scheduler {
             anyhow::ensure!(token_hash.is_some(), "an admin token requires an API token");
         }
         for p in &permissions {
-            anyhow::ensure!(admin || Permission::ISSUABLE.iter().any(|q| q.name() == p), "unknown permission {p}; tokens may hold read, submit and manage, or admin");
+            anyhow::ensure!(admin || Permission::ISSUABLE.iter().any(|q| q.name() == p), "unknown permission {p}; tokens may hold read, submit and manage, or exclusive router_sync or admin");
         }
         let permissions: Vec<String> = if admin { vec![Permission::Admin.name().into()] } else {
             Permission::ISSUABLE.iter().map(|q| q.name()).filter(|q| permissions.iter().any(|p| p == q)).map(Into::into).collect()
@@ -615,7 +621,7 @@ impl Scheduler {
         }
         anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
         anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
-        anyhow::ensure!(admin || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
+        anyhow::ensure!(admin || router_sync || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
         anyhow::ensure!(!manage || (tag.is_some() && token_hash.is_some()), "manage tokens require a tag and API token");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");

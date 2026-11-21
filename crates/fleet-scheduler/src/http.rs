@@ -42,6 +42,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/nodes/:name/drain", post(drain).delete(undrain))
         .with_state(state.clone())
         .merge(crate::workloads::router(state.workloads.clone()))
+        .merge(crate::router_control::router(state.clone()))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/access", get(access))
@@ -60,6 +61,7 @@ pub fn router(state: HttpState) -> Router {
 pub fn required(method: &Method, path: &str) -> Permission {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
+        (&Method::POST, ["routers", _, "sync"]) => Permission::RouterSync,
         (&Method::GET, ["namespaces"] | ["namespaces", _]) => Permission::Read,
         (&Method::GET, ["apps" | "batches", ..]) => Permission::Read,
         (&Method::POST, ["apps" | "batches", _, "jobs"]) => Permission::Submit,
