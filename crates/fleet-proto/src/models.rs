@@ -19,7 +19,10 @@ impl NodeReport {
             let prefix = format!("{}-",instance.entry_name);
             anyhow::ensure!(e.allocation_id.strip_prefix(&prefix).and_then(|s|s.parse::<u64>().ok()).is_some_and(|index| index < entry.replicas()), "invalid runtime replica");
             let expected: Vec<String> = entry.0["services"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-            anyhow::ensure!(instance.services == expected, "runtime services differ from app manifest");
+            // An unhealthy workload may retain only its declared management
+            // endpoint so an administrator can repair this exact allocation.
+            anyhow::ensure!(instance.services == expected || (instance.services == ["control"]
+                && expected.iter().any(|s| s == "control")), "runtime services differ from app manifest");
         }
         Ok(())
     }

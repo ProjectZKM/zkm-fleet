@@ -129,6 +129,34 @@ def test_unreachable_docker_is_not_confirmed_cleanup(monkeypatch):
     assert not node.container_gone("unknown")
 
 
+def test_unhealthy_app_reports_only_its_owned_management_service(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    raw = yaml.safe_load(e.apps_file.read_text())
+    raw['shim_network'] = {'gateway_url': 'https://control.example', 'relay_url': 'wss://data.example',
+        'token_file': '/private/node.jwt', 'public_key_file': '/private/gateway.pem', 'issuer': 'test'}
+    raw['apps'][0]['services'] = ['http', 'control']
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    replica = e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))['web-0'], 'launch')
+    health = ReplicaHealth(name='web-0', spec=actors.spec_hash(replica), executor=ExecutorKind.SHIM,
+        execution=replica.execution, ready=False, management_ready=True)
+    monkeypatch.setattr(node, 'alive_nodes', lambda: [{}])
+    monkeypatch.setattr(node, 'resources', lambda: ({'GPU': 0, 'CPU': 1}, {'GPU': 0, 'CPU': 0}))
+    monkeypatch.setattr(reconcile, 'running', lambda: {'web-0': object()})
+    monkeypatch.setattr(reconcile, 'health_of', lambda *a, **kw: health)
+    monkeypatch.setattr(shim, 'capabilities', lambda _: [])
+    report = e.report()
+    assert not report['apps'][0]['ready']
+    assert report['runtime_instances'][0]['services'] == ['control']
+    health.ready = True
+    assert e.report()['runtime_instances'][0]['services'] == ['http', 'control']
+    health.ready = False
+    health.management_ready = False
+    assert e.report().get('runtime_instances', []) == []
+    health.management_ready = True
+    health.execution = replace(replica.execution, lease_id='obsolete')
+    assert e.report().get('runtime_instances', []) == []
+
+
 def test_services_require_network_capability_and_are_bound_into_request(tmp_path, monkeypatch):
     cfg = config(tmp_path)
     cfg["apps"][0].update(services=["gateway"], container_port=18789, entrypoint="/bin/sh")

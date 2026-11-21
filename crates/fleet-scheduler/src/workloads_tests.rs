@@ -61,17 +61,30 @@ async fn runtime_instances_are_exact_scoped_live_allocations() {
     let (_dir,c,ns)=setup().await;
     let mut report=scale_inventory(&ns,false,false);
     report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
-    report.apps[0]["services"]=json!(["http"]);
+    report.apps[0]["services"]=json!(["http", "control"]);
     report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-network-v1".into()];
-    report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http"],
+    report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http", "control"],
         "execution":{"namespace":ns,"workload":"model","allocation_id":"model-0","lease_id":"lease","generation":1,"node_id":"machine"}}])).unwrap();
     let mut bad=report.clone();bad.runtime_instances[0].execution.node_id="other-machine".into();
     assert!(c.report("gpu","session",bad).await.is_err());
     let mut bad=report.clone();bad.runtime_instances[0].services=vec!["unapproved".into()];
     assert!(c.report("gpu","session",bad).await.is_err());
-    c.report("gpu","session",report).await.unwrap();
+    c.report("gpu","session",report.clone()).await.unwrap();
     assert_eq!(c.app_resources(&ns,"model",Some("scope=default"))["runtime_instances"][0]["execution"]["lease_id"],"lease");
     assert_eq!(c.app_resources(&ns,"model",Some("scope=other"))["runtime_instances"],json!([]));
+    // Repair remains reachable when the application fails its health check;
+    // application traffic must never use this exception.
+    report.apps[0]["ready"] = json!(false);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.runtime_instances[0].services = vec!["control".into()];
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"][0]["services"],json!(["control"]));
+    report.apps[0]["disabled"] = json!(true);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.apps[0]["disabled"] = json!(false);
+    c.report("gpu", "session", report).await.unwrap();
     c.end_session("gpu","session");
     assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
 }

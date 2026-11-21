@@ -739,6 +739,9 @@ class ReplicaHealth(Record):
     gpu_ready: bool | None = None
     port: int | None = None
     ready: bool | None = None
+    # Shim's authenticated local management listener can be available while the
+    # application is unhealthy (for example during state restore).
+    management_ready: bool = False
     stopping: bool = False
     error: str | None = None
 

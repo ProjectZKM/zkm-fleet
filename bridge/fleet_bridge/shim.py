@@ -220,6 +220,7 @@ class _ShimApp:
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),
+            management_ready=status.get("state") == "ready",
             ready=status.get("state") == "ready" and actors._http_ok(self.health_url)).dump()
 
 
