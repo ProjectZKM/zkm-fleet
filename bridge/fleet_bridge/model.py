@@ -502,6 +502,7 @@ class HttpIngress(Record):
     paths: list[str]
     methods: list[str]
     bearer_env: str | None = None
+    single_use: bool = False
 
     def __post_init__(self) -> None:
         if (not 1 <= len(self.paths) <= 32 or any(not p.startswith("/") or len(p)>256 or not p.isascii()

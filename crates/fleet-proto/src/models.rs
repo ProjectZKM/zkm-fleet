@@ -303,7 +303,8 @@ impl RegisterAppRequest {
             for (name, rule) in rules {
                 anyhow::ensure!(name != "control" && spec.get("services").and_then(Value::as_array).is_some_and(|s| s.iter().any(|v| v == name)), "ingress must reference an application service");
                 let rule = rule.as_object().ok_or_else(|| anyhow::anyhow!("ingress rule must be an object"))?;
-                anyhow::ensure!(rule.keys().all(|k| ["paths", "methods", "bearer_env"].contains(&k.as_str())), "unknown ingress field");
+                anyhow::ensure!(rule.keys().all(|k| ["paths", "methods", "bearer_env", "single_use"].contains(&k.as_str())), "unknown ingress field");
+                anyhow::ensure!(rule.get("single_use").is_none_or(Value::is_boolean), "single_use must be boolean");
                 anyhow::ensure!(rule.get("paths").and_then(Value::as_array).is_some_and(|paths| !paths.is_empty() && paths.len() <= 32 && paths.iter().all(|p| p.as_str().is_some_and(|p| p.starts_with('/') && p.len()<=256 && p.is_ascii() && !p.contains(['%', '?', '#', '\\']) && !p.chars().any(char::is_control) && !p.split('/').any(|p| p == "." || p == "..")))), "invalid ingress paths");
                 anyhow::ensure!(rule.get("methods").and_then(Value::as_array).is_some_and(|methods| !methods.is_empty() && methods.len()<=7 && methods.iter().all(|m| m.as_str().is_some_and(|m| ["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].contains(&m)))), "invalid ingress methods");
                 if let Some(env) = rule.get("bearer_env").filter(|v| !v.is_null()) {
@@ -408,7 +409,7 @@ mod tests {
             "services":["chat","control"],"env":{"TOKEN":"private"},
             "ingress":{"chat":{"paths":["/v1/chat/completions"],"methods":["POST"],"bearer_env":"TOKEN"}}});
         RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
-        for (field, value) in [("paths",json!(["/../exec"])),("methods",json!(["CONNECT"])),("bearer_env",json!("MISSING"))] {
+        for (field, value) in [("paths",json!(["/../exec"])),("methods",json!(["CONNECT"])),("bearer_env",json!("MISSING")),("single_use",json!("true"))] {
             let mut bad=good.clone(); bad["ingress"]["chat"][field]=value;
             assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
         }

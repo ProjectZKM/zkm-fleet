@@ -33,6 +33,8 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
+    if any(rule.single_use for rule in spec.app.ingress.values()):
+        return "shim-single-use-ingress-v1"
     if spec.app.ingress or "control" in spec.app.services:
         return "shim-management-v1"
     if spec.app.port_base == 0:
@@ -54,7 +56,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             return []
         modern = "data-plane-v1" in value.get("features", [])
         management = "runtime-management-v1" in value.get("features", [])
-        return [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
+        return (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
 
@@ -171,7 +173,7 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         "driver_options": {"port": port,
             **({"container_port": app.container_port} if app.container_port is not None else {}),
             **({"entrypoint": app.entrypoint} if app.entrypoint is not None else {}),
-            **({"ingress": app.ingress} if app.ingress else {}),
+            **({"ingress": {name:{k:v for k,v in to_dict(rule).items() if k!="single_use" or v} for name,rule in app.ingress.items()}} if app.ingress else {}),
             "gpus": gpus, "volumes": volumes,
             "user": app.user, "workdir": app.workdir, "stop_timeout_s": app.stop_timeout_s,
             "shm_bytes": (app.shm_gb if app.shm_gb is not None else 16) * 2**30}}
