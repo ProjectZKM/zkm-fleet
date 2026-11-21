@@ -13,6 +13,10 @@ def test_native_prover_version_can_be_pinned_without_changing_other_apps():
     specs = reconcile.replica_specs(cfg)
     assert actors._node_binary(specs["old-0"]) == "/opt/fleet/prover-old"
     assert actors._node_binary(specs["new-0"]) == "/opt/fleet/prover-v2"
+    # A worker loaded before the bridge upgrade only reads this existing field.
+    assert specs["new-0"].cluster.node_binary == "/opt/fleet/prover-v2"
+    assert specs["old-0"].cluster.node_binary == "/opt/fleet/prover-old"
+    assert cfg.cluster.node_binary == "/opt/fleet/prover-old"
     assert not specs["new-0"].app.worker_command  # Still accepts SDK input.
     for invalid in ("relative/prover", "", "/opt/prover\x00"):
         with pytest.raises(ValueError, match="prover_binary"):

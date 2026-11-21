@@ -399,6 +399,10 @@ path in that prover's existing node-owned `apps.yaml` entry. Other apps retain
 the shared `node_binary`. This override is not accepted through user app creation
 or settings APIs. It keeps the native prover's SDK input path; `worker_command`
 instead denotes an integrated app that owns its inputs and rejects SDK submission.
+The bridge resolves this selection before handing the replica to Ray, so an older
+resident Ray worker also receives the selected executable. After upgrading the
+bridge, restart its node adapter and drain/restart the affected app; check the
+running prover's executable, not only the configured path, before submitting work.
 
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
