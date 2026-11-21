@@ -30,7 +30,10 @@ impl<'a> Entry<'a> {
         match self.0.get("runtime") {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,
-            Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some("shim-docker-v1"),
+            Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
+                if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }
+                else if self.0.get("container_port").is_some() || self.0.get("entrypoint").is_some() { "shim-runtime-v2" }
+                else { "shim-docker-v1" }),
             Some(_) => Some("unsupported-runtime"),
         }
     }

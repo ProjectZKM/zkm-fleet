@@ -127,3 +127,32 @@ def test_missing_container_detection_handles_docker_error_case(monkeypatch, mess
 def test_unreachable_docker_is_not_confirmed_cleanup(monkeypatch):
     monkeypatch.setattr(node.subprocess,"run",lambda *a,**k:Mock(returncode=1,stdout="",stderr="Cannot connect to Docker daemon"))
     assert not node.container_gone("unknown")
+
+
+def test_services_require_network_capability_and_are_bound_into_request(tmp_path, monkeypatch):
+    cfg = config(tmp_path)
+    cfg["apps"][0].update(services=["gateway"], container_port=18789, entrypoint="/bin/sh")
+    with pytest.raises(ValueError, match="shim_network"):
+        reconcile.load_apps(cfg)
+    cfg["shim_network"] = {"gateway_url":"https://control.example", "relay_url":"wss://data.example",
+        "token_file":"/private/node.jwt", "public_key_file":"/private/gateway.pem", "issuer":"control"}
+    parsed=reconcile.load_apps(cfg)
+    replica=shim.RuntimeBook(tmp_path/"book").bind(reconcile.replica_specs(parsed)["web-0"],"launch")
+    request=shim.launch_request(replica,[])
+    assert request["services"]==[{"id":{"namespace":replica.execution.namespace,"workload":replica.execution.workload,"service":"gateway"},"protocol":"http1","endpoint_ref":"app"}]
+    assert request["driver_options"]["container_port"]==18789
+    assert shim.required_capability(replica)=="shim-network-v1"
+    monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"]}'))
+    assert shim.capabilities(parsed.cluster)==[shim.CAPABILITY]
+    monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1"]}'))
+    assert "shim-network-v1" in shim.capabilities(parsed.cluster)
+    legacy=config(tmp_path,False)
+    before=actors.spec_hash(reconcile.replica_specs(reconcile.load_apps(legacy))["web-0"])
+    legacy["shim_network"]=cfg["shim_network"]
+    assert actors.spec_hash(reconcile.replica_specs(reconcile.load_apps(legacy))["web-0"])==before
+
+
+@pytest.mark.parametrize("services", [["../control"], ["http","http"], ["http"]*9])
+def test_invalid_services_never_reach_an_executor(tmp_path,services):
+    cfg=config(tmp_path);cfg["apps"][0]["services"]=services
+    with pytest.raises(ValueError):reconcile.load_apps(cfg)

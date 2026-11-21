@@ -800,3 +800,36 @@ Node control gRPC uses TLS with the scheduler's certificate and the cluster toke
 generated CA, which each execution machine needs a copy of. Proof clients use their
 bundled signing key and bearer token at their app endpoint: plain HTTP on loopback,
 an authenticated HTTPS gateway from outside.
+
+### Shim service data plane
+
+Ordinary shim apps can declare `services: [http]` in the existing app spec. These
+names map to the app's loopback listener; `container_port` optionally differs from
+`port_base + replica index`, and `entrypoint` optionally overrides the image's
+entrypoint. All three are administrator-owned settings and require explicit
+`runtime: {executor: shim, driver: docker}`. Changes use the existing drain,
+confirmed cleanup and replacement sequence.
+
+The existing node apps.yaml accepts `shim_network` with `gateway_url`, `relay_url`,
+`token_file`, `public_key_file`, and `issuer`. These are trusted node settings,
+never passed into the workload environment. The central gateway URL serves only
+registration/control requests; `relay_url` is the independent WSS data plane.
+Shim obtains and verifies exact-execution grants and owns outbound connections.
+The gateway must authorize against live Fleet execution metadata before issuing
+any grant. No service tokens or application traffic are carried in heartbeats.
+
+The additive `NodeReport.runtime_instances` field carries typed execution
+identity, readiness and approved service names. App responses expose these as
+`runtime_instances` only while the corresponding enabled allocation and worker
+are live, excluding other tags. Consumers must use the complete identity and
+must not guess node addresses or host ports. Replacing an execution changes its
+route; session/ComfyUI affinity must fail rather than switch instances silently.
+
+Upgrade scheduler/fleet-node before the bridge (older JSON readers reject unknown
+fields). The bridge advertises `shim-network-v1` only when the binary and node
+network settings support it. New container-port/entrypoint options require
+`shim-runtime-v2`. Existing Docker-only shim and legacy tasks remain supported;
+installing network settings leaves legacy deployment hashes unchanged. New shim
+actors use a separate Ray worker environment so updated adapter code loads
+without restarting Ray or existing detached apps. Stop/delete requires the shim
+to drain live streams before releasing the port and Ray reservation.

@@ -456,6 +456,27 @@ class ControlPlaneConfig(Record):
     gpu_port_range: tuple[int, int] = (30100, 30199)
     shim_binary: str | None = None
     shim_state_dir: str | None = None
+    shim_network: ShimNetworkConfig | None = None
+
+
+@dataclass(kw_only=True)
+class ShimNetworkConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    gateway_url: str
+    relay_url: str
+    token_file: str
+    public_key_file: str
+    issuer: str
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlsplit
+        for value, secure, local in [(self.gateway_url,"https","http"),(self.relay_url,"wss","ws")]:
+            url=urlsplit(value)
+            if (url.scheme != secure and not (url.scheme == local and url.hostname in ("127.0.0.1","::1"))
+                    or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("","/")):
+                raise ModelError("shim network requires TLS URLs without credentials or paths")
+        if not self.issuer or not all(os.path.isabs(p) and "\x00" not in p for p in (self.token_file,self.public_key_file)):
+            raise ModelError("shim network needs an issuer and absolute credential/key paths")
 
 
 class ExecutorKind(str, enum.Enum):
@@ -481,6 +502,9 @@ class AppSpec(Record):
 
     name: str
     runtime: RuntimeSelection | None = None
+    services: list[str] = field(default_factory=list)
+    container_port: int | None = None
+    entrypoint: str | None = None
     namespace: str = "00000000000000000000000000000000"
     tag: str | None = None
     priority: int = 0
@@ -522,6 +546,14 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
+        if self.services or self.container_port is not None or self.entrypoint is not None:
+            if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
+                raise ModelError("services, container_port and entrypoint require explicit shim execution")
+        if (len(self.services) != len(set(self.services)) or len(self.services) > 8
+                or any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", s) for s in self.services)):
+            raise ModelError("invalid runtime services")
+        if self.container_port is not None and not 1 <= self.container_port <= 65535:
+            raise ModelError("invalid container_port")
         if self.runtime is not None and self.kind is not AppRuntime.APP:
             raise ModelError("runtime selection is supported only for ordinary apps")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
@@ -572,6 +604,8 @@ class AppsConfig(Record):
         if any(a.runtime and a.runtime.executor is ExecutorKind.SHIM for a in apps):
             if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
+        if any(a.services for a in apps) and cluster.shim_network is None:
+            raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
         return cls(cluster=cluster, apps=apps, raw=dict(data))
 
 
@@ -587,6 +621,14 @@ class RuntimeIdentity(Record):
     def __post_init__(self) -> None:
         if self.generation < 1 or not all((self.namespace,self.workload,self.allocation_id,self.lease_id,self.node_id)):
             raise ModelError("runtime identity requires a positive generation and complete allocation")
+
+
+@dataclass(kw_only=True)
+class RuntimeInstance(Record):
+    entry_name: str
+    execution: RuntimeIdentity
+    ready: bool
+    services: list[str] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -665,6 +707,7 @@ class ReplicaHealth(Record):
 
     name: str
     executor: ExecutorKind = ExecutorKind.LEGACY
+    execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)

@@ -896,6 +896,7 @@ impl WorkloadController {
         {
             return Err(fail(400, "invalid capacity"));
         }
+        report.validate_runtime_instances().map_err(|e| fail(400,e.to_string()))?;
         let mut report = report;
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()

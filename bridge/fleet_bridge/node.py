@@ -22,7 +22,7 @@ import ray
 import yaml
 
 from . import actors, reconcile, jobs, shim
-from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection
+from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -413,7 +413,7 @@ class NodeExecutor:
         self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
         for spec in replicas:
-            if shim.selected(spec) and shim.CAPABILITY not in shim.capabilities(cfg.cluster):
+            if shim.selected(spec) and shim.required_capability(spec) not in shim.capabilities(cfg.cluster):
                 raise ValueError("node does not support the selected shim runtime")
             if spec.name in existing:
                 health = reconcile.health_of(existing[spec.name])
@@ -632,6 +632,7 @@ class NodeExecutor:
         cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
         apps = cfg.raw.get("apps", [])
         running = reconcile.running()
+        runtime_instances = []
         for app in apps:
             names = [f"{app['name']}-{i}" for i in range(app.get("replicas", 1))]
             app.setdefault("namespace", "0" * 32)
@@ -646,6 +647,11 @@ class NodeExecutor:
                 try:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
                     healthy = health is not None and health.is_ready and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
+                    if healthy and health.execution is not None:
+                        record = self.runtimes.read(name)
+                        if record is not None and not record.cleaned and record.execution == health.execution:
+                            runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
+                                ready=True, services=list(app.get("services", []))).dump())
                 except Exception as error:
                     # Starting or restarting one actor must not suppress the
                     # machine heartbeat or another command's cleanup acknowledgment.
@@ -677,6 +683,7 @@ class NodeExecutor:
                 log.exception("reading local job %s", entry.name)
         runtime_capabilities = shim.capabilities(cfg.cluster)
         return {**({"runtime_capabilities": runtime_capabilities} if runtime_capabilities else {}),
+            **({"runtime_instances": runtime_instances} if runtime_instances else {}),
             "version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
