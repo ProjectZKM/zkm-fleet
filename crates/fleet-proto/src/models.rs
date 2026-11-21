@@ -5,6 +5,33 @@ use crate::stage::v1::Status as StageStatus;
 use serde_json::Value;
 
 impl NodeReport {
+    pub fn validate_native_provers(&self) -> anyhow::Result<()> {
+        for entry in self.entries() {
+            if let Some(binary) = entry.0.get("prover_binary").filter(|v| !v.is_null()) {
+                anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu")
+                    && !entry.integrated_worker() && !entry.machine().is_empty()
+                    && entry.machine() == self.machine
+                    && binary.as_str().is_some_and(|p| p.starts_with('/') && p.len() <= 4096
+                        && !p.chars().any(char::is_control)),
+                    "prover_binary requires an absolute path and a native prover pinned to the reporting machine");
+            }
+        }
+        anyhow::ensure!(self.native_provers.len() <= 1024, "too many native prover processes");
+        let mut seen = std::collections::HashSet::new();
+        for process in &self.native_provers {
+            let entry = self.entry(&process.entry_name)
+                .ok_or_else(|| anyhow::anyhow!("native prover process has no app"))?;
+            let prefix = format!("{}-", entry.name());
+            anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu") && !entry.integrated_worker()
+                && process.replica_name.strip_prefix(&prefix).and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|index| index < entry.replicas() && process.replica_name == format!("{prefix}{index}"))
+                && process.executable.starts_with('/') && process.executable.len() <= 4096
+                && !process.executable.chars().any(char::is_control)
+                && seen.insert(&process.replica_name), "invalid native prover process");
+        }
+        Ok(())
+    }
+
     pub fn validate_runtime_instances(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.runtime_instances.len() <= 1024, "too many runtime instances");
         let mut seen = std::collections::HashSet::new();

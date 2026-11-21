@@ -66,8 +66,8 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
             recovered=node.NodeExecutor(str(apps),str(batches),str(tmp_path/"jobs"))
             recovered.set_app({"app":new_app,"disabled":False},"after-adapter-restart")
             assert recovered.runtimes.read(modern+"-0").execution==allocation.execution
-            instances=recovered.report()["runtime_instances"]
-            assert instances==[{"entry_name":modern,"execution":allocation.execution.dump(),"ready":True,"services":[]}]
+            # This fixture declares no service: no data route should be advertised.
+            assert recovered.report().get("runtime_instances", []) == []
             assert inspect(status["runtime_id"])["State"]["StartedAt"]==current["State"]["StartedAt"]
             assert inspect(actors.app_container(legacy+"-0"))["Id"]==old["Id"]
             assert inspect(actors.app_container(legacy+"-0"))["State"]["StartedAt"]==old["State"]["StartedAt"]

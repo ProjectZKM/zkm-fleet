@@ -22,7 +22,7 @@ import ray
 import yaml
 
 from . import actors, reconcile, jobs, shim
-from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance
+from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance, NativeProverProcess
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -420,7 +420,7 @@ class NodeExecutor:
                 wanted = ExecutorKind.SHIM if shim.selected(spec) else ExecutorKind.LEGACY
                 if health.executor is not wanted:
                     raise ValueError("executor change requires explicit drain and confirmed cleanup")
-                if health.is_ready and health.spec == actors.spec_hash(spec):
+                if reconcile.matches(spec, health):
                     continue
                 if shim.selected(spec):
                     raise ValueError("shim execution is unhealthy; retained until explicit cleanup")
@@ -633,6 +633,7 @@ class NodeExecutor:
         apps = cfg.raw.get("apps", [])
         running = reconcile.running()
         runtime_instances = []
+        native_provers = []
         for app in apps:
             names = [f"{app['name']}-{i}" for i in range(app.get("replicas", 1))]
             app.setdefault("namespace", "0" * 32)
@@ -648,6 +649,11 @@ class NodeExecutor:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
                     owned_executor = health is not None and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
                     healthy = owned_executor and health.is_ready
+                    if app.get("prover_binary"):
+                        healthy = healthy and health.prover_binary == os.path.realpath(app["prover_binary"])
+                    if owned_executor and health.prover_binary and app["kind"] in ("ziren-gpu", "ziren-cpu") and not app.get("worker_command"):
+                        native_provers.append(NativeProverProcess(entry_name=app["name"], replica_name=name,
+                            executable=health.prover_binary).dump())
                     if owned_executor and health.execution is not None and (healthy or health.management_ready):
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
@@ -687,6 +693,7 @@ class NodeExecutor:
         runtime_capabilities = shim.capabilities(cfg.cluster)
         return {**({"runtime_capabilities": runtime_capabilities} if runtime_capabilities else {}),
             **({"runtime_instances": runtime_instances} if runtime_instances else {}),
+            **({"native_provers": native_provers} if native_provers else {}),
             "version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),
