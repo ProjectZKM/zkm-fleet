@@ -407,6 +407,16 @@ Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.
 
+Future shim integration must remain opt-in through the existing runtime settings.
+An entry or durable execution record without a shim selection retains its existing
+executor. Installing shim or upgrading Fleet must not rewrite existing app specs,
+change their deployment hashes, replace live replicas, or replay completed launch
+commands. Persist the executor selection with each new execution and recover that
+selection with its original node and lease. Switching an app affects new executions
+after an explicit drain; existing apps do not require configuration, image, or data
+migration. A shim failure must not fall back to an executor that bypasses policy
+verification. These are integration requirements; this PR adds no shim executor.
+
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
 client or SDK endpoint. Its
