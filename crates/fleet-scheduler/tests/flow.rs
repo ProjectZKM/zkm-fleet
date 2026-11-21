@@ -210,6 +210,18 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     let mut operator=second.clone(); operator["service"]=json!("control"); operator["principal"]=json!("12".repeat(32));
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&operator).send().await.unwrap().status(),403);
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&h.admin).json(&operator).send().await.unwrap().status(),200);
+    // New workloads inherit an operator-approved namespace/service default.
+    // An exact disabled entry must still win over that default.
+    policy["workload"]=json!("*"); policy["service"]=json!("chat");
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    let mut fresh=operator.clone(); fresh["workload"]=json!("new-agent"); fresh["service"]=json!("chat");
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),200);
+    policy["workload"]=fresh["workload"].clone(); policy["enabled"]=json!(false);
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),403);
+    fresh["workload"]=json!("another-agent");
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),200);
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&other).json(&fresh).send().await.unwrap().status(),403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
