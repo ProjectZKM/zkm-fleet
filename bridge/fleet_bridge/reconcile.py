@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import replace
 from typing import Any, Mapping
 
 import ray
@@ -50,7 +51,12 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
             config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
             if app.kind is AppRuntime.APP:
                 config["index"] = i
-            out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=file.cluster, config=config)
+            # Resolve the administrator's executable selection before crossing
+            # the Ray boundary. Existing Ray workers may still have the older
+            # actors module loaded during a rolling bridge upgrade; they read
+            # the established cluster.node_binary field.
+            cluster = replace(file.cluster, node_binary=app.prover_binary) if app.prover_binary else file.cluster
+            out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=cluster, config=config)
     return out
 
 
