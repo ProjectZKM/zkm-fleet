@@ -784,11 +784,38 @@ further new revocations return 507 without dropping old entries. Provision anoth
 router with a fresh grant issuer/key before this limit, withdraw the old router
 and reissue grants; resetting state under the old issuer would revive old grants.
 Revoking the sync token can suspend the entire router.
-Policy/key updates, end-user/session revocation and automatic app lifecycle
-revocation are follow-up work. Application ownership checks remain mandatory.
+Signing-key updates and automatic app lifecycle revocation remain follow-up work.
+Application ownership checks remain mandatory.
 Configure the existing relay environment with `TRUSTED_ROUTER_FLEET_URL`,
 `TRUSTED_ROUTER_ID`, `TRUSTED_ROUTER_TOKEN_FILE`; see trusted-data-router's
 `crates/transport/CONTROL.md` for deployment and binary acceptance instructions.
+
+Schema 18 adds a separate authorization snapshot and applied revision. An admin
+can `PUT /routers/ID/access-policy` with `{namespace, workload, service, version,
+sha256, enabled}`. The first policy activates identity enforcement for that relay.
+`workload: "*"` supplies a default within one exact namespace and service; an exact
+workload policy always wins, including `enabled: false`. Requests cannot use a
+wildcard target. Upgrade both Fleet and the relay before publishing defaults.
+Changing an existing policy requires a higher version. New agents can inherit
+defaults without letting application backends write infrastructure policy.
+
+A backend's namespace-wide `read,router_delegate` credential may request an
+opaque connection binding at `POST /routers/ID/authorize` after it authenticates
+the user and checks business ownership. Film's model API keys and permissions,
+and ClawUp's chat credentials and bot ownership, remain application-owned. Fleet
+checks namespace/service infrastructure access; it does not validate those keys.
+Administrators cannot obtain ordinary delegated application bindings; the reserved
+`control` service requires an administrator. Backends may revoke opaque subjects
+or sessions only within their namespace via `POST /routers/ID/revoke-subject`.
+
+`authorization.revision`, `delivered_authorization_revision` and
+`applied_authorization_revision` are independent of route generations/revocations.
+Before switching pilot traffic, require the applied authorization and route
+revisions to match the desired values and `applied_ms` to be less than 30 seconds
+old. Snapshot capacity is 1024 total policies plus permanent subject revocations;
+new entries fail with 507 at capacity without discarding denials. Large rollouts
+require safe collection/pagination. These references and ACKs are not policy or
+TEE execution proofs. No existing application is rescheduled by a policy update.
 
 ## MCP
 

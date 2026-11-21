@@ -101,6 +101,8 @@ message RouterSyncResponse {
 // Application access policy is independent of runtime registration/generation.
 message RouterAccessPolicy {
   required string namespace = 1;
+  // Exact workload, or "*" for an administrator-owned namespace/service default.
+  // An exact policy takes precedence, including an explicitly disabled policy.
   required string workload = 2;
   required string service = 3;
   required uint64 version = 4;

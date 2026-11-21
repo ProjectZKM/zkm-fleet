@@ -37,7 +37,7 @@ fn router_name(s: &str) -> bool {
 fn router_namespace(s: &str) -> bool { s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
 impl RouterAccessPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(router_namespace(&self.namespace) && router_name(&self.workload) && router_name(&self.service)
+        anyhow::ensure!(router_namespace(&self.namespace) && (self.workload == "*" || router_name(&self.workload)) && router_name(&self.service)
             && self.version > 0 && valid_route_id(&self.sha256), "invalid router access policy");
         Ok(())
     }
@@ -76,8 +76,10 @@ impl RouterAuthorization {
         request.validate()?;
         anyhow::ensure!(!self.revoked_subjects.iter().any(|r| r.namespace == request.namespace && r.principal == request.principal
             && r.session.as_ref().is_none_or(|s| s == &request.session)), "subject revoked");
-        let policy = self.policies.iter().find(|p| p.namespace == request.namespace && p.workload == request.workload
-            && p.service == request.service && p.enabled).ok_or_else(|| anyhow::anyhow!("service not authorized"))?;
+        let scoped = |p: &&RouterAccessPolicy| p.namespace == request.namespace && p.service == request.service;
+        let policy = self.policies.iter().filter(scoped).find(|p| p.workload == request.workload)
+            .or_else(|| self.policies.iter().filter(scoped).find(|p| p.workload == "*"))
+            .filter(|p| p.enabled).ok_or_else(|| anyhow::anyhow!("service not authorized"))?;
         Ok(RouterAccessBinding {principal: request.principal.clone(), session: request.session.clone(),
             policy_version: policy.version, policy_sha256: policy.sha256.clone()})
     }
@@ -511,6 +513,23 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+
+    #[test]
+    fn namespace_service_defaults_never_override_exact_denials_or_cross_namespaces() {
+        let policy = RouterAccessPolicy { namespace:"ab".repeat(16),workload:"*".into(),service:"chat".into(),
+            version:1,sha256:"cd".repeat(32),enabled:true };
+        let mut auth=RouterAuthorization {revision:1,policies:vec![policy.clone()],revoked_subjects:vec![]};
+        auth.validate().unwrap();
+        let mut request=RouterAuthorizeRequest {namespace:policy.namespace.clone(),workload:"new-agent".into(),service:"chat".into(),
+            principal:"12".repeat(32),session:"34".repeat(32)};
+        assert_eq!(auth.authorize(&request).unwrap().policy_version,1);
+        auth.policies.push(RouterAccessPolicy {workload:request.workload.clone(),enabled:false,..policy.clone()});
+        assert!(auth.authorize(&request).is_err());
+        request.workload="another-agent".into(); assert!(auth.authorize(&request).is_ok());
+        request.namespace="ef".repeat(16); assert!(auth.authorize(&request).is_err());
+        request.namespace=policy.namespace; request.service="control".into(); assert!(auth.authorize(&request).is_err());
+        request.service="chat".into();request.workload="*".into();assert!(auth.authorize(&request).is_err());
+    }
 
     #[test]
     fn runtime_ingress_and_automatic_ports_are_validated_before_placement() {
