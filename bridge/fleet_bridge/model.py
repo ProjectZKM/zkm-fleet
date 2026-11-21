@@ -497,12 +497,29 @@ class RuntimeSelection(Record):
 
 
 @dataclass(kw_only=True)
+class HttpIngress(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    paths: list[str]
+    methods: list[str]
+    bearer_env: str | None = None
+
+    def __post_init__(self) -> None:
+        if (not 1 <= len(self.paths) <= 32 or any(not p.startswith("/") or len(p)>256 or not p.isascii()
+                or any(c in p for c in "%?#\\") or any(c in p.split("/") for c in (".",".."))
+                or any(ord(c)<32 or ord(c)==127 for c in p) for p in self.paths)
+                or not 1 <= len(self.methods) <= 7 or any(m not in ("GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS") for m in self.methods)
+                or self.bearer_env is not None and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", self.bearer_env)):
+            raise ModelError("invalid HTTP ingress")
+
+
+@dataclass(kw_only=True)
 class AppSpec(Record):
     """One entry of `apps:`."""
 
     name: str
     runtime: RuntimeSelection | None = None
     services: list[str] = field(default_factory=list)
+    ingress: dict[str, HttpIngress] = field(default_factory=dict)
     container_port: int | None = None
     entrypoint: str | None = None
     namespace: str = "00000000000000000000000000000000"
@@ -546,14 +563,20 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
-        if self.services or self.container_port is not None or self.entrypoint is not None:
+        if self.services or self.ingress or self.container_port is not None or self.entrypoint is not None:
             if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
                 raise ModelError("services, container_port and entrypoint require explicit shim execution")
         if (len(self.services) != len(set(self.services)) or len(self.services) > 8
                 or any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", s) for s in self.services)):
             raise ModelError("invalid runtime services")
+        if any(name not in self.services or name == "control" for name in self.ingress):
+            raise ModelError("ingress must reference declared application services")
+        if any(rule.bearer_env and not self.env.get(rule.bearer_env) for rule in self.ingress.values()):
+            raise ModelError("ingress bearer environment is missing")
         if self.container_port is not None and not 1 <= self.container_port <= 65535:
             raise ModelError("invalid container_port")
+        if self.port_base == 0 and (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM or self.container_port is None):
+            raise ModelError("automatic host ports require shim and container_port")
         if self.runtime is not None and self.kind is not AppRuntime.APP:
             raise ModelError("runtime selection is supported only for ordinary apps")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:

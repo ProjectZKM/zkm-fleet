@@ -284,10 +284,10 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 9] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint"];
+    pub const CONTAINER_SETTINGS: [&'static str; 10] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        if ["services", "container_port", "entrypoint"].iter().any(|k| spec.contains_key(*k)) {
+        if ["services", "container_port", "entrypoint", "ingress"].iter().any(|k| spec.contains_key(*k)) {
             anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
                 "transport settings require explicit shim execution");
         }
@@ -296,6 +296,24 @@ impl RegisterAppRequest {
             let mut names = std::collections::HashSet::new();
             anyhow::ensure!(services.len() <= 8 && services.iter().all(|s| s.as_str().is_some_and(|s|
                 !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') && names.insert(s))), "invalid services");
+        }
+        if let Some(ingress) = spec.get("ingress") {
+            let rules = ingress.as_object().ok_or_else(|| anyhow::anyhow!("ingress must be an object"))?;
+            anyhow::ensure!(rules.len() <= 8, "too many ingress rules");
+            for (name, rule) in rules {
+                anyhow::ensure!(name != "control" && spec.get("services").and_then(Value::as_array).is_some_and(|s| s.iter().any(|v| v == name)), "ingress must reference an application service");
+                let rule = rule.as_object().ok_or_else(|| anyhow::anyhow!("ingress rule must be an object"))?;
+                anyhow::ensure!(rule.keys().all(|k| ["paths", "methods", "bearer_env"].contains(&k.as_str())), "unknown ingress field");
+                anyhow::ensure!(rule.get("paths").and_then(Value::as_array).is_some_and(|paths| !paths.is_empty() && paths.len() <= 32 && paths.iter().all(|p| p.as_str().is_some_and(|p| p.starts_with('/') && p.len()<=256 && p.is_ascii() && !p.contains(['%', '?', '#', '\\']) && !p.chars().any(char::is_control) && !p.split('/').any(|p| p == "." || p == "..")))), "invalid ingress paths");
+                anyhow::ensure!(rule.get("methods").and_then(Value::as_array).is_some_and(|methods| !methods.is_empty() && methods.len()<=7 && methods.iter().all(|m| m.as_str().is_some_and(|m| ["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].contains(&m)))), "invalid ingress methods");
+                if let Some(env) = rule.get("bearer_env").filter(|v| !v.is_null()) {
+                    let env = env.as_str().ok_or_else(|| anyhow::anyhow!("invalid bearer environment"))?;
+                    anyhow::ensure!(!env.is_empty() && env.len()<=128 && env.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && spec.get("env").and_then(|e|e.get(env)).and_then(Value::as_str).is_some_and(|s| !s.is_empty()), "missing ingress bearer environment");
+                }
+            }
+        }
+        if spec.get("port_base").and_then(Value::as_u64) == Some(0) {
+            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})) && spec.get("container_port").is_some(), "automatic host ports require shim and container_port");
         }
         if let Some(port) = spec.get("container_port") {
             anyhow::ensure!(port.as_u64().is_some_and(|p| (1..=65535).contains(&p)), "invalid container_port");
@@ -383,6 +401,22 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+
+    #[test]
+    fn runtime_ingress_and_automatic_ports_are_validated_before_placement() {
+        let good = json!({"runtime":{"executor":"shim","driver":"docker"},"port_base":0,"container_port":18789,
+            "services":["chat","control"],"env":{"TOKEN":"private"},
+            "ingress":{"chat":{"paths":["/v1/chat/completions"],"methods":["POST"],"bearer_env":"TOKEN"}}});
+        RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
+        for (field, value) in [("paths",json!(["/../exec"])),("methods",json!(["CONNECT"])),("bearer_env",json!("MISSING"))] {
+            let mut bad=good.clone(); bad["ingress"]["chat"][field]=value;
+            assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
+        }
+        let mut bad=good.clone(); bad["ingress"]["control"]=bad["ingress"]["chat"].clone();
+        assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
+        let mut bad=good; bad.as_object_mut().unwrap().remove("container_port");
+        assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
+    }
 
     #[test]
     fn runtime_selection_is_explicit_and_rejects_unsupported_trust_options() {

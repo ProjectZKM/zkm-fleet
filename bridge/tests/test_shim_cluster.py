@@ -34,7 +34,7 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
     legacy_app={"name":legacy,"namespace":"0"*32,"app":legacy,"kind":"app", "gpus":0,"cpus":0.5,
         "memory_gb":0.125,"image":"python:3.12-slim","port_base":port(),"stop_timeout_s":1,"ready_timeout_s":30,
         "command":["python","-m","http.server","{port}","--bind","127.0.0.1"]}
-    new_app={**legacy_app,"name":modern,"app":modern,"port_base":port(),
+    new_app={**legacy_app,"name":modern,"app":modern,"port_base":0,"container_port":8080,
         "runtime":{"executor":"shim","driver":"docker"},
         "command":["python","-m","http.server","{port}","--bind","0.0.0.0"]}
     apps=tmp_path/"apps.yaml";batches=tmp_path/"batches.yaml";batches.write_text("batches: {}\n")
@@ -58,6 +58,8 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
             status=shim.invoke(allocation.binary,allocation.state_dir,socket.gethostname(),
                 {"operation":"inspect","execution":allocation.execution})
             current=inspect(status["runtime_id"])
+            assert status["port"] > 0
+            assert current["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] == str(status["port"])
             assert current["HostConfig"]["NanoCpus"]==500_000_000
             assert current["HostConfig"]["Memory"]==134_217_728
             assert all(p["HostIp"]=="127.0.0.1" for ports in current["HostConfig"]["PortBindings"].values() for p in ports)
