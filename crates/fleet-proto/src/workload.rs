@@ -31,7 +31,8 @@ impl<'a> Entry<'a> {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,
             Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
-                if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
+                if self.0["service_protocol"] == "tcp" { "shim-tcp-v1" }
+                else if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
                 else if self.0["ingress"].as_object().is_some_and(|i| !i.is_empty()) || self.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")) { "shim-management-v1" }
                 else if self.0["port_base"].as_u64() == Some(0) { "shim-automatic-port-v1" }
                 else if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }

@@ -904,6 +904,17 @@ entrypoint. All three are administrator-owned settings and require explicit
 `runtime: {executor: shim, driver: docker}`. Changes use the existing drain,
 confirmed cleanup and replacement sequence.
 
+For an opaque TCP service such as OpenSSH, declare `services: [ssh]` and
+`service_protocol: tcp` in that same spec. HTTP remains the default; no old app
+configuration or launch hash changes. TCP requires `shim-tcp-v1` and uses a
+loopback TCP readiness probe, never an HTTP request to the SSH port. Its client
+opens the existing authenticated `/v1/tunnel/{route}` WebSocket byte stream.
+Native application authentication still runs inside the tunnel. HTTP ingress
+rules cannot be combined with a TCP app; an optional reserved `control` service
+continues to use HTTP and administrator-only grants. Changing the protocol is an
+administrator operation and uses the existing drain/reconfigure path. This adds
+no host network access, storage replication or automatic task migration.
+
 The existing node apps.yaml accepts `shim_network` with `gateway_url`, `relay_url`,
 `token_file`, `public_key_file`, and `issuer`. These are trusted node settings,
 never passed into the workload environment. The central gateway URL serves only

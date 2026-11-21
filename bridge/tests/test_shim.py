@@ -10,6 +10,38 @@ from fleet_bridge import actors, reconcile, shim, node
 from fleet_bridge.model import ExecutorKind, ReplicaHealth, AppSpec
 
 
+def test_tcp_service_uses_tcp_health_and_requires_new_capability(tmp_path, monkeypatch):
+    from fleet_bridge.model import ServiceProtocol
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, services=["ssh", "control"], service_protocol=ServiceProtocol.TCP))
+    bound = shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
+    assert shim.required_capability(bound) == "shim-tcp-v1"
+    assert [v["protocol"] for v in shim.launch_request(bound, [])["services"]] == ["tcp", "http1"]
+    actor = object.__new__(shim._ShimApp)
+    actor.spec, actor.port = bound, 12345
+    connected = Mock()
+    connected.return_value.__enter__ = Mock()
+    connected.return_value.__exit__ = Mock()
+    monkeypatch.setattr(shim.socket, "create_connection", connected)
+    monkeypatch.setattr(actors, "_http_ok", lambda _: pytest.fail("TCP must not send HTTP to SSH"))
+    assert actor.application_ready()
+    connected.assert_called_once_with(("127.0.0.1", 12345), timeout=3)
+    monkeypatch.setattr(shim._ShimApp, "call", lambda self, command: {"state":"ready","port":12345})
+    monkeypatch.setattr(shim._ShimApp, "start_network", lambda self: None)
+    # Initial admission must use the same probe as subsequent heartbeats.
+    assert shim._ShimApp(bound).port == 12345
+    assert connected.call_count == 2
+    connected.side_effect = OSError()
+    assert not actor.application_ready()
+    for updates in ({"runtime":None}, {"services":["control"]}, {"ingress":{"ssh":object()}}):
+        with pytest.raises(ValueError):
+            replace(s.app, **updates)
+    raw = config(tmp_path)
+    raw["apps"][0]["service_protocol"] = "udp"
+    with pytest.raises(ValueError):
+        reconcile.load_apps(raw)
+
+
 def config(tmp_path, selected=True):
     app = {"name":"web", "kind":"app", "image":"python:3.12-slim", "gpus":0,
         "cpus":0.5, "memory_gb":0.125, "port_base":18080, "command":["serve", "{port}"]}

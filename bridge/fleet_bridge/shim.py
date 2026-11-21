@@ -21,7 +21,7 @@ from typing import Any
 import ray
 
 from . import actors
-from .model import AppReplicaSpec, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, to_dict
+from .model import AppReplicaSpec, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, ServiceProtocol, to_dict
 
 CAPABILITY = "shim-docker-v1"
 
@@ -35,6 +35,8 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
+    if spec.app.service_protocol is ServiceProtocol.TCP:
+        return "shim-tcp-v1"
     if any(rule.single_use for rule in spec.app.ingress.values()):
         return "shim-single-use-ingress-v1"
     if spec.app.ingress or "control" in spec.app.services:
@@ -61,7 +63,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             return []
         modern = "data-plane-v1" in value.get("features", [])
         management = "runtime-management-v1" in value.get("features", [])
-        return (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
+        return (["shim-tcp-v1"] if config.shim_network and modern and management else []) + (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
 
@@ -209,7 +211,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         "policy": {"issuer": "fleet", "policy_id": "unproved-container-lifecycle", "version": 0, "sha256": ""},
         "trust": {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"},
         "services": [{"id": {"namespace": spec.execution.namespace, "workload": spec.execution.workload, "service": name},
-            "protocol": "http1", "endpoint_ref": "control" if name == "control" else f"ingress:{name}" if name in app.ingress else "app"} for name in app.services],
+            "protocol": "http1" if name == "control" else app.service_protocol.value,
+            "endpoint_ref": "control" if name == "control" else f"ingress:{name}" if name in app.ingress else "app"} for name in app.services],
         "driver_options": {"port": port,
             **({"container_port": app.container_port} if app.container_port is not None else {}),
             **({"entrypoint": app.entrypoint} if app.entrypoint is not None else {}),
@@ -234,7 +237,7 @@ class _ShimApp:
         self.network = None
         self.start_network()
         deadline = time.monotonic() + spec.app.ready_timeout_s
-        while not actors._http_ok(self.health_url):
+        while not self.application_ready():
             if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get("state") != "ready":
                 raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
             time.sleep(2)
@@ -266,7 +269,16 @@ class _ShimApp:
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),
             management_ready=status.get("state") == "ready",
-            ready=status.get("state") == "ready" and actors._http_ok(self.health_url)).dump()
+            ready=status.get("state") == "ready" and self.application_ready()).dump()
+
+    def application_ready(self) -> bool:
+        if self.spec.app.service_protocol is ServiceProtocol.HTTP1:
+            return actors._http_ok(self.health_url)
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), timeout=3):
+                return True
+        except OSError:
+            return False
 
 
 ShimApp = ray.remote(_ShimApp)

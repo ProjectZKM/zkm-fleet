@@ -395,12 +395,19 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 10] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress"];
+    pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        if ["services", "container_port", "entrypoint", "ingress"].iter().any(|k| spec.contains_key(*k)) {
+        if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
             anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
                 "transport settings require explicit shim execution");
+        }
+        if let Some(protocol) = spec.get("service_protocol") {
+            anyhow::ensure!(matches!(protocol.as_str(), Some("http1" | "tcp")), "invalid service_protocol");
+            if protocol == "tcp" {
+                anyhow::ensure!(spec.get("services").and_then(Value::as_array).is_some_and(|s| s.iter().any(|s| s.as_str().is_some_and(|s| s != "control")))
+                    && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|i| i.is_empty())), "TCP requires an application service without HTTP ingress");
+            }
         }
         if let Some(services) = spec.get("services") {
             let services = services.as_array().ok_or_else(|| anyhow::anyhow!("services must be an array"))?;
@@ -529,6 +536,18 @@ mod tests {
         request.namespace="ef".repeat(16); assert!(auth.authorize(&request).is_err());
         request.namespace=policy.namespace; request.service="control".into(); assert!(auth.authorize(&request).is_err());
         request.service="chat".into();request.workload="*".into();assert!(auth.authorize(&request).is_err());
+    }
+
+    #[test]
+    fn tcp_services_require_shim_and_capable_nodes_without_http_ingress() {
+        let good = json!({"runtime":{"executor":"shim","driver":"docker"},"services":["ssh","control"],"service_protocol":"tcp"});
+        RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
+        assert_eq!(crate::workload::Entry(&good).runtime_capability(), Some("shim-tcp-v1"));
+        for (field,value) in [("service_protocol",json!("udp")),("runtime",json!({"executor":"legacy"})),
+            ("services",json!(["control"])),("ingress",json!({"ssh":{}}))] {
+            let mut bad=good.clone(); bad[field]=value;
+            assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
+        }
     }
 
     #[test]

@@ -480,6 +480,11 @@ class ShimNetworkConfig(Record):
             raise ModelError("shim network needs an issuer and absolute credential/key paths")
 
 
+class ServiceProtocol(str, enum.Enum):
+    HTTP1 = "http1"
+    TCP = "tcp"
+
+
 class ExecutorKind(str, enum.Enum):
     LEGACY = "legacy"
     SHIM = "shim"
@@ -521,6 +526,7 @@ class AppSpec(Record):
     name: str
     runtime: RuntimeSelection | None = None
     services: list[str] = field(default_factory=list)
+    service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
     ingress: dict[str, HttpIngress] = field(default_factory=dict)
     container_port: int | None = None
     entrypoint: str | None = None
@@ -565,6 +571,10 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
+        if self.service_protocol is ServiceProtocol.TCP:
+            if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
+                    or not any(s != "control" for s in self.services) or self.ingress):
+                raise ModelError("TCP requires a shim application service without HTTP ingress")
         if self.services or self.ingress or self.container_port is not None or self.entrypoint is not None:
             if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
                 raise ModelError("services, container_port and entrypoint require explicit shim execution")
