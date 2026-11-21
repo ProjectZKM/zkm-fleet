@@ -25,6 +25,16 @@ impl<'a> Entry<'a> {
     /// the scheduler keeps from it.
     pub const REPORTED: [&'static str; 4] = ["ready", "logs", "cleaned", "namespace_ref"];
 
+    /// Missing selection is permanently the legacy path, including old records.
+    pub fn runtime_capability(self) -> Option<&'static str> {
+        match self.0.get("runtime") {
+            None => None,
+            Some(v) if v == &json!({"executor":"legacy"}) => None,
+            Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some("shim-docker-v1"),
+            Some(_) => Some("unsupported-runtime"),
+        }
+    }
+
     /// The entry's own name, unique on its node.
     pub fn name(self) -> &'a str {
         text(self.0, "name")
@@ -183,6 +193,9 @@ impl ScaleStatus {
 }
 
 impl NodeReport {
+    pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
+        entry.runtime_capability().is_none_or(|cap| self.runtime_capabilities.iter().any(|v| v == cap))
+    }
     /// The entries the node configures, with how each runs there.
     pub fn entries(&self) -> impl Iterator<Item = Entry<'_>> {
         self.apps.iter().map(|v| Entry(v))

@@ -469,6 +469,12 @@ impl WorkloadController {
         parameters: Value,
     ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock();
+        if operation == NodeOperation::SetApp && parameters["disabled"] != true {
+            let entry = Entry(&parameters["app"]);
+            if entry.runtime_capability().is_some() && !inner.workers.get(worker).is_some_and(|w| w.report.supports_runtime(entry)) {
+                return Err(fail(409, "node does not support the selected runtime"));
+            }
+        }
         let c = CommandRecord {
             id: uuid::Uuid::new_v4().to_string(),
             worker: worker.into(),
@@ -1026,6 +1032,10 @@ impl WorkloadController {
                     .insert(key.clone(), intent.clone());
                 intent
             };
+            // An older/downgraded bridge cannot attest cleanup of a shim allocation.
+            if !report.supports_runtime(intent.entry()) {
+                continue;
+            }
             if observed.holds_allocation() {
                 let id = format!("deployment:{key}");
                 if observed.cleaned() && intent.disabled {
@@ -1775,6 +1785,15 @@ impl WorkloadController {
 fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
     i.commands.open()
         .filter(|c| c.worker == worker && !c.done && c.admitted)
+        .filter(|c| i.workers.get(worker).is_some_and(|w| {
+            w.report.supports_runtime(Entry(&c.parameters["app"]))
+                && w.report.supports_runtime(Entry(&c.parameters["create"]))
+                && w.report.supports_runtime(Entry(&c.parameters["set"]))
+                && i.deployments.values().filter(|d| d.worker == worker
+                    && (c.changes_entry(worker, d.entry().name()) || c.changed_entry() == d.entry().name()
+                        || c.removes_app(d.entry().app())))
+                    .all(|d| w.report.supports_runtime(d.entry()))
+        }))
         .take(16)
         .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
         .collect()

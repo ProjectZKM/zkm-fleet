@@ -89,7 +89,7 @@ def _coerce(tp: Any, value: Any, where: str) -> Any:
                 return value
             if not isinstance(value, Mapping):
                 raise ModelError(f"{where}: expected a {tp.__name__} mapping, got {type(value).__name__}")
-            return from_dict(tp, value, where=where)
+            return from_dict(tp, value, strict=getattr(tp, "STRICT_FIELDS", False), where=where)
         if issubclass(tp, enum.Enum):
             if isinstance(value, tp):
                 return value
@@ -454,6 +454,25 @@ class ControlPlaneConfig(Record):
     node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
     gpu_port_range: tuple[int, int] = (30100, 30199)
+    shim_binary: str | None = None
+    shim_state_dir: str | None = None
+
+
+class ExecutorKind(str, enum.Enum):
+    LEGACY = "legacy"
+    SHIM = "shim"
+
+
+@dataclass(kw_only=True)
+class RuntimeSelection(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    executor: ExecutorKind
+    driver: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.executor is ExecutorKind.LEGACY and self.driver is not None
+                or self.executor is ExecutorKind.SHIM and self.driver != "docker"):
+            raise ModelError("runtime must select legacy or shim with driver docker")
 
 
 @dataclass(kw_only=True)
@@ -461,6 +480,7 @@ class AppSpec(Record):
     """One entry of `apps:`."""
 
     name: str
+    runtime: RuntimeSelection | None = None
     namespace: str = "00000000000000000000000000000000"
     tag: str | None = None
     priority: int = 0
@@ -502,6 +522,8 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
+        if self.runtime is not None and self.kind is not AppRuntime.APP:
+            raise ModelError("runtime selection is supported only for ordinary apps")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
         if self.prover_binary is not None:
@@ -544,7 +566,27 @@ class AppsConfig(Record):
     def parse(cls, data: Mapping[str, Any]) -> AppsConfig:
         cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
         apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
+        for a in data.get("apps", []):
+            if "runtime" in a:
+                from_dict(RuntimeSelection, a["runtime"], strict=True)
+        if any(a.runtime and a.runtime.executor is ExecutorKind.SHIM for a in apps):
+            if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
+                raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
         return cls(cluster=cluster, apps=apps, raw=dict(data))
+
+
+@dataclass(kw_only=True)
+class RuntimeIdentity(Record):
+    namespace: str
+    workload: str
+    allocation_id: str
+    lease_id: str
+    generation: int
+    node_id: str
+
+    def __post_init__(self) -> None:
+        if self.generation < 1 or not all((self.namespace,self.workload,self.allocation_id,self.lease_id,self.node_id)):
+            raise ModelError("runtime identity requires a positive generation and complete allocation")
 
 
 @dataclass(kw_only=True)
@@ -559,6 +601,8 @@ class AppReplicaSpec(Record):
     app: AppSpec
     cluster: ControlPlaneConfig
     config: dict[str, Any] = field(default_factory=dict)
+    # Pinned machine allocation, supplied before entering Ray; absent for legacy.
+    execution: RuntimeIdentity | None = None
 
     @property
     def kind(self) -> AppRuntime:
@@ -620,6 +664,7 @@ class ReplicaHealth(Record):
     """What an actor answers to `health()`."""
 
     name: str
+    executor: ExecutorKind = ExecutorKind.LEGACY
     spec: str | None = None  # the replica's spec hash
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)

@@ -238,14 +238,14 @@ impl WorkloadController {
 
     /// Settings an update may change on an app. The rest is identity, placement or the
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
-    pub(super) const APP_SETTINGS: [&'static str; 11] = ["image", "env", "command", "user", "workdir", "volumes",
-        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s"];
+    pub(super) const APP_SETTINGS: [&'static str; 12] = ["image", "env", "command", "user", "workdir", "volumes",
+        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime"];
     // Apps can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
-    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 6] = ["image", "env", "command", "user", "workdir", "volumes"];
+    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 7] = ["image", "env", "command", "user", "workdir", "volumes", "runtime"];
     // A namespace's owner creates its own apps, as it does its batches: the host's
     // filesystem and user ids stay administrator settings.
-    const ADMIN_CREATE_SETTINGS: [&'static str; 3] = ["user", "volumes", "proof_storage_root"];
+    const ADMIN_CREATE_SETTINGS: [&'static str; 4] = ["user", "volumes", "proof_storage_root", "runtime"];
 
     /// Starts enabling or disabling these deployments of `app` the way a scale changes them:
     /// drain, stop, the node writes the enabled state, start again unless disabled. The caller
@@ -312,6 +312,7 @@ impl WorkloadController {
             .ok_or_else(|| fail(400, "set at least one setting"))?;
         for (key, value) in &set {
             let valid = match key.as_str() {
+                "runtime" => fleet_proto::model::v1::RegisterAppRequest::validate_runtime(value).is_ok(),
                 "image" => value.as_str().is_some_and(|v| !v.is_empty() && !v.starts_with('-')),
                 "env" => value.as_object().is_some_and(|o| o.values().all(Value::is_string)),
                 "command" | "volumes" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
@@ -325,6 +326,15 @@ impl WorkloadController {
             }
         }
         let (key, mut intent) = self.deployment_to_change(namespace, app, node)?;
+        if set.contains_key("runtime") && !intent.entry().is_container() {
+            return Err(fail(400, "runtime selection is supported only for ordinary apps"));
+        }
+        if let Some(runtime) = set.get("runtime") {
+            let candidate = json!({"runtime": runtime});
+            let supported = self.inner.lock().workers.get(&intent.worker)
+                .is_some_and(|w| w.report.supports_runtime(Entry(&candidate)));
+            if !supported { return Err(fail(409, "node does not support the selected runtime")); }
+        }
         if set.iter().all(|(k, v)| intent.spec.get(k) == Some(v)) {
             return Ok(self.scale_value(&intent));
         }
@@ -876,10 +886,10 @@ impl WorkloadController {
     /// fewest free GPUs among those, as a batch-class proof app is placed, so larger requests
     /// keep the larger gaps; otherwise the one with the most free GPUs, where the app waits for
     /// room. Whether it has the room now comes along. `except` are nodes not to pick.
-    fn place_app(&self, entry: Entry<'_>, except: &[String]) -> anyhow::Result<(String, bool)> {
+    pub(super) fn place_app(&self, entry: Entry<'_>, except: &[String]) -> anyhow::Result<(String, bool)> {
         let (gpus, cpus) = entry.total(1.0);
         let large: Vec<String> = self.inner.lock().workers.iter()
-            .filter(|(id, w)| !except.contains(id) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .filter(|(id, w)| !except.contains(id) && w.report.supports_runtime(entry) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
         let sizes: Vec<(String, f64, f64)> = large.into_iter()
             .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Callable
 
 import ray
 from ray._raylet import PlacementGroupID
@@ -18,7 +18,7 @@ from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after
-from .model import ResourceRequest, ReplicaHealth, AppReplicaSpec, AppRuntime, AppsConfig
+from .model import ResourceRequest, ReplicaHealth, AppReplicaSpec, AppRuntime, AppsConfig, ExecutorKind
 
 NAMESPACE = "zkm-fleet"
 
@@ -51,6 +51,8 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
             config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
             if app.kind is AppRuntime.APP:
                 config["index"] = i
+            if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+                config.update(shim_binary=file.cluster.shim_binary, shim_state_dir=file.cluster.shim_state_dir)
             # Resolve the administrator's executable selection before crossing
             # the Ray boundary. Existing Ray workers may still have the older
             # actors module loaded during a rolling bridge upgrade; they read
@@ -106,7 +108,11 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
     try:
         ray.get(pg.ready(), timeout=ready_timeout_s)
-        actor: ActorHandle[Any] = ACTORS[spec.kind].options(
+        factory = ACTORS[spec.kind]
+        if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
+            from .shim import ShimApp
+            factory = ShimApp
+        actor: ActorHandle[Any] = factory.options(
             name=spec.name,
             namespace=NAMESPACE,
             lifetime="detached",
@@ -119,17 +125,20 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
         ).remote(spec)
         health_of(actor, ready_timeout_s)
     except BaseException:
-        # A failed start must not keep its detached group: it holds the replica's
-        # GPUs and CPUs and blocks every retry.
+        # Legacy cleanup removes its detached group. Shim retains reservations
+        # until its durable allocation has confirmed cleanup.
         try:
-            stop(spec.name)
+            if not (spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM):
+                stop(spec.name)
+            # Shim allocations retain reservations until node-owned cleanup
+            # confirms the persisted execution is gone.
         except Exception:
             logging.getLogger(__name__).exception("cleanup after failed start of %s", spec.name)
         raise
     return actor
 
 
-def stop(name: str) -> None:
+def stop(name: str, *, cleanup: Callable[[], None] | None = None) -> None:
     """Kills the actor, then removes what it owned on its machine. The kill comes first:
     an actor asked to shut down and left alive restarts itself (max_restarts=-1) when
     its watcher sees the container gone, and the restart races the replacement."""
@@ -139,7 +148,10 @@ def stop(name: str) -> None:
         actor = None
     if actor is not None:
         ray.kill(actor, no_restart=True)
-        ray.get(clean_after.remote(name), timeout=120)
+        if cleanup is None:
+            ray.get(clean_after.remote(name), timeout=120)
+    if cleanup is not None:
+        cleanup()
     # Find all generations because an actor can have been restarted several
     # times. Only remove live groups; Ray retains removed group names forever.
     prefix = f"pg-{name}-"

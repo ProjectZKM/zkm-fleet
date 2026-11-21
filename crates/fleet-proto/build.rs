@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NodeReport.apps",
         "NodeReport.jobs",
         "NodeReport.results",
+        "NodeReport.runtime_capabilities",
         "CreateNamespaceRequest.quota",
         "AllocationRequest.restore",
         "CreateTokenRequest.label",
