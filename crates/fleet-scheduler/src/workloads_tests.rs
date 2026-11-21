@@ -55,6 +55,26 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
 fn inventory(namespace: &str) -> NodeReport {
     serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
 }
+
+#[tokio::test]
+async fn runtime_instances_are_exact_scoped_live_allocations() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
+    report.apps[0]["services"]=json!(["http"]);
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-network-v1".into()];
+    report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http"],
+        "execution":{"namespace":ns,"workload":"model","allocation_id":"model-0","lease_id":"lease","generation":1,"node_id":"machine"}}])).unwrap();
+    let mut bad=report.clone();bad.runtime_instances[0].execution.node_id="other-machine".into();
+    assert!(c.report("gpu","session",bad).await.is_err());
+    let mut bad=report.clone();bad.runtime_instances[0].services=vec!["unapproved".into()];
+    assert!(c.report("gpu","session",bad).await.is_err());
+    c.report("gpu","session",report).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=default"))["runtime_instances"][0]["execution"]["lease_id"],"lease");
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=other"))["runtime_instances"],json!([]));
+    c.end_session("gpu","session");
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+}
 fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
     JobReport {
         id: job.id.clone(),

@@ -4,6 +4,27 @@ use crate::model::v1::*;
 use crate::stage::v1::Status as StageStatus;
 use serde_json::Value;
 
+impl NodeReport {
+    pub fn validate_runtime_instances(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.runtime_instances.len() <= 1024, "too many runtime instances");
+        let mut seen = std::collections::HashSet::new();
+        for instance in &self.runtime_instances {
+            let e = &instance.execution;
+            let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
+            anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && entry.is_container()
+                && e.node_id == self.machine && e.generation > 0
+                && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
+                && [&e.namespace,&e.workload,&e.allocation_id,&e.lease_id,&e.node_id].iter().all(|v| !v.is_empty() && v.len() <= 256 && !v.chars().any(char::is_control))
+                && seen.insert((&e.namespace,&e.allocation_id,&e.node_id)), "invalid runtime execution identity");
+            let prefix = format!("{}-",instance.entry_name);
+            anyhow::ensure!(e.allocation_id.strip_prefix(&prefix).and_then(|s|s.parse::<u64>().ok()).is_some_and(|index| index < entry.replicas()), "invalid runtime replica");
+            let expected: Vec<String> = entry.0["services"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
+            anyhow::ensure!(instance.services == expected, "runtime services differ from app manifest");
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_tag(tag: &str) -> anyhow::Result<()> {
     let (key, value) = tag
         .split_once('=')
@@ -263,7 +284,27 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 6] = ["command", "port_base", "health_path", "workdir", "user", "runtime"];
+    pub const CONTAINER_SETTINGS: [&'static str; 9] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint"];
+
+    pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        if ["services", "container_port", "entrypoint"].iter().any(|k| spec.contains_key(*k)) {
+            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
+                "transport settings require explicit shim execution");
+        }
+        if let Some(services) = spec.get("services") {
+            let services = services.as_array().ok_or_else(|| anyhow::anyhow!("services must be an array"))?;
+            let mut names = std::collections::HashSet::new();
+            anyhow::ensure!(services.len() <= 8 && services.iter().all(|s| s.as_str().is_some_and(|s|
+                !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') && names.insert(s))), "invalid services");
+        }
+        if let Some(port) = spec.get("container_port") {
+            anyhow::ensure!(port.as_u64().is_some_and(|p| (1..=65535).contains(&p)), "invalid container_port");
+        }
+        if let Some(entrypoint) = spec.get("entrypoint") {
+            anyhow::ensure!(entrypoint.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')), "invalid entrypoint");
+        }
+        Ok(())
+    }
     /// Settings only a prover's spec (`kind: ziren-gpu` or `ziren-cpu`) may give.
     pub const PROVER_SETTINGS: [&'static str; 3] = ["proof_storage_root", "backend", "rust_log"];
 
@@ -319,6 +360,7 @@ impl RegisterAppRequest {
         if let Some(runtime) = spec.get("runtime") {
             Self::validate_runtime(runtime)?;
         }
+        Self::validate_transport(spec)?;
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
         let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()

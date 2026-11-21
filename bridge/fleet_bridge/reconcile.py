@@ -53,6 +53,8 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
                 config["index"] = i
             if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
                 config.update(shim_binary=file.cluster.shim_binary, shim_state_dir=file.cluster.shim_state_dir)
+                if app.services:
+                    config["shim_network"] = file.cluster.shim_network.dump() if file.cluster.shim_network else None
             # Resolve the administrator's executable selection before crossing
             # the Ray boundary. Existing Ray workers may still have the older
             # actors module loaded during a rolling bridge upgrade; they read
@@ -109,9 +111,13 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
     try:
         ray.get(pg.ready(), timeout=ready_timeout_s)
         factory = ACTORS[spec.kind]
+        extra = {}
         if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
             from .shim import ShimApp
             factory = ShimApp
+            # A distinct worker environment loads the new adapter without
+            # restarting Ray or any detached legacy app during bridge upgrades.
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "data-plane-v1"}}
         actor: ActorHandle[Any] = factory.options(
             name=spec.name,
             namespace=NAMESPACE,
@@ -122,6 +128,7 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             num_gpus=b.gpu,
             memory=b.memory,
             scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
+            **extra,
         ).remote(spec)
         health_of(actor, ready_timeout_s)
     except BaseException:
