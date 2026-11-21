@@ -387,22 +387,44 @@ storage path: references are `file://`, with owner-managed shared mounts for
 replicas on different machines. Fleet keeps admission, quotas, placement, retries and
 execution leases, and stores no proof inputs or outputs.
 
-The generic `fleet-ziren-node` SDK and CUDA client are pinned together to Ziren
-2.0 revision `c9988a098d92bc55a85ca9307c470d1f97be3337`, matching GPU image
+The generic `fleet-ziren-node` SDK and CUDA client follow Ziren's `main` branch
+in the manifest. `Cargo.lock` fixes both at the validated Ziren 2.0 revision
+`c9988a098d92bc55a85ca9307c470d1f97be3337`, matching GPU image
 `ziren-gpu:c9988a0-8f3c7fb6`. Pin the guest and its receipt verifier to that same
 revision. The circuit label `v2.0.0` alone does not establish CUDA wire compatibility:
 older 2.0 clients can fail decoding the newer server's compressed proof. Upgrade
 the client binary with the image; do not mix their proof representations. CI
 compiles the full SDK/CUDA adapter as well as testing storage without the runtime.
+Use locked builds. Dependency updates must revalidate this tuple; regenerating
+the lockfile is an intentional upgrade, including its Plonky3 dependencies.
 For a staged upgrade, an administrator can set `prover_binary` to an absolute
-path in that prover's existing node-owned `apps.yaml` entry. Other apps retain
+path and `machine` to this host in that prover's existing node-owned `apps.yaml`
+entry. Both fields are node-owned; the scheduler preserves updates and never
+automatically copies that executable selection to another machine. Other apps retain
 the shared `node_binary`. This override is not accepted through user app creation
 or settings APIs. It keeps the native prover's SDK input path; `worker_command`
 instead denotes an integrated app that owns its inputs and rejects SDK submission.
-The bridge resolves this selection before handing the replica to Ray, so an older
-resident Ray worker also receives the selected executable. After upgrading the
-bridge, restart its node adapter and drain/restart the affected app; check the
-running prover's executable, not only the configured path, before submitting work.
+The bridge resolves this selection before handing the replica to Ray. Its deployment
+hash covers the selected executable, so changing an unused shared `node_binary`
+does not restart a pinned prover, and an old adapter that ignored the override no
+longer makes the wrong executable look current. New explicitly selected prover
+actors load the updated adapter in a distinct Ray worker environment. Detached
+legacy actors and their deployment hashes remain unchanged.
+
+Upgrade scheduler and `fleet-node` before the bridge: report v3 adds optional
+`native_provers` records (`entry_name`, `replica_name`, `executable`). Before the
+upgrade, add `machine` to entries already using `prover_binary`. The actor reads
+the running executable from `/proc/<pid>/exe`; older actors omit this evidence.
+The machine's status includes these records for operator inspection. A selected
+prover is not reported ready if its observed executable differs or is unknown.
+Drain/restart only the affected app before submitting work. The shared process
+role marker makes orphan cleanup work for renamed prover executables while still
+checking the exact replica name.
+
+Executable observations are operational metadata, not remote attestation or an
+SDK/CUDA protocol compatibility check. Scheduling still matches the circuit label;
+a validated protocol fingerprint covering the SDK, CUDA server and guest/verifier
+remains follow-up work. Operators must deploy the validated tuple above together.
 Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.

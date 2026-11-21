@@ -584,8 +584,9 @@ class AppSpec(Record):
             raise ModelError("priority must be a signed 32-bit integer")
         if self.prover_binary is not None:
             if (self.kind is AppRuntime.APP or self.worker_command
+                    or not self.machine or not self.machine.strip()
                     or not os.path.isabs(self.prover_binary) or "\x00" in self.prover_binary):
-                raise ModelError("prover_binary requires an absolute path on a native prover without worker_command")
+                raise ModelError("prover_binary requires a machine-pinned native prover and an absolute path without worker_command")
         if self.worker_command:
             if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):
@@ -653,6 +654,13 @@ class RuntimeInstance(Record):
     execution: RuntimeIdentity
     ready: bool
     services: list[str] = field(default_factory=list)
+
+
+@dataclass(kw_only=True)
+class NativeProverProcess(Record):
+    entry_name: str
+    replica_name: str
+    executable: str
 
 
 @dataclass(kw_only=True)
@@ -733,6 +741,7 @@ class ReplicaHealth(Record):
     executor: ExecutorKind = ExecutorKind.LEGACY
     execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
+    prover_binary: str | None = None  # observed /proc/<pid>/exe; absent on older actors
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)
     gpu_port: int | None = None

@@ -561,6 +561,7 @@ impl WorkloadController {
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
+                "native_provers":w.report.native_provers,
                 "batches":w.report.batches.keys().collect::<Vec<_>>(),
                 "heartbeat_age_ms":((now()-w.seen)*1000.0) as u64})
         }).collect()
@@ -897,6 +898,7 @@ impl WorkloadController {
             return Err(fail(400, "invalid capacity"));
         }
         report.validate_runtime_instances().map_err(|e| fail(400,e.to_string()))?;
+        report.validate_native_provers().map_err(|e| fail(400,e.to_string()))?;
         let mut report = report;
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()
