@@ -117,7 +117,7 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             factory = ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "single-use-ingress-v1"}}
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "runtime-recovery-v1"}}
         actor: ActorHandle[Any] = factory.options(
             name=spec.name,
             namespace=NAMESPACE,
