@@ -125,7 +125,8 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             factory = ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "runtime-recovery-v1"}}
+            adapter = "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
         elif spec.app.prover_binary:
             # Newly selected provers load the updated actor without restarting Ray.
             extra["runtime_env"] = {"env_vars": {"FLEET_PROVER_ADAPTER": "executable-v1"}}

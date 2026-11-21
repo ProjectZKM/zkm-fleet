@@ -456,6 +456,7 @@ class ControlPlaneConfig(Record):
     gpu_port_range: tuple[int, int] = (30100, 30199)
     shim_binary: str | None = None
     shim_state_dir: str | None = None
+    shim_daemon: bool = False
     shim_network: ShimNetworkConfig | None = None
 
 
@@ -629,6 +630,9 @@ class AppsConfig(Record):
         if any(a.runtime and a.runtime.executor is ExecutorKind.SHIM for a in apps):
             if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
+        if cluster.shim_daemon and (not cluster.shim_state_dir or not os.path.isabs(cluster.shim_state_dir)
+                or len(os.fsencode(os.path.join(cluster.shim_state_dir, "control.sock"))) >= 108):
+            raise ModelError("shim daemon requires an absolute state directory with a Unix socket path under 108 bytes")
         if any(a.services for a in apps) and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
         return cls(cluster=cluster, apps=apps, raw=dict(data))

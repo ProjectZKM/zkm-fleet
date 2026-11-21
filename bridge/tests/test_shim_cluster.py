@@ -28,7 +28,8 @@ def inspect(name):
 
 
 @pytest.mark.skipif(not os.environ.get("TRUSTED_SHIM_TEST_BINARY"), reason="requires companion binary and local Docker")
-def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_path):
+@pytest.mark.parametrize("daemon", [False, True])
+def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_path, daemon):
     suffix=uuid.uuid4().hex[:8]
     legacy=f"shim-legacy-{suffix}"; modern=f"shim-optin-{suffix}"
     legacy_app={"name":legacy,"namespace":"0"*32,"app":legacy,"kind":"app", "gpus":0,"cpus":0.5,
@@ -42,6 +43,8 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
     apps.write_text(yaml.safe_dump(cfg))
     executor=node.NodeExecutor(str(apps),str(batches),str(tmp_path/"jobs"))
     recovered=None
+    service=None
+    private_state=tempfile.TemporaryDirectory(prefix="shim-state-")
     with tempfile.TemporaryDirectory(prefix="shim-ray-") as ray_dir:
         ray.init(address="local",num_cpus=2,num_gpus=0,include_dashboard=False,
             object_store_memory=80*1024*1024,_temp_dir=ray_dir,log_to_driver=False,
@@ -50,13 +53,21 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
             executor.set_app({"app":legacy_app,"disabled":False},"legacy-start")
             old=inspect(actors.app_container(legacy+"-0"))
             # Installing shim and adding a new opted-in app leaves legacy config intact.
-            cfg.update(shim_binary=os.environ["TRUSTED_SHIM_TEST_BINARY"],shim_state_dir=str(tmp_path/"shim-state"))
+            cfg.update(shim_binary=os.environ["TRUSTED_SHIM_TEST_BINARY"],shim_state_dir=private_state.name,shim_daemon=daemon)
+            if daemon:
+                service=subprocess.Popen([cfg['shim_binary'],'--serve','--state-dir',private_state.name,
+                    '--node-id',socket.gethostname()])
+                import time
+                from pathlib import Path
+                for _ in range(100):
+                    if Path(private_state.name,'control.sock').exists():break
+                    time.sleep(.05)
             cfg["apps"].append(new_app);apps.write_text(yaml.safe_dump(cfg))
             executor.set_app({"app":legacy_app,"disabled":False},"legacy-reconcile")
             executor.set_app({"app":new_app,"disabled":False},"shim-start")
             allocation=executor.runtimes.read(modern+"-0")
             status=shim.invoke(allocation.binary,allocation.state_dir,socket.gethostname(),
-                {"operation":"inspect","execution":allocation.execution})
+                {"operation":"inspect","execution":allocation.execution},daemon=allocation.daemon)
             current=inspect(status["runtime_id"])
             assert status["port"] > 0
             assert current["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] == str(status["port"])
@@ -87,3 +98,6 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
                 executor.pool.shutdown()
                 if recovered: recovered.pool.shutdown()
                 ray.shutdown()
+                if service:
+                    service.terminate();service.wait(timeout=10)
+                private_state.cleanup()

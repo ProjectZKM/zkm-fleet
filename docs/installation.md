@@ -49,6 +49,28 @@ Verify on the control host:
 fleetctl node gpu-1
 ```
 
+### Nodes with persistent shim services
+
+For a package containing `trusted-shim-runtime`, add `--with-shim` to the node
+installation command. It requires systemd and sudo access. This installs three
+independent units: `zkm-fleet-node.service`, `zkm-fleet-ray.service`, and
+`zkm-fleet-shim.service`; it does not install a new cron entry. Existing watchdog
+entries read `FLEET_NODE_SUPERVISED=1` from the same `watchdog.env`.
+
+The installer adds `shim_binary`, `shim_state_dir`, and `shim_daemon: true` to
+the existing `apps.yaml` only when shim has not been configured. The executable
+is pinned under `libexec/trusted-shim/<sha256>/`. Reinstalling stages new artifacts
+without switching the running shim or restarting its service. Keep the state path
+short enough that `state/control.sock` is under Linux's 108-byte Unix socket limit.
+Configure `shim_network` in that same file for service forwarding; runtime drivers
+and network credentials retain their existing validation and authorization.
+
+Legacy apps keep their executor. An existing stdio shim allocation also keeps its
+transport and executable: the installer refuses to silently convert it to daemon
+mode. Introduce daemon mode on a new node, or explicitly drain and clean up those
+shim allocations first. Existing Ray processes are left running; moving Ray itself
+under a different service supervisor is a separate maintenance operation.
+
 ## Options
 
 Fetch `setup.sh` from the release you are installing: the script and the package it
