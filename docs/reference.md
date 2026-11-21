@@ -825,6 +825,13 @@ are live, excluding other tags. Consumers must use the complete identity and
 must not guess node addresses or host ports. Replacing an execution changes its
 route; session/ComfyUI affinity must fail rather than switch instances silently.
 
+If an application's health probe fails while its shim runtime still runs, the
+node may report only the declared `control` service as ready. This lets an
+administrator repair or restart the exact allocation without advertising its
+unhealthy application services. Disabled, stale, ended and retiring allocations
+remain hidden. Upgrade the scheduler's report validation before the bridge to
+accept this restricted service subset. No legacy task changes executor.
+
 Upgrade scheduler/fleet-node before the bridge (older JSON readers reject unknown
 fields). The bridge advertises `shim-network-v1` only when the binary and node
 network settings support it. New container-port/entrypoint options require

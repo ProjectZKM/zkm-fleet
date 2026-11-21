@@ -646,12 +646,15 @@ class NodeExecutor:
             for name in names:
                 try:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
-                    healthy = health is not None and health.is_ready and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
-                    if healthy and health.execution is not None:
+                    owned_executor = health is not None and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
+                    healthy = owned_executor and health.is_ready
+                    if owned_executor and health.execution is not None and (healthy or health.management_ready):
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
-                            runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
-                                ready=True, services=list(app.get("services", []))).dump())
+                            services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
+                            if services:
+                                runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
+                                    ready=True, services=services).dump())
                 except Exception as error:
                     # Starting or restarting one actor must not suppress the
                     # machine heartbeat or another command's cleanup acknowledgment.
