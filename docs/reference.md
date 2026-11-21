@@ -403,6 +403,9 @@ The bridge resolves this selection before handing the replica to Ray, so an olde
 resident Ray worker also receives the selected executable. After upgrading the
 bridge, restart its node adapter and drain/restart the affected app; check the
 running prover's executable, not only the configured path, before submitting work.
+Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
+directory when deploying: a source tree in that directory takes precedence over
+an installed wheel, so updating the wheel alone may leave the running code old.
 
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
