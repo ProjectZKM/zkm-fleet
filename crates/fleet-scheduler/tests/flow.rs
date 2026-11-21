@@ -154,6 +154,65 @@ const TEST_ELFS: &[&[u8]] =
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_scoped() {
+    use serde_json::{json,Value};
+    let h = start().await;
+    let namespace: Value = h.client.get(format!("{}/namespaces/{PROOFS}",h.http)).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let namespace = namespace["id"].as_str().unwrap();
+    create_namespace(&h,"other",None);
+    let (sync_token, backend, other) = ("ca".repeat(48), "cb".repeat(48), "cc".repeat(48));
+    for (id,secret,ns,permissions) in [("ca",&sync_token,PROOFS,vec!["router_sync"]),
+        ("cb",&backend,PROOFS,vec!["read","router_delegate"]),("cc",&other,"other",vec!["read","router_delegate"])] {
+        let body = json!({"id":id.repeat(16),"address":id.repeat(20),"namespace":ns,"permissions":permissions,
+            "token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))});
+        assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&body).send().await.unwrap().status(),201);
+    }
+    let base = format!("{}/routers/auth-relay",h.http);
+    h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"ca".repeat(16)}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let mut policy=json!({"namespace":namespace,"workload":"agent","service":"chat","version":1,"sha256":"ab".repeat(32),"enabled":true});
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&backend).json(&policy).send().await.unwrap().status(),403);
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    let access=json!({"namespace":namespace,"workload":"agent","service":"chat","principal":"ab".repeat(32),"session":"cd".repeat(32)});
+    for denied in [USER, &other, &h.admin] {
+        assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(denied).json(&access).send().await.unwrap().status(),403);
+    }
+    let first:Value=h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&access).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(first["policy_version"],1);
+    policy["sha256"]=json!("ef".repeat(32));
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().status(),409);
+    policy["version"]=json!(2);
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    let revocation=json!({"namespace":namespace,"principal":access["principal"],"session":access["session"]});
+    assert_eq!(h.client.post(format!("{base}/revoke-subject")).bearer_auth(&other).json(&revocation).send().await.unwrap().status(),403);
+    for _ in 0..2 {
+        h.client.post(format!("{base}/revoke-subject")).bearer_auth(&backend).json(&revocation).send().await.unwrap().error_for_status().unwrap();
+    }
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&access).send().await.unwrap().status(),403);
+    let mut second=access.clone(); second["session"]=json!("ee".repeat(32));
+    let second_binding:Value=h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&second).send().await.unwrap().json().await.unwrap();
+    assert_eq!(second_binding["policy_version"],2);
+    let snapshot:Value=h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().json().await.unwrap();
+    assert_eq!(snapshot["revision"],0); // authorization never increments runtime generations or route tombstones
+    assert_eq!(snapshot["authorization"]["revision"],3);
+    let mut ack=json!({"epoch":snapshot["epoch"],"after_revision":0,"applied_revision":0,"applied_authorization_revision":4});
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).json(&ack).send().await.unwrap().status(),409);
+    ack["applied_authorization_revision"]=json!(3);
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).json(&ack).send().await.unwrap().status(),200);
+    let state:Value=h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(state["applied_authorization_revision"],3);
+    let user_revoke=json!({"namespace":namespace,"principal":access["principal"],"session":null});
+    h.client.post(format!("{base}/revoke-subject")).bearer_auth(&backend).json(&user_revoke).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&second).send().await.unwrap().status(),403);
+    policy["service"]=json!("control");
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    let mut operator=second.clone(); operator["service"]=json!("control"); operator["principal"]=json!("12".repeat(32));
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&operator).send().await.unwrap().status(),403);
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&h.admin).json(&operator).send().await.unwrap().status(),200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
     use serde_json::json;
     let h = start().await;

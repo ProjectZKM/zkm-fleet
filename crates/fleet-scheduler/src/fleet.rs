@@ -588,6 +588,12 @@ impl Scheduler {
     ) -> anyhow::Result<Token> {
         use crate::token::Permission;
         let permissions: Vec<String> = if permissions.is_empty() { vec!["read".into(), "submit".into()] } else { permissions };
+        let router_delegate = permissions.iter().any(|p| p == Permission::RouterDelegate.name());
+        if router_delegate {
+            anyhow::ensure!(permissions.iter().all(|p| matches!(p.as_str(), "read" | "router_delegate"))
+                && token_hash.is_some() && tag.is_none() && apps.is_none(),
+                "router_delegate requires a namespace-wide backend credential, no tag/app grants, and only optional read permission");
+        }
         let router_sync = permissions.iter().any(|p| p == Permission::RouterSync.name());
         if router_sync {
             anyhow::ensure!(permissions.len() == 1 && token_hash.is_some()
@@ -621,7 +627,7 @@ impl Scheduler {
         }
         anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
         anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
-        anyhow::ensure!(admin || router_sync || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
+        anyhow::ensure!(admin || router_sync || router_delegate || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
         anyhow::ensure!(!manage || (tag.is_some() && token_hash.is_some()), "manage tokens require a tag and API token");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");
