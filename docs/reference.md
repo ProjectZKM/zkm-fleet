@@ -833,3 +833,11 @@ installing network settings leaves legacy deployment hashes unchanged. New shim
 actors use a separate Ray worker environment so updated adapter code loads
 without restarting Ray or existing detached apps. Stop/delete requires the shim
 to drain live streams before releasing the port and Ray reservation.
+
+### Shim management and ingress
+
+The explicit Docker shim executor can declare the reserved `control` service for node-local administration. It maps to the shim's control endpoint; the central connection gateway requires Fleet administrator permission to issue that service's access grant. Application ingress is an administrator-only `ingress` map in the existing app spec, keyed by a declared service name (excluding `control`), with exact `paths`, allowed `methods`, and optional `bearer_env`. The shim injects that container environment credential locally after verifying the execution grant. A normal service with no ingress rule still maps directly to the app's port.
+
+`port_base: 0` plus an explicit `container_port` asks the shim to reserve a host loopback port per allocation. `{port}` in shim command/environment templates denotes `container_port` when one is set; readiness and node reports use the actual host port returned by the shim. The reservation survives restart and is released only after confirmed cleanup. Runtime management/ingress requires `shim-management-v1`; automatic ports require `shim-automatic-port-v1`. Older nodes are ineligible. The bridge supervises a failed connector process without replacing the runtime. These capabilities require trusted-shim #5 and trusted-data-router #4.
+
+Installing this support does not select it for legacy apps. Proof-required policy/TEE execution and the OpenShell driver are still not accepted by this Docker lifecycle path; requesting unsupported trust modes fails validation.

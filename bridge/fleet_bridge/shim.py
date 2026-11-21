@@ -33,6 +33,10 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
+    if spec.app.ingress or "control" in spec.app.services:
+        return "shim-management-v1"
+    if spec.app.port_base == 0:
+        return "shim-automatic-port-v1"
     if spec.app.services:
         return "shim-network-v1"
     if spec.app.container_port is not None or spec.app.entrypoint is not None:
@@ -49,7 +53,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         if value.get("protocol") != 1 or "docker" not in value.get("drivers", []):
             return []
         modern = "data-plane-v1" in value.get("features", [])
-        return [CAPABILITY] + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else [])
+        management = "runtime-management-v1" in value.get("features", [])
+        return [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
 
@@ -146,8 +151,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     app = spec.app
     if spec.execution is None or app.port_base is None or not app.image:
         raise ValueError("shim needs a persisted execution, image and port_base")
-    port = app.port_base + spec.index
-    fill = {"port": port, "index": spec.index, "gpus": ",".join(str(i) for i in range(len(gpus)))}
+    port = app.port_base + spec.index if app.port_base else 0
+    fill = {"port": app.container_port or port, "index": spec.index, "gpus": ",".join(str(i) for i in range(len(gpus)))}
     volumes = []
     for volume in app.volumes:
         path, _, options = volume.partition(":")
@@ -162,10 +167,11 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         "policy": {"issuer": "fleet", "policy_id": "unproved-container-lifecycle", "version": 0, "sha256": ""},
         "trust": {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"},
         "services": [{"id": {"namespace": spec.execution.namespace, "workload": spec.execution.workload, "service": name},
-            "protocol": "http1", "endpoint_ref": "app"} for name in app.services],
+            "protocol": "http1", "endpoint_ref": "control" if name == "control" else f"ingress:{name}" if name in app.ingress else "app"} for name in app.services],
         "driver_options": {"port": port,
             **({"container_port": app.container_port} if app.container_port is not None else {}),
             **({"entrypoint": app.entrypoint} if app.entrypoint is not None else {}),
+            **({"ingress": app.ingress} if app.ingress else {}),
             "gpus": gpus, "volumes": volumes,
             "user": app.user, "workdir": app.workdir, "stop_timeout_s": app.stop_timeout_s,
             "shm_bytes": (app.shm_gb if app.shm_gb is not None else 16) * 2**30}}
@@ -176,12 +182,23 @@ class _ShimApp:
         self.spec = spec
         self.gpus = actors._granted_gpus() if spec.app.gpus else []
         request = launch_request(spec, self.gpus)
-        self.port = request["driver_options"]["port"]
-        self.health_url = f"http://127.0.0.1:{self.port}{spec.app.health_path}"
         status = self.call({"operation": "launch", "request": request})
         if status.get("state") != "ready":
             raise RuntimeError("shim execution is not running; explicit cleanup is required")
+        self.port = status.get("port") or request["driver_options"]["port"]
+        if not self.port:
+            raise RuntimeError("shim did not report its assigned service port")
+        self.health_url = f"http://127.0.0.1:{self.port}{spec.app.health_path}"
         self.network = None
+        self.start_network()
+        deadline = time.monotonic() + spec.app.ready_timeout_s
+        while not actors._http_ok(self.health_url):
+            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get("state") != "ready":
+                raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
+            time.sleep(2)
+
+    def start_network(self) -> None:
+        spec = self.spec
         if spec.app.services:
             # The Rust shim owns endpoints, grant verification, reconnect and
             # stream drain. Ray supervises only this local process.
@@ -190,17 +207,14 @@ class _ShimApp:
             self.network.stdin.write(json.dumps(to_dict({"operation": "network", "execution": spec.execution,
                 "config": spec.cluster.shim_network})).encode())
             self.network.stdin.close()
-        deadline = time.monotonic() + spec.app.ready_timeout_s
-        while not actors._http_ok(self.health_url):
-            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get("state") != "ready":
-                raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
-            time.sleep(2)
 
     def call(self, command: dict[str, Any]) -> dict[str, Any]:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command)
 
     def health(self) -> dict[str, Any]:
         status = self.call({"operation": "inspect", "execution": self.spec.execution})
+        if status.get("state") == "ready" and self.network is not None and self.network.poll() is not None:
+            self.start_network()
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),

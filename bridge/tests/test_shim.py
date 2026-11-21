@@ -156,3 +156,24 @@ def test_services_require_network_capability_and_are_bound_into_request(tmp_path
 def test_invalid_services_never_reach_an_executor(tmp_path,services):
     cfg=config(tmp_path);cfg["apps"][0]["services"]=services
     with pytest.raises(ValueError):reconcile.load_apps(cfg)
+
+
+def test_management_ingress_and_automatic_port_require_modern_shim(tmp_path):
+    raw=config(tmp_path)
+    raw['shim_network']={'gateway_url':'https://control.example','relay_url':'wss://relay.example',
+        'token_file':'/private/node.jwt','public_key_file':'/private/public.pem','issuer':'test'}
+    app=raw['apps'][0]
+    app.update(port_base=0,container_port=18789,services=['chat','control'],env={'TOKEN':'private'},
+        ingress={'chat':{'paths':['/v1/chat/completions'],'methods':['POST'],'bearer_env':'TOKEN'}})
+    parsed=reconcile.load_apps(raw)
+    replica=shim.RuntimeBook(tmp_path/'book').bind(reconcile.replica_specs(parsed)['web-0'],'launch')
+    request=shim.launch_request(replica,[])
+    assert request['driver_options']['port']==0
+    assert request['command']==['serve','18789']
+    assert [s['endpoint_ref'] for s in request['services']]==['ingress:chat','control']
+    assert shim.required_capability(replica)=='shim-management-v1'
+    app['ingress']['chat']['paths']=['/../exec']
+    with pytest.raises(ValueError):reconcile.load_apps(raw)
+    app['ingress']['chat']['paths']=['/v1/chat/completions']
+    app['ingress']['chat']['bearer_env']='MISSING'
+    with pytest.raises(ValueError):reconcile.load_apps(raw)
