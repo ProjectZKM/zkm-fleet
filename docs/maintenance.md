@@ -88,6 +88,16 @@ grants because Fleet no longer has a live observation, and is not covered by the
 node-upgrade continuity guarantee. Shim/Ray/Docker/host upgrades are separate
 operations and must not be bundled into this restart.
 
+ClawUp's Fleet adapter requires shim's authenticated `GET /logs?tail=N`
+management endpoint. The release bundle includes that implementation. Installing
+an updated node package only stages its shim binary; it does not switch an
+already running shim. For an older shim, schedule a separate maintenance window:
+drain the node, finish/stop affected workloads and confirm their cleanup; stop
+`zkm-fleet-shim.service`, update `shim_binary` in the existing `apps.yaml` to the
+staged executable, then start the service and run `fleet_bridge.shim check` before
+resuming workloads. Preserve `shim_state_dir` and its allocation/replay journals.
+Do not turn a routine node upgrade into an implicit runtime migration.
+
 Run the real systemd acceptance against local, isolated services (no local prover):
 
 ```sh
