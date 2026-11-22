@@ -322,7 +322,6 @@ def test_management_ingress_and_automatic_port_require_modern_shim(tmp_path):
 def test_native_companion_settings_use_existing_config_and_cannot_change_during_node_upgrade(tmp_path, monkeypatch):
     import hashlib
     import json
-    from fleet_bridge.model import to_dict
     path = tmp_path / "apps.yaml"
     raw = config(tmp_path)
     raw["shim_daemon"] = True
@@ -332,7 +331,8 @@ def test_native_companion_settings_use_existing_config_and_cannot_change_during_
     parsed = shim.daemon_config(path)
     options = shim.daemon_options(parsed)
     assert options["openshell"]["ledger_ca_file"] is None
-    expected = hashlib.sha256(json.dumps(to_dict(parsed.shim_openshell),sort_keys=True,separators=(",", ":"),ensure_ascii=False).encode()).hexdigest()
+    assert "supervisor_image" not in options["openshell"]
+    expected = hashlib.sha256(json.dumps(options["openshell"],sort_keys=True,separators=(",", ":"),ensure_ascii=False).encode()).hexdigest()
     active = {"protocol":1,"features":["runtime-daemon-v1","openshell-provisioning-v1"],"openshell_config_sha256":expected}
     monkeypatch.setattr(shim, "daemon_call", lambda *a, **kw: active)
     shim.check_daemon(parsed)
@@ -341,11 +341,16 @@ def test_native_companion_settings_use_existing_config_and_cannot_change_during_
         with pytest.raises(RuntimeError, match="settings differ"):
             shim.check_daemon(parsed)
     active["openshell_config_sha256"] = expected
+    enabled = replace(parsed, shim_openshell=replace(parsed.shim_openshell, supervisor_image="sha256:" + "a" * 64))
+    assert shim.daemon_options(enabled)["openshell"]["supervisor_image"] == "sha256:" + "a" * 64
+    with pytest.raises(RuntimeError, match="settings differ"):
+        shim.check_daemon(enabled)
     with pytest.raises(RuntimeError, match="settings differ"):
         shim.check_daemon(replace(parsed,shim_openshell=None))
     for field, value in [("socket","relative.sock"),("ledger_endpoint","http://remote.example"),
             ("ledger_endpoint","https://secret@fleet.example"),("ledger_endpoint","https://fleet.example/path"),
-            ("ledger_ca_file","relative.pem"),("ledger_token","must-not-be-configured")]:
+            ("ledger_ca_file","relative.pem"),("ledger_token","must-not-be-configured"),
+            ("supervisor_image","supervisor:latest")]:
         invalid = copy.deepcopy(raw); invalid["shim_openshell"][field] = value
         path.write_text(yaml.safe_dump(invalid))
         with pytest.raises(ValueError): shim.daemon_config(path)
@@ -354,7 +359,8 @@ def test_native_companion_settings_use_existing_config_and_cannot_change_during_
     with pytest.raises(ValueError,match="persistent shim daemon"): shim.daemon_config(path)
 
 
-def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path):
+@pytest.mark.parametrize("supervisor_image", [None, "sha256:" + "a" * 64])
+def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path, supervisor_image):
     import os
     import subprocess
     import sys
@@ -369,6 +375,8 @@ def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path)
         raw = {"shim_binary":binary,"shim_state_dir":str(Path(root)/"state"),"shim_daemon":True,
             "shim_openshell":{"socket":str(Path(root)/"driver.sock"),"admission_policy":"approved",
                 "ledger_endpoint":"https://fleet.example"},"apps":["invalid app deliberately ignored by daemon bootstrap"]}
+        if supervisor_image is not None:
+            raw["shim_openshell"]["supervisor_image"] = supervisor_image
         path.write_text(yaml.safe_dump(raw))
         parsed = shim.daemon_config(path)
         process = subprocess.Popen([sys.executable,"-m","fleet_bridge.shim","serve","--apps",str(path)],
@@ -377,6 +385,7 @@ def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path)
             shim.check_daemon(parsed,wait_seconds=10)
             value = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
             assert value["drivers"] == ["docker","openshell"]
+            assert ("openshell-local-services-v1" in value["features"]) == (supervisor_image is not None)
             assert value["pid"] == process.pid
             changed = replace(parsed,shim_openshell=replace(parsed.shim_openshell,ledger_endpoint="https://other.example"))
             with pytest.raises(RuntimeError, match="settings differ"):shim.check_daemon(changed)
@@ -438,7 +447,7 @@ def test_native_profile_rejects_unmapped_settings(tmp_path,key,value):
 
 def test_native_capability_requires_matching_configuration_and_allocation_protocol(tmp_path,monkeypatch):
     config=reconcile.load_apps(native_config(tmp_path)).cluster
-    digest=shim.hashlib.sha256(shim.json.dumps(shim.to_dict(config.shim_openshell),sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(config)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
         "features":["openshell-provisioning-v1"]}
     monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)

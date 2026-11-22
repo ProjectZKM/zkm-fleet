@@ -339,13 +339,19 @@ def daemon_config(path: Path) -> ControlPlaneConfig:
 
 
 def daemon_options(config: ControlPlaneConfig) -> dict[str, Any]:
-    return {"openshell": to_dict(config.shim_openshell)} if config.shim_openshell is not None else {}
+    if config.shim_openshell is None:
+        return {}
+    native = to_dict(config.shim_openshell)
+    # Preserve the running provisioning-only companion's configuration digest.
+    if native["supervisor_image"] is None:
+        del native["supervisor_image"]
+    return {"openshell": native}
 
 
 def check_openshell(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
     expected = None
     if config.shim_openshell is not None:
-        encoded = json.dumps(to_dict(config.shim_openshell), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        encoded = json.dumps(daemon_options(config)["openshell"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
         expected = hashlib.sha256(encoded).hexdigest()
         if "openshell-provisioning-v1" not in value.get("features", []):
             raise RuntimeError("running shim does not support native OpenShell provisioning")

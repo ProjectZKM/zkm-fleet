@@ -474,6 +474,8 @@ shim_openshell:
   ledger_endpoint: https://fleet.example
   # Optional private CA; absolute, regular, not group/world writable.
   ledger_ca_file: /etc/zkm-fleet/ca.pem
+  # Optional local service adapter: exact local ID of the composed supervisor.
+  # supervisor_image: sha256:<64 lowercase hex characters>
 ```
 
 These are operator settings, not allocation credentials. The native driver remains
@@ -485,7 +487,7 @@ Docker apps and their persisted execution selection remain unchanged.
 
 The daemon's private `provision` operation accepts exact native gateway bytes and
 a proof-backed grant, consumes the grant centrally before Create, and keeps only
-ownership/digests on disk. Native inspection/cleanup survives gateway outages and
+ownership/digests and admitted public service metadata on disk. Native inspection/cleanup survives gateway outages and
 expired credentials. An explicit `runtime: {executor: shim, driver: openshell}`
 App now reserves Ray resources and a durable shim allocation before provisioning.
 This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
@@ -494,6 +496,22 @@ workdir, user overrides and GPU mappings are not supported by this profile yet.
 Only a companion advertising `openshell-allocation-v1` exposes its placement
 capability. Native reservations remain `ready: false` with no services; a complete
 reservation set holds quota without repeatedly scheduling another start.
+
+The private shim adapter additionally supports proof-bound HTTP service declarations
+and `network` commands with `driver: openshell`. Fleet checks their service IDs,
+container port and health path against the admitted manifest; the daemon stores
+those targets and the native bundle's public SSH fingerprint. Later network
+commands cannot change them. The operator's immutable `supervisor_image` enables
+`openshell-local-services-v1`, which is deliberately not a placement/publication
+capability. Existing Docker network records remain compatible.
+
+Local health gates registration and unhealthy applications lose active streams.
+The daemon retries health recovery, restores connectors after a companion restart,
+and drains them before acknowledging runtime deletion. Production native App
+service selection/publication remains disabled until Fleet joins authenticated
+gateway configuration readiness: the native supervisor health socket only reports
+session acceptance, which precedes asynchronous policy activation. A node report
+claiming `ready: true` alone cannot publish a native service in Fleet resources.
 
 The scheduler embeds the stock OpenShell compute extension. Enable it in the
 existing scheduler configuration, under `policy_gateway` alongside its approved
@@ -632,7 +650,13 @@ wrong supervisor images and wrong SSH host keys are rejected. Revocation and
 local cancellation close active streams. Application bytes continue locally with
 the central OpenShell gateway offline, within the test's route lease. Test-issued
 route grants do not replace production Fleet control-snapshot freshness; automatic
-native service publication and app health integration remain migration gates.
+native service publication remains a migration gate. A second route exercises the
+persistent daemon against the same real workload: unhealthy startup and central
+denial prevent registration, health loss drains an active SSE stream, recovery
+needs no Ray/client restart, companion restart restores the exact allocation
+without another proof/Create, and deletion drains streams and removes connector
+records. The durable record retains the public host fingerprint and excludes
+native credentials/environment.
 The workload has no published host ports and retains `network=none`.
 It keeps node observations flowing until both native
 creation and gateway readiness complete: the stock driver can acknowledge Create

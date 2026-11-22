@@ -1,4 +1,4 @@
-//! Opt-in stock gateway + stock Docker driver acceptance. Only proofs are doubled.
+//! Opt-in stock gateway/driver acceptance. Proof and route-grant authorities are fixtures.
 use super::*;
 use std::{path::Path, process::Command};
 
@@ -99,6 +99,9 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         policy_setup_with_inventory("openshell", |report| {
             report.apps[0]["image"] = json!(image);
             report.apps[0]["command"] = json!(command);
+            report.apps[0]["services"] = json!(["native-http"]);
+            report.apps[0]["container_port"] = json!(8090);
+            report.apps[0]["health_path"] = json!("/health");
         })
         .await;
     // Retain private diagnostics outside the repository, including on failure.
@@ -145,26 +148,35 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     let mut native = driver(&root, &native_socket, api_port, &scope).await;
     let state = root.join("shim");
     let shim_socket = state.join("control.sock");
-    let stop = tokio_util::sync::CancellationToken::new();
-    let shutdown = stop.clone();
-    let ledger_endpoint = address.clone();
-    let daemon = tokio::spawn(async move {
-        trusted_shim::daemon::serve_configured(
-            &state,
-            "machine".into(),
-            trusted_shim::daemon::DaemonConfig {
-                openshell: Some(trusted_shim::openshell_daemon::OpenShellConfig {
-                    socket: native_socket,
-                    admission_policy: admission(),
-                    ledger_endpoint,
-                    ledger_ca_file: None,
-                }),
-            },
-            shutdown,
-        )
-        .await
-        .unwrap()
-    });
+    let start_daemon = || {
+        let state = state.clone();
+        let socket = native_socket.clone();
+        let ledger_endpoint = address.clone();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let shutdown = stop.clone();
+        let daemon = tokio::spawn(async move {
+            trusted_shim::daemon::serve_configured(
+                &state,
+                "machine".into(),
+                trusted_shim::daemon::DaemonConfig {
+                    openshell: Some(trusted_shim::openshell_daemon::OpenShellConfig {
+                        socket,
+                        admission_policy: admission(),
+                        ledger_endpoint,
+                        ledger_ca_file: None,
+                        supervisor_image: Some(
+                            std::env::var("OPENSHELL_TEST_SUPERVISOR_IMAGE").unwrap(),
+                        ),
+                    }),
+                },
+                shutdown,
+            )
+            .await
+            .unwrap()
+        });
+        (stop, daemon)
+    };
+    let (mut stop, mut daemon) = start_daemon();
     socket_ready(&shim_socket).await;
     shim_call(
         &shim_socket,
@@ -175,6 +187,11 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     launch.policy = policy.policy.clone();
     launch.image = image;
     launch.command = command;
+    launch.services = serde_json::from_value(json!([{
+        "id":{"namespace":request.execution.namespace,"workload":request.execution.workload,"service":"native-http"},
+        "protocol":"http1","endpoint_ref":"app"
+    }])).unwrap();
+    launch.driver_options = json!({"container_port":8090,"health_path":"/health"});
     let native_policy = SandboxPolicy {
         version: 1,
         process: Some(protocol::sandbox::v1::ProcessPolicy {
@@ -248,7 +265,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     .unwrap();
     let node = node_delivery::DeliveryClient {
         http: reqwest::Client::new(),
-        scheduler: address,
+        scheduler: address.clone(),
         secret: "cluster".into(),
         worker: "gpu".into(),
         session: "session".into(),
@@ -418,6 +435,85 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         "Bearer application-owned-key"
     );
     routed.websocket().await;
+    let managed_root = root.join("managed-router");
+    std::fs::create_dir(&managed_root).unwrap();
+    let managed = route::Route::managed(&managed_root, &request.execution).await;
+    let network_command = json!({"operation":"network","driver":"openshell",
+        "execution":request.execution,"config":managed.config});
+    // Persisted service map supplies the only target. A grant response cannot
+    // select a port, native sandbox, supervisor image or SSH identity.
+    http_client
+        .get(format!("http://{}/health/unready", service.address()))
+        .send()
+        .await
+        .unwrap();
+    shim_call(&shim_socket, network_command.clone()).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!managed.ready().await);
+    assert_eq!(managed.registrations.load(Ordering::SeqCst), 0);
+    http_client
+        .get(format!("http://{}/health/ready", service.address()))
+        .send()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!managed.ready().await); // health alone cannot obtain central approval
+    managed.control_ready.store(true, Ordering::SeqCst);
+    managed.wait_ready().await;
+    assert_eq!(
+        managed
+            .get("echo")
+            .bearer_auth("managed-app-key")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "Bearer managed-app-key"
+    );
+    managed.websocket().await;
+    let mut health_stream = managed.get("events").send().await.unwrap();
+    assert!(health_stream.chunk().await.unwrap().is_some());
+    managed.get("health/unready").send().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while let Ok(Some(_)) = health_stream.chunk().await {}
+        while managed.ready().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("application health loss drains managed streams");
+    assert_eq!(scope.ids("container"), containers);
+    http_client
+        .get(format!("http://{}/health/ready", service.address()))
+        .send()
+        .await
+        .unwrap();
+    // Health recovery is owned by the daemon; no Ray/client restart is needed.
+    managed.wait_ready().await;
+    // Only the shim companion restarts. Neither proof, launch credentials nor
+    // another native Create are needed to recover its stored service binding.
+    stop.cancel();
+    daemon.await.unwrap();
+    (stop, daemon) = start_daemon();
+    socket_ready(&shim_socket).await;
+    managed.wait_ready().await;
+    assert_eq!(scope.ids("container"), containers);
+    assert_eq!(network.submitted.load(Ordering::SeqCst), 1);
+    let mut stored = std::fs::read(state.join("openshell.sqlite")).unwrap();
+    stored.extend(std::fs::read(state.join("openshell.sqlite-wal")).unwrap_or_default());
+    let record = String::from_utf8_lossy(&stored);
+    assert!(record.contains(&host_key));
+    for secret in [
+        "PRIVATE KEY",
+        "launch_authentication",
+        "sandbox_token",
+        "ledger_token",
+        "environment",
+    ] {
+        assert!(!record.contains(secret));
+    }
     // A still-connected supervisor must not preserve gateway readiness after
     // Fleet loses the owning node session.
     c.end_session("gpu", "session");
@@ -506,12 +602,25 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         .await
         .unwrap();
     assert!(stream.chunk().await.unwrap().is_some());
+    let mut managed_stream = managed.get("events").send().await.unwrap();
+    assert!(managed_stream.chunk().await.unwrap().is_some());
     shim_call(
         &shim_socket,
         json!({"operation":"delete","execution":request.execution,"driver":"openshell"}),
     )
     .await;
     assert!(scope.ids("container").is_empty());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Ok(Some(_)) = managed_stream.chunk().await {}
+    })
+    .await
+    .expect("cleanup drains persistent native connector before acknowledgment");
+    assert!(!managed.ready().await);
+    assert!(!state.join("networks").read_dir().unwrap().any(|e| e
+        .unwrap()
+        .path()
+        .extension()
+        .is_some_and(|s| s == "json")));
     tokio::time::timeout(Duration::from_secs(3), async {
         while !service.is_finished() {
             tokio::time::sleep(Duration::from_millis(20)).await;

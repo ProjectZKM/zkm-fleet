@@ -478,6 +478,7 @@ class ShimOpenShellConfig(Record):
     admission_policy: str
     ledger_endpoint: str
     ledger_ca_file: str | None = None
+    supervisor_image: str | None = None
 
     def __post_init__(self) -> None:
         from urllib.parse import urlsplit
@@ -490,6 +491,8 @@ class ShimOpenShellConfig(Record):
             raise ModelError("OpenShell needs an absolute private driver socket and admission acknowledgement")
         if self.ledger_ca_file is not None and (url.scheme != "https" or not os.path.isabs(self.ledger_ca_file) or "\x00" in self.ledger_ca_file):
             raise ModelError("OpenShell private CA requires HTTPS and an absolute certificate path")
+        if self.supervisor_image is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", self.supervisor_image):
+            raise ModelError("OpenShell supervisor requires an immutable local Docker image ID")
 
 
 @dataclass(kw_only=True)

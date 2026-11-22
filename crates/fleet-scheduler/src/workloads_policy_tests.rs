@@ -808,6 +808,45 @@ fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::Prov
     )
     .unwrap()
 }
+
+#[tokio::test]
+async fn native_service_admission_binds_manifest_and_local_readiness_cannot_publish_routes() {
+    let (_dir, c, mut report, _, r) = policy_setup_with_inventory("openshell", |report| {
+        report.apps[0]["services"] = json!(["http"]);
+        report.apps[0]["container_port"] = json!(8090);
+        report.apps[0]["health_path"] = json!("/health");
+    })
+    .await;
+    let mut launch = provisioning(&r).request;
+    launch.services = serde_json::from_value(json!([{
+        "id":{"namespace":r.execution.namespace,"workload":r.execution.workload,"service":"http"},
+        "protocol":"http1","endpoint_ref":"app"
+    }]))
+    .unwrap();
+    launch.driver_options = json!({"container_port":8090,"health_path":"/health"});
+    c.with_runtime_delivery(&r.execution, None, Some(&launch), |_| Ok(()))
+        .unwrap();
+    for field in 0..4 {
+        let mut changed = launch.clone();
+        match field {
+            0 => changed.driver_options["container_port"] = json!(8091),
+            1 => changed.driver_options["health_path"] = json!("/other"),
+            2 => changed.services[0].id.service = "undeclared".into(),
+            _ => changed.services[0].id.namespace = "another-tenant".into(),
+        }
+        assert!(c
+            .with_runtime_delivery(&r.execution, None, Some(&changed), |_| Ok(()))
+            .is_err());
+    }
+    report.apps[0]["ready"] = json!(true);
+    report.runtime_instances[0].ready = true;
+    report.runtime_instances[0].services = vec!["http".into()];
+    c.report("gpu", "session", report).await.unwrap();
+    assert_eq!(
+        c.app_resources(&r.execution.namespace, "model", None)["runtime_instances"],
+        json!([])
+    );
+}
 async fn delivery_node(
     c: &Arc<WorkloadController>,
     ticket: &str,

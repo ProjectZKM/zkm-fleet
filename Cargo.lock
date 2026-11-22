@@ -4972,6 +4972,7 @@ dependencies = [
  "base64 0.22.1",
  "glob",
  "ipnet",
+ "jsonwebtoken 10.4.0",
  "libc",
  "miette",
  "nix 0.29.0",
@@ -4996,6 +4997,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -9027,7 +9029,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-shim?rev=433ba17fe6d1d95898e5ccdbdf17e26001706ba1#433ba17fe6d1d95898e5ccdbdf17e26001706ba1"
+source = "git+https://github.com/BotMesh/trusted-shim?rev=60cadf70228128440244bf798fb0d3c2be6dc716#60cadf70228128440244bf798fb0d3c2be6dc716"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",

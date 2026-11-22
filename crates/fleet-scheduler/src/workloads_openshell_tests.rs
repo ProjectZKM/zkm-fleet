@@ -321,6 +321,7 @@ async fn startup(forged: bool, stock: bool) {
                     admission_policy: admission(),
                     ledger_endpoint,
                     ledger_ca_file: None,
+                    supervisor_image: None,
                 }),
             },
             stop2,

@@ -36,7 +36,7 @@ fs2 = "0.4"
 prost-native = { package = "prost", version = "0.14" }
 tonic-native = { package = "tonic", version = "0.14", features = ["transport"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "433ba17fe6d1d95898e5ccdbdf17e26001706ba1", features = ["ziren", "openshell"] }
+trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "60cadf70228128440244bf798fb0d3c2be6dc716", features = ["ziren", "openshell"] }
 
 [dev-dependencies]
 tonic-native = { package = "tonic", version = "0.14", features = ["tls-ring"] }

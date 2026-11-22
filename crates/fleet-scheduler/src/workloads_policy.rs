@@ -202,12 +202,29 @@ impl WorkloadController {
                     != spec["memory_gb"]
                         .as_f64()
                         .map(|n| (n * (1u64 << 30) as f64).round() as u64)
-                || !r.services.is_empty()
-                || !r.driver_options.is_null()
                 || r.trust.attestation
                     != trusted_shim::attestation::AttestationRequirement::SkipNonTee
                 || r.trust.attestation_proof != trusted_shim::proof::ProofRequirement::NotRequired
                 || r.trust.policy_proof != trusted_shim::proof::ProofRequirement::NotRequired
+            {
+                return Err(Error::Rejected);
+            }
+            let options = trusted_shim::openshell_services::ServiceOptions::from_request(r)
+                .map_err(|_| Error::Rejected)?;
+            let names: Vec<_> = r.services.iter().map(|s| s.id.service.as_str()).collect();
+            if serde_json::json!(names)
+                != spec
+                    .get("services")
+                    .cloned()
+                    .unwrap_or(serde_json::json!([]))
+                || options.as_ref().is_some_and(|o| {
+                    spec["container_port"] != o.container_port
+                        || spec
+                            .get("health_path")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("/")
+                            != o.health_path
+                })
             {
                 return Err(Error::Rejected);
             }

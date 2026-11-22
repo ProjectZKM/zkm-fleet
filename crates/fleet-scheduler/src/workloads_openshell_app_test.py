@@ -7,12 +7,21 @@ import time
 
 class Application(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    healthy = True
 
     def log_message(self, *_):
         pass
 
     def do_GET(self):
-        if self.path == "/ws":
+        if self.path.startswith("/health"):
+            if self.path == "/health/unready":
+                Application.healthy = False
+            elif self.path == "/health/ready":
+                Application.healthy = True
+            self.send_response(200 if Application.healthy else 503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/ws":
             # Minimal test peer: only short, final, masked client frames. This
             # exercises real WS upgrades/binary bytes, not a production server.
             key = self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"

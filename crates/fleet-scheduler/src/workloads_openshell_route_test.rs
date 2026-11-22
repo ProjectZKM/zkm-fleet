@@ -1,6 +1,15 @@
 //! Real local relay/connector fixture. Only route grants are issued by the test;
 //! production publication remains gated on app readiness and Fleet control sync.
-use std::{net::SocketAddr, path::Path, process::Command, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::Path,
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use trusted_router_transport::{
     edge,
@@ -17,15 +26,28 @@ pub(super) struct Route {
     client: reqwest::Client,
     connector: tokio::task::JoinHandle<()>,
     relay: tokio::task::JoinHandle<()>,
+    registration: tokio::task::JoinHandle<()>,
+    pub(super) config: trusted_shim::data_plane::NetworkConfig,
+    pub(super) control_ready: Arc<AtomicBool>,
+    pub(super) registrations: Arc<AtomicUsize>,
 }
 impl Drop for Route {
     fn drop(&mut self) {
         self.connector.abort();
         self.relay.abort();
+        self.registration.abort();
     }
 }
 impl Route {
     pub(super) async fn start(root: &Path, execution: &ExecutionIdentity, app: SocketAddr) -> Self {
+        Self::prepare(root, execution, Some(app)).await
+    }
+
+    pub(super) async fn managed(root: &Path, execution: &ExecutionIdentity) -> Self {
+        Self::prepare(root, execution, None).await
+    }
+
+    async fn prepare(root: &Path, execution: &ExecutionIdentity, app: Option<SocketAddr>) -> Self {
         let private = root.join("router-key.pem");
         let public = root.join("router-public.pem");
         for args in [
@@ -52,9 +74,11 @@ impl Route {
                 .status
                 .success());
         }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o644)).unwrap();
         let key = std::fs::read(private).unwrap();
         let relay = Relay::new(
-            Verifier::new(&std::fs::read(public).unwrap(), "native-test".into()).unwrap(),
+            Verifier::new(&std::fs::read(&public).unwrap(), "native-test".into()).unwrap(),
             &root.join("router.sqlite"),
         )
         .unwrap();
@@ -68,7 +92,7 @@ impl Route {
             aud: AUDIENCE.into(),
             sub: execution.node_id.clone(),
             nbf: grants::now(),
-            exp: grants::now() + 120,
+            exp: grants::now() + 600,
             purpose: Purpose::Register,
             http_request: None,
             access: None,
@@ -89,10 +113,50 @@ impl Route {
         let token = grants::sign(&key, &grant).unwrap();
         let url = format!("ws://{address}/v1/connect/{route}");
         let connector = tokio::spawn(async move {
-            edge::connect(&url, &token, app, CancellationToken::new())
-                .await
-                .unwrap();
+            if let Some(app) = app {
+                edge::connect(&url, &token, app, CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
         });
+        // Only this acceptance fixture grants registration. Production Fleet
+        // must join authenticated native policy readiness before issuing it.
+        let control_ready = Arc::new(AtomicBool::new(app.is_some()));
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let approved = control_ready.clone();
+        let accepted = registrations.clone();
+        let registration_grant = grant.clone();
+        let registration_key = key.clone();
+        let router = axum::Router::new().route("/v1/runtime/registration", axum::routing::post(
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let approved = approved.clone(); let accepted = accepted.clone();
+                let grant = registration_grant.clone(); let key = registration_key.clone();
+                async move {
+                    if !approved.load(Ordering::SeqCst)
+                        || headers.get("authorization").and_then(|s|s.to_str().ok()) != Some("Bearer fixture-enrollment")
+                        || body["execution"] != serde_json::json!(grant.execution)
+                        || body["service"] != serde_json::json!({"id":grant.service,"protocol":"http1","endpoint_ref":"app"}) {
+                        return Err(axum::http::StatusCode::FORBIDDEN);
+                    }
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    Ok(axum::Json(serde_json::json!({"token":grants::sign(&key, &grant).unwrap()})))
+                }
+            }));
+        let registration_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registration_address = registration_listener.local_addr().unwrap();
+        let registration = tokio::spawn(async move {
+            axum::serve(registration_listener, router).await.unwrap();
+        });
+        let token_file = root.join("router-enrollment");
+        std::fs::write(&token_file, "fixture-enrollment").unwrap();
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config = trusted_shim::data_plane::NetworkConfig {
+            gateway_url: format!("http://{registration_address}"),
+            relay_url: format!("ws://{address}"),
+            token_file,
+            public_key_file: public,
+            issuer: "native-test".into(),
+        };
         let access = grants::sign(
             &key,
             &Grant {
@@ -115,24 +179,26 @@ impl Route {
             .build()
             .unwrap();
         let base = format!("http://{address}");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if client
-                    .get(format!("{base}/v1/ready/{route}"))
-                    .bearer_auth(&access)
-                    .send()
-                    .await
-                    .unwrap()
-                    .status()
-                    == 204
-                {
-                    break;
+        if app.is_some() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if client
+                        .get(format!("{base}/v1/ready/{route}"))
+                        .bearer_auth(&access)
+                        .send()
+                        .await
+                        .unwrap()
+                        .status()
+                        == 204
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("outbound connector readiness");
+            })
+            .await
+            .expect("outbound connector readiness");
+        }
         let mut other = Grant {
             purpose: Purpose::Access,
             ..grant
@@ -154,7 +220,31 @@ impl Route {
             client,
             connector,
             relay,
+            registration,
+            config,
+            control_ready,
+            registrations,
         }
+    }
+
+    pub(super) async fn ready(&self) -> bool {
+        self.client
+            .get(format!("{}/v1/ready/{}", self.base, self.route))
+            .bearer_auth(&self.access)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            == 204
+    }
+    pub(super) async fn wait_ready(&self) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !self.ready().await {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("managed outbound connector readiness");
     }
 
     pub(super) fn get(&self, path: &str) -> reqwest::RequestBuilder {
