@@ -126,6 +126,13 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let dispatcher = tokio::spawn(fleet.clone().dispatch_loop());
     let policy = workloads.policy.clone();
     let compute_controller = workloads.clone();
+    let readiness_controller = workloads.clone();
+    let readiness_observer = cfg.policy_gateway.as_ref().and_then(|p| p.openshell.as_ref())
+        .and_then(|o| o.gateway.as_ref()).map(openshell::Observer::new).transpose()?;
+    let readiness_loop = async move {
+        if let Some(observer) = readiness_observer { observer.run(readiness_controller).await; }
+        std::future::pending::<()>().await;
+    };
     let compute_socket = cfg.policy_gateway.as_ref().and_then(|p| p.openshell.as_ref()).map(|o| o.compute_socket.clone());
     let compute_loop = async move {
         if let Some(path) = compute_socket { return openshell::serve(compute_controller,path).await; }
@@ -156,6 +163,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = dispatcher => r?,
         r = dispatch_loop => r??,
         _ = receipt_loop => anyhow::bail!("policy receipt worker stopped"),
+        _ = readiness_loop => anyhow::bail!("OpenShell readiness observer stopped"),
         r = compute_loop => { r?; anyhow::bail!("OpenShell compute extension stopped"); },
     }
     Ok(())

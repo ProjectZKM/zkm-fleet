@@ -30,7 +30,9 @@ impl<'a> Entry<'a> {
         match self.0.get("runtime") {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,
-            Some(v) if v == &json!({"executor":"shim", "driver":"openshell"}) => Some("shim-openshell-provisioning-v1"),
+            Some(v) if v == &json!({"executor":"shim", "driver":"openshell"}) => Some(
+                if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" }
+                else { "shim-openshell-provisioning-v1" }),
             Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
                 if self.0["service_protocol"] == "tcp" { "shim-tcp-v1" }
                 else if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
@@ -204,7 +206,7 @@ impl NodeReport {
     /// Native provisioning holds resources before there is an application route.
     /// Only a complete set of exact, durable replica reservations counts here.
     pub fn native_allocated(&self, entry: Entry<'_>) -> bool {
-        if entry.runtime_capability() != Some("shim-openshell-provisioning-v1") || entry.disabled() {
+        if !matches!(entry.runtime_capability(), Some("shim-openshell-provisioning-v1" | "shim-openshell-services-v1")) || entry.disabled() {
             return false;
         }
         let instances: Vec<_> = self.runtime_instances.iter().filter(|r| r.entry_name == entry.name()).collect();
@@ -212,7 +214,7 @@ impl NodeReport {
             instances.iter().any(|r| r.execution.allocation_id == format!("{}-{index}", entry.name())
                 && r.execution.node_id == self.machine && r.execution.workload == entry.app()
                 && (r.execution.namespace == entry.namespace() || Some(r.execution.namespace.as_str()) == entry.namespace_reference())
-                && r.execution.generation > 0 && !r.ready && r.services.is_empty()))
+                && r.execution.generation > 0 && (r.ready || r.services.is_empty())))
     }
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         entry.runtime_capability().is_none_or(|cap| self.runtime_capabilities.iter().any(|v| v == cap))

@@ -144,6 +144,13 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     let api_port = gateway::port();
     let (mut gateway_process, mut gateway) =
         gateway::start_at(&root, &compute_socket, api_port).await;
+    let gateway_config = crate::config::OpenShellGatewayConfig {
+        endpoint: format!("https://127.0.0.1:{api_port}"),
+        ca_file: root.join("ca.pem"),
+        cert_file: root.join("client.pem"),
+        key_file: root.join("client.key"),
+    };
+    let observer = crate::openshell::Observer::new(&gateway_config).unwrap();
     let native_socket = root.join("native.sock");
     let mut native = driver(&root, &native_socket, api_port, &scope).await;
     let state = root.join("shim");
@@ -349,6 +356,55 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         .unwrap();
     assert_eq!(network.submitted.load(Ordering::SeqCst), 1);
     assert!(!report.runtime_instances[0].ready && report.runtime_instances[0].services.is_empty());
+    // Local health alone cannot publish a route. Production mTLS observation
+    // must independently join the active policy and exact physical instance.
+    report.apps[0]["ready"] = json!(true);
+    report.runtime_instances[0].ready = true;
+    report.runtime_instances[0].services = vec!["native-http".into()];
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let published = || {
+        c.app_resources(&request.execution.namespace, "model", None)["runtime_instances"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(published(), 0);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            observer.refresh(&c).await;
+            if published() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("authenticated gateway admission must publish the healthy native instance");
+    let unrelated = rcgen::generate_simple_self_signed(vec!["unrelated".into()]).unwrap();
+    let untrusted_ca = root.join("untrusted-ca.pem");
+    std::fs::write(&untrusted_ca, unrelated.cert.pem()).unwrap();
+    std::fs::set_permissions(&untrusted_ca, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let untrusted = crate::openshell::Observer::new(&crate::config::OpenShellGatewayConfig {
+        ca_file: untrusted_ca,
+        ..gateway_config.clone()
+    })
+    .unwrap();
+    untrusted.refresh(&c).await;
+    assert_eq!(
+        published(),
+        0,
+        "untrusted gateway cannot retain previously cached readiness"
+    );
+    observer.refresh(&c).await;
+    assert_eq!(published(), 1);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        published(),
+        0,
+        "readiness cache expires even if the observer stops"
+    );
+    observer.refresh(&c).await;
+    assert_eq!(published(), 1);
     let containers = scope.ids("container");
     let output = Command::new("docker")
         .arg("inspect")
@@ -437,7 +493,39 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     routed.websocket().await;
     let managed_root = root.join("managed-router");
     std::fs::create_dir(&managed_root).unwrap();
-    let managed = route::Route::managed(&managed_root, &request.execution).await;
+    let managed = route::Route::managed(&managed_root, &request.execution, c.clone()).await;
+    let heartbeat = {
+        let c = c.clone();
+        let mut report = report.clone();
+        let socket = shim_socket.clone();
+        let execution = request.execution.clone();
+        tokio::spawn(async move {
+            loop {
+                let status = try_shim_call(
+                    &socket,
+                    json!({"operation":"inspect","execution":execution,"driver":"openshell"}),
+                )
+                .await;
+                if let Ok(status) = status {
+                    let ready = status["application_ready"] == true;
+                    report.apps[0]["ready"] = json!(ready);
+                    report.runtime_instances[0].ready = ready;
+                    report.runtime_instances[0].services = if ready {
+                        vec!["native-http".into()]
+                    } else {
+                        vec![]
+                    };
+                    report.runtime_instances[0].native_observation_base64 = status
+                        ["native_observation_base64"]
+                        .as_str()
+                        .map(str::to_owned);
+                    c.report("gpu", "session", report.clone()).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    let observation = tokio::spawn(observer.clone().run(c.clone()));
     let network_command = json!({"operation":"network","driver":"openshell",
         "execution":request.execution,"config":managed.config});
     // Persisted service map supplies the only target. A grant response cannot
@@ -451,6 +539,14 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(!managed.ready().await);
     assert_eq!(managed.registrations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        shim_call(
+            &shim_socket,
+            json!({"operation":"inspect","execution":request.execution,"driver":"openshell"})
+        )
+        .await["application_ready"],
+        false
+    );
     http_client
         .get(format!("http://{}/health/ready", service.address()))
         .send()
@@ -458,6 +554,14 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(!managed.ready().await); // health alone cannot obtain central approval
+    assert_eq!(
+        shim_call(
+            &shim_socket,
+            json!({"operation":"inspect","execution":request.execution,"driver":"openshell"})
+        )
+        .await["application_ready"],
+        true
+    );
     managed.control_ready.store(true, Ordering::SeqCst);
     managed.wait_ready().await;
     assert_eq!(
@@ -516,7 +620,14 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     }
     // A still-connected supervisor must not preserve gateway readiness after
     // Fleet loses the owning node session.
+    heartbeat.abort();
+    let _ = heartbeat.await;
     c.end_session("gpu", "session");
+    assert_eq!(
+        published(),
+        0,
+        "session loss immediately fences publication"
+    );
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let status = gateway
@@ -541,6 +652,9 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     .expect("lost Fleet owner must revoke joined readiness");
     // Cleanup must not require the gateway or central ledger to be available.
     gateway_process.kill().await.unwrap();
+    observer.refresh(&c).await;
+    assert_eq!(published(), 0);
+    observation.abort();
     compute.abort();
     http.abort();
     // Business bytes still use local supervisor -> native boundary, with the

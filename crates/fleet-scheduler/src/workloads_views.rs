@@ -97,14 +97,12 @@ impl WorkloadController {
             let observed = worker.and_then(|w| w.report.entry(intent.entry().name()));
             if !intent.disabled && intent.scale.as_ref().is_none_or(|s| !s.pending())
                 && tag.is_none_or(|tag| intent.entry().tag().unwrap_or("") == tag) {
-                // Native local health cannot stand in for the gateway's joined
-                // configuration/policy readiness. Keep publication closed until
-                // that authenticated control-plane observation is integrated.
-                if let Some(worker) = worker.filter(|w| !w.ended && w.report.ready
-                    && intent.spec["runtime"]["driver"] != "openshell") {
+                if let Some(worker) = worker.filter(|w| !w.ended && w.report.ready) {
                     instances.extend(worker.report.runtime_instances.iter().filter(|r| r.entry_name == intent.entry().name()
                         && r.ready && observed.is_some_and(|e| !e.disabled() && (e.ready()
-                            || r.services == ["control"]))).cloned());
+                            || r.services == ["control"]))
+                        && (intent.spec["runtime"]["driver"] != "openshell"
+                            || self.native_route_ready(&i, r))).cloned());
                 }
             }
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {

@@ -61,6 +61,31 @@ pub struct OpenShellConfig {
     pub compute_socket: PathBuf,
     /// Exact versioned resource-admission acknowledgement of the native driver.
     pub admission_policy: String,
+    /// Authenticated stock gateway API used to observe policy readiness.
+    /// Omission keeps native service publication disabled.
+    #[serde(default)]
+    pub gateway: Option<OpenShellGatewayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenShellGatewayConfig {
+    pub endpoint: String,
+    pub ca_file: PathBuf,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+}
+
+impl OpenShellGatewayConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(&self.endpoint)?;
+        anyhow::ensure!(url.scheme() == "https" && url.host_str().is_some()
+            && url.username().is_empty() && url.password().is_none()
+            && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+            && [&self.ca_file, &self.cert_file, &self.key_file].iter().all(|p| p.is_absolute()),
+            "OpenShell gateway requires an HTTPS origin and absolute mTLS file paths");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -148,6 +173,7 @@ impl SchedulerConfig {
             if let Some(o) = &policy.openshell {
                 anyhow::ensure!(o.compute_socket.is_absolute() && !o.admission_policy.is_empty()
                     && policy.preflight.is_some(), "OpenShell requires a private socket, admission policy and remote proof network");
+                if let Some(g) = &o.gateway { g.validate()?; }
             }
         }
         Ok(())

@@ -491,27 +491,34 @@ ownership/digests and admitted public service metadata on disk. Native inspectio
 expired credentials. An explicit `runtime: {executor: shim, driver: openshell}`
 App now reserves Ray resources and a durable shim allocation before provisioning.
 This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
-6 MiB); command/environment are literal. Ports, services, volumes, entrypoint,
-workdir, user overrides and GPU mappings are not supported by this profile yet.
+6 MiB); command/environment are literal. Optional HTTP app services declare
+`services`, one `container_port` and `health_path` (default `/`). These ports are
+private to the workload; `port_base`, `control`, TCP, ingress rewriting, volumes,
+entrypoint, workdir, user overrides and GPU mappings remain unsupported.
 Only a companion advertising `openshell-allocation-v1` exposes its placement
 capability. Native reservations remain `ready: false` with no services; a complete
-reservation set holds quota without repeatedly scheduling another start.
+reservation set holds quota without repeatedly scheduling another start. With
+services, placement instead requires `shim-openshell-services-v1`, advertised only
+by a companion with local health reporting and configured `shim_network`.
 
 The private shim adapter additionally supports proof-bound HTTP service declarations
 and `network` commands with `driver: openshell`. Fleet checks their service IDs,
 container port and health path against the admitted manifest; the daemon stores
 those targets and the native bundle's public SSH fingerprint. Later network
 commands cannot change them. The operator's immutable `supervisor_image` enables
-`openshell-local-services-v1`, which is deliberately not a placement/publication
-capability. Existing Docker network records remain compatible.
+`openshell-local-services-v1` and `openshell-service-health-v1`. Existing Docker
+network records remain compatible.
 
 Local health gates registration and unhealthy applications lose active streams.
 The daemon retries health recovery, restores connectors after a companion restart,
-and drains them before acknowledging runtime deletion. Production native App
-service selection/publication remains disabled until Fleet joins authenticated
-gateway configuration readiness: the native supervisor health socket only reports
-session acceptance, which precedes asynchronous policy activation. A node report
-claiming `ready: true` alone cannot publish a native service in Fleet resources.
+and drains them before acknowledging runtime deletion. Shim `inspect` reports
+`application_ready` from a successful probe within six seconds; this state is
+cleared on failure, cancellation or restart and does not wait for router grants.
+The bridge retains sanitized compute observations alongside local service health.
+Fleet publishes only after joining that health with authenticated gateway
+configuration readiness. The native supervisor health socket reports session
+acceptance before asynchronous policy activation and cannot replace this check.
+A node report claiming `ready: true` alone cannot publish a native service.
 
 The scheduler embeds the stock OpenShell compute extension. Enable it in the
 existing scheduler configuration, under `policy_gateway` alongside its approved
@@ -523,6 +530,12 @@ policy_gateway:
   openshell:
     compute_socket: /run/zkm-fleet/openshell-compute.sock
     admission_policy: '<exact native driver resource-admission acknowledgement>'
+    # Optional: required to publish native application services.
+    gateway:
+      endpoint: https://openshell.example:8080
+      ca_file: /etc/zkm-fleet/openshell-ca.pem
+      cert_file: /etc/zkm-fleet/openshell-client.pem
+      key_file: /etc/zkm-fleet/openshell-client.key
 ```
 
 The socket directory must already exist, owned by the scheduler/gateway UID with
@@ -531,7 +544,33 @@ unmodified gateway with `--compute-driver docker --compute-driver-socket` pointi
 to this socket. Operators deploy that gateway and the node's native compute driver;
 Fleet neither launches nor modifies them. The admission acknowledgement must match
 the node's `shim_openshell` settings. This initial profile supports CPU/memory
-limits; it does not advertise gateway-managed lifecycle, GPU or application routes.
+limits and private HTTP app routes; it does not advertise gateway-managed lifecycle
+or GPU support.
+
+The scheduler's observer calls the stock API over mTLS; the key must be a
+same-UID 0600 regular file and certificates must not be group/world writable.
+All paths are absolute and symlinks are rejected. The HTTPS origin must match
+the server certificate. These credentials remain in the central scheduler.
+Omitting `gateway` preserves provisioning and leaves native publication closed.
+
+The observer joins the exact public sandbox/workspace with the Fleet Compute
+extension's persisted Create identity and fresh owned native observation. Public
+compute fields may be absent. It requires Ready/configuration acceptance, the approved native policy hash and
+loaded latest policy revision. It compares accepted configuration/provider
+revisions with the current desired configuration. Configuration instance and
+supervisor session IDs are separate upstream identities. Queries have a two-second
+total deadline per sandbox, with at most 16 in flight. Successful observations
+expire five seconds after query start and are never persisted; failure removes
+cached readiness. Publication also rechecks node session freshness, live intent,
+quota, allocation generation, physical instance and active Rail policy.
+
+This gates new route grants and renewals. It does not instantly revoke previously
+issued grants: the router's existing registration/access grants last up to 900
+seconds; explicit route revocation or control-lease expiry can drain them sooner.
+Local application health loss and runtime deletion independently drain shim
+streams. Native gateway readiness loss alone currently stops publication and
+renewal, not an already authorized stream. Tightening this revocation window is a
+remaining migration acceptance item.
 
 Fleet namespace IDs exceeding OpenShell's 19-byte routable-name limit map to
 stable native workspace names. Full canonical identities remain in authorization

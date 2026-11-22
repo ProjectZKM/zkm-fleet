@@ -161,6 +161,9 @@ pub(super) async fn start_at(
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    for name in ["ca.pem", "client.pem"] {
+        std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     let tls = tonic_native::transport::ClientTlsConfig::new()
         .ca_certificate(tonic_native::transport::Certificate::from_pem(
             std::fs::read(root.join("ca.pem")).unwrap(),

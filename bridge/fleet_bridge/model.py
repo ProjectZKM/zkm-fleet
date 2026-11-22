@@ -609,10 +609,14 @@ class AppSpec(Record):
         if self.runtime and self.runtime.driver == "openshell":
             if (self.gpus != 0 or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
                     or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
-                    or self.services or self.ingress or self.volumes or self.shm_gb is not None
-                    or any(v is not None for v in (self.port_base, self.container_port, self.entrypoint, self.user, self.workdir))
-                    or self.service_protocol is not ServiceProtocol.HTTP1 or self.health_path != "/"):
-                raise ModelError("native OpenShell requires CPU/memory limits and provisioning-only settings")
+                    or self.ingress or self.volumes or self.shm_gb is not None
+                    or any(v is not None for v in (self.port_base, self.entrypoint, self.user, self.workdir))
+                    or self.service_protocol is not ServiceProtocol.HTTP1 or "control" in self.services
+                    or bool(self.services) != (self.container_port is not None)
+                    or not self.health_path.startswith("/") or self.health_path.startswith("//")
+                    or len(self.health_path.encode()) > 2048 or any(ord(c) < 32 or ord(c) == 127 or c in "\\#" for c in self.health_path)
+                    or not self.services and self.health_path != "/"):
+                raise ModelError("native OpenShell requires CPU/memory limits and optional private HTTP app services")
         if self.service_protocol is ServiceProtocol.TCP:
             if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
                     or not any(s != "control" for s in self.services) or self.ingress):

@@ -37,7 +37,7 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 def required_capability(spec: AppReplicaSpec) -> str:
     if spec.app.runtime and spec.app.runtime.driver == "openshell":
-        return "shim-openshell-provisioning-v1"
+        return "shim-openshell-services-v1" if spec.app.services else "shim-openshell-provisioning-v1"
     if spec.app.service_protocol is ServiceProtocol.TCP:
         return "shim-tcp-v1"
     if any(rule.single_use for rule in spec.app.ingress.values()):
@@ -71,6 +71,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             check_openshell(config, value)
             if "openshell" in value.get("drivers", []) and "openshell-allocation-v1" in value.get("features", []):
                 native = ["shim-openshell-provisioning-v1"]
+                if config.shim_network and "openshell-service-health-v1" in value.get("features", []):
+                    native.append("shim-openshell-services-v1")
         return native + (["shim-tcp-v1"] if config.shim_network and modern and management else []) + (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
@@ -311,14 +313,22 @@ class _ProvisionedApp:
         if status.get("phase") not in ("reserved", "authorizing", "dispatched", "created"):
             raise RuntimeError("native allocation requires explicit cleanup")
 
-    def call(self, operation: str) -> dict[str, Any]:
+    def call(self, operation: str, **fields: Any) -> dict[str, Any]:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(),
-            {"operation": operation, "execution": self.spec.execution, "driver": "openshell"}, daemon=True)
+            {"operation": operation, "execution": self.spec.execution, "driver": "openshell", **fields}, daemon=True)
 
     def health(self) -> dict[str, Any]:
         status = self.call("inspect")
+        if self.spec.app.services and status.get("platform_ready"):
+            try:
+                self.call("network", config=self.spec.cluster.shim_network)
+            except (RuntimeError, OSError, ValueError):
+                logging.getLogger(__name__).warning("native shim connector recovery failed for %s", self.spec.name)
+        # A local health verdict is independent of connector registration.
+        # Fleet joins it with authenticated gateway policy readiness.
+        ready = bool(self.spec.app.services and status.get("platform_ready") and status.get("application_ready"))
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
-            execution=self.spec.execution, machine=socket.gethostname(), ready=False,
+            execution=self.spec.execution, machine=socket.gethostname(), ready=ready,
             native_observation_base64=status.get("native_observation_base64"),
             allocation_reserved=status.get("phase") in ("reserved", "authorizing", "dispatched", "created")).dump()
 

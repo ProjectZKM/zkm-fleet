@@ -244,6 +244,7 @@ async fn policy_setup_with_inventory(
     }
     report.runtime_capabilities = vec![
         "shim-openshell-provisioning-v1".into(),
+        "shim-openshell-services-v1".into(),
         "shim-docker-v1".into(),
         "shim-network-v1".into(),
         "shim-management-v1".into(),

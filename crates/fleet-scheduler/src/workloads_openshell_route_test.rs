@@ -40,14 +40,23 @@ impl Drop for Route {
 }
 impl Route {
     pub(super) async fn start(root: &Path, execution: &ExecutionIdentity, app: SocketAddr) -> Self {
-        Self::prepare(root, execution, Some(app)).await
+        Self::prepare(root, execution, Some(app), None).await
     }
 
-    pub(super) async fn managed(root: &Path, execution: &ExecutionIdentity) -> Self {
-        Self::prepare(root, execution, None).await
+    pub(super) async fn managed(
+        root: &Path,
+        execution: &ExecutionIdentity,
+        controller: Arc<crate::workloads::WorkloadController>,
+    ) -> Self {
+        Self::prepare(root, execution, None, Some(controller)).await
     }
 
-    async fn prepare(root: &Path, execution: &ExecutionIdentity, app: Option<SocketAddr>) -> Self {
+    async fn prepare(
+        root: &Path,
+        execution: &ExecutionIdentity,
+        app: Option<SocketAddr>,
+        controller: Option<Arc<crate::workloads::WorkloadController>>,
+    ) -> Self {
         let private = root.join("router-key.pem");
         let public = root.join("router-public.pem");
         for args in [
@@ -119,8 +128,8 @@ impl Route {
                     .unwrap();
             }
         });
-        // Only this acceptance fixture grants registration. Production Fleet
-        // must join authenticated native policy readiness before issuing it.
+        // Signing/enrollment are fixtures; the managed route uses the actual
+        // Fleet publication predicate and authenticated native gateway observer.
         let control_ready = Arc::new(AtomicBool::new(app.is_some()));
         let registrations = Arc::new(AtomicUsize::new(0));
         let approved = control_ready.clone();
@@ -131,8 +140,13 @@ impl Route {
             move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
                 let approved = approved.clone(); let accepted = accepted.clone();
                 let grant = registration_grant.clone(); let key = registration_key.clone();
+                let controller = controller.clone();
                 async move {
+                    let published = controller.as_ref().is_none_or(|c| c.app_resources(&grant.service.namespace, &grant.service.workload, None)["runtime_instances"]
+                        .as_array().is_some_and(|instances| instances.iter().any(|i| i["execution"] == serde_json::json!(grant.execution)
+                            && i["services"].as_array().is_some_and(|s| s.iter().any(|s|s==&grant.service.service)))));
                     if !approved.load(Ordering::SeqCst)
+                        || !published
                         || headers.get("authorization").and_then(|s|s.to_str().ok()) != Some("Bearer fixture-enrollment")
                         || body["execution"] != serde_json::json!(grant.execution)
                         || body["service"] != serde_json::json!({"id":grant.service,"protocol":"http1","endpoint_ref":"app"}) {

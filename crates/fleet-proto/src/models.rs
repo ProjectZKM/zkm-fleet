@@ -401,18 +401,25 @@ impl RegisterAppRequest {
     pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        if spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"})) {
+        let native = spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"}));
+        if native {
+            let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
+            let health = spec.get("health_path").map_or(Some("/"), Value::as_str);
             anyhow::ensure!(spec.get("gpus").and_then(Value::as_f64) == Some(0.0)
                 && spec.get("cpus").and_then(Value::as_u64).is_some_and(|v| v > 0 && v <= u32::MAX as u64 / 1000)
                 && spec.get("memory_gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v * (1u64 << 30) as f64 >= (6 * 1024 * 1024) as f64 && v * ((1u64 << 30) as f64) < u64::MAX as f64)
-                && ["port_base", "container_port", "entrypoint", "user", "workdir", "shm_gb", "service_protocol", "health_path"].iter().all(|k| !spec.contains_key(*k))
-                && ["services", "volumes"].iter().all(|k| spec.get(*k).is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())))
-                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty())),
-                "native OpenShell requires CPU/memory limits and provisioning-only settings");
-            return Ok(());
+                && ["port_base", "entrypoint", "user", "workdir", "shm_gb"].iter().all(|k| !spec.contains_key(*k))
+                && spec.get("volumes").is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()))
+                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty()))
+                && spec.get("service_protocol").is_none_or(|v| v == "http1")
+                && spec.get("services").and_then(Value::as_array).is_none_or(|s| s.iter().all(|s| s != "control"))
+                && services == spec.contains_key("container_port")
+                && health.is_some_and(|p| p.starts_with('/') && !p.starts_with("//") && p.len() <= 2048
+                    && !p.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'#') && (services || p == "/")),
+                "native OpenShell requires CPU/memory limits and optional private HTTP app services");
         }
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
-            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
+            anyhow::ensure!(native || spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
                 "transport settings require explicit shim execution");
         }
         if let Some(protocol) = spec.get("service_protocol") {
@@ -589,6 +596,14 @@ mod tests {
             ("cpus",json!(0)),("cpus",json!(0.5)),("memory_gb",json!(0.001)),("volumes",json!(["/host"])),("entrypoint",json!("/bin/sh"))] {
             let mut bad = spec.clone(); bad[field] = value;
             assert!(request(bad).validate().is_err(),"{field}");
+        }
+        let mut http=spec.clone();http["services"]=json!(["http"]);http["container_port"]=json!(8090);http["health_path"]=json!("/health");
+        request(http.clone()).validate().unwrap();
+        assert_eq!(crate::workload::Entry(&http).runtime_capability(),Some("shim-openshell-services-v1"));
+        for (field,value) in [("services",json!(["control"])),("services",json!([])),("container_port",json!(0)),
+            ("service_protocol",json!("tcp")),("health_path",json!("//other/health")),("health_path",json!("/a#b")),
+            ("health_path",json!("/a\\b")),("health_path",json!("/a\n")),("health_path",Value::Null)] {
+            let mut bad=http.clone();bad[field]=value;assert!(request(bad).validate().is_err(),"{field}");
         }
     }
 

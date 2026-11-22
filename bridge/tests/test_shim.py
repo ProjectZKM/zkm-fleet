@@ -491,3 +491,76 @@ def test_native_observation_report_remains_unready_and_allocation_owned(tmp_path
     assert not record["ready"] and record["services"] == []
     health.execution = replace(replica.execution, lease_id="obsolete")
     assert e.report().get("runtime_instances", []) == []
+
+
+def native_service_config(tmp_path):
+    raw = native_config(tmp_path)
+    raw["apps"][0].update(services=["http"], container_port=8080, health_path="/health")
+    raw["shim_openshell"]["supervisor_image"] = "sha256:" + "a" * 64
+    raw["shim_network"] = {"gateway_url":"http://127.0.0.1:9191", "relay_url":"ws://127.0.0.1:9999",
+        "token_file":str(tmp_path/"token"),"public_key_file":str(tmp_path/"public"),"issuer":"test"}
+    return raw
+
+
+def test_native_services_report_local_health_without_waiting_for_registration(tmp_path, monkeypatch):
+    raw = native_service_config(tmp_path)
+    cfg = reconcile.load_apps(raw)
+    spec = shim.RuntimeBook(tmp_path/"book").bind(reconcile.replica_specs(cfg)["web-0"], "launch")
+    assert shim.required_capability(spec) == "shim-openshell-services-v1"
+    commands = []
+    status = {"phase":"created", "platform_ready":True, "application_ready":False,
+        "native_observation_base64":"c2FuaXRpemVk"}
+    def invoke(binary, state, node, command, **kwargs):
+        assert kwargs == {"daemon":True}
+        commands.append(command)
+        if command["operation"] == "network":
+            assert command["driver"] == "openshell" and command["config"] == cfg.cluster.shim_network
+            return {"connected_worker":True}
+        return dict(status)
+    monkeypatch.setattr(shim,"invoke",invoke)
+    actor = shim._ProvisionedApp(spec)
+    assert not ReplicaHealth.load(actor.health()).is_ready
+    status["application_ready"] = True
+    assert ReplicaHealth.load(actor.health()).is_ready
+    status["platform_ready"] = False
+    assert not ReplicaHealth.load(actor.health()).is_ready
+    assert [c["operation"] for c in commands] == ["allocate","inspect","network","inspect","network","inspect"]
+
+
+def test_native_service_capability_requires_health_protocol_and_network_config(tmp_path, monkeypatch):
+    cfg = reconcile.load_apps(native_service_config(tmp_path)).cluster
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(cfg)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1","openshell-allocation-v1","openshell-local-services-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-services-v1" not in shim.capabilities(cfg)
+    value["features"].append("openshell-service-health-v1")
+    assert "shim-openshell-services-v1" in shim.capabilities(cfg)
+    assert "shim-openshell-services-v1" not in shim.capabilities(replace(cfg,shim_network=None))
+
+
+@pytest.mark.parametrize("key,value", [("services",["control"]),("container_port",None),
+    ("service_protocol","tcp"),("health_path","//elsewhere/health"),("health_path","/a\\b"),
+    ("health_path","/a#b"),("health_path","/a\n"),("port_base",0)])
+def test_native_service_profile_rejects_unbound_targets(tmp_path,key,value):
+    raw=native_service_config(tmp_path);raw["apps"][0][key]=value
+    with pytest.raises(ValueError): reconcile.load_apps(raw)
+
+
+def test_native_service_report_keeps_compute_observation_when_app_becomes_healthy(tmp_path, monkeypatch):
+    e=executor(tmp_path);raw=native_service_config(tmp_path)
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    replica=e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"],"launch")
+    health=ReplicaHealth(name="web-0",spec=actors.spec_hash(replica),executor=ExecutorKind.SHIM,
+        execution=replica.execution,ready=True,allocation_reserved=True,native_observation_base64="c2FuaXRpemVk")
+    monkeypatch.setattr(node,"alive_nodes",lambda:[{}])
+    monkeypatch.setattr(node,"resources",lambda:({"GPU":0,"CPU":1},{"GPU":0,"CPU":0}))
+    monkeypatch.setattr(reconcile,"running",lambda:{"web-0":object()})
+    monkeypatch.setattr(reconcile,"health_of",lambda *a,**k:health)
+    monkeypatch.setattr(shim,"capabilities",lambda _:[])
+    report=e.report();instance=report["runtime_instances"][0]
+    assert report["apps"][0]["ready"] and instance["ready"] and instance["services"]==["http"]
+    assert instance["native_observation_base64"]==health.native_observation_base64
+    health.ready=False
+    instance=e.report()["runtime_instances"][0]
+    assert not instance["ready"] and instance["services"]==[]

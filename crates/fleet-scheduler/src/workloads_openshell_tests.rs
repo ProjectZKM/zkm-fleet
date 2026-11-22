@@ -215,19 +215,21 @@ async fn socket_ready(path: &std::path::Path) {
     .unwrap();
 }
 async fn shim_call(path: &std::path::Path, command: Value) -> Value {
+    try_shim_call(path, command).await.unwrap()
+}
+async fn try_shim_call(path: &std::path::Path, command: Value) -> anyhow::Result<Value> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::UnixStream::connect(path).await.unwrap();
+    let mut s = tokio::net::UnixStream::connect(path).await?;
     s.write_all(
         &serde_json::to_vec(&json!({"protocol":1,"node_id":"machine","command":command})).unwrap(),
     )
-    .await
-    .unwrap();
-    s.shutdown().await.unwrap();
+    .await?;
+    s.shutdown().await?;
     let mut bytes = vec![];
-    s.read_to_end(&mut bytes).await.unwrap();
-    let v: Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(v.get("error").is_none(), "shim response: {v}");
-    v["result"].clone()
+    s.read_to_end(&mut bytes).await?;
+    let v: Value = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(v.get("error").is_none(), "shim request rejected");
+    Ok(v["result"].clone())
 }
 async fn compute_client(
     path: std::path::PathBuf,

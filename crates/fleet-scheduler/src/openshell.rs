@@ -46,6 +46,9 @@ use trusted_shim::{
 };
 type Result<T> = trusted_shim::rail::Result<T>;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
+#[path = "openshell_readiness.rs"]
+mod readiness;
+pub(crate) use readiness::{services_ready, Observer};
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -108,6 +111,7 @@ pub(crate) struct Launches {
     running: Mutex<BTreeSet<String>>,
     permits: Arc<Semaphore>,
     admission_policy: String,
+    readiness: readiness::Cache,
 }
 impl Launches {
     pub(crate) fn open(dir: &Path, admission_policy: String) -> anyhow::Result<Self> {
@@ -161,6 +165,7 @@ impl Launches {
             running: Mutex::new(BTreeSet::new()),
             permits: Arc::new(Semaphore::new(4)),
             admission_policy,
+            readiness: Default::default(),
         })
     }
     fn save(&self, record: &Record) -> Result<()> {
@@ -182,6 +187,7 @@ impl Launches {
         let mut records = self.records.lock();
         // Fence memory before an ambiguous rename/fsync result as well.
         records.insert(record.name.clone(), record.clone());
+        self.readiness.remove(&record.name);
         self.save(&record)
     }
 }
