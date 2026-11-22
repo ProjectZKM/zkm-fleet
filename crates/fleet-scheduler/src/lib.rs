@@ -123,6 +123,11 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
 
     tracing::info!(control = %cfg.control_addr, http = %cfg.http_addr, "listening");
     let dispatcher = tokio::spawn(fleet.clone().dispatch_loop());
+    let policy = workloads.policy.clone();
+    let receipt_loop = async move {
+        if let Some(policy) = policy { policy.receipt_loop().await; }
+        std::future::pending::<()>().await;
+    };
     let dispatch_loop = tokio::spawn(workloads.dispatch_loop());
     let f = fleet.clone();
     tokio::spawn(async move {
@@ -143,6 +148,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = servers => r?,
         r = dispatcher => r?,
         r = dispatch_loop => r??,
+        _ = receipt_loop => anyhow::bail!("policy receipt worker stopped"),
     }
     Ok(())
 }

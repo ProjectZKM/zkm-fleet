@@ -22,7 +22,7 @@ use std::{
 use tokio::sync::Semaphore;
 use trusted_shim::{
     contracts::{ExecutionIdentity, ProofKind, Validity},
-    ledger::{LedgerPermission, SqliteLedger},
+    ledger::{LedgerPermission, PreflightWorker, SqliteLedger},
     ledger_transport::{ExecutionAuthority, LedgerService},
     proof::ProgramRef,
     rail::{Error, EvaluationRequest, PolicyBundle, Result},
@@ -35,6 +35,7 @@ pub struct PolicyGateway {
     program_vkey: String,
     elf: Vec<u8>,
     permits: Arc<Semaphore>,
+    preflight: Option<Arc<PreflightWorker>>,
 }
 
 impl PolicyGateway {
@@ -46,6 +47,7 @@ impl PolicyGateway {
             program_vkey: String::new(),
             elf: vec![],
             permits: Arc::new(Semaphore::new(16)),
+            preflight: None,
         })
     }
     pub(crate) fn open(cfg: &SchedulerConfig) -> anyhow::Result<Option<Arc<Self>>> {
@@ -94,14 +96,92 @@ impl PolicyGateway {
             program.clone(),
             verifier,
         )?);
+        let preflight = if let Some(config) = &p.preflight {
+            fleet_proto::initialize_tls();
+            let channel = trusted_shim::ledger_transport::RemoteLedger::endpoint(&config.endpoint)?
+                .connect_lazy();
+            let mut network = trusted_shim::network::ZirenNetwork::from_channel(
+                channel,
+                &private_secret(&config.token_file)?,
+                program.clone(),
+                elf.clone(),
+            )?;
+            if let Some(path) = &config.signer_file {
+                let secret = private_secret(path)?;
+                network = network.with_fleet_signer(&hex::decode(
+                    secret.strip_prefix("0x").unwrap_or(&secret),
+                )?)?;
+            }
+            Some(Arc::new(PreflightWorker::new(
+                ledger.clone(),
+                Arc::new(network),
+            )))
+        } else {
+            None
+        };
         Ok(Some(Arc::new(Self {
             ledger,
             program,
             program_vkey: p.program_vkey.clone(),
             elf,
             permits: Arc::new(Semaphore::new(16)),
+            preflight,
         })))
     }
+
+    /// Runs inside the scheduler process. Each iteration resumes persisted IDs;
+    /// no action request waits for proving or starts a local prover.
+    pub(crate) async fn receipt_loop(self: Arc<Self>) {
+        let Some(worker) = &self.preflight else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        loop {
+            let ledger = self.ledger.clone();
+            let ids = tokio::task::spawn_blocking(move || ledger.pending_preflight()).await;
+            if let Ok(Ok(ids)) = ids {
+                // Bound concurrent network calls; one stalled job cannot block
+                // the rest of the queue. IDs and witness bytes stay out of logs.
+                let mut tasks = tokio::task::JoinSet::new();
+                for id in ids {
+                    if tasks.len() >= 4 {
+                        let _ = tasks.join_next().await;
+                    }
+                    let worker = worker.clone();
+                    tasks.spawn(async move {
+                        let _ = worker.advance(&id).await;
+                    });
+                }
+                while tasks.join_next().await.is_some() {}
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_network(&mut self, network: Arc<dyn trusted_shim::proof::ProofNetwork>) {
+        self.preflight = Some(Arc::new(PreflightWorker::new(self.ledger.clone(), network)));
+    }
+}
+
+fn private_secret(path: &std::path::Path) -> anyhow::Result<String> {
+    anyhow::ensure!(path.is_absolute(), "proof credential path must be absolute");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        meta.is_file() && meta.permissions().mode() & 0o077 == 0 && meta.len() <= 4096,
+        "proof credential file must be bounded, private and regular"
+    );
+    let mut value = String::new();
+    file.take(4097).read_to_string(&mut value)?;
+    anyhow::ensure!(
+        !value.trim().is_empty() && value.len() <= 4096,
+        "invalid proof credential"
+    );
+    Ok(value.trim().to_owned())
 }
 
 /// These routes are merged inside the existing administrative auth middleware.
@@ -118,6 +198,8 @@ pub(crate) fn admin_router(c: Arc<WorkloadController>) -> Router {
         .route("/policy/allocations/revoke", post(revoke))
         .route("/policy/requests", post(stage))
         .route("/policy/requests/:id", get(request))
+        .route("/policy/preflight", post(preflight))
+        .route("/policy/preflight/:id", get(preflight_receipt))
         .route("/policy/credentials", post(credential))
         .route("/policy/credentials/:id", delete(revoke_credential))
         .with_state(c)
@@ -269,6 +351,43 @@ async fn stage(
 async fn request(State(c): State<Arc<WorkloadController>>, Path(id): Path<String>) -> Response {
     run(c, None, move |l| Ok(json!(l.request(&id)?))).await
 }
+async fn preflight(
+    State(c): State<Arc<WorkloadController>>,
+    Json(r): Json<PolicyStageRequest>,
+) -> Response {
+    if c.policy.as_ref().is_none_or(|p| p.preflight.is_none()) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let request: EvaluationRequest = match serde_json::from_value(r.request.0) {
+        Ok(v) => v,
+        Err(_) => return failure(Error::InvalidInput),
+    };
+    run(c, Some(request.execution.clone()), move |l| {
+        let result = l.preflight(&r.job_id, &request, r.cost)?;
+        let grant = result.grant.map(|g| {
+            json!({
+                "id":g.id,"credential":g.credential,"execution":g.execution,
+                "request_sha256":g.request_sha256,"validity":g.validity,
+            })
+        });
+        Ok(json!({"job_id":r.job_id,"decision":result.decision,
+            "receipt_state":result.receipt_state,"grant":grant}))
+    })
+    .await
+}
+async fn preflight_receipt(
+    State(c): State<Arc<WorkloadController>>,
+    Path(id): Path<String>,
+) -> Response {
+    run(c, None, move |l| {
+        let state = l.preflight_receipt_state(&id)?;
+        let receipt = l
+            .preflight_receipt(&id)?
+            .map(|r| hex::encode(r.encoded_receipt));
+        Ok(json!({"job_id":id,"receipt_state":state,"receipt_hex":receipt}))
+    })
+    .await
+}
 async fn revoke(
     State(c): State<Arc<WorkloadController>>,
     Json(e): Json<RuntimeExecutionIdentity>,
@@ -312,6 +431,58 @@ async fn revoke_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn preflight_requires_explicit_private_remote_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("guest.elf");
+        let token = dir.path().join("proof.token");
+        std::fs::write(&elf, b"\x7fELF-policy-fixture").unwrap();
+        std::fs::write(&token, "t".repeat(64)).unwrap();
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg: SchedulerConfig = serde_yaml::from_str(&format!(
+            "data_dir: {}\ncluster_token_file: cluster\ncontrol_addr: 127.0.0.1:0\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        cfg.policy_gateway = Some(crate::config::PolicyGatewayConfig {
+            program_elf: elf.clone(),
+            program_sha256: hex::encode(Sha256::digest(std::fs::read(elf).unwrap())),
+            program_vkey: "01".repeat(32),
+            preflight: Some(crate::config::PreflightConfig {
+                endpoint: "http://127.0.0.1:9".into(),
+                token_file: token.clone(),
+                signer_file: None,
+            }),
+        });
+        cfg.validate().unwrap();
+        assert!(PolicyGateway::open(&cfg)
+            .unwrap()
+            .unwrap()
+            .preflight
+            .is_some());
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PolicyGateway::open(&cfg).is_err());
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&token, &link).unwrap();
+        let p = cfg
+            .policy_gateway
+            .as_mut()
+            .unwrap()
+            .preflight
+            .as_mut()
+            .unwrap();
+        p.token_file = link;
+        assert!(PolicyGateway::open(&cfg).is_err());
+        cfg.policy_gateway
+            .as_mut()
+            .unwrap()
+            .preflight
+            .as_mut()
+            .unwrap()
+            .endpoint = "http://example.com".into();
+        assert!(cfg.validate().is_err());
+    }
     #[test]
     fn approved_guest_and_private_durable_ledger_are_required() {
         let dir = tempfile::tempdir().unwrap();
@@ -327,6 +498,7 @@ mod tests {
             program_elf: elf.clone(),
             program_sha256: hex::encode(Sha256::digest(std::fs::read(&elf).unwrap())),
             program_vkey: "01".repeat(32),
+            preflight: None,
         });
         let p = PolicyGateway::open(&cfg).unwrap().unwrap();
         p.ledger.set_budget("durable", 1).unwrap();

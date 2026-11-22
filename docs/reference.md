@@ -911,6 +911,8 @@ router delegates and execution credentials cannot call them.
 | `POST /policy/allocations/revoke` | Exact execution identity; durable even after replacement |
 | `POST /policy/requests` | `{job_id, request, cost}`; persist before remote proof submission |
 | `GET /policy/requests/:id` | Exact staged evaluation request for recovery |
+| `POST /policy/preflight` | `{job_id, request, cost}`; native decision, optional single-use grant and background receipt state |
+| `GET /policy/preflight/:id` | Receipt state and `receipt_hex` only after cryptographic verification |
 | `POST /policy/credentials` | `{execution, permission, expires_at}`; returns `{id, token, expires_at}` once, with `Cache-Control: no-store` |
 | `DELETE /policy/credentials/:id` | Revoke by SHA-256 identifier; never put the bearer in a URL |
 
@@ -921,6 +923,58 @@ an administrator or namespace token. The ledger verifies the pinned proof and
 current policy/context, accounts for budget atomically and consumes each grant
 once. A transport failure after consumption is ambiguous: do not retry dispatch.
 The shim must reconcile its durable local operation instead.
+
+Runtime action authorization uses preflight: the current approved Rego policy is
+evaluated before dispatch; the exact proof witness and native decision are saved
+in the same transaction as the Allow grant and budget reservation. Deny and
+ApprovalRequired also produce background receipts, without execution grants.
+The action's tool consumes its existing grant rather than producing another proof.
+The preflight endpoint is still administrator-only; an agent cannot choose this
+mode to downgrade a strict request. It rejects `runtime.*` operations and reuse
+of a strict job/action. Startup proof verification and registration remain
+synchronous; the existing proof-required Reserve RPC is unchanged.
+
+Enable the worker in the existing `policy_gateway` section (the existing guest
+manifest fields remain required):
+
+```yaml
+policy_gateway:
+  program_elf: /opt/fleet/policy-guest.elf
+  program_sha256: <approved-ELF-SHA256>
+  program_vkey: <approved-vk.bytes32>
+  preflight:
+    endpoint: https://policy-proof-app.example/
+    token_file: /private/policy-proof.token
+    # signer_file: /private/policy-proof-sdk.key
+```
+
+This is the policy proof app's StageService endpoint, not Fleet's control URL.
+The optional SDK signer is a private hex-encoded secp256k1 key for deployments
+that require signed proof submissions. Files must be absolute, private, bounded
+and regular; no token/key discovery occurs. TLS verifies the OS trust roots;
+plain HTTP is restricted to numeric loopback tests. With no worker configuration,
+preflight admission returns 503. No local prover or extra gateway is started.
+
+The scheduler drives up to four remote operations concurrently. Receipt states
+are `queued`, `proving`, `verified` and `failed`. Only the approved cryptographic
+verifier can produce `verified`; native Allow and a completed network job cannot.
+Workers retain the original policy/request through changes and expiry, and never
+renew grants when receipts complete. Queued jobs survive restart; ambiguous
+submissions are polled by their original ID without automatic resubmission. A
+crash before that RPC can need operator reconciliation. Failed jobs block new
+preflight actions for that instance. At 128 outstanding receipts (including
+failures), admission rejects further requests. This is backpressure, not an
+end-to-end latency guarantee. Existing executed effects cannot be rolled back by
+a late proof failure. Receipt retention/monitoring and application action-hook
+wiring are still deployment responsibilities.
+
+GOAT registration and policy authority remain separate integration work. Non-TEE
+agents register owner-authorized keys as `unattested`; TEE agents additionally
+require a verified RA result bound to their instance/key before readiness.
+Future GOAT policy synchronization must authenticate owner and chain/contract,
+confirmed policy version/digest and revocation before activating the local
+snapshot. Current preflight uses the administratively activated snapshot and
+does not claim chain synchronization or hardware attestation.
 
 Activation, staging, credential issuance, reservation and consumption are fenced
 by current Fleet state: exact reported or centrally prepared runtime identity, active deployment,

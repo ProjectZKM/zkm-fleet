@@ -31,7 +31,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 rand = "0.8"
 reqwest.workspace = true
-trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "a6d14148b9d6e6fb75017995551af8c865990c32", features = ["ziren", "openshell"] }
+trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "9d3cca49e0c3255887aa6724506282d7338725c9", features = ["ziren", "openshell"] }
 
 [dev-dependencies]
 bincode.workspace = true

@@ -10,6 +10,164 @@ use trusted_shim::{
 };
 
 struct TestVerifier;
+
+#[derive(Default)]
+struct PreflightNetwork {
+    done: std::sync::atomic::AtomicBool,
+    public: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+}
+#[async_trait::async_trait]
+impl trusted_shim::proof::ProofNetwork for PreflightNetwork {
+    async fn submit(
+        &self,
+        request: &trusted_shim::proof::ProofRequest,
+    ) -> trusted_shim::Result<String> {
+        let public = evaluate_witness(&request.witness).unwrap();
+        assert_eq!(public, request.expected_public_values);
+        self.public
+            .lock()
+            .unwrap()
+            .insert(request.request_id.clone(), public);
+        Ok(request.request_id.clone())
+    }
+    async fn status(&self, id: &str) -> trusted_shim::Result<trusted_shim::proof::ProofStatus> {
+        Ok(if self.done.load(std::sync::atomic::Ordering::SeqCst) {
+            trusted_shim::proof::ProofStatus::Complete(ProofReceipt {
+                job_id: id.into(),
+                encoded_receipt: self.public.lock().unwrap()[id].clone(),
+            })
+        } else {
+            trusted_shim::proof::ProofStatus::Pending
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preflight_returns_before_proof_and_background_worker_preserves_execution_fences() {
+    let (_dir, c, mut report, p, mut r) = policy_setup().await;
+    activate(&c, &p, &r).await;
+    r.action_id = "preflight-action".into();
+    let body = json!({"job_id":"async-proof","request":r,"cost":1});
+    assert_eq!(
+        admin(&c, "POST", "/policy/preflight", body.clone())
+            .await
+            .status(),
+        503
+    );
+    let n = Arc::new(PreflightNetwork::default());
+    let mut c = Arc::try_unwrap(c).ok().unwrap();
+    Arc::get_mut(c.policy.as_mut().unwrap())
+        .unwrap()
+        .test_network(n.clone());
+    let c = Arc::new(c);
+    let worker = tokio::spawn(c.policy.as_ref().unwrap().clone().receipt_loop());
+    let response = admin(&c, "POST", "/policy/preflight", body.clone()).await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let allowed = json_body(response).await;
+    assert_eq!(allowed["decision"]["decision"], "allow");
+    assert_eq!(allowed["receipt_state"], "queued");
+    assert!(!allowed["grant"].is_null());
+    let grant: trusted_shim::rail::ExecutionGrant = trusted_shim::rail::ExecutionGrant {
+        id: allowed["grant"]["id"].as_str().unwrap().into(),
+        credential: serde_json::from_value(allowed["grant"]["credential"].clone()).unwrap(),
+        execution: r.execution.clone(),
+        request_sha256: allowed["grant"]["request_sha256"].as_str().unwrap().into(),
+        validity: serde_json::from_value(allowed["grant"]["validity"].clone()).unwrap(),
+    };
+    let auth = credential(&c, &r, "execution").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::http::router(crate::http::HttpState {
+        fleet: c.fleet.clone(),
+        workloads: c.clone(),
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let remote = RemoteLedger::connect(
+        &address,
+        auth["token"].as_str().unwrap(),
+        r.execution.clone(),
+    )
+    .await
+    .unwrap();
+    let digest = request_digest(&r).unwrap();
+    // A policy verdict cannot bypass Fleet's current node-session fence.
+    report.ready = false;
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert!(remote.consume(&grant, &r.execution, &digest).await.is_err());
+    report.ready = true;
+    c.report("gpu", "session", report).await.unwrap();
+    remote.consume(&grant, &r.execution, &digest).await.unwrap();
+    assert!(remote.consume(&grant, &r.execution, &digest).await.is_err());
+    let pending =
+        json_body(admin(&c, "GET", "/policy/preflight/async-proof", json!({})).await).await;
+    assert_ne!(pending["receipt_state"], "verified");
+    assert!(pending["receipt_hex"].is_null());
+    n.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status =
+                json_body(admin(&c, "GET", "/policy/preflight/async-proof", json!({})).await).await;
+            if status["receipt_state"] == "verified" {
+                assert!(!status["receipt_hex"].is_null());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(remote.consume(&grant, &r.execution, &digest).await.is_err());
+    assert_eq!(
+        admin(&c, "POST", "/policy/preflight", body).await.status(),
+        409
+    );
+    r.action_id = "denied".into();
+    r.operation = "delete".into();
+    let denied = json_body(
+        admin(
+            &c,
+            "POST",
+            "/policy/preflight",
+            json!({"job_id":"deny-proof","request":r,"cost":1}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(denied["decision"]["decision"], "deny");
+    assert!(denied["grant"].is_null());
+    r.action_id = "startup".into();
+    r.operation = "runtime.create".into();
+    assert_eq!(
+        admin(
+            &c,
+            "POST",
+            "/policy/preflight",
+            json!({"job_id":"startup","request":r,"cost":1})
+        )
+        .await
+        .status(),
+        400
+    );
+    for path in ["/policy/preflight", "/policy/preflight/async-proof"] {
+        let response = serve(
+            &c,
+            Request::builder()
+                .method(if path.ends_with("preflight") {
+                    "POST"
+                } else {
+                    "GET"
+                })
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), 401);
+    }
+    worker.abort();
+    server.abort();
+}
 impl ReceiptVerifier for TestVerifier {
     fn verify(
         &self,

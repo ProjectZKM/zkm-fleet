@@ -46,6 +46,19 @@ pub struct PolicyGatewayConfig {
     pub program_elf: PathBuf,
     pub program_sha256: String,
     pub program_vkey: String,
+    /// Remote policy-receipt worker. When absent, preflight admission is disabled.
+    #[serde(default)]
+    pub preflight: Option<PreflightConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightConfig {
+    /// The policy proof app's StageService endpoint, not the Fleet control URL.
+    pub endpoint: String,
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub signer_file: Option<PathBuf>,
 }
 
 /// Settings this configuration no longer has, with what replaced them: starting with one is
@@ -114,6 +127,12 @@ impl SchedulerConfig {
                 && policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey).len() == 64
                 && hex::decode(policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey)).is_ok(),
                 "invalid approved policy guest manifest");
+            if let Some(p) = &policy.preflight {
+                anyhow::ensure!(p.token_file.is_absolute()
+                    && p.signer_file.as_ref().is_none_or(|f| f.is_absolute())
+                    && trusted_shim::ledger_transport::RemoteLedger::endpoint(&p.endpoint).is_ok(),
+                    "invalid preflight proof-network configuration");
+            }
         }
         Ok(())
     }
