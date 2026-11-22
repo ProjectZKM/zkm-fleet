@@ -706,6 +706,7 @@ class RuntimeInstance(Record):
     execution: RuntimeIdentity
     ready: bool
     services: list[str] = field(default_factory=list)
+    native_observation_base64: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -805,6 +806,7 @@ class ReplicaHealth(Record):
     management_ready: bool = False
     # Durable native ownership may precede compute creation and route readiness.
     allocation_reserved: bool = False
+    native_observation_base64: str | None = None
     stopping: bool = False
     error: str | None = None
 

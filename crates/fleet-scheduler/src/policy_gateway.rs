@@ -30,12 +30,14 @@ use trusted_shim::{
 };
 
 pub struct PolicyGateway {
-    ledger: Arc<SqliteLedger>,
-    program: ProgramRef,
+    pub(crate) ledger: Arc<SqliteLedger>,
+    pub(crate) program: ProgramRef,
     program_vkey: String,
     elf: Vec<u8>,
     permits: Arc<Semaphore>,
     preflight: Option<Arc<PreflightWorker>>,
+    pub(crate) network: Option<Arc<dyn trusted_shim::proof::ProofNetwork>>,
+    pub(crate) openshell: Option<Arc<crate::openshell::Launches>>,
 }
 
 impl PolicyGateway {
@@ -48,6 +50,8 @@ impl PolicyGateway {
             elf: vec![],
             permits: Arc::new(Semaphore::new(16)),
             preflight: None,
+            network: None,
+            openshell: None,
         })
     }
     pub(crate) fn open(cfg: &SchedulerConfig) -> anyhow::Result<Option<Arc<Self>>> {
@@ -96,7 +100,7 @@ impl PolicyGateway {
             program.clone(),
             verifier,
         )?);
-        let preflight = if let Some(config) = &p.preflight {
+        let network: Option<Arc<dyn trusted_shim::proof::ProofNetwork>> = if let Some(config) = &p.preflight {
             fleet_proto::initialize_tls();
             let channel = trusted_shim::ledger_transport::RemoteLedger::endpoint(&config.endpoint)?
                 .connect_lazy();
@@ -112,13 +116,13 @@ impl PolicyGateway {
                     secret.strip_prefix("0x").unwrap_or(&secret),
                 )?)?;
             }
-            Some(Arc::new(PreflightWorker::new(
-                ledger.clone(),
-                Arc::new(network),
-            )))
+            Some(Arc::new(network))
         } else {
             None
         };
+        let preflight = network.as_ref().map(|n| Arc::new(PreflightWorker::new(ledger.clone(), n.clone())));
+        let openshell = p.openshell.as_ref().map(|o| crate::openshell::Launches::open(
+            &dir.join("openshell"), o.admission_policy.clone()).map(Arc::new)).transpose()?;
         Ok(Some(Arc::new(Self {
             ledger,
             program,
@@ -126,6 +130,8 @@ impl PolicyGateway {
             elf,
             permits: Arc::new(Semaphore::new(16)),
             preflight,
+            network,
+            openshell,
         })))
     }
 
@@ -160,7 +166,8 @@ impl PolicyGateway {
 
     #[cfg(test)]
     pub(crate) fn test_network(&mut self, network: Arc<dyn trusted_shim::proof::ProofNetwork>) {
-        self.preflight = Some(Arc::new(PreflightWorker::new(self.ledger.clone(), network)));
+        self.preflight = Some(Arc::new(PreflightWorker::new(self.ledger.clone(), network.clone())));
+        self.network = Some(network);
     }
 }
 
@@ -445,6 +452,7 @@ mod tests {
         ))
         .unwrap();
         cfg.policy_gateway = Some(crate::config::PolicyGatewayConfig {
+            openshell: None,
             program_elf: elf.clone(),
             program_sha256: hex::encode(Sha256::digest(std::fs::read(elf).unwrap())),
             program_vkey: "01".repeat(32),
@@ -495,6 +503,7 @@ mod tests {
         .unwrap();
         assert!(PolicyGateway::open(&cfg).unwrap().is_none());
         cfg.policy_gateway = Some(crate::config::PolicyGatewayConfig {
+            openshell: None,
             program_elf: elf.clone(),
             program_sha256: hex::encode(Sha256::digest(std::fs::read(&elf).unwrap())),
             program_vkey: "01".repeat(32),

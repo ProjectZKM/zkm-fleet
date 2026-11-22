@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PolicyStageRequest",
         "PolicyBudgetRequest",
         "PolicyCredentialRequest",
+        "OpenShellLaunchPreparation",
         "RuntimeInstance",
         "RuntimeDeliveryOffer",
         "RuntimeDeliveryRecord",
@@ -67,6 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PolicyStageRequest",
         "PolicyBudgetRequest",
         "PolicyCredentialRequest",
+        "OpenShellLaunchPreparation",
         "RouterAccessPolicy",
         "RouterSubjectRevocation",
         "RouterAuthorization",
@@ -130,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default)]");
     }
-    for path in ["RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization"] {
+    for path in ["RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64"] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
     build = build

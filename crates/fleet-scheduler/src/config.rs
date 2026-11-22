@@ -49,6 +49,18 @@ pub struct PolicyGatewayConfig {
     /// Remote policy-receipt worker. When absent, preflight admission is disabled.
     #[serde(default)]
     pub preflight: Option<PreflightConfig>,
+    /// Stock gateway compute extension, embedded in this scheduler process.
+    #[serde(default)]
+    pub openshell: Option<OpenShellConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenShellConfig {
+    /// Same-host private Unix socket selected in the stock gateway config.
+    pub compute_socket: PathBuf,
+    /// Exact versioned resource-admission acknowledgement of the native driver.
+    pub admission_policy: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +144,10 @@ impl SchedulerConfig {
                     && p.signer_file.as_ref().is_none_or(|f| f.is_absolute())
                     && trusted_shim::ledger_transport::RemoteLedger::endpoint(&p.endpoint).is_ok(),
                     "invalid preflight proof-network configuration");
+            }
+            if let Some(o) = &policy.openshell {
+                anyhow::ensure!(o.compute_socket.is_absolute() && !o.admission_policy.is_empty()
+                    && policy.preflight.is_some(), "OpenShell requires a private socket, admission policy and remote proof network");
             }
         }
         Ok(())

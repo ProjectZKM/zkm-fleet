@@ -31,16 +31,22 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 rand = "0.8"
 reqwest.workspace = true
-trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "9d3cca49e0c3255887aa6724506282d7338725c9", features = ["ziren", "openshell"] }
+base64 = "0.22"
+fs2 = "0.4"
+prost-native = { package = "prost", version = "0.14" }
+tonic-native = { package = "tonic", version = "0.14", features = ["transport"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "5f05e728444f80973a566a15039e5355a3eb0dd7", features = ["ziren", "openshell"] }
 
 [dev-dependencies]
+tonic-native = { package = "tonic", version = "0.14", features = ["tls-ring"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 bincode.workspace = true
 prost.workspace = true
-prost-native = { package = "prost", version = "0.14" }
 rcgen = "0.14"
 fleet-proof-app = { path = "../fleet-proof-app" }
 fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
-tokio-stream = { version = "0.1", features = ["net"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

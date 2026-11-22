@@ -319,6 +319,7 @@ class _ProvisionedApp:
         status = self.call("inspect")
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution, machine=socket.gethostname(), ready=False,
+            native_observation_base64=status.get("native_observation_base64"),
             allocation_reserved=status.get("phase") in ("reserved", "authorizing", "dispatched", "created")).dump()
 
 

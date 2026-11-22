@@ -132,6 +132,11 @@ fn intent(
 }
 
 impl WorkloadController {
+    pub(crate) fn native_observation(&self, e: &ExecutionIdentity) -> Result<Option<String>> {
+        self.with_runtime_delivery_info(e, None, None, |_, instance| {
+            Ok(instance.native_observation_base64.clone())
+        })
+    }
     /// Hold the live deployment/quota fence through a private delivery transition.
     /// Native reservations must be reported by the owning fresh node session.
     pub(crate) fn with_runtime_delivery<T>(
@@ -140,6 +145,15 @@ impl WorkloadController {
         caller: Option<(&str, &str)>,
         launch: Option<&trusted_shim::runtime::LaunchRequest>,
         op: impl FnOnce(&str) -> Result<T>,
+    ) -> Result<T> {
+        self.with_runtime_delivery_info(e, caller, launch, |worker, _| op(worker))
+    }
+    fn with_runtime_delivery_info<T>(
+        &self,
+        e: &ExecutionIdentity,
+        caller: Option<(&str, &str)>,
+        launch: Option<&trusted_shim::runtime::LaunchRequest>,
+        op: impl FnOnce(&str, &fleet_proto::model::v1::RuntimeInstance) -> Result<T>,
     ) -> Result<T> {
         let i = self.inner.lock();
         let (worker_id, worker) = owner(&i, e, self.fleet.cfg.node_stale_secs)?;
@@ -202,7 +216,7 @@ impl WorkloadController {
             &e.namespace,
             &format!("deployment:{worker_id}-{}", instance.entry_name),
         )?;
-        op(worker_id)
+        op(worker_id, instance)
     }
 
     /// An operator may prepare exactly one identity for an already admitted

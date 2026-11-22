@@ -495,42 +495,103 @@ Only a companion advertising `openshell-allocation-v1` exposes its placement
 capability. Native reservations remain `ready: false` with no services; a complete
 reservation set holds quota without repeatedly scheduling another start.
 
-Private creation delivery uses the existing Fleet gateway and outbound node agent:
+The scheduler embeds the stock OpenShell compute extension. Enable it in the
+existing scheduler configuration, under `policy_gateway` alongside its approved
+program and remote `preflight` proof-network settings:
 
-1. Obtain the exact reported execution identity after admission/reservation.
-2. Prepare native bytes at the unmodified OpenShell gateway and obtain a Rail grant
-   through the remote proof network. The launch must exactly match Fleet's admitted
-   image, command, environment and hard resource limits.
-3. `PUT /policy/runtime-deliveries/<64-lowercase-hex-ticket>` with the private
-   `ProvisionRequest` JSON and an administrator credential. The request is bounded
-   to 4 MiB. Before enqueueing, Fleet decodes the stock gateway's native message
-   and checks its workspace, workload inputs, native policy and exact Rail
-   resource/parameter commitments. Native credentials never belong in an App
-   spec or environment.
-4. Heartbeats carry only ticket, execution and payload digest. The node claims the
-   payload once with its cluster credential and current worker/session, then sends
-   it directly to the private shim Unix socket. Identity, deployment intent,
-   generation, drain state and quota are checked again at claim time. Central
-   Consume still authorizes the native Create.
-5. `GET` the same administrative URL for metadata/status. `acknowledged` means the
-   shim accepted provisioning, not application readiness. `DELETE` cancels only a
-   queued delivery; cancelling/cleaning the allocation is a separate lifecycle step.
+```yaml
+policy_gateway:
+  # Existing program_elf, program_sha256, program_vkey and preflight settings.
+  openshell:
+    compute_socket: /run/zkm-fleet/openshell-compute.sock
+    admission_policy: '<exact native driver resource-admission acknowledgement>'
+```
 
-`workloads/runtime-deliveries` stores digests and results only. After a control-plane
-restart, queued deliveries report `awaiting_payload`; resubmit the exact same body
-and ticket while its grant is valid. Dispatched deliveries are never redelivered,
-including after lost responses or node restart. Reconcile an uncertain result by
-inspecting the exact shim allocation; never mint a new create to retry ambiguity.
-Persist these records together with allocation journals. The trust model remains
-Fleet's trusted cluster agents plus session fencing; this is not TEE attestation or
-individual cryptographic node enrollment. Production links use HTTPS; HTTP is
-limited to local acceptance.
+The socket directory must already exist, owned by the scheduler/gateway UID with
+mode 0700. Fleet creates a 0600 socket and accepts only that UID. Configure the
+unmodified gateway with `--compute-driver docker --compute-driver-socket` pointing
+to this socket. Operators deploy that gateway and the node's native compute driver;
+Fleet neither launches nor modifies them. The admission acknowledgement must match
+the node's `shim_openshell` settings. This initial profile supports CPU/memory
+limits; it does not advertise gateway-managed lifecycle, GPU or application routes.
 
-The stock OpenShell gateway compute extension still needs wiring to Fleet's
-existing proof/delivery flow. Joined supervisor, fence and application readiness
-also remain necessary before migrating application traffic through this native
-profile. Do not place the native payload, ledger bearer
-or grant in a heartbeat, diagnostic or Ray actor.
+Fleet namespace IDs exceeding OpenShell's 19-byte routable-name limit map to
+stable native workspace names. Full canonical identities remain in authorization
+and proof commitments; conflicting mappings are rejected. Explicit nonempty
+commands are required at launch preparation: an omitted command makes the stock
+gateway request an interactive TTY, which this profile excludes.
+
+The startup flow is synchronous through proof verification and native creation:
+
+1. Admit the App, wait for its reserved execution identity, and activate its policy
+   using Fleet's existing policy APIs. The backend resolves its user's identity;
+   these APIs accept Fleet administrators, not application API keys.
+2. `POST /policy/openshell/launches` with `request` (the exact admitted
+   `LaunchRequest`), `native_policy_base64` (stock `SandboxPolicy` protobuf),
+   `principal`, `cost`, and `expires_at` (Unix seconds, at most 15 minutes ahead).
+   The response contains a deterministic `name`, mapped `workspace`, and
+   `create_request_base64` (stock
+   public `CreateSandboxRequest` protobuf). It is private and `no-store`; workload
+   environment may contain secrets. An identical preparation is idempotent.
+3. The control-plane caller submits that decoded request to the authenticated stock
+   gateway, in the returned `workspace` (create it through the stock API first). The gateway calls Fleet's
+   validation extension before minting credentials, then calls Create with its
+   exact private native bytes. Fleet binds those bytes to the allocation and policy.
+4. Fleet stages `runtime.create` at its central ledger, submits the pinned guest to
+   the configured remote proof app, waits for the receipt, and verifies it against
+   the exact decision and active policy epoch. Only then does it issue a single-use
+   grant and stage the existing private delivery. No local prover is started.
+5. Outbound heartbeats carry only a ticket, execution identity and digest. The node
+   claims the private body once, then forwards it directly to the same-UID shim
+   socket. The shim repeats native binding checks, consumes the grant centrally,
+   and calls the native compute driver. Claim/Consume recheck the current node
+   session, generation, deployment intent and quota.
+6. Shim inspection returns a bounded native observation stripped of configuration,
+   credentials, local endpoint addresses and condition messages. Bridge heartbeats
+   carry that control metadata while retaining `ready: false` and no services.
+   Fleet returns only fresh, allocation-owned observations to the stock gateway;
+   an observation cannot bypass proof/delivery, cross workspaces, or replace a
+   pinned native instance. The gateway still owns supervisor/fence readiness.
+
+`GET /policy/openshell/launches/<name>` exposes phase, execution, sandbox ID and
+proof job ID, never credentials or launch inputs. Phases are `prepared`, `bound`,
+`proving`, `dispatching`, `delivered`, and `created`; `created` acknowledges native
+creation, not application readiness. Four creates may run concurrently. A callback
+with different private bytes is rejected. A disconnected RPC does not cancel an
+accepted create; inspect the same operation before retrying.
+
+Persist `data_dir/policy/openshell`, the policy ledger and allocation/delivery
+journals together. A durable proof claim precedes submission; after an ambiguous
+submit, only the same job ID is polled. A crash between claiming and submitting
+requires operator reconciliation. Before minting a grant/delivery, a durable
+`dispatching` fence prevents reminting credentials after a crash. An ambiguous
+`dispatching` operation never reports success from a node observation alone.
+Expired/failed operations need reconciliation; they are not automatically recreated.
+
+The lower-level administrative `PUT /policy/runtime-deliveries/<64-hex-ticket>`
+remains available for exact `ProvisionRequest` delivery. Its 4 MiB private bodies
+stay in memory; `workloads/runtime-deliveries` stores metadata only. Queued records
+become `awaiting_payload` after restart and require the identical body/ticket while
+its grant is valid. Dispatched records are never automatically redelivered. Inspect
+the exact shim allocation for an uncertain result. `DELETE` cancels only a queued
+delivery; stop/delete of a running allocation belongs to Fleet's lifecycle API,
+not the stock gateway's lifecycle RPCs in this profile.
+
+This retains Fleet's trusted cluster-agent/session model; it is not TEE attestation
+or individual cryptographic node enrollment. Production links use HTTPS. Joined
+supervisor/fence/application readiness and service routing remain migration gates.
+Never place native payloads, grants or ledger credentials in App specs, heartbeats,
+logs or Ray actors. GOAT registration execution remains TODO.
+
+The opt-in control integration test launches the pinned, unmodified gateway with
+mTLS and exercises actual Fleet HTTP/UDS, node delivery and the persistent shim.
+Proof and native compute are explicit test doubles; it does not establish workload
+isolation or application readiness:
+
+```sh
+OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
+  cargo test --locked -p fleet-scheduler --lib stock_gateway_startup -- --ignored
+```
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:
@@ -1000,9 +1061,9 @@ held quota. After command completion, the exact reported runtime identity takes
 over; absence never authorizes a new creation. A late report of an older prepared
 generation cannot revive its authorization.
 
-Private outbound delivery is available as described above. The native
-OpenShell gateway protocol adapter still needs integration with Fleet's existing
-proof and delivery flow; OpenShell does not introduce another scheduler.
+The native OpenShell compute extension uses Fleet's existing remote proof and
+private outbound delivery flow as described above; OpenShell introduces no
+additional scheduler.
 Do not put credentials or native launch secrets in App specs, environment,
 node reports or diagnostics. Docker still rejects requested
 proof-required execution modes; mounting this ledger does not change that driver.

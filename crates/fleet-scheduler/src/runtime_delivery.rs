@@ -146,7 +146,7 @@ impl DeliveryQueue {
         i.payloads.insert(r.offer.ticket.clone(), bytes);
         Ok(r)
     }
-    fn record(&self, ticket: &str) -> Result<RuntimeDeliveryRecord> {
+    pub(crate) fn record(&self, ticket: &str) -> Result<RuntimeDeliveryRecord> {
         let mut i = self.inner.lock();
         self.expire(&mut i)?;
         i.records.get(ticket).cloned().ok_or(Error::Rejected)
@@ -276,6 +276,45 @@ pub(crate) fn node_router(c: Arc<WorkloadController>) -> Router {
         .route("/internal/runtime-deliveries/:ticket/ack", post(ack))
         .with_state(c)
 }
+pub(crate) fn stage_payload(
+    c: &WorkloadController,
+    ticket: String,
+    p: ProvisionRequest,
+) -> Result<RuntimeDeliveryRecord> {
+    if !valid_ticket(&ticket) {
+        return Err(Error::InvalidInput);
+    }
+    p.validate().map_err(|_| Error::InvalidInput)?;
+    // Bind gateway-native bytes to the exact proved request before any
+    // credentials enter delivery. Shim repeats this before central Consume.
+    p.validate_native().map_err(|_| Error::Rejected)?;
+    let bytes = trusted_shim::rail::rego::canonical_bytes(
+        &serde_json::to_value(&p).map_err(|_| Error::InvalidInput)?,
+    )?;
+    let e = &p.request.execution;
+    c.with_runtime_delivery(e, None, Some(&p.request), |worker| {
+        let offer = RuntimeDeliveryOffer {
+            ticket,
+            execution: serde_json::from_value(
+                serde_json::to_value(e).map_err(|_| Error::InvalidInput)?,
+            )
+            .map_err(|_| Error::InvalidInput)?,
+            payload_sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        c.deliveries.stage(
+            RuntimeDeliveryRecord {
+                offer,
+                worker: worker.into(),
+                expires_at: p.authorization.validity.expires_at,
+                state: "queued".into(),
+                claimed_session: None,
+            },
+            bytes,
+        )
+    })
+}
+
+
 async fn stage(
     State(c): State<Arc<WorkloadController>>,
     Path(ticket): Path<String>,
@@ -294,34 +333,7 @@ async fn stage(
         let _permit = permit;
         let p: ProvisionRequest =
             serde_json::from_slice(&bytes).map_err(|_| Error::InvalidInput)?;
-        p.validate().map_err(|_| Error::InvalidInput)?;
-        // Bind gateway-native bytes to the exact proved request before any
-        // credentials enter delivery. Shim repeats this before central Consume.
-        p.validate_native().map_err(|_| Error::Rejected)?;
-        let bytes = trusted_shim::rail::rego::canonical_bytes(
-            &serde_json::to_value(&p).map_err(|_| Error::InvalidInput)?,
-        )?;
-        let e = &p.request.execution;
-        c.with_runtime_delivery(e, None, Some(&p.request), |worker| {
-            let offer = RuntimeDeliveryOffer {
-                ticket,
-                execution: serde_json::from_value(
-                    serde_json::to_value(e).map_err(|_| Error::InvalidInput)?,
-                )
-                .map_err(|_| Error::InvalidInput)?,
-                payload_sha256: hex::encode(Sha256::digest(&bytes)),
-            };
-            c.deliveries.stage(
-                RuntimeDeliveryRecord {
-                    offer,
-                    worker: worker.into(),
-                    expires_at: p.authorization.validity.expires_at,
-                    state: "queued".into(),
-                    claimed_session: None,
-                },
-                bytes,
-            )
-        })
+        stage_payload(&c, ticket, p)
     })
     .await;
     private(match result {

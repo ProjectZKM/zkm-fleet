@@ -1,6 +1,8 @@
 //! Full HTTP administration + HTTP/2 node RPC on the same listener. The fake
 //! receipt verifier isolates orchestration; production pins the Ziren verifier.
 use super::*;
+#[path = "workloads_openshell_tests.rs"]
+mod openshell_startup;
 use trusted_shim::{
     contracts::{ExecutionIdentity, PolicyRef, ProofKind, Validity},
     ledger::SqliteLedger,
@@ -221,6 +223,7 @@ async fn policy_setup_with_driver(
         json!(["control"])
     };
     if driver == "openshell" {
+        report.apps[0]["command"] = json!(["/bin/true"]);
         report.apps[0]["gpus"] = json!(0);
         report.apps[0]["replicas"] = json!(1);
         report.apps[0]["memory_gb"] = json!(0.125);
@@ -740,7 +743,7 @@ fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::Prov
     let mut a = request.clone();
     a.operation = "runtime.create".into();
     let launch: trusted_shim::runtime::LaunchRequest=serde_json::from_value(json!({
-        "execution":a.execution,"driver":"openshell","image":"runner:1","command":[],"environment":{},
+        "execution":a.execution,"driver":"openshell","image":"runner:1","command":["/bin/true"],"environment":{},
         "limits":{"cpu_millicores":2000,"memory_bytes":134217728},
         "policy":{"issuer":"fleet","policy_id":"create","version":1,"sha256":"a".repeat(64)},
         "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required","attestation_proof":"not_required"},"services":[]
@@ -750,7 +753,7 @@ fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::Prov
     let sandbox = DriverSandbox {
         id: "sandbox-id".into(),
         name: binding.request().name,
-        workspace: launch.execution.namespace.clone(),
+        workspace: trusted_shim::openshell_gateway::workspace_name(&launch.execution.namespace),
         spec: Some(DriverSandboxSpec {
             command: launch.command.clone(),
             environment: launch.environment.clone().into_iter().collect(),

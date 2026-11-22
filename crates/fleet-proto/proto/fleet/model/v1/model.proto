@@ -341,11 +341,24 @@ message PolicyCredentialRequest {
   required uint64 expires_at = 3;
 }
 
+// Operator preparation for the stock OpenShell gateway's compute callback.
+// No gateway launch credentials are stored in this record or public App specs.
+message OpenShellLaunchPreparation {
+  required Json request = 1;
+  required string native_policy_base64 = 2;
+  required string principal = 3;
+  required uint64 expires_at = 4;
+  required uint64 cost = 5;
+}
+
 message RuntimeInstance {
   required string entry_name = 1;
   required RuntimeExecutionIdentity execution = 2;
   required bool ready = 3;
   repeated string services = 4;
+  // Bounded, sanitized native compute observation. Never includes a spec,
+  // credentials, node-local service endpoints or platform diagnostic messages.
+  optional string native_observation_base64 = 5;
 }
 
 message JobReport {

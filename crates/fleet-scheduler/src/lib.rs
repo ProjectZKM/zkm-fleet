@@ -14,6 +14,7 @@ pub mod token;
 pub mod router_control;
 pub mod policy_gateway;
 mod runtime_delivery;
+mod openshell;
 
 use std::future::IntoFuture;
 use std::sync::Arc;
@@ -124,6 +125,12 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     tracing::info!(control = %cfg.control_addr, http = %cfg.http_addr, "listening");
     let dispatcher = tokio::spawn(fleet.clone().dispatch_loop());
     let policy = workloads.policy.clone();
+    let compute_controller = workloads.clone();
+    let compute_socket = cfg.policy_gateway.as_ref().and_then(|p| p.openshell.as_ref()).map(|o| o.compute_socket.clone());
+    let compute_loop = async move {
+        if let Some(path) = compute_socket { return openshell::serve(compute_controller,path).await; }
+        std::future::pending::<anyhow::Result<()>>().await
+    };
     let receipt_loop = async move {
         if let Some(policy) = policy { policy.receipt_loop().await; }
         std::future::pending::<()>().await;
@@ -149,6 +156,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = dispatcher => r?,
         r = dispatch_loop => r??,
         _ = receipt_loop => anyhow::bail!("policy receipt worker stopped"),
+        r = compute_loop => { r?; anyhow::bail!("OpenShell compute extension stopped"); },
     }
     Ok(())
 }

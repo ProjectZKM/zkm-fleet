@@ -411,11 +411,13 @@ def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_pat
         assert command["driver"] == "openshell"
         assert command["execution"] == spec.execution
         calls.append(command["operation"])
-        return {"phase":"created", "platform_ready":True, "cleaned":True}
+        return {"phase":"created", "platform_ready":True, "cleaned":True,
+                "native_observation_base64":"c2FuaXRpemVk"}
     monkeypatch.setattr(shim,"invoke",invoke)
     actor = shim._ProvisionedApp(spec)
     health = ReplicaHealth.load(actor.health())
     assert health.allocation_reserved and not health.is_ready and not health.management_ready
+    assert health.native_observation_base64 == "c2FuaXRpemVk"
     assert reconcile.matches(spec,health)
     assert calls == ["allocate", "inspect"]
     assert book.read(spec.name).driver == "openshell"
@@ -460,3 +462,23 @@ def test_native_selection_cannot_be_swapped_for_docker_in_admitted_command(tmp_p
         with pytest.raises(ValueError,match="runtime selection differs"):
             executor.set_app({"app":app,"disabled":False},"bad-command")
     finally: executor.pool.shutdown()
+
+
+def test_native_observation_report_remains_unready_and_allocation_owned(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    raw = native_config(tmp_path)
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    replica = e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    health = ReplicaHealth(name="web-0", spec=actors.spec_hash(replica), executor=ExecutorKind.SHIM,
+        execution=replica.execution, ready=False, allocation_reserved=True,
+        native_observation_base64="c2FuaXRpemVk")
+    monkeypatch.setattr(node, "alive_nodes", lambda: [{}])
+    monkeypatch.setattr(node, "resources", lambda: ({"GPU": 0, "CPU": 1}, {"GPU": 0, "CPU": 0}))
+    monkeypatch.setattr(reconcile, "running", lambda: {"web-0": object()})
+    monkeypatch.setattr(reconcile, "health_of", lambda *a, **kw: health)
+    monkeypatch.setattr(shim, "capabilities", lambda _: [])
+    record = e.report()["runtime_instances"][0]
+    assert record["native_observation_base64"] == health.native_observation_base64
+    assert not record["ready"] and record["services"] == []
+    health.execution = replace(replica.execution, lease_id="obsolete")
+    assert e.report().get("runtime_instances", []) == []

@@ -117,8 +117,10 @@ impl NodeReport {
         anyhow::ensure!(self.runtime_instances.len() <= 1024, "too many runtime instances");
         let mut seen = std::collections::HashSet::new();
         for instance in &self.runtime_instances {
+            anyhow::ensure!(instance.native_observation_base64.as_ref().is_none_or(|v| !v.is_empty() && v.len() <= 21848), "invalid native observation size");
             let e = &instance.execution;
             let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
+            anyhow::ensure!(instance.native_observation_base64.is_none() || entry.0["runtime"]["driver"] == "openshell", "native observation requires OpenShell runtime");
             anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && entry.is_container()
                 && e.node_id == self.machine && e.generation > 0
                 && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
