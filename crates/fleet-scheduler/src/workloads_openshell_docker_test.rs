@@ -93,7 +93,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         "python3".to_string(),
         "-u".into(),
         "-c".into(),
-        include_str!("workloads_openshell_app_test.py").into(),
+        include_str!("../tests/fixtures/openshell_app.py").into(),
     ];
     let (dir, c, mut report, mut policy, mut request) =
         policy_setup_with_inventory("openshell", |report| {
