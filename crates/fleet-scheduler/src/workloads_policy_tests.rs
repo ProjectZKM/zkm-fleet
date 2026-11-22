@@ -157,6 +157,249 @@ async fn credential(c: &Arc<WorkloadController>, r: &EvaluationRequest, permissi
     json_body(response).await
 }
 
+#[tokio::test]
+async fn precreate_policy_requires_a_durable_admitted_command_and_survives_restart() {
+    let (_dir, c, mut report, p, mut r) = policy_setup().await;
+    report.runtime_instances.clear();
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert!(c.guard(&r.execution).is_err());
+    assert_eq!(
+        admin(
+            &c,
+            "POST",
+            "/policy/allocations/prepare",
+            json!(r.execution)
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let command = c
+        .command(
+            "gpu",
+            NodeOperation::SetApp,
+            message::set_app(&report.apps[0], false),
+        )
+        .unwrap();
+    r.execution.lease_id = command.clone();
+    // A queued intent without resource admission is never authorization.
+    assert_eq!(
+        admin(
+            &c,
+            "POST",
+            "/policy/allocations/prepare",
+            json!(r.execution)
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    c.dispatch().await.unwrap();
+    assert!(c.inner.lock().commands.get(&command).unwrap().admitted);
+    for field in 0..6 {
+        let mut e = r.execution.clone();
+        match field {
+            0 => e.namespace.push('x'),
+            1 => e.workload.push('x'),
+            2 => e.allocation_id = "model-2".into(),
+            3 => e.lease_id.push('x'),
+            4 => e.generation = 0,
+            _ => e.node_id.push('x'),
+        }
+        assert!(!admin(&c, "POST", "/policy/allocations/prepare", json!(e))
+            .await
+            .status()
+            .is_success());
+    }
+    json_body(
+        admin(
+            &c,
+            "POST",
+            "/policy/allocations/prepare",
+            json!(r.execution),
+        )
+        .await,
+    )
+    .await;
+    json_body(
+        admin(
+            &c,
+            "POST",
+            "/policy/allocations/prepare",
+            json!(r.execution),
+        )
+        .await,
+    )
+    .await;
+    assert!(c.guard(&r.execution).is_ok());
+    let mut different = r.execution.clone();
+    different.generation += 1;
+    assert_eq!(
+        admin(&c, "POST", "/policy/allocations/prepare", json!(different))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert!(c.guard(&different).is_err());
+    // Activation/staging/credential issuance work before a runtime exists.
+    activate(&c, &p, &r).await;
+    let access = credential(&c, &r, "admission_and_execution").await;
+    let mut recovered = WorkloadController::new(c.fleet.clone(), c.cluster.clone()).unwrap();
+    recovered.policy = c.policy.clone();
+    let recovered = Arc::new(recovered);
+    assert!(recovered.guard(&r.execution).is_err()); // require a fresh node session
+    recovered
+        .report("gpu", "restarted", report.clone())
+        .await
+        .unwrap();
+    assert!(recovered.guard(&r.execution).is_ok());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::http::router(crate::http::HttpState {
+        fleet: recovered.fleet.clone(),
+        workloads: recovered.clone(),
+    });
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = RemoteLedger::connect(
+        &address,
+        access["token"].as_str().unwrap(),
+        r.execution.clone(),
+    )
+    .await
+    .unwrap();
+    let decision = RegorusEngine.evaluate(&p, &r).unwrap();
+    let grant = client
+        .reserve(&decision, Some(&encode_public_values(&decision).unwrap()))
+        .await
+        .unwrap();
+    recovered.inner.lock().commands.update(&command, |c| {
+        c.done = true;
+    });
+    assert!(recovered.guard(&r.execution).is_err()); // a finished command cannot authorize absent compute
+    assert!(client
+        .consume(&grant, &r.execution, &grant.request_sha256)
+        .await
+        .is_err());
+    report.runtime_instances = serde_json::from_value(json!([{
+        "entry_name":"model","ready":false,"services":["control"],"execution":r.execution
+    }]))
+    .unwrap();
+    recovered.report("gpu", "restarted", report).await.unwrap();
+    assert!(recovered.guard(&r.execution).is_ok()); // exact reported ownership takes over
+    client
+        .consume(&grant, &r.execution, &grant.request_sha256)
+        .await
+        .unwrap();
+    assert!(client
+        .consume(&grant, &r.execution, &grant.request_sha256)
+        .await
+        .is_err());
+    recovered
+        .fleet
+        .release_allocation("deployment:gpu-model")
+        .await
+        .unwrap();
+    assert!(recovered.guard(&r.execution).is_err());
+    server.abort();
+}
+
+#[tokio::test]
+async fn prepared_generations_reject_parallel_launches_and_fence_old_reports() {
+    let (_dir, c, mut report, _, mut r) = policy_setup().await;
+    report.runtime_instances.clear();
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let first = c
+        .command(
+            "gpu",
+            NodeOperation::SetApp,
+            message::set_app(&report.apps[0], false),
+        )
+        .unwrap();
+    c.dispatch().await.unwrap();
+    r.execution.lease_id = first.clone();
+    c.prepare_policy_execution(&r.execution).unwrap();
+    let old = r.execution.clone();
+    // Persist a completed command, as an acknowledged node result does.
+    let finished = c
+        .inner
+        .lock()
+        .commands
+        .update(&first, |c| {
+            c.done = true;
+            c.clone()
+        })
+        .unwrap();
+    c.save("commands", &first, &finished).unwrap();
+    r.execution.lease_id = c
+        .command(
+            "gpu",
+            NodeOperation::SetApp,
+            message::set_app(&report.apps[0], false),
+        )
+        .unwrap();
+    c.dispatch().await.unwrap();
+    assert!(c.prepare_policy_execution(&r.execution).is_err()); // generation cannot be reused
+    r.execution.generation += 1;
+    c.prepare_policy_execution(&r.execution).unwrap();
+    assert!(c.guard(&r.execution).is_ok());
+    report.runtime_instances = serde_json::from_value(json!([{
+        "entry_name":"model","ready":true,"services":["control"],"execution":old
+    }]))
+    .unwrap();
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(c.guard(&old).is_err()); // late old heartbeat cannot revive authorization
+    assert!(c.guard(&r.execution).is_err()); // nor hide a conflicting live instance
+}
+
+#[tokio::test]
+async fn precreate_scaling_authorizes_only_the_current_admitted_start() {
+    let (_dir, c, mut report, _, mut r) = policy_setup().await;
+    report.runtime_instances.clear();
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let mut scale = scaling::new_scale(report.apps[0].0.clone(), false);
+    c.inner
+        .lock()
+        .deployments
+        .get_mut("gpu-model")
+        .unwrap()
+        .scale = Some(scale.clone());
+    let id = c
+        .command(
+            "gpu",
+            NodeOperation::SetApp,
+            message::scale_step(&report.apps[0], false, scale.id(), "start"),
+        )
+        .unwrap();
+    scale.start = Some(id.clone());
+    scale.phase = fleet_proto::model::v1::ScalePhase::Starting as i32;
+    c.inner
+        .lock()
+        .deployments
+        .get_mut("gpu-model")
+        .unwrap()
+        .scale = Some(scale.clone());
+    c.dispatch().await.unwrap();
+    r.execution.lease_id = id;
+    c.prepare_policy_execution(&r.execution).unwrap();
+    assert!(c.guard(&r.execution).is_ok());
+    for changed in 0..4 {
+        let mut wrong = scale.clone();
+        match changed {
+            0 => wrong.id.push('x'),
+            1 => wrong.start = Some("another-command".into()),
+            2 => wrong.phase = fleet_proto::model::v1::ScalePhase::Draining as i32,
+            _ => wrong.phase = fleet_proto::model::v1::ScalePhase::Failed as i32,
+        }
+        c.inner
+            .lock()
+            .deployments
+            .get_mut("gpu-model")
+            .unwrap()
+            .scale = Some(wrong);
+        assert!(c.guard(&r.execution).is_err());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_gateway_shares_listener_and_fences_consumption_with_live_fleet_state() {
     let (_dir, c, report, p, r) = policy_setup().await;

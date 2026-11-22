@@ -7,55 +7,208 @@ use trusted_shim::{
     rail::{Error, Result},
 };
 
+pub(super) fn preparation_key(e: &ExecutionIdentity) -> Result<String> {
+    if e.generation == 0
+        || [
+            &e.namespace,
+            &e.workload,
+            &e.allocation_id,
+            &e.lease_id,
+            &e.node_id,
+        ]
+        .iter()
+        .any(|s| s.is_empty() || s.len() > 256 || s.contains('\0'))
+    {
+        return Err(Error::InvalidInput);
+    }
+    // One immutable identity per admitted command/replica, not one per caller
+    // supplied generation. Retain history to fence later generation rollback.
+    trusted_shim::rail::rego::commitment(
+        "fleet.policy-preparation.v1",
+        &(
+            &e.namespace,
+            &e.workload,
+            &e.allocation_id,
+            &e.lease_id,
+            &e.node_id,
+        ),
+    )
+}
+
+fn same_slot(a: &ExecutionIdentity, b: &ExecutionIdentity) -> bool {
+    a.namespace == b.namespace
+        && a.workload == b.workload
+        && a.allocation_id == b.allocation_id
+        && a.node_id == b.node_id
+}
+
+fn owner<'a>(
+    i: &'a WorkloadState,
+    e: &ExecutionIdentity,
+    stale: u64,
+) -> Result<(&'a str, &'a NodeSession)> {
+    let mut owners = i
+        .workers
+        .iter()
+        .filter(|(_, w)| w.report.machine == e.node_id);
+    let (id, w) = owners.next().ok_or(Error::Rejected)?;
+    if owners.next().is_some() || w.ended || !w.report.ready || now() - w.seen >= stale as f64 {
+        return Err(Error::Rejected);
+    }
+    Ok((id, w))
+}
+
+fn pending_entry<'a>(i: &'a WorkloadState, worker: &str, e: &ExecutionIdentity) -> Result<&'a str> {
+    let c = i.commands.get(&e.lease_id).ok_or(Error::Rejected)?;
+    let entry = c.entry();
+    if c.worker != worker
+        || c.done
+        || !c.admitted
+        || c.error.is_some()
+        || !c.is(NodeOperation::SetApp)
+        || !c.starts()
+        || entry.runtime_capability().is_none()
+        || entry.namespace() != e.namespace
+        || entry.app() != e.workload
+    {
+        return Err(Error::Rejected);
+    }
+    let index = e
+        .allocation_id
+        .strip_prefix(&format!("{}-", entry.name()))
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or(Error::Rejected)?;
+    if index >= entry.replicas() || e.allocation_id != format!("{}-{index}", entry.name()) {
+        return Err(Error::Rejected);
+    }
+    let intent = i
+        .deployments
+        .get(&format!("{worker}-{}", entry.name()))
+        .ok_or(Error::Rejected)?;
+    if intent.spec != c.parameters["app"] {
+        return Err(Error::Rejected);
+    }
+    if intent.scale.as_ref().is_some_and(|s| {
+        s.phase() != fleet_proto::model::v1::ScalePhase::Starting
+            || s.start.as_deref() != Some(e.lease_id.as_str())
+            || c.scale_id() != Some(s.id())
+    }) {
+        return Err(Error::Rejected);
+    }
+    Ok(entry.name())
+}
+
+fn intent(
+    i: &WorkloadState,
+    worker_id: &str,
+    worker: &NodeSession,
+    entry: &str,
+    e: &ExecutionIdentity,
+) -> Result<()> {
+    let intent = i
+        .deployments
+        .get(&format!("{worker_id}-{entry}"))
+        .ok_or(Error::Rejected)?;
+    if intent.disabled
+        || intent.entry().namespace() != e.namespace
+        || intent.entry().app() != e.workload
+        || intent.scale.as_ref().is_some_and(|s| {
+            s.pending()
+                && !(s.phase() == fleet_proto::model::v1::ScalePhase::Starting
+                    && s.start.as_deref() == Some(e.lease_id.as_str())
+                    && i.commands.get(&e.lease_id).is_some_and(|c| {
+                        c.admitted
+                            && c.error.is_none()
+                            && c.starts()
+                            && c.scale_id() == Some(s.id())
+                    }))
+        })
+        || scaling::retiring(i, intent)
+        || !worker.report.entry(entry).is_some_and(|e| !e.disabled())
+    {
+        return Err(Error::Rejected);
+    }
+    Ok(())
+}
+
+impl WorkloadController {
+    /// An operator may prepare exactly one identity for an already admitted
+    /// command's replica. This neither schedules a workload nor changes legacy
+    /// execution modes. Store before activation/remote proof/dispatch.
+    pub(crate) fn prepare_policy_execution(&self, e: &ExecutionIdentity) -> Result<()> {
+        let key = preparation_key(e)?;
+        let mut i = self.inner.lock();
+        let (worker_id, worker) = owner(&i, e, self.fleet.cfg.node_stale_secs)?;
+        let entry = pending_entry(&i, worker_id, e)?;
+        intent(&i, worker_id, worker, entry, e)?;
+        if worker.report.runtime_instances.iter().any(|r| {
+            let observed = crate::policy_gateway::identity(r.execution.clone());
+            same_slot(&observed, e)
+        }) {
+            return Err(Error::Conflict);
+        }
+        let _quota = self
+            .fleet
+            .policy_allocation_guard(&e.namespace, &format!("deployment:{worker_id}-{entry}"))?;
+        if let Some(previous) = i.policy_preparations.get(&key) {
+            return if previous == e {
+                Ok(())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        if i.policy_preparations.values().any(|old| {
+            same_slot(old, e)
+                && (old.generation >= e.generation
+                    || i.commands.get(&old.lease_id).is_some_and(|c| !c.done))
+        }) {
+            return Err(Error::Conflict);
+        }
+        self.save("policy-preparations", &key, e)
+            .map_err(|_| Error::Unavailable)?;
+        i.policy_preparations.insert(key, e.clone());
+        Ok(())
+    }
+}
+
 impl ExecutionAuthority for WorkloadController {
     fn guard(&self, execution: &ExecutionIdentity) -> Result<Box<dyn ExecutionGuard + '_>> {
         let i = self.inner.lock();
-        let mut owners = i
-            .workers
-            .iter()
-            .filter(|(_, w)| w.report.machine == execution.node_id);
-        let (worker_id, worker) = owners.next().ok_or(Error::Rejected)?;
-        // A duplicate machine identity is ambiguous even if one session is stale.
-        if owners.next().is_some()
-            || worker.ended
-            || !worker.report.ready
-            || now() - worker.seen >= self.fleet.cfg.node_stale_secs as f64
+        let (worker_id, worker) = owner(&i, execution, self.fleet.cfg.node_stale_secs)?;
+        if i.policy_preparations
+            .values()
+            .any(|e| same_slot(e, execution) && e.generation > execution.generation)
         {
             return Err(Error::Rejected);
         }
-        let instance = worker
-            .report
-            .runtime_instances
-            .iter()
-            .find(|r| {
-                let e = &r.execution;
-                e.namespace == execution.namespace
-                    && e.workload == execution.workload
-                    && e.allocation_id == execution.allocation_id
-                    && e.lease_id == execution.lease_id
-                    && e.generation == execution.generation
-                    && e.node_id == execution.node_id
-            })
-            .ok_or(Error::Rejected)?;
-        let intent = i
-            .deployments
-            .get(&format!("{worker_id}-{}", instance.entry_name))
-            .ok_or(Error::Rejected)?;
-        if intent.disabled
-            || intent.entry().namespace() != execution.namespace
-            || intent.entry().app() != execution.workload
-            || intent.scale.as_ref().is_some_and(|s| s.pending())
-            || scaling::retiring(&i, intent)
-            || !worker
-                .report
-                .entry(&instance.entry_name)
-                .is_some_and(|e| !e.disabled())
-        {
-            return Err(Error::Rejected);
-        }
+        let instance = worker.report.runtime_instances.iter().find(|r| {
+            let e = &r.execution;
+            e.namespace == execution.namespace
+                && e.workload == execution.workload
+                && e.allocation_id == execution.allocation_id
+                && e.lease_id == execution.lease_id
+                && e.generation == execution.generation
+                && e.node_id == execution.node_id
+        });
+        let entry = if let Some(instance) = instance {
+            instance.entry_name.as_str()
+        } else {
+            if i.policy_preparations.get(&preparation_key(execution)?) != Some(execution)
+                || worker.report.runtime_instances.iter().any(|r| {
+                    same_slot(
+                        &crate::policy_gateway::identity(r.execution.clone()),
+                        execution,
+                    )
+                })
+            {
+                return Err(Error::Rejected);
+            }
+            pending_entry(&i, worker_id, execution)?
+        };
+        intent(&i, worker_id, worker, entry, execution)?;
         let quota = self.fleet.policy_allocation_guard(
             &execution.namespace,
-            &format!("deployment:{worker_id}-{}", instance.entry_name),
+            &format!("deployment:{worker_id}-{entry}"),
         )?;
         Ok(Box::new((i, quota)))
     }

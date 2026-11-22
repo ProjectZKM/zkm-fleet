@@ -141,6 +141,7 @@ struct WorkloadState {
     commands: Records<CommandRecord>,
     workers: BTreeMap<String, NodeSession>,
     deployments: BTreeMap<String, AppDeployment>,
+    policy_preparations: BTreeMap<String, trusted_shim::contracts::ExecutionIdentity>,
 }
 
 pub struct WorkloadController {
@@ -163,7 +164,7 @@ fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
 impl WorkloadController {
     pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
-        for name in ["apps", "jobs", "commands", "artifacts", "deployments"] {
+        for name in ["apps", "jobs", "commands", "artifacts", "deployments", "policy-preparations"] {
             fs::create_dir_all(dir.join(name))?;
         }
         let mut inner = WorkloadState::default();
@@ -180,6 +181,11 @@ impl WorkloadController {
             inner
                 .deployments
                 .insert(format!("{}-{}", v.worker, v.entry().name()), v);
+        }
+        for v in load::<fleet_proto::model::v1::RuntimeExecutionIdentity>(&dir.join("policy-preparations"))? {
+            let v = crate::policy_gateway::identity(v);
+            anyhow::ensure!(inner.policy_preparations.insert(policy::preparation_key(&v)?, v).is_none(),
+                "duplicate durable policy preparation");
         }
         fleet.set_worker_owned_apps(worker_owned(&inner));
         let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;

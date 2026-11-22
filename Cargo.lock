@@ -6918,7 +6918,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-shim?rev=1093c647eaf259da0505803ff29ffd87cc4334ce#1093c647eaf259da0505803ff29ffd87cc4334ce"
+source = "git+https://github.com/BotMesh/trusted-shim?rev=5445d607dea5b657e70b674d50a60c2a3e470467#5445d607dea5b657e70b674d50a60c2a3e470467"
 dependencies = [
  "alloy-primitives",
  "async-trait",

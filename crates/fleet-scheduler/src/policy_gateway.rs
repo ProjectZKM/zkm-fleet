@@ -114,6 +114,7 @@ pub(crate) fn admin_router(c: Arc<WorkloadController>) -> Router {
         .route("/policy/program/elf", get(elf))
         .route("/policy/budgets", put(budget))
         .route("/policy/allocations/activate", post(activate))
+        .route("/policy/allocations/prepare", post(prepare))
         .route("/policy/allocations/revoke", post(revoke))
         .route("/policy/requests", post(stage))
         .route("/policy/requests/:id", get(request))
@@ -139,7 +140,7 @@ pub(crate) fn node_router(c: Arc<WorkloadController>) -> Router {
         .route_service("/trusted.ledger.v1.AuthorizationLedger/Consume", service)
 }
 
-fn identity(e: RuntimeExecutionIdentity) -> ExecutionIdentity {
+pub(crate) fn identity(e: RuntimeExecutionIdentity) -> ExecutionIdentity {
     ExecutionIdentity {
         namespace: e.namespace,
         workload: e.workload,
@@ -223,6 +224,33 @@ async fn activate(
         Ok(json!({}))
     })
     .await
+}
+async fn prepare(
+    State(c): State<Arc<WorkloadController>>,
+    Json(e): Json<RuntimeExecutionIdentity>,
+) -> Response {
+    let Some(p) = &c.policy else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(permit) = p.permits.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let e = identity(e);
+        c.prepare_policy_execution(&e)?;
+        Ok::<_, Error>(e)
+    })
+    .await
+    .unwrap_or(Err(Error::Unavailable))
+    {
+        Ok(e) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({"execution":e})),
+        )
+            .into_response(),
+        Err(e) => failure(e),
+    }
 }
 async fn stage(
     State(c): State<Arc<WorkloadController>>,

@@ -837,6 +837,7 @@ router delegates and execution credentials cannot call them.
 | `GET /policy/program` | Approved guest hashes and `program_vkey` |
 | `GET /policy/program/elf` | Approved ELF bytes |
 | `PUT /policy/budgets` | `{name, allowance}`; cumulative allowance never resets spending |
+| `POST /policy/allocations/prepare` | Exact execution identity for an admitted, unfinished start command and one configured replica; persist before activation |
 | `POST /policy/allocations/activate` | `{execution, policy, context, previous_state_root, budget}` |
 | `POST /policy/allocations/revoke` | Exact execution identity; durable even after replacement |
 | `POST /policy/requests` | `{job_id, request, cost}`; persist before remote proof submission |
@@ -853,15 +854,26 @@ once. A transport failure after consumption is ambiguous: do not retry dispatch.
 The shim must reconcile its durable local operation instead.
 
 Activation, staging, credential issuance, reservation and consumption are fenced
-by current Fleet state: exact reported runtime identity, active deployment,
+by current Fleet state: exact reported or centrally prepared runtime identity, active deployment,
 fresh connected node, active namespace and held resource allocation. The fence
 remains locked through the ledger transaction. Node replacement, scale changes,
 suspension and resource release reject old credentials without waiting for TTL.
 Credential rotation does not reauthorize a revoked execution or reset budgets.
 
-This increment admits already reported runtimes. Native OpenShell preparation,
-pre-create activation and automatic private delivery of credentials are separate
-integration requirements. Do not put credentials or native launch secrets in App
+For creation, prepare an identity whose `lease_id` is the admitted `SetApp`
+command ID, `allocation_id` is an actual `entry-N` replica, and namespace,
+workload and machine match the command. A preparation cannot replace a reported
+runtime, change an existing command's identity, reuse an older generation, or
+overlap a preceding unfinished preparation. It does not schedule a new job or
+change the requested driver. Retain `workloads/policy-preparations` with command
+history across upgrades; those generated state records contain no credentials.
+An unfinished command must remain admitted with unchanged deployment intent and
+held quota. After command completion, the exact reported runtime identity takes
+over; absence never authorizes a new creation. A late report of an older prepared
+generation cannot revive its authorization.
+
+Native OpenShell preparation and automatic private delivery of credentials
+still require node/gateway integration. Do not put credentials or native launch secrets in App
 specs, environment, node reports or diagnostics. Docker still rejects requested
 proof-required execution modes; mounting this ledger does not change that driver.
 Film model keys and ClawUp user/session authorization remain application-owned.
