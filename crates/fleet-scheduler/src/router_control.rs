@@ -18,6 +18,7 @@ use fleet_proto::{
     models::{
         valid_route_id, valid_router_id, MAX_ROUTER_REVOCATIONS, ROUTER_CAPABILITIES_HEADER,
         ROUTER_WORKLOAD_DEFAULTS, ROUTER_SCOPED_REVOCATIONS,
+        ROUTER_REVOCATION_COMPACTION,
     },
 };
 
@@ -404,11 +405,25 @@ async fn revoke_subject(
         {
             return Err(StatusCode::FORBIDDEN);
         }
-        if auth.revoked_subjects.contains(&revocation) {
+        let covered = auth.revoked_subjects.iter().any(|old| old.covers(&revocation));
+        let previous_len = auth.revoked_subjects.len();
+        // Only upgraded relays accept removing a record covered by a broader
+        // denial. Preserve old snapshots for legacy relays. CAS commits the
+        // replacement and revision atomically, never an intermediate deletion.
+        if next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_COMPACTION) {
+            auth.revoked_subjects.retain(|old| !revocation.covers(old) || old.covers(&revocation));
+        }
+        if covered && previous_len == auth.revoked_subjects.len() {
             return Ok(());
         }
-        auth.revoked_subjects.push(revocation.clone());
-        auth.validate_namespace_capacity(&revocation.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        if !covered {
+            auth.revoked_subjects.push(revocation.clone());
+        }
+        // Shrinking a legacy oversized namespace cannot consume another share.
+        // Apply admission quotas only when this mutation allocates a new slot.
+        if auth.revoked_subjects.len() > previous_len {
+            auth.validate_namespace_capacity(&revocation.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+        }
         auth.revision = auth
             .revision
             .checked_add(1)

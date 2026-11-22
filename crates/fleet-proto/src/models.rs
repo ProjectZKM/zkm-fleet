@@ -8,6 +8,7 @@ pub const MAX_ROUTER_REVOCATIONS: usize = 4096;
 pub const ROUTER_CAPABILITIES_HEADER: &str = "x-fleet-router-capabilities";
 pub const ROUTER_WORKLOAD_DEFAULTS: &str = "workload-defaults-v1";
 pub const ROUTER_SCOPED_REVOCATIONS: &str = "scoped-revocations-v1";
+pub const ROUTER_REVOCATION_COMPACTION: &str = "revocation-compaction-v1";
 pub fn valid_router_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -51,6 +52,14 @@ impl RouterAccessPolicy {
     }
 }
 impl RouterSubjectRevocation {
+    /// Whether retaining this denial makes the old record redundant, including
+    /// its operator/application scope. This never expires a permanent ban.
+    pub fn covers(&self, old: &Self) -> bool {
+        self.namespace == old.namespace && self.principal == old.principal
+            && (self.session.is_none() || self.session == old.session)
+            && (self.application_only != Some(true) || old.application_only == Some(true))
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(router_namespace(&self.namespace) && valid_route_id(&self.principal)
             && self.session.as_ref().is_none_or(|s| valid_route_id(s)), "invalid subject revocation");

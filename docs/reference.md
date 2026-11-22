@@ -1093,6 +1093,15 @@ New authorization records have a 64-record namespace budget within the existing
 1024-record router limit (at most 16 fully reserved namespace shares). Historical
 larger namespaces remain readable; policy replacement retains its existing slot.
 
+With `revocation-compaction-v1` advertised, an explicit broad subject revocation
+atomically replaces session records it fully covers. Retrying a broad revocation
+also removes covered records retained by older versions. Namespace, principal and
+operator/application scope must all be covered; Fleet never turns session logout
+into a user ban automatically. The relay independently validates coverage before
+committing and canceling affected streams. Upgrade the relay first: a rollback
+can reject the compacted snapshot and must not reset its durable state. Without
+this capability, Fleet retains the old append-only representation.
+
 Changing an existing policy requires a higher version. New agents can inherit
 defaults without letting application backends write infrastructure policy. Defaults
 also apply to existing workloads without an exact entry; publish explicit disabled
@@ -1446,7 +1455,9 @@ Upgrade Fleet, relay and shim before issuing identity-bound grants; old shim
 parsers reject them. Enable all needed service policies before switching a shared
 router's clients. Unconfigured routers and legacy tasks retain their behavior.
 The initial authorization snapshot caps policies plus permanent revocations at
-1024 records and returns 507 at capacity. Collection/pagination, key rotation and
+1024 records and returns 507 at capacity. Compaction only removes denials covered
+by an explicitly requested broader ban; distinct permanent bans still consume
+capacity. General collection/pagination, key rotation and
 automatic app-lifecycle revocation remain follow-up work; do not discard records
 to recover capacity. See trusted-data-router `crates/transport/CONTROL.md` for the
 complete rollout and credential boundaries.

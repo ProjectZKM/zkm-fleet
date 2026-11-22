@@ -308,6 +308,94 @@ async fn shared_router_redacts_delegates_and_suspension_withdraws_policies_durab
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn router_revocation_compaction_recovers_capacity_without_restoring_access() {
+    use fleet_proto::models::ROUTER_NAMESPACE_RECORDS;
+    use serde_json::{json, Value};
+    let h = start().await;
+    let ns: Value = h.client.get(format!("{}/namespaces/{PROOFS}", h.http))
+        .bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let ns = ns["id"].as_str().unwrap();
+    let sync_token = "ac".repeat(48);
+    let backend = "bc".repeat(48);
+    for (id, secret, permissions) in [("ac", &sync_token, vec!["router_sync"]),
+        ("bc", &backend, vec!["read", "router_delegate"])] {
+        h.client.post(format!("{}/tokens", h.http)).bearer_auth(&h.admin)
+            .json(&json!({"id":id.repeat(16),"address":id.repeat(20),"namespace":PROOFS,
+                "permissions":permissions,"token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))}))
+            .send().await.unwrap().error_for_status().unwrap();
+    }
+    let base = format!("{}/routers/compact", h.http);
+    h.client.put(&base).bearer_auth(&h.admin)
+        .json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let poll = |capabilities: &str| h.client.post(format!("{base}/sync"))
+        .bearer_auth(&sync_token).header("x-fleet-router-capabilities", capabilities)
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null}));
+    poll("scoped-revocations-v1").send().await.unwrap().error_for_status().unwrap();
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin)
+        .json(&json!({"namespace":ns,"workload":"agent","service":"chat","version":1,
+            "sha256":"ab".repeat(32),"enabled":true}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let revoke = |body: &Value| h.client.post(format!("{base}/revoke-subject"))
+        .bearer_auth(&backend).json(body);
+    let user = json!({"namespace":ns,"principal":"12".repeat(32),"session":null});
+    // Fill one namespace's quota with independent sessions of the same user.
+    for i in 0..ROUTER_NAMESPACE_RECORDS - 1 {
+        let mut session = user.clone();
+        session["session"] = json!(format!("{i:064x}"));
+        revoke(&session).send().await.unwrap().error_for_status().unwrap();
+    }
+    assert_eq!(revoke(&user).send().await.unwrap().status(), 507,
+        "a legacy relay must retain the append-only representation");
+    let before: Value = h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(before["authorization"]["revoked_subjects"].as_array().unwrap().len(), ROUTER_NAMESPACE_RECORDS - 1);
+    poll("scoped-revocations-v1,revocation-compaction-v1").send().await.unwrap().error_for_status().unwrap();
+    let compacted: Value = revoke(&user).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(compacted["revoked_subjects"].as_array().unwrap().len(), 1);
+    assert_eq!(compacted["revoked_subjects"][0]["application_only"], true);
+    assert_eq!(compacted["revision"].as_u64().unwrap(), before["authorization"]["revision"].as_u64().unwrap() + 1);
+    for session in [format!("{:064x}", 0), "ff".repeat(32)] {
+        let request = json!({"namespace":ns,"workload":"agent","service":"chat",
+            "principal":user["principal"],"session":session});
+        assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend)
+            .json(&request).send().await.unwrap().status(), 403);
+    }
+    // Repeating a covered session does not consume capacity or bump revision.
+    let mut session = user.clone();
+    session["session"] = json!(format!("{:064x}", 0));
+    let repeated: Value = revoke(&session).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(repeated, compacted);
+    let mut other = user.clone();
+    other["principal"] = json!("34".repeat(32));
+    revoke(&other).send().await.unwrap().error_for_status().unwrap();
+    // An upgrade must also reclaim redundant records created by a legacy relay.
+    poll("scoped-revocations-v1").send().await.unwrap().error_for_status().unwrap();
+    let mut legacy = user.clone();
+    legacy["principal"] = json!("56".repeat(32));
+    legacy["session"] = json!("78".repeat(32));
+    revoke(&legacy).send().await.unwrap().error_for_status().unwrap();
+    legacy["session"] = Value::Null;
+    let old: Value = revoke(&legacy).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(old["revoked_subjects"].as_array().unwrap().len(), 4);
+    poll("scoped-revocations-v1,revocation-compaction-v1").send().await.unwrap().error_for_status().unwrap();
+    let new: Value = revoke(&legacy).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(new["revoked_subjects"].as_array().unwrap().len(), 3);
+    assert_eq!(new["revision"].as_u64().unwrap(), old["revision"].as_u64().unwrap() + 1);
+    // Application-wide denial cannot discard an operator's all-service session ban.
+    let mut operator = legacy.clone();
+    operator["session"] = json!("78".repeat(32));
+    h.client.post(format!("{base}/revoke-subject")).bearer_auth(&h.admin)
+        .json(&operator).send().await.unwrap().error_for_status().unwrap();
+    let retained: Value = revoke(&legacy).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(retained["revoked_subjects"].as_array().unwrap().len(), 4);
+    let widened: Value = h.client.post(format!("{base}/revoke-subject")).bearer_auth(&h.admin)
+        .json(&legacy).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(widened["revoked_subjects"].as_array().unwrap().len(), 3);
+    assert!(widened["revoked_subjects"].as_array().unwrap().iter()
+        .any(|r| r["principal"] == legacy["principal"] && r["session"].is_null() && r["application_only"] != true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
     use serde_json::json;
     let h = start().await;
