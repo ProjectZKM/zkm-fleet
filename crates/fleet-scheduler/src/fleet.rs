@@ -344,6 +344,22 @@ impl Scheduler {
         all
     }
 
+    /// Keep suspension and resource release fenced through a policy ledger
+    /// transaction. Lock order is workloads -> namespaces -> allocations.
+    pub(crate) fn policy_allocation_guard(
+        &self, namespace: &str, allocation: &str,
+    ) -> trusted_shim::rail::Result<Box<dyn trusted_shim::ledger_transport::ExecutionGuard + '_>> {
+        let namespaces = self.namespaces.lock();
+        if !namespaces.values().any(|n| n.id == namespace && n.suspended_ms.is_none()) {
+            return Err(trusted_shim::rail::Error::Rejected);
+        }
+        let allocations = self.allocations.lock();
+        if !allocations.get(allocation).is_some_and(|a| a.namespace == namespace) {
+            return Err(trusted_shim::rail::Error::Rejected);
+        }
+        Ok(Box::new((namespaces, allocations)))
+    }
+
     pub async fn create_namespace(&self, name: &str, quota: Quota) -> anyhow::Result<Namespace> {
         quota.validate()?;
         anyhow::ensure!(!name.is_empty() && name.len() <= 63

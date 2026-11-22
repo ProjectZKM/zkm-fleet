@@ -24,6 +24,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "CommandRecord",
         "NodeReport",
         "RuntimeExecutionIdentity",
+        "PolicyActivationRequest",
+        "PolicyStageRequest",
+        "PolicyBudgetRequest",
+        "PolicyCredentialRequest",
         "RuntimeInstance",
         "NativeProverProcess",
         "JobReport",
@@ -56,6 +60,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for name in [
+        "PolicyActivationRequest",
+        "PolicyStageRequest",
+        "PolicyBudgetRequest",
+        "PolicyCredentialRequest",
         "RouterAccessPolicy",
         "RouterSubjectRevocation",
         "RouterAuthorization",

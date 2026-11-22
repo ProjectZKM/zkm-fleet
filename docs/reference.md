@@ -21,7 +21,7 @@ client, submission CLI, policy editor or HTTP listener.
 
 | Component | Does | Depends on |
 |---|---|---|
-| `fleet-scheduler` | Admission, namespace policy, quotas, placement and durable control records | Postgres; no Ray or prover SDK |
+| `fleet-scheduler` | Admission, namespace policy, quotas, placement, durable control records and optional proof-backed policy ledger | Postgres; policy SQLite and Ziren verifier; no Ray or prover SDK |
 | `fleet-node` | Outbound heartbeats, command delivery and log sync | The local Python adapter; no database, signer recovery or prover SDK |
 | `bridge/fleet_bridge` | Local resource grants, actors, containers and confirmed cleanup | Ray, PyYAML |
 | `fleet-proof-app` | Optional SDK endpoint beside app-owned storage | Fleet HTTPS API; no database or prover SDK |
@@ -816,6 +816,55 @@ old. Snapshot capacity is 1024 total policies plus permanent subject revocations
 new entries fail with 507 at capacity without discarding denials. Large rollouts
 require safe collection/pagination. These references and ACKs are not policy or
 TEE execution proofs. No existing application is rescheduled by a policy update.
+
+### Central policy ledger
+
+The optional `policy_gateway` section in the existing `fleet.yaml` pins an
+approved Ziren 2.0 policy guest ELF, its SHA-256 and its `vk.bytes32()` value.
+`fleet-scheduler` embeds the ledger in its existing HTTP listener; the existing
+HTTPS gateway forwards `/trusted.ledger.v1.AuthorizationLedger/` using HTTP/2.
+There is no new public port, standalone Rail server or local prover.
+Retain `data_dir/policy` (mode 0700), including its SQLite WAL and signing secret,
+across upgrades. Back it up consistently with SQLite's backup API. Do not share
+this SQLite file across active schedulers or restore an older ledger over live
+allocations. Disabling the section leaves legacy workloads unchanged.
+
+All `/policy/*` routes require a Fleet administrator token. Namespace owners,
+router delegates and execution credentials cannot call them.
+
+| Method and route | Input / result |
+| --- | --- |
+| `GET /policy/program` | Approved guest hashes and `program_vkey` |
+| `GET /policy/program/elf` | Approved ELF bytes |
+| `PUT /policy/budgets` | `{name, allowance}`; cumulative allowance never resets spending |
+| `POST /policy/allocations/activate` | `{execution, policy, context, previous_state_root, budget}` |
+| `POST /policy/allocations/revoke` | Exact execution identity; durable even after replacement |
+| `POST /policy/requests` | `{job_id, request, cost}`; persist before remote proof submission |
+| `GET /policy/requests/:id` | Exact staged evaluation request for recovery |
+| `POST /policy/credentials` | `{execution, permission, expires_at}`; returns `{id, token, expires_at}` once, with `Cache-Control: no-store` |
+| `DELETE /policy/credentials/:id` | Revoke by SHA-256 identifier; never put the bearer in a URL |
+
+`permission` is `admission`, `execution` or `admission_and_execution`; credentials
+expire in at most one hour and bind every field of the execution identity.
+The gRPC methods `Reserve` and `Consume` require those scoped credentials, not
+an administrator or namespace token. The ledger verifies the pinned proof and
+current policy/context, accounts for budget atomically and consumes each grant
+once. A transport failure after consumption is ambiguous: do not retry dispatch.
+The shim must reconcile its durable local operation instead.
+
+Activation, staging, credential issuance, reservation and consumption are fenced
+by current Fleet state: exact reported runtime identity, active deployment,
+fresh connected node, active namespace and held resource allocation. The fence
+remains locked through the ledger transaction. Node replacement, scale changes,
+suspension and resource release reject old credentials without waiting for TTL.
+Credential rotation does not reauthorize a revoked execution or reset budgets.
+
+This increment admits already reported runtimes. Native OpenShell preparation,
+pre-create activation and automatic private delivery of credentials are separate
+integration requirements. Do not put credentials or native launch secrets in App
+specs, environment, node reports or diagnostics. Docker still rejects requested
+proof-required execution modes; mounting this ledger does not change that driver.
+Film model keys and ClawUp user/session authorization remain application-owned.
 
 ## MCP
 

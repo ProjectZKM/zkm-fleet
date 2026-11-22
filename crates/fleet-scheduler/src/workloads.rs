@@ -150,6 +150,7 @@ pub struct WorkloadController {
     inner: Mutex<WorkloadState>,
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
+    pub(crate) policy: Option<Arc<crate::policy_gateway::PolicyGateway>>,
 }
 /// The proof apps an enabled integrated worker feeds: (namespace, app).
 fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
@@ -181,6 +182,7 @@ impl WorkloadController {
                 .insert(format!("{}-{}", v.worker, v.entry().name()), v);
         }
         fleet.set_worker_owned_apps(worker_owned(&inner));
+        let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;
         let controller = Self {
             fleet,
             cluster,
@@ -188,6 +190,7 @@ impl WorkloadController {
             inner: Mutex::new(inner),
             ops: tokio::sync::Mutex::new(()),
             notify: tokio::sync::Notify::new(),
+            policy,
         };
         controller.forget_deleted()?;
         Ok(controller)
@@ -2643,3 +2646,6 @@ mod views;
 
 #[path = "workloads_records.rs"]
 mod records;
+
+#[path = "workloads_policy.rs"]
+mod policy;

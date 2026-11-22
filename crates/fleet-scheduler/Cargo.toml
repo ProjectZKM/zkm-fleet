@@ -22,6 +22,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+libc = "0.2"
 sqlx.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -30,6 +31,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 rand = "0.8"
 reqwest.workspace = true
+trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "1093c647eaf259da0505803ff29ffd87cc4334ce", features = ["ziren"] }
 
 [dev-dependencies]
 bincode.workspace = true

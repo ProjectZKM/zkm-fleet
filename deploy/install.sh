@@ -45,6 +45,11 @@ else
   if [ "$WITH_SHIM" = 1 ]; then
     [ -x "$BIN/trusted-shim-runtime" ] || die "--with-shim requires the bundled trusted-shim-runtime"
     command -v systemctl >/dev/null || die "--with-shim requires systemd"
+    # Validate before replacing binaries, Python code or watchdog ownership.
+    # Retain this lock until the service installer completes its handover.
+    exec 9>"$WORKDIR/node-agent.lock"
+    flock -n 9 || die "control agent is running; use fleet-ctl node upgrade, or stop only the control agent before first supervisor conversion"
+    bash "$SRC/deploy/install-node-services.sh" "$PREFIX" "$ETC" "$WORKDIR" "$BIN/trusted-shim-runtime" --check
   fi
   [ -z "$PROOF_ROOTS" ] || [ -x "$BIN/fleet-ziren-node" ] || [ -x "$PREFIX/bin/fleet-ziren-node" ] \
     || die "--proof-storage-roots requires the optional fleet-ziren-node storage handler"
@@ -120,7 +125,7 @@ EOF
   echo "[install] HTTPS gateway: $PUBLIC_URL; MCP: $PUBLIC_URL/mcp"
 else
   cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh} "$PREFIX/deploy/"
-  cp "$SRC"/deploy/{shim-start.sh,install-node-services.sh} "$PREFIX/deploy/"
+  cp "$SRC"/deploy/{shim-start.sh,ray-watch.sh,install-node-services.sh} "$PREFIX/deploy/"
   # The node holds the cluster token, never the administrator or user tokens.
   [ "$(readlink -f "$TOKEN")" = "$(readlink -m "$ETC/cluster.token")" ] || install -m 600 "$TOKEN" "$ETC/cluster.token"
   if [ -n "$CA" ]; then
@@ -152,13 +157,13 @@ EOF
       install -m 640 "$PROOF_ROOTS" "$ETC/proof-storage-roots"
     fi
   fi
-  {
+  if [ ! -f "$ETC/watchdog.env" ]; then {
     printf 'FLEET_HOME=%q\nFLEET_ETC=%q\nFLEET_LOG=%q\nFLEET_WORKDIR=%q\n' "$PREFIX" "$ETC" "$WORKDIR/logs" "$WORKDIR"
     printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_JOBS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$JOBS_DIR" "$CA"
     [ ! -f "$ETC/proof-storage-roots" ] || printf 'FLEET_PROOF_STORAGE_ROOTS_FILE=%q\n' "$ETC/proof-storage-roots"
     printf 'RAY_NUM_CPUS=%q\nCUDA_VISIBLE_DEVICES=%q\n' "$CPUS" "$CUDA"
-    [ "$WITH_SHIM" != 1 ] || printf 'FLEET_NODE_SUPERVISED=1\n'
   } > "$ETC/watchdog.env"
+  fi
   if [ "$WITH_SHIM" = 1 ]; then
     bash "$PREFIX/deploy/install-node-services.sh" "$PREFIX" "$ETC" "$WORKDIR" "$BIN/trusted-shim-runtime"
   else

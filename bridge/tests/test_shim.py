@@ -106,6 +106,39 @@ def test_daemon_network_is_owned_by_service_not_ray_subprocess(tmp_path, monkeyp
     assert actor.call.call_args.args[0]["operation"] == "network"
 
 
+def test_network_recovery_failure_preserves_observed_runtime_and_repair(tmp_path, monkeypatch):
+    s=spec(tmp_path)
+    actor=object.__new__(shim._ShimApp)
+    actor.spec=replace(s,cluster=replace(s.cluster,shim_daemon=True))
+    actor.port=12345;actor.gpus=[];actor.network=None
+    actor.call=Mock(return_value={"state":"ready"})
+    actor.start_network=Mock(side_effect=RuntimeError('temporary connector failure'))
+    actor.application_ready=Mock(return_value=False)
+    value=actor.health()
+    assert value['management_ready'] is True and value['ready'] is False
+    actor.application_ready.return_value=True
+    assert actor.health()['ready'] is True
+
+
+def test_service_bootstrap_ignores_invalid_apps_but_validates_daemon_settings(tmp_path,monkeypatch):
+    path=tmp_path/'apps.yaml'
+    # Invalid application and network settings must remain remotely repairable.
+    path.write_text('apps: [broken]\nshim_network: {relay_url: invalid}\n')
+    assert shim.daemon_config(path).shim_daemon is False
+    path.write_text('shim_daemon: true\nshim_binary: /bin/shim\nshim_state_dir: /tmp/shim\napps: [broken]\n')
+    config=shim.daemon_config(path)
+    call=Mock(side_effect=[RuntimeError('starting'),{'protocol':1,'features':['runtime-daemon-v1']}])
+    monkeypatch.setattr(shim,'daemon_call',call)
+    monkeypatch.setattr(shim.time,'sleep',lambda _:None)
+    shim.check_daemon(config,wait_seconds=1)
+    assert call.call_count==2
+    for binary in [None,'relative',123]:
+        data={'shim_daemon':True,'shim_state_dir':'/tmp/shim'}
+        if binary is not None:data['shim_binary']=binary
+        path.write_text(yaml.safe_dump(data))
+        with pytest.raises(ValueError):shim.daemon_config(path)
+
+
 @pytest.mark.parametrize("runtime", [None, {"executor":"unknown"}, {"executor":"shim", "driver":"openshell"},
     {"executor":"shim", "driver":"docker", "policy_proof":"required"}])
 def test_unsupported_or_misspelled_runtime_is_not_ignored(tmp_path, runtime):

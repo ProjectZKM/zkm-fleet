@@ -57,6 +57,14 @@ independent units: `zkm-fleet-node.service`, `zkm-fleet-ray.service`, and
 `zkm-fleet-shim.service`; it does not install a new cron entry. Existing watchdog
 entries read `FLEET_NODE_SUPERVISED=1` from the same `watchdog.env`.
 
+For the first supervisor conversion, stop only the existing control agent before
+running the installer; leave Ray, shim and application containers running. The
+installer takes `node-agent.lock` before replacing files and refuses a live agent.
+After conversion, use `fleet-ctl node upgrade` for upgrades. Failed service handover
+restores `apps.yaml` and `watchdog.env`, keeping the previous watchdog ownership.
+Existing systemd units and drop-ins are preserved. Review any operator-written
+units separately; the installer never replaces their user, environment or command.
+
 The installer adds `shim_binary`, `shim_state_dir`, and `shim_daemon: true` to
 the existing `apps.yaml` only when shim has not been configured. The executable
 is pinned under `libexec/trusted-shim/<sha256>/`. Reinstalling stages new artifacts
@@ -64,6 +72,9 @@ without switching the running shim or restarting its service. Keep the state pat
 short enough that `state/control.sock` is under Linux's 108-byte Unix socket limit.
 Configure `shim_network` in that same file for service forwarding; runtime drivers
 and network credentials retain their existing validation and authorization.
+The installer preserves existing YAML text and mode, validates the pinned binary's
+hash and publishes it atomically. The Ray service runs its watchdog every 30 seconds,
+including temp-link repair, while the node waits for shim readiness before connecting.
 
 Legacy apps keep their executor. An existing stdio shim allocation also keeps its
 transport and executable: the installer refuses to silently convert it to daemon

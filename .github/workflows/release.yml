@@ -76,8 +76,10 @@ jobs:
 
       - name: Build the pinned node runtime companion
         run: |
+          TRUSTED_SHIM_REV=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/fleet-scheduler/Cargo.toml", "rb"))["dependencies"]["trusted-shim"]["rev"])')
+          echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
           cargo install --locked --force --git https://github.com/BotMesh/trusted-shim \
-            --rev a1eba4eafea5f4d1db453aa5c692d612cd7ebe61 \
+            --rev "$TRUSTED_SHIM_REV" \
             --bin trusted-shim-runtime --root target/shim
 
       - name: Publish scheduler image to GHCR
@@ -110,11 +112,11 @@ jobs:
           install -m 755 target/shim/bin/trusted-shim-runtime "$DIST/bin/"
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
             deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh \
-            deploy/shim-start.sh deploy/install-node-services.sh "$DIST/deploy/"
+            deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
-          printf 'trusted_shim_revision=a1eba4eafea5f4d1db453aa5c692d612cd7ebe61\n' >> "$DIST/VERSION"
+          printf 'trusted_shim_revision=%s\n' "$TRUSTED_SHIM_REV" >> "$DIST/VERSION"
           tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
           cd dist
           sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"

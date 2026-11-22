@@ -161,6 +161,9 @@ def test_upgrade_and_rollback_preserve_runtime_sse_websocket_and_job():
             subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(private)],check=True)
             private.chmod(0o600)
             subprocess.run(['openssl','pkey','-in',str(private),'-pubout','-out',str(public)],check=True)
+            # Trust-bundle loading rejects group-writable keys independently of
+            # the host's umask (developer workspaces commonly use 0002).
+            public.chmod(0o644)
             node_claim={'iss':'upgrade-test','aud':'trusted-runtime-node/v1','sub':socket.gethostname(),
                 'namespaces':[namespace],'nbf':int(time.time()),'exp':int(time.time())+3600}
             node_token=subprocess.check_output([str(router_bin),'enroll-node',str(private)],input=json.dumps(node_claim).encode()).decode().strip()

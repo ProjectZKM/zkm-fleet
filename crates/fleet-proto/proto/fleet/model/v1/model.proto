@@ -294,6 +294,31 @@ message RuntimeExecutionIdentity {
   required string node_id = 6;
 }
 
+// Central policy gateway operator APIs. Policy/witness JSON is owned by Rail;
+// this protocol never puts credentials in App specs, reports or heartbeats.
+message PolicyActivationRequest {
+  required RuntimeExecutionIdentity execution = 1;
+  required Json policy = 2;
+  required Json context = 3;
+  required string previous_state_root = 4;
+  required string budget = 5;
+}
+message PolicyStageRequest {
+  required string job_id = 1;
+  required Json request = 2;
+  required uint64 cost = 3;
+}
+message PolicyBudgetRequest {
+  required string name = 1;
+  required uint64 allowance = 2;
+}
+message PolicyCredentialRequest {
+  required RuntimeExecutionIdentity execution = 1;
+  // admission, execution, or admission_and_execution.
+  required string permission = 2;
+  required uint64 expires_at = 3;
+}
+
 message RuntimeInstance {
   required string entry_name = 1;
   required RuntimeExecutionIdentity execution = 2;

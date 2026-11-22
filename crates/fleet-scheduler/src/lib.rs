@@ -12,6 +12,7 @@ pub mod workloads;
 pub mod store;
 pub mod token;
 pub mod router_control;
+pub mod policy_gateway;
 
 use std::future::IntoFuture;
 use std::sync::Arc;

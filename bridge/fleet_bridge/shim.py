@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import stat
@@ -264,7 +265,13 @@ class _ShimApp:
         status = self.call({"operation": "inspect", "execution": self.spec.execution})
         if status.get("state") == "ready" and (self.spec.cluster.shim_daemon or
                 self.network is not None and self.network.poll() is not None):
-            self.start_network()
+            try:
+                self.start_network()
+            except (RuntimeError, OSError, ValueError):
+                # The observed container and repair endpoint remain valid even
+                # if re-registering its connector temporarily fails. Router
+                # leases independently fence actual reachability.
+                logging.getLogger(__name__).warning("shim connector recovery failed for %s", self.spec.name)
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),
@@ -284,29 +291,25 @@ class _ShimApp:
 ShimApp = ray.remote(_ShimApp)
 
 
-def main() -> None:
-    """Installer/service entry points use the existing apps.yaml exclusively."""
-    import argparse
+def daemon_config(path: Path) -> ControlPlaneConfig:
+    """Service bootstrap reads only its own settings; bad app entries remain
+    repairable through the node's control connection."""
     import yaml
-    from .model import AppsConfig
+    from .model import from_dict
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError("apps.yaml must contain a mapping")
+    return from_dict(ControlPlaneConfig, {key:data[key] for key in
+        ("shim_binary", "shim_state_dir", "shim_daemon") if key in data})
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=["check", "serve"])
-    parser.add_argument("--apps", required=True)
-    parser.add_argument("--wait-seconds", type=float, default=0)
-    args = parser.parse_args()
-    config = AppsConfig.parse(yaml.safe_load(Path(args.apps).read_text())).cluster
+
+def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
     if not config.shim_daemon:
-        if args.operation == "serve":
-            parser.error("shim_daemon must be enabled in apps.yaml")
         return
-    if args.operation == "serve":
-        os.execv(config.shim_binary, [config.shim_binary, "--serve", "--state-dir", config.shim_state_dir,
-            "--node-id", socket.gethostname()])
-    deadline = time.monotonic() + args.wait_seconds
+    deadline = time.monotonic() + wait_seconds
     while True:
         try:
-            value = daemon_call(config.shim_state_dir, socket.gethostname(), {"operation": "capabilities"}, timeout=5)
+            value = daemon_call(config.shim_state_dir, socket.gethostname(), {"operation":"capabilities"}, timeout=5)
             break
         except RuntimeError:
             if time.monotonic() >= deadline:
@@ -314,6 +317,26 @@ def main() -> None:
             time.sleep(.2)
     if value.get("protocol") != 1 or "runtime-daemon-v1" not in value.get("features", []):
         raise RuntimeError("running shim has an incompatible protocol; node was not changed")
+
+
+def main() -> None:
+    """Installer/service entry points use the existing apps.yaml exclusively."""
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("operation", choices=["check", "serve"])
+    parser.add_argument("--apps", required=True)
+    parser.add_argument("--wait-seconds", type=float, default=0)
+    args = parser.parse_args()
+    config = daemon_config(Path(args.apps))
+    if not config.shim_daemon:
+        if args.operation == "serve":
+            parser.error("shim_daemon must be enabled in apps.yaml")
+        return
+    if args.operation == "serve":
+        os.execv(config.shim_binary, [config.shim_binary, "--serve", "--state-dir", config.shim_state_dir,
+            "--node-id", socket.gethostname()])
+    check_daemon(config, args.wait_seconds)
 
 
 if __name__ == "__main__":

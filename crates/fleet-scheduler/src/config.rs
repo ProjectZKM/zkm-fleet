@@ -33,6 +33,19 @@ pub struct SchedulerConfig {
     /// Every other caller has a token from the database (`fleet-scheduler issue-admin` makes
     /// the first administrator's).
     pub cluster_token_file: PathBuf,
+    /// Optional central policy admission, hosted on this scheduler's HTTP/2
+    /// listener. Reuses data_dir for its private durable authorization ledger.
+    #[serde(default)]
+    pub policy_gateway: Option<PolicyGatewayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyGatewayConfig {
+    /// Approved guest ELF and vk.bytes32() from the same build manifest.
+    pub program_elf: PathBuf,
+    pub program_sha256: String,
+    pub program_vkey: String,
 }
 
 /// Settings this configuration no longer has, with what replaced them: starting with one is
@@ -94,6 +107,14 @@ impl SchedulerConfig {
             "control gRPC requires TLS whenever it is network-reachable or backed by production Postgres"
         );
         anyhow::ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
+        if let Some(policy) = &self.policy_gateway {
+            anyhow::ensure!(policy.program_elf.is_absolute()
+                && policy.program_sha256.len() == 64
+                && policy.program_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                && policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey).len() == 64
+                && hex::decode(policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey)).is_ok(),
+                "invalid approved policy guest manifest");
+        }
         Ok(())
     }
 }
