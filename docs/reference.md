@@ -931,8 +931,9 @@ ApprovalRequired also produce background receipts, without execution grants.
 The action's tool consumes its existing grant rather than producing another proof.
 The preflight endpoint is still administrator-only; an agent cannot choose this
 mode to downgrade a strict request. It rejects `runtime.*` operations and reuse
-of a strict job/action. Startup proof verification and registration remain
-synchronous; the existing proof-required Reserve RPC is unchanged.
+of a strict job/action. Startup proof verification remains synchronous; the
+existing proof-required Reserve RPC is unchanged. GOAT registration execution
+is deferred and is not a prerequisite for the current Docker migration path.
 
 Enable the worker in the existing `policy_gateway` section (the existing guest
 manifest fields remain required):
@@ -968,9 +969,13 @@ end-to-end latency guarantee. Existing executed effects cannot be rolled back by
 a late proof failure. Receipt retention/monitoring and application action-hook
 wiring are still deployment responsibilities.
 
-GOAT registration and policy authority remain separate integration work. Non-TEE
-agents register owner-authorized keys as `unattested`; TEE agents additionally
-require a verified RA result bound to their instance/key before readiness.
+GOAT registration execution remains TODO. The companion shim exposes a pure
+EIP-712 owner-consent interface; this Fleet revision does not invoke it or submit
+chain transactions. The future adapter must obtain the user's signature in
+advance, atomically consume its nonce and preserve ownership when registering.
+Signing alone does not register an agent or attest its runtime. Non-TEE identities
+will be explicitly `unattested`; TEE identities will additionally require a
+verified RA result bound to their instance/key before that trust profile is ready.
 Future GOAT policy synchronization must authenticate owner and chain/contract,
 confirmed policy version/digest and revocation before activating the local
 snapshot. Current preflight uses the administratively activated snapshot and
