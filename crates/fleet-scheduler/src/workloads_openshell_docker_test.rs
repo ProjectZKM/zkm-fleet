@@ -525,7 +525,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
             }
         })
     };
-    let observation = tokio::spawn(observer.clone().run(c.clone()));
+    let mut observation = tokio::spawn(observer.clone().run(c.clone()));
     let network_command = json!({"operation":"network","driver":"openshell",
         "execution":request.execution,"config":managed.config});
     // Persisted service map supplies the only target. A grant response cannot
@@ -577,6 +577,74 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         "Bearer managed-app-key"
     );
     managed.websocket().await;
+    // Keep the same SSE and WebSocket alive beyond the first 30-second lease.
+    // Healthy registration renewal must not reconnect or replay application work.
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let registered = managed.registrations.load(Ordering::SeqCst);
+    let mut lease_stream = managed
+        .get("events")
+        .timeout(Duration::from_secs(90))
+        .send()
+        .await
+        .unwrap();
+    assert!(lease_stream.chunk().await.unwrap().is_some());
+    let mut lease_socket = managed.open_websocket().await;
+    let until = tokio::time::Instant::now() + Duration::from_secs(32);
+    while tokio::time::Instant::now() < until {
+        assert!(lease_stream.chunk().await.unwrap().is_some());
+    }
+    assert!(managed.registrations.load(Ordering::SeqCst) > registered);
+    lease_socket
+        .send(Message::Text("after-renewal".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        lease_socket.next().await.unwrap().unwrap(),
+        Message::Text("after-renewal".into())
+    );
+
+    // Stop only the central observer. Local health, the node session and native
+    // containers remain alive. Its five-second cache expires, then the last
+    // 30-second route lease drains both streams despite valid Access tokens.
+    observation.abort();
+    let _ = (&mut observation).await;
+    tokio::time::timeout(Duration::from_secs(37), async {
+        while let Ok(Some(_)) = lease_stream.chunk().await {}
+        while let Some(Ok(message)) = lease_socket.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+            assert!(!matches!(message, Message::Text(_) | Message::Binary(_)));
+        }
+        while managed.ready().await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("central readiness expiry must drain active native streams");
+    assert_eq!(published(), 0);
+    assert_eq!(
+        shim_call(
+            &shim_socket,
+            json!({"operation":"inspect","execution":request.execution,"driver":"openshell"})
+        )
+        .await["application_ready"],
+        true
+    );
+    assert!(!managed
+        .get("echo")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert_eq!(scope.ids("container"), containers);
+    observation = tokio::spawn(observer.clone().run(c.clone()));
+    managed.wait_ready().await;
+    managed.websocket().await;
+    assert_eq!(managed.get("echo").send().await.unwrap().status(), 200);
+    assert_eq!(network.submitted.load(Ordering::SeqCst), 1);
     let mut health_stream = managed.get("events").send().await.unwrap();
     assert!(health_stream.chunk().await.unwrap().is_some());
     managed.get("health/unready").send().await.unwrap();

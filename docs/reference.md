@@ -564,13 +564,18 @@ expire five seconds after query start and are never persisted; failure removes
 cached readiness. Publication also rechecks node session freshness, live intent,
 quota, allocation generation, physical instance and active Rail policy.
 
-This gates new route grants and renewals. It does not instantly revoke previously
-issued grants: the router's existing registration/access grants last up to 900
-seconds; explicit route revocation or control-lease expiry can drain them sooner.
-Local application health loss and runtime deletion independently drain shim
-streams. Native gateway readiness loss alone currently stops publication and
-renewal, not an already authorized stream. Tightening this revocation window is a
-remaining migration acceptance item.
+This gates new route grants and renewals. The updated embedded Router gateway
+issues 30-second node registration leases, counted from the start of each Fleet
+readiness check. Shim renews in place; failed renewal cannot extend the lease.
+Expiry drains existing HTTP/SSE/WebSocket streams even if their application
+Access tokens remain valid (up to 900 seconds). With the five-second observation
+cache, native readiness loss drains in about 35 seconds plus timer/clock skew;
+gateway and relay clocks must be synchronized. Explicit route revocation,
+control-lease expiry, local health loss and deletion can drain sooner. Transient
+readiness loss permits reconnection to the same execution after recovery without
+another proof/Create. Upgrade embedded gateways before depending on this bound:
+previously issued long leases retain their original signed expiry, including
+through a shorter renewal. This does not migrate or restart existing workloads.
 
 Fleet namespace IDs exceeding OpenShell's 19-byte routable-name limit map to
 stable native workspace names. Full canonical identities remain in authorization
@@ -688,10 +693,12 @@ are preserved, SSE streams and WebSocket text/binary frames pass, foreign tenant
 wrong supervisor images and wrong SSH host keys are rejected. Revocation and
 local cancellation close active streams. Application bytes continue locally with
 the central OpenShell gateway offline, within the test's route lease. Test-issued
-route grants do not replace production Fleet control-snapshot freshness; automatic
-native service publication remains a migration gate. A second route exercises the
+route grants do not replace production Fleet control-snapshot freshness. A second route exercises the
 persistent daemon against the same real workload: unhealthy startup and central
-denial prevent registration, health loss drains an active SSE stream, recovery
+denial prevent registration, 30-second leases renew without interrupting active
+SSE/WebSocket streams, and central observer expiry drains them while local health
+remains good. Readiness recovery reopens the same route without replacing its
+containers. Health loss drains an active SSE stream, recovery
 needs no Ray/client restart, companion restart restores the exact allocation
 without another proof/Create, and deletion drains streams and removes connector
 records. The durable record retains the public host fingerprint and excludes

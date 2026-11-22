@@ -139,9 +139,11 @@ impl Route {
         let router = axum::Router::new().route("/v1/runtime/registration", axum::routing::post(
             move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
                 let approved = approved.clone(); let accepted = accepted.clone();
-                let grant = registration_grant.clone(); let key = registration_key.clone();
+                let mut grant = registration_grant.clone(); let key = registration_key.clone();
                 let controller = controller.clone();
                 async move {
+                    grant.nbf = grants::now();
+                    grant.exp = grant.nbf + trusted_router_transport::control::REGISTRATION_LIFETIME;
                     let published = controller.as_ref().is_none_or(|c| c.app_resources(&grant.service.namespace, &grant.service.workload, None)["runtime_instances"]
                         .as_array().is_some_and(|instances| instances.iter().any(|i| i["execution"] == serde_json::json!(grant.execution)
                             && i["services"].as_array().is_some_and(|s| s.iter().any(|s|s==&grant.service.service)))));
@@ -267,9 +269,11 @@ impl Route {
             .header("x-trusted-access", &self.access)
     }
 
-    pub(super) async fn websocket(&self) {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    pub(super) async fn open_websocket(
+        &self,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = format!(
             "{}/v1/http/{}/ws",
             self.base.replace("http://", "ws://"),
@@ -280,7 +284,13 @@ impl Route {
         request
             .headers_mut()
             .insert("x-trusted-access", self.access.parse().unwrap());
-        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    pub(super) async fn websocket(&self) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let mut socket = self.open_websocket().await;
         for message in [
             Message::Text("native-chat".into()),
             Message::Binary(vec![0, 1, 255].into()),

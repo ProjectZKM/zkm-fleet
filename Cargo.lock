@@ -8999,7 +8999,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=c5ef05076ef62a2073110aa295d967d6e6f5d573#c5ef05076ef62a2073110aa295d967d6e6f5d573"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=85a6de3a6fa19e98641cfec9f3fcde4cdec723e6#85a6de3a6fa19e98641cfec9f3fcde4cdec723e6"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -9029,7 +9029,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-shim?rev=026a469290d219cf97e94575c0d445c219813253#026a469290d219cf97e94575c0d445c219813253"
+source = "git+https://github.com/BotMesh/trusted-shim?rev=32f416e9e490fbb67b467bab359b826db136208a#32f416e9e490fbb67b467bab359b826db136208a"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
