@@ -398,9 +398,9 @@ class NodeExecutor:
             raise ValueError("app scope differs from configured scope")
         if app.get("kind") != configured.kind.value or app.get("tag") != configured.tag:
             raise ValueError("app kind or tag differs from configured scope")
-        selected = configured.runtime.executor if configured.runtime else ExecutorKind.LEGACY
-        requested = RuntimeSelection.load(app["runtime"], strict=True).executor if "runtime" in app else ExecutorKind.LEGACY
-        if not p["disabled"] and selected is not requested:
+        selected = configured.runtime or RuntimeSelection(executor=ExecutorKind.LEGACY)
+        requested = RuntimeSelection.load(app["runtime"], strict=True) if "runtime" in app else RuntimeSelection(executor=ExecutorKind.LEGACY)
+        if not p["disabled"] and selected != requested:
             raise ValueError("runtime selection differs from the admitted command")
         running = [n for n in reconcile.running()
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
@@ -424,12 +424,18 @@ class NodeExecutor:
                     continue
                 if shim.selected(spec):
                     raise ValueError("shim execution is unhealthy; retained until explicit cleanup")
+                if spec.app.kind in ("ziren-cpu", "ziren-gpu") and not spec.app.worker_command:
+                    # An upgraded bridge cannot infer that an old actor is idle
+                    # from missing/stale executable evidence. Keep its process
+                    # and GPU allocation until an explicit drained stop confirms
+                    # cleanup; ordinary reconciliation must not abort a proof.
+                    raise ValueError("native prover differs from configuration; explicit drain and cleanup required")
                 reconcile.stop(spec.name)
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
             spec = self.runtimes.bind(spec, command_id)
             reconcile.start(spec)
-        return {"disabled": False, "ready": True}
+        return {"disabled": False, "ready": not (configured.runtime and configured.runtime.driver == "openshell")}
 
     def _remove_replicas(self, names: list[str]) -> None:
         for name in names:
@@ -654,11 +660,14 @@ class NodeExecutor:
                     if owned_executor and health.prover_binary and app["kind"] in ("ziren-gpu", "ziren-cpu") and not app.get("worker_command"):
                         native_provers.append(NativeProverProcess(entry_name=app["name"], replica_name=name,
                             executable=health.prover_binary).dump())
-                    if owned_executor and health.execution is not None and (healthy or health.management_ready):
+                    if owned_executor and health.execution is not None and (healthy or health.management_ready or health.allocation_reserved):
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
                             services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
-                            if services:
+                            if record.driver == "openshell" and health.allocation_reserved:
+                                runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
+                                    ready=healthy, services=services if healthy else [], native_observation_base64=health.native_observation_base64).dump())
+                            elif services:
                                 runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
                                     ready=True, services=services).dump())
                 except Exception as error:

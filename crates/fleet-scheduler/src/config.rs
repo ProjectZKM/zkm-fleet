@@ -33,6 +33,69 @@ pub struct SchedulerConfig {
     /// Every other caller has a token from the database (`fleet-scheduler issue-admin` makes
     /// the first administrator's).
     pub cluster_token_file: PathBuf,
+    /// Optional central policy admission, hosted on this scheduler's HTTP/2
+    /// listener. Reuses data_dir for its private durable authorization ledger.
+    #[serde(default)]
+    pub policy_gateway: Option<PolicyGatewayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyGatewayConfig {
+    /// Approved guest ELF and vk.bytes32() from the same build manifest.
+    pub program_elf: PathBuf,
+    pub program_sha256: String,
+    pub program_vkey: String,
+    /// Remote policy-receipt worker. When absent, preflight admission is disabled.
+    #[serde(default)]
+    pub preflight: Option<PreflightConfig>,
+    /// Stock gateway compute extension, embedded in this scheduler process.
+    #[serde(default)]
+    pub openshell: Option<OpenShellConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenShellConfig {
+    /// Same-host private Unix socket selected in the stock gateway config.
+    pub compute_socket: PathBuf,
+    /// Exact versioned resource-admission acknowledgement of the native driver.
+    pub admission_policy: String,
+    /// Authenticated stock gateway API used to observe policy readiness.
+    /// Omission keeps native service publication disabled.
+    #[serde(default)]
+    pub gateway: Option<OpenShellGatewayConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenShellGatewayConfig {
+    pub endpoint: String,
+    pub ca_file: PathBuf,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+}
+
+impl OpenShellGatewayConfig {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(&self.endpoint)?;
+        anyhow::ensure!(url.scheme() == "https" && url.host_str().is_some()
+            && url.username().is_empty() && url.password().is_none()
+            && url.path() == "/" && url.query().is_none() && url.fragment().is_none()
+            && [&self.ca_file, &self.cert_file, &self.key_file].iter().all(|p| p.is_absolute()),
+            "OpenShell gateway requires an HTTPS origin and absolute mTLS file paths");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightConfig {
+    /// The policy proof app's StageService endpoint, not the Fleet control URL.
+    pub endpoint: String,
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub signer_file: Option<PathBuf>,
 }
 
 /// Settings this configuration no longer has, with what replaced them: starting with one is
@@ -94,6 +157,25 @@ impl SchedulerConfig {
             "control gRPC requires TLS whenever it is network-reachable or backed by production Postgres"
         );
         anyhow::ensure!(self.max_attempts >= 1, "max_attempts must be at least 1");
+        if let Some(policy) = &self.policy_gateway {
+            anyhow::ensure!(policy.program_elf.is_absolute()
+                && policy.program_sha256.len() == 64
+                && policy.program_sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                && policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey).len() == 64
+                && hex::decode(policy.program_vkey.strip_prefix("0x").unwrap_or(&policy.program_vkey)).is_ok(),
+                "invalid approved policy guest manifest");
+            if let Some(p) = &policy.preflight {
+                anyhow::ensure!(p.token_file.is_absolute()
+                    && p.signer_file.as_ref().is_none_or(|f| f.is_absolute())
+                    && trusted_shim::ledger_transport::RemoteLedger::endpoint(&p.endpoint).is_ok(),
+                    "invalid preflight proof-network configuration");
+            }
+            if let Some(o) = &policy.openshell {
+                anyhow::ensure!(o.compute_socket.is_absolute() && !o.admission_policy.is_empty()
+                    && policy.preflight.is_some(), "OpenShell requires a private socket, admission policy and remote proof network");
+                if let Some(g) = &o.gateway { g.validate()?; }
+            }
+        }
         Ok(())
     }
 }

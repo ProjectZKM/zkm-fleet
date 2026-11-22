@@ -10,6 +10,38 @@ from fleet_bridge import actors, reconcile, shim, node
 from fleet_bridge.model import ExecutorKind, ReplicaHealth, AppSpec
 
 
+def test_tcp_service_uses_tcp_health_and_requires_new_capability(tmp_path, monkeypatch):
+    from fleet_bridge.model import ServiceProtocol
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, services=["ssh", "control"], service_protocol=ServiceProtocol.TCP))
+    bound = shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
+    assert shim.required_capability(bound) == "shim-tcp-v1"
+    assert [v["protocol"] for v in shim.launch_request(bound, [])["services"]] == ["tcp", "http1"]
+    actor = object.__new__(shim._ShimApp)
+    actor.spec, actor.port = bound, 12345
+    connected = Mock()
+    connected.return_value.__enter__ = Mock()
+    connected.return_value.__exit__ = Mock()
+    monkeypatch.setattr(shim.socket, "create_connection", connected)
+    monkeypatch.setattr(actors, "_http_ok", lambda _: pytest.fail("TCP must not send HTTP to SSH"))
+    assert actor.application_ready()
+    connected.assert_called_once_with(("127.0.0.1", 12345), timeout=3)
+    monkeypatch.setattr(shim._ShimApp, "call", lambda self, command: {"state":"ready","port":12345})
+    monkeypatch.setattr(shim._ShimApp, "start_network", lambda self: None)
+    # Initial admission must use the same probe as subsequent heartbeats.
+    assert shim._ShimApp(bound).port == 12345
+    assert connected.call_count == 2
+    connected.side_effect = OSError()
+    assert not actor.application_ready()
+    for updates in ({"runtime":None}, {"services":["control"]}, {"ingress":{"ssh":object()}}):
+        with pytest.raises(ValueError):
+            replace(s.app, **updates)
+    raw = config(tmp_path)
+    raw["apps"][0]["service_protocol"] = "udp"
+    with pytest.raises(ValueError):
+        reconcile.load_apps(raw)
+
+
 def config(tmp_path, selected=True):
     app = {"name":"web", "kind":"app", "image":"python:3.12-slim", "gpus":0,
         "cpus":0.5, "memory_gb":0.125, "port_base":18080, "command":["serve", "{port}"]}
@@ -33,6 +65,78 @@ def test_installing_shim_does_not_change_legacy_hash_or_execution(tmp_path):
     book = shim.RuntimeBook(tmp_path/"runtimes")
     assert book.bind(upgraded, "new-command").execution is None
     assert not book.root.exists()
+
+
+def test_daemon_transport_is_persisted_and_never_silently_migrated(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    book = shim.RuntimeBook(tmp_path / "runtimes")
+    first = book.bind(s, "launch")
+    daemon_spec = replace(s, cluster=replace(s.cluster, shim_daemon=True))
+    with pytest.raises(ValueError, match="active shim allocation"):
+        book.bind(daemon_spec, "upgrade")
+    assert book.read(s.name).execution == first.execution
+    call = Mock(return_value={"cleaned": True})
+    monkeypatch.setattr(shim, "invoke", call)
+    book.cleanup(s.name)
+    assert call.call_args.kwargs["daemon"] is False
+    book.bind(daemon_spec, "new-allocation")
+    assert book.read(s.name).daemon is True
+    book.cleanup(s.name)
+    assert call.call_args.kwargs["daemon"] is True
+
+
+def test_missing_daemon_never_falls_back_to_executable(tmp_path, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(shim.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="no legacy fallback"):
+        shim.invoke("/unused/binary", str(tmp_path), socket.gethostname(), {"operation":"capabilities"}, daemon=True)
+    run.assert_not_called()
+
+
+def test_daemon_network_is_owned_by_service_not_ray_subprocess(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, services=["http"]), cluster=replace(s.cluster, shim_daemon=True))
+    actor = object.__new__(shim._ShimApp)
+    actor.spec = s
+    actor.call = Mock(return_value={"connected_worker":True})
+    spawn = Mock()
+    monkeypatch.setattr(shim.subprocess, "Popen", spawn)
+    actor.start_network()
+    spawn.assert_not_called()
+    assert actor.call.call_args.args[0]["operation"] == "network"
+
+
+def test_network_recovery_failure_preserves_observed_runtime_and_repair(tmp_path, monkeypatch):
+    s=spec(tmp_path)
+    actor=object.__new__(shim._ShimApp)
+    actor.spec=replace(s,cluster=replace(s.cluster,shim_daemon=True))
+    actor.port=12345;actor.gpus=[];actor.network=None
+    actor.call=Mock(return_value={"state":"ready"})
+    actor.start_network=Mock(side_effect=RuntimeError('temporary connector failure'))
+    actor.application_ready=Mock(return_value=False)
+    value=actor.health()
+    assert value['management_ready'] is True and value['ready'] is False
+    actor.application_ready.return_value=True
+    assert actor.health()['ready'] is True
+
+
+def test_service_bootstrap_ignores_invalid_apps_but_validates_daemon_settings(tmp_path,monkeypatch):
+    path=tmp_path/'apps.yaml'
+    # Invalid application and network settings must remain remotely repairable.
+    path.write_text('apps: [broken]\nshim_network: {relay_url: invalid}\n')
+    assert shim.daemon_config(path).shim_daemon is False
+    path.write_text('shim_daemon: true\nshim_binary: /bin/shim\nshim_state_dir: /tmp/shim\napps: [broken]\n')
+    config=shim.daemon_config(path)
+    call=Mock(side_effect=[RuntimeError('starting'),{'protocol':1,'features':['runtime-daemon-v1']}])
+    monkeypatch.setattr(shim,'daemon_call',call)
+    monkeypatch.setattr(shim.time,'sleep',lambda _:None)
+    shim.check_daemon(config,wait_seconds=1)
+    assert call.call_count==2
+    for binary in [None,'relative',123]:
+        data={'shim_daemon':True,'shim_state_dir':'/tmp/shim'}
+        if binary is not None:data['shim_binary']=binary
+        path.write_text(yaml.safe_dump(data))
+        with pytest.raises(ValueError):shim.daemon_config(path)
 
 
 @pytest.mark.parametrize("runtime", [None, {"executor":"unknown"}, {"executor":"shim", "driver":"openshell"},
@@ -213,3 +317,250 @@ def test_management_ingress_and_automatic_port_require_modern_shim(tmp_path):
     app['ingress']['chat']['paths']=['/v1/chat/completions']
     app['ingress']['chat']['bearer_env']='MISSING'
     with pytest.raises(ValueError):reconcile.load_apps(raw)
+
+
+def test_native_companion_settings_use_existing_config_and_cannot_change_during_node_upgrade(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    path = tmp_path / "apps.yaml"
+    raw = config(tmp_path)
+    raw["shim_daemon"] = True
+    raw["shim_openshell"] = {"socket":"/run/openshell/compute.sock", "admission_policy":"approved",
+        "ledger_endpoint":"https://fleet.example"}
+    path.write_text(yaml.safe_dump(raw))
+    parsed = shim.daemon_config(path)
+    options = shim.daemon_options(parsed)
+    assert options["openshell"]["ledger_ca_file"] is None
+    assert "supervisor_image" not in options["openshell"]
+    expected = hashlib.sha256(json.dumps(options["openshell"],sort_keys=True,separators=(",", ":"),ensure_ascii=False).encode()).hexdigest()
+    active = {"protocol":1,"features":["runtime-daemon-v1","openshell-provisioning-v1"],"openshell_config_sha256":expected}
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **kw: active)
+    shim.check_daemon(parsed)
+    for value in [None,"other"]:
+        active["openshell_config_sha256"] = value
+        with pytest.raises(RuntimeError, match="settings differ"):
+            shim.check_daemon(parsed)
+    active["openshell_config_sha256"] = expected
+    enabled = replace(parsed, shim_openshell=replace(parsed.shim_openshell, supervisor_image="sha256:" + "a" * 64))
+    assert shim.daemon_options(enabled)["openshell"]["supervisor_image"] == "sha256:" + "a" * 64
+    with pytest.raises(RuntimeError, match="settings differ"):
+        shim.check_daemon(enabled)
+    with pytest.raises(RuntimeError, match="settings differ"):
+        shim.check_daemon(replace(parsed,shim_openshell=None))
+    for field, value in [("socket","relative.sock"),("ledger_endpoint","http://remote.example"),
+            ("ledger_endpoint","https://secret@fleet.example"),("ledger_endpoint","https://fleet.example/path"),
+            ("ledger_ca_file","relative.pem"),("ledger_token","must-not-be-configured"),
+            ("supervisor_image","supervisor:latest")]:
+        invalid = copy.deepcopy(raw); invalid["shim_openshell"][field] = value
+        path.write_text(yaml.safe_dump(invalid))
+        with pytest.raises(ValueError): shim.daemon_config(path)
+    raw["shim_daemon"] = False
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError,match="persistent shim daemon"): shim.daemon_config(path)
+
+
+@pytest.mark.parametrize("supervisor_image", [None, "sha256:" + "a" * 64])
+def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path, supervisor_image):
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+    binary = os.environ.get("TRUSTED_SHIM_OPENSHELL_TEST_BINARY")
+    if not binary:
+        pytest.skip("requires companion built with --features openshell")
+    # Keep the Unix socket within the kernel's pathname bound.
+    with tempfile.TemporaryDirectory(prefix="fleet-native-") as root:
+        path = tmp_path / "native-apps.yaml"
+        raw = {"shim_binary":binary,"shim_state_dir":str(Path(root)/"state"),"shim_daemon":True,
+            "shim_openshell":{"socket":str(Path(root)/"driver.sock"),"admission_policy":"approved",
+                "ledger_endpoint":"https://fleet.example"},"apps":["invalid app deliberately ignored by daemon bootstrap"]}
+        if supervisor_image is not None:
+            raw["shim_openshell"]["supervisor_image"] = supervisor_image
+        path.write_text(yaml.safe_dump(raw))
+        parsed = shim.daemon_config(path)
+        process = subprocess.Popen([sys.executable,"-m","fleet_bridge.shim","serve","--apps",str(path)],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            shim.check_daemon(parsed,wait_seconds=10)
+            value = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
+            assert value["drivers"] == ["docker","openshell"]
+            assert ("openshell-local-services-v1" in value["features"]) == (supervisor_image is not None)
+            assert value["pid"] == process.pid
+            changed = replace(parsed,shim_openshell=replace(parsed.shim_openshell,ledger_endpoint="https://other.example"))
+            with pytest.raises(RuntimeError, match="settings differ"):shim.check_daemon(changed)
+            # An unavailable native driver/gateway does not stop the companion.
+            response = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
+            assert response["pid"] == process.pid
+        finally:
+            process.terminate()
+            process.communicate(timeout=15)
+        assert process.returncode == 0
+
+
+def native_config(tmp_path):
+    data = config(tmp_path)
+    data.update(shim_daemon=True, shim_openshell={"socket":str(tmp_path/"compute.sock"),
+        "admission_policy":"approved", "ledger_endpoint":"http://127.0.0.1:8905"})
+    app = data["apps"][0]
+    app.pop("port_base")
+    app["cpus"] = 1
+    app["runtime"]["driver"] = "openshell"
+    return data
+
+
+def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_path, monkeypatch):
+    data = native_config(tmp_path)
+    spec = reconcile.replica_specs(reconcile.load_apps(data))["web-0"]
+    book = shim.RuntimeBook(tmp_path/"book")
+    spec = book.bind(spec, "launch")
+    calls = []
+    def invoke(binary, state, node, command, **kwargs):
+        assert kwargs == {"daemon":True}
+        assert command["driver"] == "openshell"
+        assert command["execution"] == spec.execution
+        calls.append(command["operation"])
+        return {"phase":"created", "platform_ready":True, "cleaned":True,
+                "native_observation_base64":"c2FuaXRpemVk"}
+    monkeypatch.setattr(shim,"invoke",invoke)
+    actor = shim._ProvisionedApp(spec)
+    health = ReplicaHealth.load(actor.health())
+    assert health.allocation_reserved and not health.is_ready and not health.management_ready
+    assert health.native_observation_base64 == "c2FuaXRpemVk"
+    assert reconcile.matches(spec,health)
+    assert calls == ["allocate", "inspect"]
+    assert book.read(spec.name).driver == "openshell"
+    book.cleanup(spec.name)
+    assert calls[-2:] == ["allocate", "delete"]
+    assert book.read(spec.name).cleaned
+    with pytest.raises(ValueError): book.bind(spec,"launch")
+    next_spec = book.bind(spec,"replacement")
+    assert next_spec.execution.generation == spec.execution.generation + 1
+
+
+@pytest.mark.parametrize("key,value", [("port_base",123), ("services",["http"]), ("gpus",1),
+    ("volumes",["/tmp"]),("memory_gb",0),("cpus",0.5),("user","root"),("entrypoint","/bin/sh")])
+def test_native_profile_rejects_unmapped_settings(tmp_path,key,value):
+    data=native_config(tmp_path);data["apps"][0][key]=value
+    with pytest.raises(ValueError): reconcile.load_apps(data)
+
+
+def test_native_capability_requires_matching_configuration_and_allocation_protocol(tmp_path,monkeypatch):
+    config=reconcile.load_apps(native_config(tmp_path)).cluster
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(config)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-provisioning-v1" not in shim.capabilities(config)
+    value["features"].append("openshell-allocation-v1")
+    assert "shim-openshell-provisioning-v1" in shim.capabilities(config)
+    value["openshell_config_sha256"]="wrong"
+    assert shim.capabilities(config)==[]
+
+
+def test_native_selection_cannot_be_swapped_for_docker_in_admitted_command(tmp_path,monkeypatch):
+    import yaml
+    data=native_config(tmp_path)
+    apps=tmp_path/"apps.yaml";apps.write_text(yaml.safe_dump(data))
+    batches=tmp_path/"batches.yaml";batches.write_text("batches: {}\n")
+    executor=node.NodeExecutor(str(apps),str(batches),str(tmp_path/"jobs"))
+    monkeypatch.setattr(node,"alive_nodes",lambda:[{"Alive":True,"NodeManagerAddress":"127.0.0.1"}])
+    app=copy.deepcopy(data["apps"][0]);app.update(namespace="0"*32,app="web")
+    app["runtime"]["driver"]="docker"
+    try:
+        with pytest.raises(ValueError,match="runtime selection differs"):
+            executor.set_app({"app":app,"disabled":False},"bad-command")
+    finally: executor.pool.shutdown()
+
+
+def test_native_observation_report_remains_unready_and_allocation_owned(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    raw = native_config(tmp_path)
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    replica = e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    health = ReplicaHealth(name="web-0", spec=actors.spec_hash(replica), executor=ExecutorKind.SHIM,
+        execution=replica.execution, ready=False, allocation_reserved=True,
+        native_observation_base64="c2FuaXRpemVk")
+    monkeypatch.setattr(node, "alive_nodes", lambda: [{}])
+    monkeypatch.setattr(node, "resources", lambda: ({"GPU": 0, "CPU": 1}, {"GPU": 0, "CPU": 0}))
+    monkeypatch.setattr(reconcile, "running", lambda: {"web-0": object()})
+    monkeypatch.setattr(reconcile, "health_of", lambda *a, **kw: health)
+    monkeypatch.setattr(shim, "capabilities", lambda _: [])
+    record = e.report()["runtime_instances"][0]
+    assert record["native_observation_base64"] == health.native_observation_base64
+    assert not record["ready"] and record["services"] == []
+    health.execution = replace(replica.execution, lease_id="obsolete")
+    assert e.report().get("runtime_instances", []) == []
+
+
+def native_service_config(tmp_path):
+    raw = native_config(tmp_path)
+    raw["apps"][0].update(services=["http"], container_port=8080, health_path="/health")
+    raw["shim_openshell"]["supervisor_image"] = "sha256:" + "a" * 64
+    raw["shim_network"] = {"gateway_url":"http://127.0.0.1:9191", "relay_url":"ws://127.0.0.1:9999",
+        "token_file":str(tmp_path/"token"),"public_key_file":str(tmp_path/"public"),"issuer":"test"}
+    return raw
+
+
+def test_native_services_report_local_health_without_waiting_for_registration(tmp_path, monkeypatch):
+    raw = native_service_config(tmp_path)
+    cfg = reconcile.load_apps(raw)
+    spec = shim.RuntimeBook(tmp_path/"book").bind(reconcile.replica_specs(cfg)["web-0"], "launch")
+    assert shim.required_capability(spec) == "shim-openshell-services-v1"
+    commands = []
+    status = {"phase":"created", "platform_ready":True, "application_ready":False,
+        "native_observation_base64":"c2FuaXRpemVk"}
+    def invoke(binary, state, node, command, **kwargs):
+        assert kwargs == {"daemon":True}
+        commands.append(command)
+        if command["operation"] == "network":
+            assert command["driver"] == "openshell" and command["config"] == cfg.cluster.shim_network
+            return {"connected_worker":True}
+        return dict(status)
+    monkeypatch.setattr(shim,"invoke",invoke)
+    actor = shim._ProvisionedApp(spec)
+    assert not ReplicaHealth.load(actor.health()).is_ready
+    status["application_ready"] = True
+    assert ReplicaHealth.load(actor.health()).is_ready
+    status["platform_ready"] = False
+    assert not ReplicaHealth.load(actor.health()).is_ready
+    assert [c["operation"] for c in commands] == ["allocate","inspect","network","inspect","network","inspect"]
+
+
+def test_native_service_capability_requires_health_protocol_and_network_config(tmp_path, monkeypatch):
+    cfg = reconcile.load_apps(native_service_config(tmp_path)).cluster
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(cfg)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1","openshell-allocation-v1","openshell-local-services-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-services-v1" not in shim.capabilities(cfg)
+    value["features"].append("openshell-service-health-v1")
+    assert "shim-openshell-services-v1" in shim.capabilities(cfg)
+    assert "shim-openshell-services-v1" not in shim.capabilities(replace(cfg,shim_network=None))
+
+
+@pytest.mark.parametrize("key,value", [("services",["control"]),("container_port",None),
+    ("service_protocol","tcp"),("health_path","//elsewhere/health"),("health_path","/a\\b"),
+    ("health_path","/a#b"),("health_path","/a\n"),("port_base",0)])
+def test_native_service_profile_rejects_unbound_targets(tmp_path,key,value):
+    raw=native_service_config(tmp_path);raw["apps"][0][key]=value
+    with pytest.raises(ValueError): reconcile.load_apps(raw)
+
+
+def test_native_service_report_keeps_compute_observation_when_app_becomes_healthy(tmp_path, monkeypatch):
+    e=executor(tmp_path);raw=native_service_config(tmp_path)
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    replica=e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"],"launch")
+    health=ReplicaHealth(name="web-0",spec=actors.spec_hash(replica),executor=ExecutorKind.SHIM,
+        execution=replica.execution,ready=True,allocation_reserved=True,native_observation_base64="c2FuaXRpemVk")
+    monkeypatch.setattr(node,"alive_nodes",lambda:[{}])
+    monkeypatch.setattr(node,"resources",lambda:({"GPU":0,"CPU":1},{"GPU":0,"CPU":0}))
+    monkeypatch.setattr(reconcile,"running",lambda:{"web-0":object()})
+    monkeypatch.setattr(reconcile,"health_of",lambda *a,**k:health)
+    monkeypatch.setattr(shim,"capabilities",lambda _:[])
+    report=e.report();instance=report["runtime_instances"][0]
+    assert report["apps"][0]["ready"] and instance["ready"] and instance["services"]==["http"]
+    assert instance["native_observation_base64"]==health.native_observation_base64
+    health.ready=False
+    instance=e.report()["runtime_instances"][0]
+    assert not instance["ready"] and instance["services"]==[]

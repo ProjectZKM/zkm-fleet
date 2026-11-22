@@ -4,6 +4,8 @@ use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
+mod policy;
+
 /// The administrator's token the tests' scheduler has.
 const ADMIN: &str = "adminadminadminadminadminadminadminadminadminadminadminadminadmin1";
 
