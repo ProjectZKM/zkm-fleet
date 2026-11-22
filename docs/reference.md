@@ -658,6 +658,21 @@ The local acceptance below uses supervisor host networking to reach a loopback
 test gateway. Workloads still use `network=none`. This test does not certify a
 cross-machine deployment or a firewall/NAT configuration.
 
+The pinned router transport keeps idle outbound WSS connections alive with
+15-second Ping/Pong controls and a 15-second reply deadline. Silent network loss
+drains application streams within about 30 seconds plus scheduling delay;
+recovery never replays requests. Dedicated ingress idle timeouts must allow this
+interval; configure at least 60 seconds for operational margin. No node inbound
+listener is needed.
+
+Router's `tools/test_nat.py` covers two isolated stateful NATs, overlapping private
+addresses, TCP/443-only egress, blocked inbound traffic, TLS validation, tenant
+and app-key isolation, idle continuity, network blackholes and recovery.
+`tools/test_remote.py` additionally exercises a real remote connector through
+temporary public TLS ingress, with SSH used only for fixture setup/cleanup.
+These transport tests use synthetic grants and loopback applications; they do
+not replace cross-machine Fleet/OpenShell control or real Film/ClawUp acceptance.
+
 The opt-in control integration test launches the pinned, unmodified gateway with
 mTLS and exercises actual Fleet HTTP/UDS, node delivery and the persistent shim.
 Proof and native compute are explicit test doubles; it does not establish workload
