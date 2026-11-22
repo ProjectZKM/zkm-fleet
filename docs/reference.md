@@ -457,11 +457,39 @@ Keep the allocation and shim journals across upgrades and restarts.
 
 Shim delegates lifecycle to upstream Docker, applies CPU/memory hard limits and
 checks effective limits before start. Its service port is published only on local
-loopback; independent router integration is a later step. GPU ids are Ray's assigned
-ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
+loopback; declared services use the independent router through outbound node
+connectors. GPU ids are Ray's assigned ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
 it makes no shell-policy enforcement claim. OpenShell/TEE and proof-required
 lifecycle requests are unsupported and rejected. The existing separate proof-required
 action admission path in trusted-shim is unchanged.
+
+The bundled companion is built with OpenShell support. Operators can enable its
+native provisioning endpoint in the **same** `apps.yaml`, alongside `shim_daemon`:
+
+```yaml
+shim_daemon: true
+shim_openshell:
+  socket: /run/openshell/compute.sock
+  admission_policy: '<acknowledgement from the native driver configuration>'
+  ledger_endpoint: https://fleet.example
+  # Optional private CA; absolute, regular, not group/world writable.
+  ledger_ca_file: /etc/zkm-fleet/ca.pem
+```
+
+These are operator settings, not allocation credentials. The native driver remains
+an unmodified OpenShell process with a same-UID private socket. Node bootstrap
+compares the running daemon's configuration digest with these settings; changing
+or removing them requires explicit companion reconciliation. A node upgrade never
+restarts the companion to apply a different policy gateway or driver. Existing
+Docker apps and their persisted execution selection remain unchanged.
+
+The daemon's private `provision` operation accepts exact native gateway bytes and
+a proof-backed grant, consumes the grant centrally before Create, and keeps only
+ownership/digests on disk. Native inspection/cleanup survives gateway outages and
+expired credentials. This enables local native provisioning, not Fleet App
+selection of OpenShell: automatic gateway orchestration, private outbound delivery
+to remote nodes, and supervisor/application readiness are still required. Do not
+place the native payload, ledger bearer or grant in an app, heartbeat or environment.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:

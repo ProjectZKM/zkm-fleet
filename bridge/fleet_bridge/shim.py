@@ -300,7 +300,22 @@ def daemon_config(path: Path) -> ControlPlaneConfig:
     if not isinstance(data, dict):
         raise ValueError("apps.yaml must contain a mapping")
     return from_dict(ControlPlaneConfig, {key:data[key] for key in
-        ("shim_binary", "shim_state_dir", "shim_daemon") if key in data})
+        ("shim_binary", "shim_state_dir", "shim_daemon", "shim_openshell") if key in data})
+
+
+def daemon_options(config: ControlPlaneConfig) -> dict[str, Any]:
+    return {"openshell": to_dict(config.shim_openshell)} if config.shim_openshell is not None else {}
+
+
+def check_openshell(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
+    expected = None
+    if config.shim_openshell is not None:
+        encoded = json.dumps(to_dict(config.shim_openshell), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        expected = hashlib.sha256(encoded).hexdigest()
+        if "openshell-provisioning-v1" not in value.get("features", []):
+            raise RuntimeError("running shim does not support native OpenShell provisioning")
+    if value.get("openshell_config_sha256") != expected:
+        raise RuntimeError("running shim OpenShell settings differ; reconcile the companion explicitly before starting the node")
 
 
 def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
@@ -317,6 +332,7 @@ def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
             time.sleep(.2)
     if value.get("protocol") != 1 or "runtime-daemon-v1" not in value.get("features", []):
         raise RuntimeError("running shim has an incompatible protocol; node was not changed")
+    check_openshell(config, value)
 
 
 def main() -> None:
@@ -334,8 +350,12 @@ def main() -> None:
             parser.error("shim_daemon must be enabled in apps.yaml")
         return
     if args.operation == "serve":
-        os.execv(config.shim_binary, [config.shim_binary, "--serve", "--state-dir", config.shim_state_dir,
-            "--node-id", socket.gethostname()])
+        options = daemon_options(config)
+        command = [config.shim_binary, "--serve", "--state-dir", config.shim_state_dir,
+            "--node-id", socket.gethostname()]
+        if options:
+            command += ["--options", json.dumps(options)]
+        os.execv(config.shim_binary, command)
     check_daemon(config, args.wait_seconds)
 
 

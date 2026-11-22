@@ -80,7 +80,7 @@ jobs:
           echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
           cargo install --locked --force --git https://github.com/BotMesh/trusted-shim \
             --rev "$TRUSTED_SHIM_REV" \
-            --bin trusted-shim-runtime --root target/shim
+            --features openshell --bin trusted-shim-runtime --root target/shim
 
       - name: Publish scheduler image to GHCR
         shell: bash

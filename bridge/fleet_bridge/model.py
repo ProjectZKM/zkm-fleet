@@ -458,13 +458,38 @@ class ControlPlaneConfig(Record):
     shim_state_dir: str | None = None
     shim_daemon: bool = False
     shim_network: ShimNetworkConfig | None = None
+    shim_openshell: ShimOpenShellConfig | None = None
 
     def __post_init__(self) -> None:
+        if self.shim_openshell is not None and not self.shim_daemon:
+            raise ModelError("OpenShell requires the persistent shim daemon")
         if self.shim_daemon:
             if not all(p and os.path.isabs(p) and "\x00" not in p for p in (self.shim_binary, self.shim_state_dir)):
                 raise ModelError("shim daemon requires absolute shim_binary and shim_state_dir")
             if len(os.fsencode(os.path.join(self.shim_state_dir, "control.sock"))) >= 108:
                 raise ModelError("shim daemon requires a Unix socket path under 108 bytes")
+
+
+@dataclass(kw_only=True)
+class ShimOpenShellConfig(Record):
+    """Operator endpoints only; per-allocation credentials never enter apps.yaml."""
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    socket: str
+    admission_policy: str
+    ledger_endpoint: str
+    ledger_ca_file: str | None = None
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlsplit
+        url = urlsplit(self.ledger_endpoint)
+        if (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1"))
+                or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("", "/")):
+            raise ModelError("OpenShell policy gateway requires TLS without credentials or a path")
+        if (not os.path.isabs(self.socket) or "\x00" in self.socket or len(os.fsencode(self.socket)) >= 108
+                or not self.admission_policy or len(self.admission_policy.encode()) > 65536):
+            raise ModelError("OpenShell needs an absolute private driver socket and admission acknowledgement")
+        if self.ledger_ca_file is not None and (url.scheme != "https" or not os.path.isabs(self.ledger_ca_file) or "\x00" in self.ledger_ca_file):
+            raise ModelError("OpenShell private CA requires HTTPS and an absolute certificate path")
 
 
 @dataclass(kw_only=True)

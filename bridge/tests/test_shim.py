@@ -317,3 +317,73 @@ def test_management_ingress_and_automatic_port_require_modern_shim(tmp_path):
     app['ingress']['chat']['paths']=['/v1/chat/completions']
     app['ingress']['chat']['bearer_env']='MISSING'
     with pytest.raises(ValueError):reconcile.load_apps(raw)
+
+
+def test_native_companion_settings_use_existing_config_and_cannot_change_during_node_upgrade(tmp_path, monkeypatch):
+    import hashlib
+    import json
+    from fleet_bridge.model import to_dict
+    path = tmp_path / "apps.yaml"
+    raw = config(tmp_path)
+    raw["shim_daemon"] = True
+    raw["shim_openshell"] = {"socket":"/run/openshell/compute.sock", "admission_policy":"approved",
+        "ledger_endpoint":"https://fleet.example"}
+    path.write_text(yaml.safe_dump(raw))
+    parsed = shim.daemon_config(path)
+    options = shim.daemon_options(parsed)
+    assert options["openshell"]["ledger_ca_file"] is None
+    expected = hashlib.sha256(json.dumps(to_dict(parsed.shim_openshell),sort_keys=True,separators=(",", ":"),ensure_ascii=False).encode()).hexdigest()
+    active = {"protocol":1,"features":["runtime-daemon-v1","openshell-provisioning-v1"],"openshell_config_sha256":expected}
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **kw: active)
+    shim.check_daemon(parsed)
+    for value in [None,"other"]:
+        active["openshell_config_sha256"] = value
+        with pytest.raises(RuntimeError, match="settings differ"):
+            shim.check_daemon(parsed)
+    active["openshell_config_sha256"] = expected
+    with pytest.raises(RuntimeError, match="settings differ"):
+        shim.check_daemon(replace(parsed,shim_openshell=None))
+    for field, value in [("socket","relative.sock"),("ledger_endpoint","http://remote.example"),
+            ("ledger_endpoint","https://secret@fleet.example"),("ledger_endpoint","https://fleet.example/path"),
+            ("ledger_ca_file","relative.pem"),("ledger_token","must-not-be-configured")]:
+        invalid = copy.deepcopy(raw); invalid["shim_openshell"][field] = value
+        path.write_text(yaml.safe_dump(invalid))
+        with pytest.raises(ValueError): shim.daemon_config(path)
+    raw["shim_daemon"] = False
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError,match="persistent shim daemon"): shim.daemon_config(path)
+
+
+def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+    binary = os.environ.get("TRUSTED_SHIM_OPENSHELL_TEST_BINARY")
+    if not binary:
+        pytest.skip("requires companion built with --features openshell")
+    # Keep the Unix socket within the kernel's pathname bound.
+    with tempfile.TemporaryDirectory(prefix="fleet-native-") as root:
+        path = tmp_path / "native-apps.yaml"
+        raw = {"shim_binary":binary,"shim_state_dir":str(Path(root)/"state"),"shim_daemon":True,
+            "shim_openshell":{"socket":str(Path(root)/"driver.sock"),"admission_policy":"approved",
+                "ledger_endpoint":"https://fleet.example"},"apps":["invalid app deliberately ignored by daemon bootstrap"]}
+        path.write_text(yaml.safe_dump(raw))
+        parsed = shim.daemon_config(path)
+        process = subprocess.Popen([sys.executable,"-m","fleet_bridge.shim","serve","--apps",str(path)],
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        try:
+            shim.check_daemon(parsed,wait_seconds=10)
+            value = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
+            assert value["drivers"] == ["docker","openshell"]
+            assert value["pid"] == process.pid
+            changed = replace(parsed,shim_openshell=replace(parsed.shim_openshell,ledger_endpoint="https://other.example"))
+            with pytest.raises(RuntimeError, match="settings differ"):shim.check_daemon(changed)
+            # An unavailable native driver/gateway does not stop the companion.
+            response = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
+            assert response["pid"] == process.pid
+        finally:
+            process.terminate()
+            process.communicate(timeout=15)
+        assert process.returncode == 0
