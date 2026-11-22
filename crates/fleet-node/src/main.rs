@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5));
     if url.scheme() == "https" {
+        fleet_proto::initialize_tls();
         let mut tls = ClientTlsConfig::new().with_webpki_roots();
         if let Some(ca) = &a.scheduler_ca_file {
             let bytes = tokio::fs::read(ca).await?;

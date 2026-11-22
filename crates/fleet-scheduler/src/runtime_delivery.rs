@@ -295,6 +295,9 @@ async fn stage(
         let p: ProvisionRequest =
             serde_json::from_slice(&bytes).map_err(|_| Error::InvalidInput)?;
         p.validate().map_err(|_| Error::InvalidInput)?;
+        // Bind gateway-native bytes to the exact proved request before any
+        // credentials enter delivery. Shim repeats this before central Consume.
+        p.validate_native().map_err(|_| Error::Rejected)?;
         let bytes = trusted_shim::rail::rego::canonical_bytes(
             &serde_json::to_value(&p).map_err(|_| Error::InvalidInput)?,
         )?;
@@ -382,7 +385,7 @@ async fn claim(
         let bytes = c.deliveries.payload(&ticket)?;
         let p: ProvisionRequest =
             serde_json::from_slice(&bytes).map_err(|_| Error::InvalidInput)?;
-        p.validate().map_err(|_| Error::Rejected)?;
+        p.validate_native().map_err(|_| Error::Rejected)?;
         c.with_runtime_delivery(
             &identity(r.offer.execution),
             Some((&worker, &session)),

@@ -503,7 +503,10 @@ Private creation delivery uses the existing Fleet gateway and outbound node agen
    image, command, environment and hard resource limits.
 3. `PUT /policy/runtime-deliveries/<64-lowercase-hex-ticket>` with the private
    `ProvisionRequest` JSON and an administrator credential. The request is bounded
-   to 4 MiB. Native credentials never belong in an App spec or environment.
+   to 4 MiB. Before enqueueing, Fleet decodes the stock gateway's native message
+   and checks its workspace, workload inputs, native policy and exact Rail
+   resource/parameter commitments. Native credentials never belong in an App
+   spec or environment.
 4. Heartbeats carry only ticket, execution and payload digest. The node claims the
    payload once with its cluster credential and current worker/session, then sends
    it directly to the private shim Unix socket. Identity, deployment intent,
@@ -523,9 +526,10 @@ Fleet's trusted cluster agents plus session fencing; this is not TEE attestation
 individual cryptographic node enrollment. Production links use HTTPS; HTTP is
 limited to local acceptance.
 
-Automatic OpenShell gateway preparation/proof orchestration and joined supervisor,
-fence and application readiness remain necessary before migrating application
-traffic through this native profile. Do not place the native payload, ledger bearer
+The stock OpenShell gateway compute extension still needs wiring to Fleet's
+existing proof/delivery flow. Joined supervisor, fence and application readiness
+also remain necessary before migrating application traffic through this native
+profile. Do not place the native payload, ledger bearer
 or grant in a heartbeat, diagnostic or Ray actor.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
@@ -937,8 +941,9 @@ held quota. After command completion, the exact reported runtime identity takes
 over; absence never authorizes a new creation. A late report of an older prepared
 generation cannot revive its authorization.
 
-Private outbound delivery is available as described above. Automatic native
-OpenShell preparation and proof orchestration still require gateway integration.
+Private outbound delivery is available as described above. The native
+OpenShell gateway protocol adapter still needs integration with Fleet's existing
+proof and delivery flow; OpenShell does not introduce another scheduler.
 Do not put credentials or native launch secrets in App specs, environment,
 node reports or diagnostics. Docker still rejects requested
 proof-required execution modes; mounting this ledger does not change that driver.

@@ -99,6 +99,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let control_addr = cfg.control_addr.parse()?;
     let mut control_server = Server::builder();
     if let Some(tls) = &cfg.control_tls {
+        fleet_proto::initialize_tls();
         let identity = Identity::from_pem(
             std::fs::read(&tls.cert_path)?,
             std::fs::read(&tls.key_path)?,

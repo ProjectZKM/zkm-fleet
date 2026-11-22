@@ -572,6 +572,13 @@ async fn policy_administration_rejects_tenants_forged_allocations_and_retired_ge
 }
 
 fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::ProvisionRequest {
+    use prost_native::Message;
+    use trusted_shim::openshell_gateway::{
+        protocol::compute::v1::{
+            DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxTemplate,
+        },
+        GatewayLaunch, SandboxPolicy,
+    };
     let mut a = request.clone();
     a.operation = "runtime.create".into();
     let launch: trusted_shim::runtime::LaunchRequest=serde_json::from_value(json!({
@@ -580,6 +587,35 @@ fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::Prov
         "policy":{"issuer":"fleet","policy_id":"create","version":1,"sha256":"a".repeat(64)},
         "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required","attestation_proof":"not_required"},"services":[]
     })).unwrap();
+    let policy = SandboxPolicy::default();
+    let binding = GatewayLaunch::new(launch.clone(), policy.clone()).unwrap();
+    let sandbox = DriverSandbox {
+        id: "sandbox-id".into(),
+        name: binding.request().name,
+        workspace: launch.execution.namespace.clone(),
+        spec: Some(DriverSandboxSpec {
+            command: launch.command.clone(),
+            environment: launch.environment.clone().into_iter().collect(),
+            policy: Some(policy),
+            sandbox_token: "synthetic-native-token".into(),
+            launch_authentication: b"synthetic-native-credentials".to_vec(),
+            template: Some(DriverSandboxTemplate {
+                image: launch.image.clone(),
+                resources: Some(DriverResourceRequirements {
+                    cpu_limit: "2000m".into(),
+                    memory_limit: "134217728".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bytes = sandbox.encode_to_vec();
+    let native = binding.bind(&bytes).unwrap();
+    a.resource = native.authorization_resource();
+    a.parameters = native.authorization_parameters();
     let g = trusted_shim::rail::ExecutionGrant {
         id: "grant".into(),
         credential: vec![1],
@@ -589,8 +625,8 @@ fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::Prov
     };
     trusted_shim::provisioning::ProvisionRequest::new(
         launch,
-        b"synthetic-native-credentials",
-        "a".repeat(64),
+        &bytes,
+        binding.policy_sha256().into(),
         a,
         g,
         "b".repeat(64),
@@ -645,6 +681,18 @@ async fn private_delivery_checks_manifest_session_quota_and_durable_single_claim
         let mut bad = payload.clone();
         bad["request"][field] = value;
         assert_eq!(admin(&c, "PUT", &path, bad).await.status(), 403);
+    }
+    // Tampering with native policy/bytes must fail centrally, before any
+    // one-shot delivery ticket can become visible to the node.
+    for (field, value) in [
+        ("native_policy_sha256", json!("f".repeat(64))),
+        ("native_create_base64", json!("bm90LXByb3RvYnVm")),
+    ] {
+        let mut bad = payload.clone();
+        bad[field] = value;
+        assert_eq!(admin(&c, "PUT", &path, bad).await.status(), 403);
+        assert!(c.deliveries.offers("gpu").is_empty());
+        assert_eq!(admin(&c, "GET", &path, json!({})).await.status(), 403);
     }
     let staged = json_body(admin(&c, "PUT", &path, payload.clone()).await).await;
     assert_eq!(staged["state"], "queued");
