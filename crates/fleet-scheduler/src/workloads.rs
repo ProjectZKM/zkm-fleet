@@ -141,6 +141,7 @@ struct WorkloadState {
     commands: Records<CommandRecord>,
     workers: BTreeMap<String, NodeSession>,
     deployments: BTreeMap<String, AppDeployment>,
+    policy_preparations: BTreeMap<String, trusted_shim::contracts::ExecutionIdentity>,
 }
 
 pub struct WorkloadController {
@@ -150,6 +151,8 @@ pub struct WorkloadController {
     inner: Mutex<WorkloadState>,
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
+    pub(crate) policy: Option<Arc<crate::policy_gateway::PolicyGateway>>,
+    pub(crate) deliveries: crate::runtime_delivery::DeliveryQueue,
 }
 /// The proof apps an enabled integrated worker feeds: (namespace, app).
 fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
@@ -162,7 +165,7 @@ fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
 impl WorkloadController {
     pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
-        for name in ["apps", "jobs", "commands", "artifacts", "deployments"] {
+        for name in ["apps", "jobs", "commands", "artifacts", "deployments", "policy-preparations"] {
             fs::create_dir_all(dir.join(name))?;
         }
         let mut inner = WorkloadState::default();
@@ -180,14 +183,22 @@ impl WorkloadController {
                 .deployments
                 .insert(format!("{}-{}", v.worker, v.entry().name()), v);
         }
+        for v in load::<fleet_proto::model::v1::RuntimeExecutionIdentity>(&dir.join("policy-preparations"))? {
+            let v = crate::policy_gateway::identity(v);
+            anyhow::ensure!(inner.policy_preparations.insert(policy::preparation_key(&v)?, v).is_none(),
+                "duplicate durable policy preparation");
+        }
         fleet.set_worker_owned_apps(worker_owned(&inner));
+        let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;
         let controller = Self {
+            deliveries: crate::runtime_delivery::DeliveryQueue::open(&dir.join("runtime-deliveries"))?,
             fleet,
             cluster,
             dir,
             inner: Mutex::new(inner),
             ops: tokio::sync::Mutex::new(()),
             notify: tokio::sync::Notify::new(),
+            policy,
         };
         controller.forget_deleted()?;
         Ok(controller)
@@ -469,6 +480,12 @@ impl WorkloadController {
         parameters: Value,
     ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock();
+        if operation == NodeOperation::SetApp && parameters["disabled"] != true {
+            let entry = Entry(&parameters["app"]);
+            if entry.runtime_capability().is_some() && !inner.workers.get(worker).is_some_and(|w| w.report.supports_runtime(entry)) {
+                return Err(fail(409, "node does not support the selected runtime"));
+            }
+        }
         let c = CommandRecord {
             id: uuid::Uuid::new_v4().to_string(),
             worker: worker.into(),
@@ -555,6 +572,7 @@ impl WorkloadController {
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
+                "native_provers":w.report.native_provers,
                 "batches":w.report.batches.keys().collect::<Vec<_>>(),
                 "heartbeat_age_ms":((now()-w.seen)*1000.0) as u64})
         }).collect()
@@ -890,6 +908,8 @@ impl WorkloadController {
         {
             return Err(fail(400, "invalid capacity"));
         }
+        report.validate_runtime_instances().map_err(|e| fail(400,e.to_string()))?;
+        report.validate_native_provers().map_err(|e| fail(400,e.to_string()))?;
         let mut report = report;
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()
@@ -1026,11 +1046,15 @@ impl WorkloadController {
                     .insert(key.clone(), intent.clone());
                 intent
             };
+            // An older/downgraded bridge cannot attest cleanup of a shim allocation.
+            if !report.supports_runtime(intent.entry()) {
+                continue;
+            }
             if observed.holds_allocation() {
                 let id = format!("deployment:{key}");
                 if observed.cleaned() && intent.disabled {
                     self.fleet.release_job(&namespace.id, &id).await?;
-                } else if observed.ready() {
+                } else if observed.ready() || report.native_allocated(observed) {
                     let (gpus, cpus) = observed.total(0.0);
                     self.fleet
                         .reserve_job(&namespace.id, observed.tag(), &id, gpus, cpus, true)
@@ -1038,7 +1062,7 @@ impl WorkloadController {
                 }
             }
             let mismatch = observed.disabled() != intent.disabled
-                || if intent.disabled { !observed.cleaned() } else { !observed.ready() };
+                || if intent.disabled { !observed.cleaned() } else { !observed.ready() && !report.native_allocated(observed) };
             let pending = {
                 self.inner.lock().commands.open().any(|c| {
                     c.changes_entry(worker_id, name)
@@ -1547,7 +1571,7 @@ impl WorkloadController {
                 let already_ready = {
                     let i = self.inner.lock();
                     i.workers.get(&c.worker).is_some_and(|w| {
-                        w.report.entries().any(|v| v.name() == s.name() && v.ready() && !v.disabled() && v.same_resources(s))
+                        w.report.entries().any(|v| v.name() == s.name() && (v.ready() || w.report.native_allocated(v)) && !v.disabled() && v.same_resources(s))
                     })
                 };
                 let (g, cpu) = s.total(0.0);
@@ -1775,6 +1799,15 @@ impl WorkloadController {
 fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
     i.commands.open()
         .filter(|c| c.worker == worker && !c.done && c.admitted)
+        .filter(|c| i.workers.get(worker).is_some_and(|w| {
+            w.report.supports_runtime(Entry(&c.parameters["app"]))
+                && w.report.supports_runtime(Entry(&c.parameters["create"]))
+                && w.report.supports_runtime(Entry(&c.parameters["set"]))
+                && i.deployments.values().filter(|d| d.worker == worker
+                    && (c.changes_entry(worker, d.entry().name()) || c.changed_entry() == d.entry().name()
+                        || c.removes_app(d.entry().app())))
+                    .all(|d| w.report.supports_runtime(d.entry()))
+        }))
         .take(16)
         .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
         .collect()
@@ -1813,6 +1846,9 @@ impl WorkerService for NodeControlService {
         let r_worker = r.worker_id.clone();
         let commands = heartbeat_commands(&self.0.inner.lock(), &r.worker_id);
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
+            runtime_deliveries: if r.runtime_delivery_ready {
+                self.0.deliveries.offers(&r.worker_id)
+            } else { vec![] },
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
             log_requests: self.0.fleet.log_relay.heartbeat(&r.worker_id, &r.session),
@@ -1843,7 +1879,7 @@ fn load<T: serde::de::DeserializeOwned>(dir: &Path) -> anyhow::Result<Vec<T>> {
         .map(|e| Ok(serde_json::from_slice(&fs::read(e.path())?)?))
         .collect()
 }
-fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(path.parent().unwrap())?;
@@ -2610,7 +2646,7 @@ async fn internal_logs(
 }
 
 #[cfg(test)]
-#[path = "workloads_tests.rs"]
+#[path = "../tests/workloads/mod.rs"]
 mod tests;
 
 #[path = "workloads_scale.rs"]
@@ -2621,3 +2657,6 @@ mod views;
 
 #[path = "workloads_records.rs"]
 mod records;
+
+#[path = "workloads_policy.rs"]
+mod policy;

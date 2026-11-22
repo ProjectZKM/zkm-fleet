@@ -81,6 +81,8 @@ def _node_env(spec: AppReplicaSpec, backend: str, app_env: bool = False, **extra
     env.update(to_env(node))
     if app_env:
         env.update(spec.app.env)
+    env["FLEET_NODE_NAME"] = spec.name
+    env["FLEET_WORKER_ROLE"] = "prover"
     # The node itself does not touch the GPUs; the GPU server does.
     env.pop("CUDA_VISIBLE_DEVICES", None)
     return env
@@ -151,7 +153,8 @@ def _kill_orphans(name: str) -> None:
                 environ = f.read().split(b"\0")
             if f"FLEET_NODE_NAME={name}".encode() not in environ:
                 continue
-            if comm != comm_name and b"FLEET_WORKER_ROLE=app" not in environ:
+            if comm != comm_name and not any(role in environ for role in
+                    (b"FLEET_WORKER_ROLE=app", b"FLEET_WORKER_ROLE=prover")):
                 continue
         except OSError:
             continue
@@ -178,6 +181,13 @@ class _NodeProcess:
 
     def alive(self) -> bool:
         return self.proc.poll() is None
+
+    def executable(self) -> str | None:
+        """Observed executable, never the configured command or a guessed path."""
+        try:
+            return os.readlink(f"/proc/{self.proc.pid}/exe")
+        except OSError:
+            return None
 
     def stop(self) -> None:
         if self.alive():
@@ -207,8 +217,6 @@ def _granted_gpus() -> list[str]:
 
 
 def _node_binary(spec: AppReplicaSpec) -> str:
-    if spec.app.prover_binary:
-        return spec.app.prover_binary
     if not spec.cluster.node_binary:
         raise RuntimeError(f"{spec.name}: apps.yaml needs node_binary for a prover")
     return spec.cluster.node_binary
@@ -317,6 +325,7 @@ class _ZirenGpuProver:
         integrated = bool(self.spec.app.worker_command)
         return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, gpu_port=self.gpu_port,
                       gpu_ready=None if integrated else _gpu_ready(self.gpu_port),
+                      prover_binary=None if integrated else self.node.executable(),
                       ready=True if integrated else None, machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
@@ -435,7 +444,8 @@ class _ZirenCpuProver:
             return ReplicaHealth(name=self.name, stopping=True).dump()
         if not self.node.alive():
             os._exit(1)
-        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname()).dump()
+        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname(),
+                             prover_binary=self.node.executable()).dump()
 
     def shutdown(self) -> None:
         _STOPPING["on"] = True

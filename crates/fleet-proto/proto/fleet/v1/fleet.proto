@@ -148,6 +148,7 @@ message WorkerHeartbeatRequest {
   // Capacity, inventories, job leases/status and command acknowledgements only.
   // Inputs, logs and outputs remain outside the heartbeat. Report version is 2.
   fleet.model.v1.NodeReport report = 5;
+  bool runtime_delivery_ready = 6;
 }
 
 // Only the session itself can end: another agent's session stays until it is quiet.
@@ -166,4 +167,5 @@ message WorkerHeartbeatResponse {
   repeated string acknowledged_jobs = 4;
   repeated ProofFetch proof_fetches = 5;
   repeated LogRequest log_requests = 6;
+  repeated fleet.model.v1.RuntimeDeliveryOffer runtime_deliveries = 7;
 }

@@ -4,6 +4,8 @@ use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
+mod policy;
+
 /// The administrator's token the tests' scheduler has.
 const ADMIN: &str = "adminadminadminadminadminadminadminadminadminadminadminadminadmin1";
 
@@ -54,6 +56,39 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
 }
 fn inventory(namespace: &str) -> NodeReport {
     serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+}
+
+#[tokio::test]
+async fn runtime_instances_are_exact_scoped_live_allocations() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
+    report.apps[0]["services"]=json!(["http", "control"]);
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-network-v1".into()];
+    report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http", "control"],
+        "execution":{"namespace":ns,"workload":"model","allocation_id":"model-0","lease_id":"lease","generation":1,"node_id":"machine"}}])).unwrap();
+    let mut bad=report.clone();bad.runtime_instances[0].execution.node_id="other-machine".into();
+    assert!(c.report("gpu","session",bad).await.is_err());
+    let mut bad=report.clone();bad.runtime_instances[0].services=vec!["unapproved".into()];
+    assert!(c.report("gpu","session",bad).await.is_err());
+    c.report("gpu","session",report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=default"))["runtime_instances"][0]["execution"]["lease_id"],"lease");
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=other"))["runtime_instances"],json!([]));
+    // Repair remains reachable when the application fails its health check;
+    // application traffic must never use this exception.
+    report.apps[0]["ready"] = json!(false);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.runtime_instances[0].services = vec!["control".into()];
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"][0]["services"],json!(["control"]));
+    report.apps[0]["disabled"] = json!(true);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.apps[0]["disabled"] = json!(false);
+    c.report("gpu", "session", report).await.unwrap();
+    c.end_session("gpu","session");
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
 }
 fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
     JobReport {
@@ -1682,6 +1717,47 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
 }
 
 #[tokio::test]
+async fn native_prover_selection_is_node_owned_and_machine_pinned() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = scale_inventory(&ns, true, false);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    report.apps[0]["prover_binary"] = json!("/opt/selected");
+    assert!(c.report("gpu", "session", report.clone()).await.is_err());
+    report.apps[0]["machine"] = json!(report.machine);
+    report.native_provers = serde_json::from_value(json!([
+        {"entry_name":"model", "replica_name":"model-0", "executable":"/opt/actual"}
+    ])).unwrap();
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let intent = c.inner.lock().deployments["gpu-model"].clone();
+    assert_eq!(intent.spec["prover_binary"], "/opt/selected");
+    assert_eq!(intent.entry().machine(), report.machine);
+    assert_eq!(c.inner.lock().workers["gpu"].report.native_provers[0].executable, "/opt/actual");
+    assert_eq!(c.worker_status()[0]["native_provers"][0]["executable"], "/opt/actual");
+    let id = c.command("gpu", NodeOperation::SetApp,
+        json!({"app":intent.spec,"disabled":false})).unwrap();
+    let command = c.inner.lock().commands[&id].clone();
+    assert!(!c.place_start(&command, false).unwrap(), "never copy a host-local binary to another node");
+    for value in [json!(null), json!("relative"), json!(42)] {
+        let mut invalid = report.clone();
+        invalid.apps[0]["prover_binary"] = value;
+        if invalid.apps[0]["prover_binary"].is_null() {
+            invalid.apps[0]["machine"] = json!("another-machine");
+            invalid.apps[0]["prover_binary"] = json!("/opt/selected");
+        }
+        assert!(c.report("gpu", "session", invalid).await.is_err());
+    }
+    let mut duplicate = report.clone();
+    duplicate.native_provers.push(duplicate.native_provers[0].clone());
+    assert!(c.report("gpu", "session", duplicate).await.is_err());
+    let mut wrong = report.clone();
+    wrong.native_provers[0].replica_name = "model-2".into();
+    assert!(c.report("gpu", "session", wrong).await.is_err());
+    report.apps[0]["prover_binary"] = Value::Null;
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(c.inner.lock().deployments["gpu-model"].spec["prover_binary"].is_null());
+}
+
+#[tokio::test]
 async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admission_guard() {
     let (_dir, c, ns) = setup().await;
     let mut report = scale_inventory(&ns, true, false);
@@ -2213,6 +2289,53 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
     assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
     assert_eq!(c.inner.lock().apps["model"].spec["image"],"web:2");
     assert_eq!(c.inner.lock().apps["model"].spec["env"],json!({"A":"1"}));
+}
+
+#[tokio::test]
+async fn shim_capability_does_not_migrate_existing_apps() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,false,false);
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let before=c.inner.lock().deployments["gpu-model"].clone();
+    let commands=c.inner.lock().commands.len();
+    let set=json!({"runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.request_update(&ns,"model",None,set.clone()).await.is_err(), "old nodes cannot select shim");
+    let mut upgraded=report;
+    upgraded.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("gpu","session",upgraded.clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(c.inner.lock().commands.len(),commands,"installation alone sends no replacement command");
+    assert_eq!(c.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let restarted=WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap();
+    assert_eq!(restarted.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let owner=user_token(&c,&ns,0x79,"scope=default",Some(vec!["model".into()]),true).await;
+    assert_eq!(scale_call(c.clone(),&owner,"PUT",&format!("/apps/model/settings?namespace={ns}"),set.clone()).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(c.request_update(&ns,"model",None,set).await.unwrap()["state"],"draining");
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
+    assert!(stop.parameters["app"].get("runtime").is_none(), "drain uses the old executor");
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none());
+}
+
+#[tokio::test]
+async fn shim_placement_and_pending_commands_require_explicit_node_capability() {
+    let (_dir,c,ns)=setup().await;
+    c.report("old","old-session",inventory(&ns)).await.unwrap();
+    let entry=json!({"name":"web","app":"web","namespace":ns,"kind":"app","gpus":0,"cpus":1,"replicas":1,
+        "runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.place_app(Entry(&entry),&[]).is_err());
+    assert!(c.command("old",NodeOperation::SetApp,message::set_app(&entry,false)).is_err());
+    let mut capable=inventory(&ns);capable.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("new","new-session",capable).await.unwrap();
+    assert_eq!(c.place_app(Entry(&entry),&[]).unwrap().0,"new");
+    let id=c.command("new",NodeOperation::SetApp,message::set_app(&entry,false)).unwrap();
+    {
+        let mut i=c.inner.lock();let mut command=i.commands[&id].clone();command.admitted=true;i.commands.insert(id.clone(),command);
+        assert_eq!(heartbeat_commands(&i,"new").len(),1);
+        i.workers.get_mut("new").unwrap().report.runtime_capabilities.clear();
+        assert!(heartbeat_commands(&i,"new").is_empty(), "downgrade cannot execute a queued shim command as legacy");
+        assert!(!i.commands[&id].done, "retain the original command and allocation");
+    }
 }
 
 #[tokio::test]

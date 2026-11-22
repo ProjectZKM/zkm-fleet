@@ -56,8 +56,83 @@ message Token {
   optional string namespace = 8;
   optional string tag = 9;
   // What the token may do: some of read, submit, manage within its namespace, tag and app
-  // grants; or admin, over every namespace (an admin token has no namespace).
+  // grants; exclusive router_sync for an enrolled router; or admin, over every
+  // namespace (an admin token has no namespace).
   repeated string permissions = 10;
+}
+
+// Fleet-owned revocation stream. Revisions index the append-only route list.
+// These records are separate from node heartbeats and carry no application data.
+message RouterEnrollment {
+  required string issuer = 1;
+  required string token_id = 2;
+}
+message RouterControl {
+  required string router_id = 1;
+  required string issuer = 2;
+  required string epoch = 3;
+  required string token_id = 4;
+  required string namespace = 5;
+  repeated string revoked_routes = 6;
+  required uint64 delivered_revision = 7;
+  optional uint64 applied_revision = 8;
+  optional uint64 applied_ms = 9;
+  optional RouterAuthorization authorization = 10;
+  optional uint64 delivered_authorization_revision = 11;
+  optional uint64 applied_authorization_revision = 12;
+  // Advertised by the authenticated relay on its latest successful sync.
+  repeated string capabilities = 13;
+}
+message RouterSyncRequest {
+  optional string epoch = 1;
+  required uint64 after_revision = 2;
+  optional uint64 applied_revision = 3;
+  optional uint64 applied_authorization_revision = 4;
+}
+message RouterSyncResponse {
+  required string router_id = 1;
+  required string issuer = 2;
+  required string epoch = 3;
+  required uint64 from_revision = 4;
+  required uint64 revision = 5;
+  repeated string revoked_routes = 6;
+  required uint32 lease_seconds = 7;
+  optional RouterAuthorization authorization = 8;
+}
+
+// Application access policy is independent of runtime registration/generation.
+message RouterAccessPolicy {
+  required string namespace = 1;
+  // Exact workload, or "*" for an administrator-owned namespace/service default.
+  // An exact policy takes precedence, including an explicitly disabled policy.
+  required string workload = 2;
+  required string service = 3;
+  required uint64 version = 4;
+  required string sha256 = 5;
+  required bool enabled = 6;
+}
+message RouterSubjectRevocation {
+  required string namespace = 1;
+  required string principal = 2;
+  optional string session = 3;
+}
+message RouterAuthorization {
+  required uint64 revision = 1;
+  repeated RouterAccessPolicy policies = 2;
+  repeated RouterSubjectRevocation revoked_subjects = 3;
+}
+message RouterAuthorizeRequest {
+  required string namespace = 1;
+  required string workload = 2;
+  required string service = 3;
+  required string principal = 4;
+  required string session = 5;
+}
+message RouterAccessBinding {
+  required string principal = 1;
+  required string session = 2;
+  required uint64 policy_version = 3;
+  required string policy_sha256 = 4;
 }
 
 enum ProofJobState {
@@ -198,6 +273,94 @@ message NodeReport {
   repeated CommandResult results = 11;
   // The release the agent was built from (the tag CI passes at build time); absent on older agents.
   optional string agent_version = 12;
+  // Explicit opt-in execution capabilities; empty on older nodes.
+  repeated string runtime_capabilities = 13;
+  // Exact durable shim allocations. Unready native reservations have no services;
+  // service grants must never address a guessed host port.
+  repeated RuntimeInstance runtime_instances = 14;
+  // Observed executable paths, not configured paths or SDK compatibility attestations.
+  repeated NativeProverProcess native_provers = 15;
+}
+
+// Metadata only: native credentials are claimed once over the private HTTPS API.
+message RuntimeDeliveryOffer {
+  required string ticket = 1;
+  required RuntimeExecutionIdentity execution = 2;
+  required string payload_sha256 = 3;
+}
+
+message RuntimeDeliveryRecord {
+  required RuntimeDeliveryOffer offer = 1;
+  required string worker = 2;
+  required uint64 expires_at = 3;
+  // queued, dispatched, acknowledged, uncertain, cancelled, expired.
+  required string state = 4;
+  optional string claimed_session = 5;
+}
+
+message RuntimeDeliveryAck {
+  // True means shim acknowledged provisioning, never application readiness.
+  required bool accepted = 1;
+}
+
+message NativeProverProcess {
+  required string entry_name = 1;
+  required string replica_name = 2;
+  required string executable = 3;
+}
+
+message RuntimeExecutionIdentity {
+  required string namespace = 1;
+  required string workload = 2;
+  required string allocation_id = 3;
+  required string lease_id = 4;
+  required uint64 generation = 5;
+  required string node_id = 6;
+}
+
+// Central policy gateway operator APIs. Policy/witness JSON is owned by Rail;
+// this protocol never puts credentials in App specs, reports or heartbeats.
+message PolicyActivationRequest {
+  required RuntimeExecutionIdentity execution = 1;
+  required Json policy = 2;
+  required Json context = 3;
+  required string previous_state_root = 4;
+  required string budget = 5;
+}
+message PolicyStageRequest {
+  required string job_id = 1;
+  required Json request = 2;
+  required uint64 cost = 3;
+}
+message PolicyBudgetRequest {
+  required string name = 1;
+  required uint64 allowance = 2;
+}
+message PolicyCredentialRequest {
+  required RuntimeExecutionIdentity execution = 1;
+  // admission, execution, or admission_and_execution.
+  required string permission = 2;
+  required uint64 expires_at = 3;
+}
+
+// Operator preparation for the stock OpenShell gateway's compute callback.
+// No gateway launch credentials are stored in this record or public App specs.
+message OpenShellLaunchPreparation {
+  required Json request = 1;
+  required string native_policy_base64 = 2;
+  required string principal = 3;
+  required uint64 expires_at = 4;
+  required uint64 cost = 5;
+}
+
+message RuntimeInstance {
+  required string entry_name = 1;
+  required RuntimeExecutionIdentity execution = 2;
+  required bool ready = 3;
+  repeated string services = 4;
+  // Bounded, sanitized native compute observation. Never includes a spec,
+  // credentials, node-local service endpoints or platform diagnostic messages.
+  optional string native_observation_base64 = 5;
 }
 
 message JobReport {

@@ -14,8 +14,7 @@
 # ${FLEET_CTL_ENV:-~/.config/zkm-fleet/ctl.env}: FLEET_PREFIX (install dir), FLEET_NODE_SSH
 # (ssh host of the node; node commands then run there), FLEET_NODE_PREFIX (its install
 # dir, default ~/app/fleet) and FLEET_RELEASE_REPO (default ProjectZKM/zkm-fleet).
-# FLEET_NODE_UNIT names the node's systemd unit; FLEET_PROOF_APP_UNITS the app endpoint
-# units a fleet-proof-app upgrade restarts; FLEET_CTL_HEALTH_WAIT how many seconds to wait for
+# FLEET_NODE_UNIT names the node's systemd unit; FLEET_CTL_HEALTH_WAIT how many seconds to wait for
 # the scheduler to start listening (default 300). Every upgrade backs up what it replaces first.
 # Node upgrades and rollbacks require systemd; see docs/maintenance.md for cron nodes.
 set -euo pipefail
@@ -25,7 +24,6 @@ ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
 PREFIX=${FLEET_PREFIX:-$(dirname "$(dirname "$SELF")")}
 NODE_SSH=${FLEET_NODE_SSH:-}; NODE_PREFIX=${FLEET_NODE_PREFIX:-\$HOME/app/fleet}
 NODE_UNIT=${FLEET_NODE_UNIT:-zkm-fleet-node.service}
-PROOF_APP_UNITS=${FLEET_PROOF_APP_UNITS:-}
 [ -n "${FLEET_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_TOKEN_FILE=$PREFIX/etc/admin.token
 DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }
@@ -197,6 +195,7 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   local b; b=$PREFIX/backup/node-$(stamp)
   # Check the new bridge imports in the node's own venv before the agent is touched.
   [ "$DRY" = 1 ] || (cd "$bridge" && "$PREFIX/venv/bin/python" -c "import fleet_bridge.node") || die "the new bridge does not import; nothing changed"
+  node_runtime_check "$bridge"
   run mkdir -p "$b"; run cp -a "$PREFIX/bin/fleet-node" "$PREFIX/bridge" "$b/"
   [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
   if [ -n "$scripts" ]; then
@@ -220,7 +219,8 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   if [ -n "$proof_app" ]; then
     run install -m 755 "$proof_app" "$PREFIX/bin/fleet-proof-app.new"
     run mv "$PREFIX/bin/fleet-proof-app.new" "$PREFIX/bin/fleet-proof-app"
-    local unit; for unit in $PROOF_APP_UNITS; do run sudo systemctl restart "$unit"; done
+    # Existing endpoint processes keep their old executable mapping. Restarting
+    # proof apps is a separate operator action, never part of a node upgrade.
   fi
   echo "node upgraded; previous files in $b"
 }
@@ -230,13 +230,18 @@ launch_scripts_dir() { # a directory holding the node's three launch scripts
   done
   return 0
 }
-node_connected() { # the agent reconnecting, not just the unit running
+node_connected() { # this invocation's agent, including operator wrapper processes
+  local invocation
   for _ in $(seq 45); do
-    journalctl -u "$NODE_UNIT" --since -30s --no-pager | grep -q "node connected to control plane" && return 0; sleep 2
+    invocation=$(systemctl show --property=InvocationID --value "$NODE_UNIT")
+    if [[ "$invocation" =~ ^[0-9a-f]{32}$ ]] && systemctl is-active --quiet "$NODE_UNIT" \
+      && journalctl -u "$NODE_UNIT" "_SYSTEMD_INVOCATION_ID=$invocation" --no-pager | grep -q "node connected to control plane"; then return 0; fi
+    sleep 2
   done; return 1
 }
 node_rollback() {
   local b; b=$(latest_backup node); [ -n "$b" ] || die "no backup in $PREFIX/backup"
+  node_runtime_check "$b/bridge"
   run sudo systemctl stop "$NODE_UNIT"
   run install -m 755 "$b/fleet-node" "$PREFIX/bin/fleet-node"
   run cp -a "$b/bridge/." "$PREFIX/bridge/"
@@ -246,12 +251,38 @@ node_rollback() {
       [ ! -f "$b/scripts/$s" ] || run install -m 755 "$b/scripts/$s" "$PREFIX/deploy/$s"
     done
   fi
-  run sudo systemctl start "$NODE_UNIT"
   if [ -f "$b/fleet-proof-app" ]; then
     run install -m 755 "$b/fleet-proof-app" "$PREFIX/bin/fleet-proof-app"
-    local unit; for unit in $PROOF_APP_UNITS; do run sudo systemctl restart "$unit"; done
   fi
+  run sudo systemctl start "$NODE_UNIT"
+  [ "$DRY" = 1 ] || node_connected || die "restored node did not reconnect; runtime services were left running"
   echo "restored $b"
+}
+
+node_runtime_check() {
+  # Use the candidate adapter against the live daemon before stopping the node.
+  # Older adapters lacking daemon support are incompatible, not a fallback.
+  [ "$DRY" = 1 ] && return 0
+  local etc=${FLEET_ETC:-$PREFIX/etc} node_env=${FLEET_ENV:-}
+  if [ -z "$node_env" ] && [ -z "${FLEET_ETC:-}" ]; then
+    node_env=$(systemctl show --property=Environment --value "$NODE_UNIT" 2>/dev/null | python3 -c \
+      'import shlex,sys; print(next((v.split("=",1)[1] for v in shlex.split(sys.stdin.read()) if v.startswith("FLEET_ENV=")),""))')
+  fi
+  node_env=${node_env:-$etc/watchdog.env}
+  if [ -z "${FLEET_ETC:-}" ] && [ -f "$node_env" ]; then
+    etc=$(bash -c '. "$1"; printf "%s" "${FLEET_ETC:-$2}"' _ "$node_env" "$etc")
+  fi
+  [ -f "$etc/apps.yaml" ] || die "cannot locate apps.yaml; set FLEET_ETC before upgrading; node was not stopped"
+  (cd "$1" && "$PREFIX/venv/bin/python" - "$etc/apps.yaml" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+data = yaml.safe_load(Path(sys.argv[1]).read_text()) or {}
+if data.get('shim_daemon'):
+    from fleet_bridge.shim import daemon_config, check_daemon
+    check_daemon(daemon_config(Path(sys.argv[1])))
+PY
+  ) || die "runtime compatibility check failed; node was not stopped"
 }
 
 app_cleanup() {

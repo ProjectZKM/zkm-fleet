@@ -76,6 +76,7 @@ impl WorkloadController {
         let mut images = std::collections::BTreeSet::new();
         let mut states = std::collections::BTreeSet::new();
         let mut reasons = Vec::new();
+        let mut instances = Vec::new();
         for intent in &deployments {
             let s = intent
                 .scale
@@ -94,6 +95,16 @@ impl WorkloadController {
             }
             let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
             let observed = worker.and_then(|w| w.report.entry(intent.entry().name()));
+            if !intent.disabled && intent.scale.as_ref().is_none_or(|s| !s.pending())
+                && tag.is_none_or(|tag| intent.entry().tag().unwrap_or("") == tag) {
+                if let Some(worker) = worker.filter(|w| !w.ended && w.report.ready) {
+                    instances.extend(worker.report.runtime_instances.iter().filter(|r| r.entry_name == intent.entry().name()
+                        && r.ready && observed.is_some_and(|e| !e.disabled() && (e.ready()
+                            || r.services == ["control"]))
+                        && (intent.spec["runtime"]["driver"] != "openshell"
+                            || self.native_route_ready(&i, r))).cloned());
+                }
+            }
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
                 "failed"
             } else if worker.is_none() {
@@ -119,7 +130,7 @@ impl WorkloadController {
         let n = self.fleet.namespace(namespace);
         json!({
             "resources":(!deployments.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
-            "tags":tags, "images":images, "state":state,
+            "tags":tags, "images":images, "state":state, "runtime_instances": instances,
             "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
             "tag_quota":tag.and_then(|tag|n.as_ref()?.tag_quotas.get(tag)),
@@ -164,6 +175,7 @@ impl WorkloadController {
             "priority": priority, "disabled": disabled, "resources": r["resources"],
             "namespace_quota": r["namespace_quota"], "tag_quota": r["tag_quota"],
             "jobs": jobs,
+            "runtime_instances":r["runtime_instances"],
         });
         for (key, value) in sections {
             v[key] = value;
