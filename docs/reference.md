@@ -608,7 +608,11 @@ OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
 
 The Docker acceptance additionally launches the stock Docker driver and real
 workload/supervisor containers. Build both binaries from the pinned OpenShell
-source and supply compatible, preloaded images by immutable ID or digest:
+source and supply compatible, preloaded images by immutable ID. Compose the
+supervisor with trusted-shim's `docker/openshell-supervisor.Dockerfile` and static
+`trusted-shim-socket` helper; the upstream supervisor and driver remain unchanged.
+The workload image must provide Python 3's standard library and numeric UID/GID
+1000 support (the acceptance uses `python:3.12-slim`):
 
 ```sh
 OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
@@ -619,10 +623,18 @@ OPENSHELL_TEST_WORKLOAD_IMAGE=sha256:... \
   cargo test --locked -p fleet-scheduler --lib stock_docker_startup -- --ignored --nocapture
 ```
 
-The workload image must provide `/bin/sleep` and support numeric UID/GID 1000.
 The test checks proof-before-create, joined gateway readiness, configuration
 activation, hard CPU/memory limits, network isolation, stale-owner rejection and
-offline shim cleanup. It keeps node observations flowing until both native
+offline shim cleanup. It also runs a real local Data Router and outgoing connector
+against the supervisor's local SSH boundary adapter: HTTP application credentials
+are preserved, SSE streams and WebSocket text/binary frames pass, foreign tenants,
+wrong supervisor images and wrong SSH host keys are rejected. Revocation and
+local cancellation close active streams. Application bytes continue locally with
+the central OpenShell gateway offline, within the test's route lease. Test-issued
+route grants do not replace production Fleet control-snapshot freshness; automatic
+native service publication and app health integration remain migration gates.
+The workload has no published host ports and retains `network=none`.
+It keeps node observations flowing until both native
 creation and gateway readiness complete: the stock driver can acknowledge Create
 before assigning a physical instance. Proof submission/verification remain test
 doubles; no prover is started and this is not a fresh cryptographic proof test.

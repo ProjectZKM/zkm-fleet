@@ -2,6 +2,9 @@
 use super::*;
 use std::{path::Path, process::Command};
 
+#[path = "workloads_openshell_route_test.rs"]
+mod route;
+
 // Every Docker operation is scoped to this test's unique operator namespace.
 struct DockerScope(String);
 impl DockerScope {
@@ -83,10 +86,15 @@ async fn driver(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires stock gateway/driver binaries, pinned runtime images, Docker and openssl"]
+#[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
 async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() {
     let image = std::env::var("OPENSHELL_TEST_WORKLOAD_IMAGE").expect("pinned workload image");
-    let command = vec!["/bin/sleep".to_string(), "300".to_string()];
+    let command = vec![
+        "python3".to_string(),
+        "-u".into(),
+        "-c".into(),
+        include_str!("workloads_openshell_app_test.py").into(),
+    ];
     let (dir, c, mut report, mut policy, mut request) =
         policy_setup_with_inventory("openshell", |report| {
             report.apps[0]["image"] = json!(image);
@@ -253,7 +261,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     );
     let mut compute_client = compute_client(compute_socket).await;
     let mut previous = None;
-    tokio::time::timeout(Duration::from_secs(90), async {
+    let (owned_native, host_key) = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let observed = shim_call(
                 &shim_socket,
@@ -276,7 +284,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
                 .into_inner()
                 .sandbox
                 .unwrap();
-            let native_instance = native.status.unwrap().instance_id;
+            let native_instance = &native.status.as_ref().unwrap().instance_id;
             let sandbox = gateway
                 .get_sandbox(query.clone())
                 .await
@@ -304,7 +312,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
                     .iter()
                     .any(|c| c.r#type == "Ready" && c.status == "True"));
                 assert_eq!(status.configuration_activated, Some(true));
-                break;
+                break (native, sandbox.host_key_fingerprint);
             }
             assert_ne!(
                 status.phase,
@@ -340,6 +348,76 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     assert_eq!(workload["HostConfig"]["NanoCpus"], 2_000_000_000_u64);
     assert_eq!(workload["HostConfig"]["Memory"], 134_217_728_u64);
     assert_eq!(workload["HostConfig"]["Privileged"], false);
+    assert!(
+        workload["HostConfig"]["PortBindings"].is_null()
+            || workload["HostConfig"]["PortBindings"]
+                .as_object()
+                .is_some_and(|p| p.is_empty())
+    );
+    let supervisor_image = std::env::var("OPENSHELL_TEST_SUPERVISOR_IMAGE").unwrap();
+    let transport_stop = tokio_util::sync::CancellationToken::new();
+    // These inputs belong to the node adapter. No service route is published by
+    // the production scheduler until application readiness/admission is wired.
+    for (native, image, key) in [
+        (
+            owned_native.clone(),
+            format!("sha256:{}", "0".repeat(64)),
+            host_key.clone(),
+        ),
+        (
+            owned_native.clone(),
+            supervisor_image.clone(),
+            format!("SHA256:{}", "A".repeat(43)),
+        ),
+        (
+            {
+                let mut foreign = owned_native.clone();
+                foreign.workspace.push('x');
+                foreign
+            },
+            supervisor_image.clone(),
+            host_key.clone(),
+        ),
+    ] {
+        assert!(matches!(
+            trusted_shim::openshell_network::bind(
+                native,
+                &image,
+                &key,
+                8090,
+                transport_stop.clone()
+            )
+            .await,
+            Err(trusted_shim::Error::Untrusted | trusted_shim::Error::Ownership)
+        ));
+    }
+    let service = trusted_shim::openshell_network::bind(
+        owned_native.clone(),
+        &supervisor_image,
+        &host_key,
+        8090,
+        transport_stop.clone(),
+    )
+    .await
+    .expect("private supervisor SSH transport");
+    let routed = route::Route::start(&root, &request.execution, service.address()).await;
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let app_url = format!("http://{}/echo", service.address());
+    let response = routed
+        .get("echo")
+        .bearer_auth("application-owned-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "Bearer application-owned-key"
+    );
+    routed.websocket().await;
     // A still-connected supervisor must not preserve gateway readiness after
     // Fleet loses the owning node session.
     c.end_session("gpu", "session");
@@ -369,12 +447,80 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     gateway_process.kill().await.unwrap();
     compute.abort();
     http.abort();
+    // Business bytes still use local supervisor -> native boundary, with the
+    // central OpenShell gateway and Fleet HTTP control plane offline.
+    let response = routed
+        .get("echo")
+        .bearer_auth("offline-control")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "Bearer offline-control");
+    routed.websocket().await;
+    let mut routed_stream = routed.get("events").send().await.unwrap();
+    assert!(routed_stream.chunk().await.unwrap().is_some());
+    routed.revoke().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Ok(Some(_)) = routed_stream.chunk().await {}
+    })
+    .await
+    .expect("router revocation closes active native streams");
+    assert!(!routed
+        .get("echo")
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    let mut stream = http_client
+        .get(format!("http://{}/events", service.address()))
+        .send()
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap()).contains("data:"));
+    transport_stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !service.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while let Ok(Some(_)) = stream.chunk().await {}
+    })
+    .await
+    .expect("cancellation drains active streams");
+    service.close().await;
+    assert!(http_client.get(&app_url).send().await.is_err());
+    // Reconnect to the same physical runtime, then delete it while a stream is
+    // active. The transport cannot survive or redirect to a replacement runtime.
+    let service = trusted_shim::openshell_network::bind(
+        owned_native,
+        &supervisor_image,
+        &host_key,
+        8090,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let mut stream = http_client
+        .get(format!("http://{}/events", service.address()))
+        .send()
+        .await
+        .unwrap();
+    assert!(stream.chunk().await.unwrap().is_some());
     shim_call(
         &shim_socket,
         json!({"operation":"delete","execution":request.execution,"driver":"openshell"}),
     )
     .await;
     assert!(scope.ids("container").is_empty());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !service.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        while let Ok(Some(_)) = stream.chunk().await {}
+    })
+    .await
+    .expect("runtime deletion closes active streams");
+    service.close().await;
     stop.cancel();
     daemon.await.unwrap();
     native.kill().await.unwrap();

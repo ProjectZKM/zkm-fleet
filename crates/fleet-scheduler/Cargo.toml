@@ -36,7 +36,7 @@ fs2 = "0.4"
 prost-native = { package = "prost", version = "0.14" }
 tonic-native = { package = "tonic", version = "0.14", features = ["transport"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "5f05e728444f80973a566a15039e5355a3eb0dd7", features = ["ziren", "openshell"] }
+trusted-shim = { git = "https://github.com/BotMesh/trusted-shim", rev = "433ba17fe6d1d95898e5ccdbdf17e26001706ba1", features = ["ziren", "openshell"] }
 
 [dev-dependencies]
 tonic-native = { package = "tonic", version = "0.14", features = ["tls-ring"] }
@@ -50,3 +50,6 @@ fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
+trusted-router-transport = { git = "https://github.com/BotMesh/trusted-data-router", rev = "c5ef05076ef62a2073110aa295d967d6e6f5d573" }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
