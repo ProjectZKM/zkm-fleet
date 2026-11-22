@@ -1,7 +1,10 @@
 # EthProofs app worker
 
+Fleet 0.2 does not automatically convert this integrated worker; preserve its
+cursor, state and image during the control-plane upgrade.
+
 Fleet pins the worker in the `third_party/reth-processor` Git submodule
-([pinned source](https://github.com/ProjectZKM/reth-processor/tree/85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9)).
+([pinned source](https://github.com/ProjectZKM/reth-processor/tree/a75cb337305eac262a31346b4b3086146fed8297)).
 The worker migration is based on
 [reth-processor PR #23](https://github.com/ProjectZKM/reth-processor/pull/23),
 `chore/ziren-v2-stateless`, which includes the Fleet worker integration and
@@ -86,8 +89,8 @@ Use a new entry name and state directory. Keep a temporary rollback package
 until proving and reporting are verified, then remove retired deployment records
 according to the app's retention policy. Keep GOAT's entry and image unchanged.
 
-Before enabling a new worker, validate local proving and API reporting with test
-credentials. For an existing stream, preserve its next unproved block and stop
+Before enabling a new worker, validate proving on a dedicated Fleet staging
+worker and API reporting with test credentials. For an existing stream, preserve its next unproved block and stop
 the previous worker before starting the replacement. Bootstrap a new state
 directory with `--start-block N`; a checkpoint takes precedence on subsequent
 restarts. Run only one worker for the stream and preserve GOAT's entry.
@@ -107,13 +110,14 @@ GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an app-owner decision; inspect it with `fleetctl --namespace zkm app` using an
 owner token for namespace `zkm`.
 
-The package records worker source commit
+The earlier acceptance package (historical baseline) records worker source commit
 `85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9` on
 `chore/ziren-v2-stateless`, with PR #23 based on `stateless`. The guest was built
 from `fd9589cd63c15c3671c643c1a34de7341a2201ff`; its SHA-256 is
 `334b45b88d6c60e3354e983a5b26ef39b18feee65da828f277a93e646c78c73b`.
-Worker updates preserve this guest and app identity. The image digest is listed
-above; package checksums and `source-revision` record the worker separately.
+The checked-in submodule now pins the revision linked at the top. Revalidate
+any new package and record its guest, image digest and `source-revision`; the
+historical checks below do not validate a newly built image.
 
 For example, request five GPUs while retaining the current CPU and replica settings:
 

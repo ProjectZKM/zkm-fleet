@@ -97,7 +97,7 @@ OpenShell revision pinned in `Cargo.lock`. Record its registry digest in
 `FLEET_OPENSHELL_IMAGE` in the existing `compose.env` before production use. The
 default revision tag is a build reference; its presence in Compose does not mean
 that a release has already been published. To package a locally built, unchanged
-upstream `openshell-gateway`, use `deploy/Dockerfile.openshell` with a minimal build
+upstream `openshell-gateway`, use `deploy/openshell/Dockerfile` with a minimal build
 context containing only that Dockerfile and binary. Ubuntu 24.04 builds require the
 matching runtime base supplied by that Dockerfile.
 

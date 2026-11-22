@@ -697,7 +697,7 @@ OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
 The Docker acceptance additionally launches the stock Docker driver and real
 workload/supervisor containers. Build both binaries from the pinned OpenShell
 source and supply compatible, preloaded images by immutable ID. Compose the
-supervisor with trusted-shim's `docker/openshell-supervisor.Dockerfile` and static
+supervisor with trusted-shim's `docker/openshell/Dockerfile.supervisor` and static
 `trusted-shim-socket` helper; the upstream supervisor and driver remain unchanged.
 The workload image must provide Python 3's standard library and numeric UID/GID
 1000 support (the acceptance uses `python:3.12-slim`):

@@ -32,6 +32,27 @@ Two integrated app workers prove on their node's own GPU server:
 - **The GOAT proof builder** serves Bitcoin node proof requests, proves its five
   circuits and keeps its task database and proofs in app storage.
 
+## Runtime deployment (0.2)
+
+Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
+node-agent upgrades leave that process and existing containers running. The native
+OpenShell gateway is an optional profile in Fleet’s Compose, required for the
+OpenShell driver. Rail is embedded policy evaluation plus a remote proof guest.
+The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
+has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
+
+GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}`
+with `sha-<full-commit>` tags and release versions. The unchanged native gateway
+uses `zkm-fleet-openshell:<upstream-revision>`. The manual proof-image workflow
+publishes `zkm-fleet-ziren-node:sha-<full-commit>` from an operator-validated
+Ziren 2.0 GPU image digest; building it does not run a prover. The node image also
+distributes binaries for the existing host installer; it does not replace local
+Ray/bridge supervision or combine the shim lifecycle with the node process.
+
+Existing workloads are not automatically migrated. Schema 20 requires a
+[backup and compatible rollback plan](docs/maintenance.md); preserve application
+data, cursors and identities before the initial upgrade.
+
 ## Get started
 
 1. [Install the control host and add a node](docs/installation.md).

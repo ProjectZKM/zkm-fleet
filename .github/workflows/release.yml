@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-openshell:$OPENSHELL_REV"
           mkdir -p target/openshell-image
-          cp deploy/Dockerfile.openshell target/openshell-image/Dockerfile
+          cp deploy/openshell/Dockerfile target/openshell-image/Dockerfile
           cp target/openshell/bin/openshell-gateway target/openshell-image/
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
@@ -65,7 +65,7 @@ jobs:
 
   build-release:
     name: Build release components
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
@@ -125,21 +125,13 @@ jobs:
             --rev "$TRUSTED_SHIM_REV" \
             --features openshell --bin trusted-shim-runtime --root target/shim
 
-      - name: Publish scheduler image to GHCR
-        shell: bash
+      - name: Publish component images to GHCR
         env:
           REGISTRY_TOKEN: ${{ github.token }}
+          PUBLISH: 'true'
         run: |
-          set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-scheduler"
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --label "org.opencontainers.image.version=${RELEASE_VERSION}" \
-            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
-            --tag "$IMAGE:${RELEASE_VERSION}" \
-            -f deploy/Dockerfile.scheduler .
-          docker push "$IMAGE:${RELEASE_VERSION}"
+          bash deploy/build-component-images.sh target/release "ghcr.io/${GITHUB_REPOSITORY,,}" "$RELEASE_VERSION"
 
       - name: Build release package
         shell: bash

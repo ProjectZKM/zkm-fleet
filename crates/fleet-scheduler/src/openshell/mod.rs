@@ -45,7 +45,6 @@ use trusted_shim::{
 };
 type Result<T> = trusted_shim::rail::Result<T>;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
-#[path = "openshell_readiness.rs"]
 mod readiness;
 pub(crate) use readiness::{services_ready, Observer};
 fn now() -> u64 {
