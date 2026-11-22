@@ -51,7 +51,9 @@ Ray/bridge supervision or combine the shim lifecycle with the node process.
 
 Existing workloads are not automatically migrated. Schema 20 requires a
 [backup and compatible rollback plan](docs/maintenance.md); preserve application
-data, cursors and identities before the initial upgrade.
+data, cursors and identities before the initial upgrade. Policy-enabled deployments
+must also coordinate Rail's v2 evaluator with the new guest, approved program key
+and policy revisions; see [policy upgrades](docs/maintenance.md#policy-evaluator).
 
 ## Get started
 

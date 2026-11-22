@@ -64,6 +64,20 @@ enabled, its initialization and one authenticated tool call. After a permissions
 change, try the changed grant with a temporary workload and a token without the
 grant, then remove both.
 
+### Policy evaluator
+
+The scheduler and shim pin Rail's v2 profile, including portable 32/64-bit
+collection indices. Run `python3 scripts/check_policy_features.py` during the
+scheduler build; it uses the pinned Rail audit for evaluator source and features.
+
+For policy-enabled workloads, build the matching guest and run Rail's native/MIPS
+checker, then verify a fresh receipt through the proof network. Approve the new
+ELF/program key and new policy revisions with the v2 engine profile before
+resuming admission on upgraded components. Old profiles are rejected; do not
+relabel historical receipts or silently rewrite stored policy digests. Preserve
+the old policy and program records for receipt history. This does not migrate or
+stop existing workloads automatically.
+
 ### Execution node
 
 ```bash

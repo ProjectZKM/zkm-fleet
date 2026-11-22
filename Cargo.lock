@@ -2747,7 +2747,7 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
- "trusted-router-transport 0.1.0 (git+https://github.com/BotMesh/trusted-data-router?rev=0ed598a246740f15878aad27fa56996ebdc4daef)",
+ "trusted-router-transport",
  "trusted-shim",
  "uuid",
 ]
@@ -6579,8 +6579,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "regorus"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "463ad781640cf7750bfc84b22cda8dffd529feb10d058d8796e2200e7209dfe7"
+source = "git+https://github.com/attestx/regorus?rev=1bbb3e6798c85e4b30b298fad9b8fc207e8480cc#1bbb3e6798c85e4b30b298fad9b8fc207e8480cc"
 dependencies = [
  "anyhow",
  "lazy_static",
@@ -8985,7 +8984,7 @@ dependencies = [
 [[package]]
 name = "trusted-rail"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-rail?rev=83162e68e9634ab33e00467fa1b622920cf51b92#83162e68e9634ab33e00467fa1b622920cf51b92"
+source = "git+https://github.com/BotMesh/trusted-rail?rev=9a9aa5cd493a9b81ba8c3ef8347afd5f9871737e#9a9aa5cd493a9b81ba8c3ef8347afd5f9871737e"
 dependencies = [
  "async-trait",
  "hex",
@@ -9000,37 +8999,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=0ed598a246740f15878aad27fa56996ebdc4daef#0ed598a246740f15878aad27fa56996ebdc4daef"
-dependencies = [
- "async-trait",
- "axum 0.8.9",
- "bytes",
- "futures",
- "hex",
- "hyper 1.11.1",
- "hyper-util",
- "jsonwebtoken 9.3.1",
- "libc",
- "pem 3.0.6",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tower-http",
- "trusted-contracts",
- "trusted-data-router",
- "yamux",
-]
-
-[[package]]
-name = "trusted-router-transport"
-version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-data-router?rev=cc7e9b5840ba8d2c353a619fd3f3b8c148cfb2a9#cc7e9b5840ba8d2c353a619fd3f3b8c148cfb2a9"
+source = "git+https://github.com/BotMesh/trusted-data-router?rev=a90f901a31dc6672686190b8236260d25a6e16a8#a90f901a31dc6672686190b8236260d25a6e16a8"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -9060,7 +9029,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-shim?rev=8606245694171e220590d333e2f92e3e4eb75cbe#8606245694171e220590d333e2f92e3e4eb75cbe"
+source = "git+https://github.com/BotMesh/trusted-shim?rev=6eddf0c68aeadb8695b6ecf92d37395d7af26531#6eddf0c68aeadb8695b6ecf92d37395d7af26531"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -9097,7 +9066,7 @@ dependencies = [
  "trusted-contracts",
  "trusted-data-router",
  "trusted-rail",
- "trusted-router-transport 0.1.0 (git+https://github.com/BotMesh/trusted-data-router?rev=cc7e9b5840ba8d2c353a619fd3f3b8c148cfb2a9)",
+ "trusted-router-transport",
  "zkm-verifier",
 ]
 
