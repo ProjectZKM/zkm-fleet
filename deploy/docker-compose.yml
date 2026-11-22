@@ -109,9 +109,10 @@ services:
       retries: 4
     stop_grace_period: 60s
 
-  # Stock Trustee verifies TEE evidence on the control plane. No node runtime,
-  # Docker socket or raw public gRPC listener is exposed by this service.
+  # Optional legacy/precheck adapter. DCAP ZK admission verifies original evidence
+  # in the guest and does not depend on this service or its signed verdict.
   trustee-as:
+    profiles: [trustee]
     image: ${FLEET_TRUSTEE_IMAGE:-ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:f65a0a74972781d5a3a9595f6e1308b86343f940738a0b6a23c270a7e8bd065a}
     restart: unless-stopped
     init: true

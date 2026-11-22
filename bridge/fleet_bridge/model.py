@@ -460,14 +460,26 @@ class TrusteeTlsConfig(Record):
 
 
 @dataclass(kw_only=True)
+class ShimDcapConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    collateral_file: str
+    min_tcb_evaluation_data_number: int
+
+    def __post_init__(self) -> None:
+        if not os.path.isabs(self.collateral_file) or not 0 < self.min_tcb_evaluation_data_number <= 0xffffffff:
+            raise ModelError("DCAP requires an absolute collateral path and positive TCB floor")
+
+
+@dataclass(kw_only=True)
 class ShimTeeConfig(Record):
     STRICT_FIELDS: typing.ClassVar[bool] = True
     mode: typing.Literal["hardware", "simulation"]
     platform: str
     evidence_endpoint: str
-    trustee_endpoint: str
-    trustee_policy_ids: list[str]
+    trustee_endpoint: str = ""
+    trustee_policy_ids: list[str] = field(default_factory=list)
     trustee_tls: TrusteeTlsConfig | None = None
+    dcap: ShimDcapConfig | None = None
     init_data_sha256: str
     endpoint_key_sha256: str
     expected_measurement: str
@@ -480,11 +492,18 @@ class ShimTeeConfig(Record):
 
     def __post_init__(self) -> None:
         endpoint = urlsplit(self.trustee_endpoint)
-        if (endpoint.username is not None or endpoint.password is not None or endpoint.query or endpoint.fragment
+        if not self.trustee_endpoint:
+            if self.trustee_tls is not None or self.trustee_policy_ids or self.dcap is None:
+                raise ModelError("AS-free attestation requires DCAP; orphan Trustee settings are invalid")
+        elif (endpoint.username is not None or endpoint.password is not None or endpoint.query or endpoint.fragment
                 or endpoint.path not in ("", "/") or not endpoint.hostname
                 or not ((endpoint.scheme == "https" and self.trustee_tls is not None)
                         or (endpoint.scheme == "http" and endpoint.hostname in ("127.0.0.1", "::1") and self.trustee_tls is None))):
             raise ModelError("Trustee requires HTTPS with node TLS credentials, or loopback HTTP")
+        if self.dcap is not None and (self.mode != "hardware" or self.platform != "tdx"):
+            raise ModelError("DCAP startup requires hardware TDX")
+        if self.dcap is not None and not re.fullmatch(r"[0-9a-f]{64}", self.expected_measurement):
+            raise ModelError("DCAP requires the complete measured-profile SHA256")
         if ((self.mode == "simulation" and self.platform != "sample")
                 or (self.mode == "hardware" and self.platform not in ("snp", "tdx"))):
             raise ModelError("TEE mode and platform disagree")

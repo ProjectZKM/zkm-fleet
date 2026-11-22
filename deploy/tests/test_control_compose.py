@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
-def control_compose(tmp_path):
+def control_compose(tmp_path, request):
     if not shutil.which("docker") or subprocess.run(
         ["docker", "compose", "version"], capture_output=True
     ).returncode:
@@ -24,6 +24,8 @@ def control_compose(tmp_path):
                FLEET_UID="12345", FLEET_GID="12346")
     args = ["docker", "compose", "--env-file", "/dev/null", "-p", "fleet-config-test",
             "-f", str(ROOT / "deploy/docker-compose.yml")]
+    if getattr(request, "param", None):
+        args += ["--profile", request.param]
     result = subprocess.run(args + ["config", "--format", "json"], env=env,
                             capture_output=True, text=True, check=True)
     return json.loads(result.stdout)
@@ -31,6 +33,7 @@ def control_compose(tmp_path):
 
 def test_default_openshell_gateway_keeps_control_host_and_health_port_private(control_compose):
     services = control_compose["services"]
+    assert "trustee-as" not in services
     assert "openshell-gateway" in services
     gateway = services["openshell-gateway"]
     upstream = re.search(r'\[\[package\]\]\nname = "openshell-core"\n.*?source = "[^"]+#([0-9a-f]+)"',
@@ -56,8 +59,10 @@ def test_default_openshell_gateway_keeps_control_host_and_health_port_private(co
         assert command[command.index(flag) + 1] == "true"
 
 
+@pytest.mark.parametrize("control_compose", ["trustee"], indirect=True)
 def test_trustee_has_persistent_state_and_no_public_or_privileged_access(control_compose):
     service = control_compose["services"]["trustee-as"]
+    assert service["profiles"] == ["trustee"]
     assert "@sha256:" in service["image"]
     assert not service.get("ports")
     assert service["read_only"] and service["cap_drop"] == ["ALL"]

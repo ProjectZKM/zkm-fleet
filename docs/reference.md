@@ -1490,7 +1490,8 @@ shim_tee:
 ```
 
 This is a configuration template, not a runnable proof guest. A matching approved
-RA guest/ELF must be supplied; hardware RA guests are not shipped yet. Simulation
+RA guest/ELF must be supplied. Shim now includes an Automata-based TDX guest;
+SNP hardware guest and live hardware/proof-network acceptance remain pending. Simulation
 also requires a remote receipt in the production daemon. Test doubles exist only
 in the shim test suite; they cannot authorize production launches.
 
@@ -1498,9 +1499,23 @@ For hardware, select `mode: hardware`, `platform: snp` or `tdx`, driver `tee`,
 matching measurement/key/init-data values and an immutable workload image digest.
 Shim and its local runtime endpoints must be inside the measured confidential
 VM. This adapter does not provision VMs or implement SGX/Nitro isolation. Attestation
-Agent collects evidence; stock Trustee prechecks it; the remote guest must verify
-the actual quote/collateral and binding before shim creates the container. Trustee
-policy results or tokens alone never satisfy the receipt requirement.
+Agent collects evidence; the remote guest verifies the actual quote/collateral and
+binding before shim creates the container. For the Automata TDX path, omit Trustee
+settings and add the following inside `shim_tee`:
+
+```yaml
+dcap:
+  collateral_file: /var/lib/zkm-fleet/attestation/tdx-collateral.abi
+  min_tcb_evaluation_data_number: 20 # example; approve the current Intel floor
+```
+
+The artifact is Automata's ABI-encoded collateral, fetched outside the guest and
+refreshed atomically. This is not an additional configuration file. Approve the
+complete measured-profile hash and the `trusted-shim-dcap-guest` ELF/key mapping.
+The guest rejects stale material, invalid signatures and incorrect launch bindings;
+shim still requires a valid remote receipt and checks expiry before creation.
+The legacy SNP/sample contract remains separate. Trustee tokens alone never
+satisfy the receipt requirement. See [shim's DCAP documentation](https://github.com/attestx/trusted-shim/tree/feat/rust-framework/attestation).
 
 With no explicit driver, shim uses its configured TEE profile or detects local
 interfaces. Detected TEE devices without an approved profile require explicit

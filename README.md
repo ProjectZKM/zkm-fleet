@@ -38,9 +38,10 @@ Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
 node-agent upgrades leave that process and existing containers running.
 OpenShell is the default shared access layer for Docker and TEE drivers; without
 user rules it adds no restrictions beyond driver limits. Its gateway is included
-in Fleet’s default Compose stack. Stock Trustee AS runs beside it on the private
-control-plane network; nodes reach its appraisal RPC through the existing HTTPS
-ingress using client certificates. Rail is embedded policy evaluation plus a remote proof guest.
+in Fleet’s default Compose stack. Trustee AS is an optional `trustee` Compose
+profile for legacy attestation/prechecks; its appraisal RPC uses the existing
+HTTPS ingress with node client certificates. TDX DCAP admission verifies original
+evidence in a Ziren guest and does not require AS. Rail is embedded policy evaluation plus a remote proof guest.
 The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
 has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
 
@@ -75,7 +76,8 @@ and policy revisions; see [policy upgrades](docs/maintenance.md#policy-evaluator
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
 | [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
 
-Node-configured TEE profiles use CoCo evidence, stock Trustee prechecks and a
-synchronous remote RA receipt gate in shim. Hardware and simulation are separate
+Node-configured TEE profiles use CoCo evidence and a synchronous remote RA receipt
+gate in shim. The TDX guest reuses Automata DCAP; SNP/sample retain their separate
+guest contracts and optional-to-the-stack Trustee adapter. Hardware and simulation are separate
 capabilities; existing Docker workloads remain unattested. See the [configuration
 and remaining hardware guest requirements](docs/reference.md#node-configured-tee-runtimes).

@@ -773,3 +773,22 @@ def test_trustee_tls_credentials_are_node_owned_and_reach_daemon(tmp_path):
         broken = {**raw, "shim_tee":{**raw["shim_tee"], **changes}}
         with pytest.raises(ValueError):
             reconcile.load_apps(broken)
+
+
+def test_dcap_guest_configuration_reaches_shim_without_as(tmp_path):
+    tee = tee_config("hardware")
+    tee.update(platform="tdx", expected_measurement="55" * 32,
+               dcap=dict(collateral_file="/var/lib/fleet/dcap.abi", min_tcb_evaluation_data_number=20))
+    del tee["trustee_endpoint"]
+    del tee["trustee_policy_ids"]
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee)
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    options = shim.daemon_options(spec.cluster)["machine"]["tee"]
+    assert options["dcap"] == tee["dcap"]
+    assert not options["trustee_endpoint"]
+    for changes in ({"dcap": None}, {"platform": "snp"},
+                    {"dcap": {**tee["dcap"], "collateral_file": "relative"}},
+                    {"dcap": {**tee["dcap"], "min_tcb_evaluation_data_number": 0}}):
+        with pytest.raises(ValueError):
+            reconcile.load_apps({**raw, "shim_tee": {**tee, **changes}})

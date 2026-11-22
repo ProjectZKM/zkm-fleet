@@ -84,8 +84,10 @@ under a different service supervisor is a separate maintenance operation.
 
 ### Trustee Attestation Service
 
-The default control-plane Compose stack includes the unmodified, digest-pinned
-`trustee-as` image. It verifies TEE evidence; Attestation Agent remains inside the
+The optional `trustee` Compose profile includes the unmodified, digest-pinned
+`trustee-as` image. Enable it with `docker compose --profile trustee up -d trustee-as`
+using the installed stack and environment. TDX DCAP ZK admission does not require
+AS; legacy SNP/sample profiles and explicitly configured prechecks still use it. It verifies TEE evidence; Attestation Agent remains inside the
 node's confidential VM. The AS does not need TEE devices or a Docker socket.
 Compose explicitly selects upstream `LocalFs` storage for policies and reference
 values via the upstream service config `deploy/trustee/as.json`, using the

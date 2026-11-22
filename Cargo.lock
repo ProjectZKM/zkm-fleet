@@ -8963,6 +8963,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-attestation-types"
+version = "0.1.0"
+source = "git+https://github.com/attestx/trusted-shim?rev=d518f38a0c7c214004a71271ac4511af56dfd3ab#d518f38a0c7c214004a71271ac4511af56dfd3ab"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "trusted-contracts",
+]
+
+[[package]]
 name = "trusted-contracts"
 version = "0.1.0"
 source = "git+https://github.com/attestx/trusted-data-router?rev=5aa93d4be778cf84714954c6d9f28631524610f7#5aa93d4be778cf84714954c6d9f28631524610f7"
@@ -9029,7 +9042,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=dab6cc68714b16d46864e78d6496efec10a657cc#dab6cc68714b16d46864e78d6496efec10a657cc"
+source = "git+https://github.com/attestx/trusted-shim?rev=d518f38a0c7c214004a71271ac4511af56dfd3ab#d518f38a0c7c214004a71271ac4511af56dfd3ab"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -9063,6 +9076,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tower 0.5.3",
+ "trusted-attestation-types",
  "trusted-contracts",
  "trusted-data-router",
  "trusted-rail",

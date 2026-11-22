@@ -39,7 +39,8 @@ def certificates(root):
             "-CAcreateserial", "-out", f"{name}.pem", "-days", "1", "-extfile", "extensions", cwd=root)
 
 
-def test_nodes_can_appraise_but_cannot_change_policy_or_impersonate_identity(tmp_path):
+@pytest.mark.parametrize("start_as", [True, False])
+def test_nodes_can_appraise_but_cannot_change_policy_or_impersonate_identity(tmp_path, start_as):
     import grpc
     proto = Path(os.environ["TRUSTEE_PROTO"]).resolve()
     run("protoc", f"-I{proto.parent}", f"--python_out={tmp_path}", str(proto))
@@ -54,18 +55,19 @@ def test_nodes_can_appraise_but_cannot_change_policy_or_impersonate_identity(tmp
     env = {k: v for k, v in os.environ.items() if not k.startswith(("FLEET_", "COMPOSE_"))}
     env["FLEET_SCHEDULER_IMAGE"] = "test:local"
     compose = subprocess.run(["docker", "compose", "--env-file", "/dev/null", "-f",
-        str(ROOT / "deploy/docker-compose.yml"), "config", "--format", "json"], env=env,
+        str(ROOT / "deploy/docker-compose.yml"), "--profile", "trustee", "config", "--format", "json"], env=env,
         check=True, capture_output=True, text=True)
     services = json.loads(compose.stdout)["services"]
     name = "fleet-trustee-test-" + uuid.uuid4().hex[:12]
     run("docker", "network", "create", name)
     try:
-        run("docker", "run", "-d", "--name", name + "-as", "--network", name, "--network-alias", "trustee-as",
-            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--tmpfs", "/tmp",
-            "--tmpfs", "/run/dcap", "--tmpfs", "/opt/confidential-containers/attestation-service",
-            "-e", "QCNL_CONF_PATH=/run/dcap/qcnl.conf",
-            "--mount", f"type=bind,src={ROOT / 'deploy/trustee/as.json'},dst=/etc/trustee/as.json,readonly", services["trustee-as"]["image"],
-            *services["trustee-as"]["command"])
+        if start_as:
+            run("docker", "run", "-d", "--name", name + "-as", "--network", name, "--network-alias", "trustee-as",
+                "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--tmpfs", "/tmp",
+                "--tmpfs", "/run/dcap", "--tmpfs", "/opt/confidential-containers/attestation-service",
+                "-e", "QCNL_CONF_PATH=/run/dcap/qcnl.conf",
+                "--mount", f"type=bind,src={ROOT / 'deploy/trustee/as.json'},dst=/etc/trustee/as.json,readonly", services["trustee-as"]["image"],
+                *services["trustee-as"]["command"])
         run("docker", "run", "-d", "--name", name + "-gateway", "--network", name,
             "--user", f"{os.getuid()}:{os.getgid()}", "-p", "127.0.0.1::8905", "--mount", f"type=bind,src={tmp_path},dst=/etc/zkm-fleet,readonly",
             services["gateway"]["image"], "-c", "/etc/zkm-fleet/gateway.yaml", "--log-level", "warn")
@@ -86,14 +88,19 @@ def test_nodes_can_appraise_but_cannot_change_policy_or_impersonate_identity(tmp
             grpc.channel_ready_future(client).result(timeout=20)
             rpc = client.unary_unary(method, request_serializer=lambda r: r.SerializeToString(),
                                     response_deserializer=pb.AttestationResponse.FromString)
-            for attempt in range(30):
-                try:
-                    assert rpc(request, timeout=2).attestation_token
-                    break
-                except grpc.RpcError as error:
-                    if error.code() != grpc.StatusCode.UNAVAILABLE or attempt == 29:
-                        raise
-                    time.sleep(0.2)
+            if not start_as:
+                with pytest.raises(grpc.RpcError) as error:
+                    rpc(request, timeout=3)
+                assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+            else:
+                for attempt in range(30):
+                    try:
+                        assert rpc(request, timeout=2).attestation_token
+                        break
+                    except grpc.RpcError as error:
+                        if error.code() != grpc.StatusCode.UNAVAILABLE or attempt == 29:
+                            raise
+                        time.sleep(0.2)
             for denied in ("SetAttestationPolicy", "GetAttestationChallenge", "UnknownMethod"):
                 with pytest.raises(grpc.RpcError) as error:
                     client.unary_unary("/attestation.AttestationService/" + denied)(b"", timeout=3)
