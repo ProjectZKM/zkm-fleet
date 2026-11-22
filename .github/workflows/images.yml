@@ -4,13 +4,25 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      openshell:
+        description: Build only the pinned OpenShell gateway
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
   group: images-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  openshell:
+    if: github.event_name == 'workflow_dispatch' && inputs.openshell
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/openshell-image.yml
   images:
+    if: ${{ !inputs.openshell }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
