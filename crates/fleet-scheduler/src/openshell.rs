@@ -364,7 +364,17 @@ impl Compute {
                 conditions: vec![DriverCondition {
                     r#type: "Ready".into(),
                     status: "False".into(),
-                    reason: "FleetObservationPending".into(),
+                    // Stock gateways treat unrecognized Ready=False reasons
+                    // as terminal failures. Before Create is acknowledged,
+                    // waiting for a node report is a normal starting state.
+                    // Once pinned, losing that observation must fail closed:
+                    // a live supervisor session cannot revive a stale owner.
+                    reason: if r.phase == "created" {
+                        "FleetObservationUnavailable"
+                    } else {
+                        "Starting"
+                    }
+                    .into(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -684,8 +694,7 @@ impl compute_driver_server::ComputeDriver for Compute {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let this = self.clone();
         tokio::spawn(async move {
-            loop {
-                let Ok(store) = launches(&this.0) else { break };
+            while let Ok(store) = launches(&this.0) {
                 let records: Vec<_> = store
                     .records
                     .lock()

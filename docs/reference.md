@@ -578,10 +578,23 @@ delivery; stop/delete of a running allocation belongs to Fleet's lifecycle API,
 not the stock gateway's lifecycle RPCs in this profile.
 
 This retains Fleet's trusted cluster-agent/session model; it is not TEE attestation
-or individual cryptographic node enrollment. Production links use HTTPS. Joined
-supervisor/fence/application readiness and service routing remain migration gates.
+or individual cryptographic node enrollment. Production links use HTTPS.
+Application readiness and service routing remain migration gates; native gateway
+readiness alone does not enable application routes.
 Never place native payloads, grants or ledger credentials in App specs, heartbeats,
 logs or Ray actors. GOAT registration execution remains TODO.
+
+Remote runtime nodes need no public inbound listener. Fleet node initiates HTTPS
+to the scheduler, the native supervisor initiates its authenticated connection to
+the central OpenShell gateway, and the shim data-plane connector initiates the
+router tunnel. Bidirectional application traffic uses that established tunnel;
+it is not carried by heartbeats. Shim and compute-driver APIs remain local Unix
+sockets. Central services must be reachable from the node's outbound network.
+Set the native Docker driver's `grpc_endpoint` and trusted `guest_tls_ca` to the
+central gateway; a remote node must not use the gateway host's loopback address.
+The local acceptance below uses supervisor host networking to reach a loopback
+test gateway. Workloads still use `network=none`. This test does not certify a
+cross-machine deployment or a firewall/NAT configuration.
 
 The opt-in control integration test launches the pinned, unmodified gateway with
 mTLS and exercises actual Fleet HTTP/UDS, node delivery and the persistent shim.
@@ -592,6 +605,30 @@ isolation or application readiness:
 OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
   cargo test --locked -p fleet-scheduler --lib stock_gateway_startup -- --ignored
 ```
+
+The Docker acceptance additionally launches the stock Docker driver and real
+workload/supervisor containers. Build both binaries from the pinned OpenShell
+source and supply compatible, preloaded images by immutable ID or digest:
+
+```sh
+OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
+OPENSHELL_DOCKER_DRIVER_BINARY=/absolute/path/to/pinned/openshell-driver-docker \
+OPENSHELL_TEST_SANDBOX_IMAGE=sha256:... \
+OPENSHELL_TEST_SUPERVISOR_IMAGE=sha256:... \
+OPENSHELL_TEST_WORKLOAD_IMAGE=sha256:... \
+  cargo test --locked -p fleet-scheduler --lib stock_docker_startup -- --ignored --nocapture
+```
+
+The workload image must provide `/bin/sleep` and support numeric UID/GID 1000.
+The test checks proof-before-create, joined gateway readiness, configuration
+activation, hard CPU/memory limits, network isolation, stale-owner rejection and
+offline shim cleanup. It keeps node observations flowing until both native
+creation and gateway readiness complete: the stock driver can acknowledge Create
+before assigning a physical instance. Proof submission/verification remain test
+doubles; no prover is started and this is not a fresh cryptographic proof test.
+Containers and volumes are scoped by a unique test namespace. Private diagnostics
+and ephemeral certificates remain in the printed temporary directory, outside the
+repository. Cleanup targets only that namespace, including after test failure.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:

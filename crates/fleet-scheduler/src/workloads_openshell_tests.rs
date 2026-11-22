@@ -259,6 +259,9 @@ async fn stock_gateway_startup_through_fleet_and_persistent_shim() {
     startup(false, true).await;
 }
 
+#[path = "workloads_openshell_docker_test.rs"]
+mod docker;
+
 #[path = "workloads_openshell_gateway_test.rs"]
 mod gateway;
 
@@ -507,7 +510,9 @@ async fn startup(forged: bool, stock: bool) {
         .into_inner()
         .sandbox
         .unwrap();
-    assert_eq!(pending.status.unwrap().conditions[0].status, "False");
+    let pending = pending.status.unwrap();
+    assert_eq!(pending.conditions[0].status, "False");
+    assert_eq!(pending.conditions[0].reason, "Starting");
     report.runtime_instances[0].native_observation_base64 = None;
     c.report("gpu", "session", report.clone()).await.unwrap();
     if !stock {
@@ -628,7 +633,9 @@ async fn startup(forged: bool, stock: bool) {
                 .into_inner()
                 .sandbox
                 .unwrap();
-            assert_eq!(denied.status.unwrap().conditions[0].status, "False");
+            let denied = denied.status.unwrap();
+            assert_eq!(denied.conditions[0].status, "False");
+            assert_eq!(denied.conditions[0].reason, "FleetObservationUnavailable");
         }
         report.runtime_instances[0].native_observation_base64 = valid_observation;
         c.report("gpu", "session", report.clone()).await.unwrap();
@@ -656,7 +663,9 @@ async fn startup(forged: bool, stock: bool) {
             .into_inner()
             .sandbox
             .unwrap();
-        assert_eq!(stale.status.unwrap().conditions[0].status, "False");
+        let stale = stale.status.unwrap();
+        assert_eq!(stale.conditions[0].status, "False");
+        assert_eq!(stale.conditions[0].reason, "FleetObservationUnavailable");
         assert!(client
             .create_sandbox(CreateSandboxRequest {
                 sandbox: Some(sandbox.clone())

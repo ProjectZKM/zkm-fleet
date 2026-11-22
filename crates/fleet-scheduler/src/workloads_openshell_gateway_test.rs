@@ -12,7 +12,7 @@ fn openssl(root: &Path, args: &[&str]) {
         "test certificate generation failed"
     );
 }
-fn port() -> u16 {
+pub(super) fn port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -23,6 +23,17 @@ fn port() -> u16 {
 pub(super) async fn start(
     root: &Path,
     socket: &Path,
+) -> (
+    tokio::process::Child,
+    protocol::open_shell_client::OpenShellClient<tonic_native::transport::Channel>,
+) {
+    start_at(root, socket, port()).await
+}
+
+pub(super) async fn start_at(
+    root: &Path,
+    socket: &Path,
+    api_port: u16,
 ) -> (
     tokio::process::Child,
     protocol::open_shell_client::OpenShellClient<tonic_native::transport::Channel>,
@@ -110,7 +121,6 @@ pub(super) async fn start(
         root.join("jwt.key"), root.join("jwt.pub"), root.join("jwt.kid")
     );
     std::fs::write(root.join("gateway.toml"), config).unwrap();
-    let api_port = port();
     let log = std::fs::File::create(root.join("gateway.log")).unwrap();
     let mut gateway = tokio::process::Command::new(binary)
         .args([

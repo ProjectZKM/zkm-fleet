@@ -194,6 +194,19 @@ async fn policy_setup_with_driver(
     PolicyBundle,
     EvaluationRequest,
 ) {
+    policy_setup_with_inventory(driver, |_| {}).await
+}
+
+async fn policy_setup_with_inventory(
+    driver: &str,
+    customize: impl FnOnce(&mut NodeReport),
+) -> (
+    tempfile::TempDir,
+    Arc<WorkloadController>,
+    NodeReport,
+    PolicyBundle,
+    EvaluationRequest,
+) {
     let (dir, c, ns) = setup().await;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -247,6 +260,7 @@ async fn policy_setup_with_driver(
         json!([{"entry_name":"model","ready":driver != "openshell","services":report.apps[0]["services"],"execution":execution}]),
     )
     .unwrap();
+    customize(&mut report);
     c.report("gpu", "session", report.clone()).await.unwrap();
     assert!(c.guard(&execution).is_ok());
     let mut policy = PolicyBundle { policy:PolicyRef { issuer:"fleet".into(),policy_id:"read".into(),version:1,sha256:String::new() },engine:engine_profile(),modules:[("p.rego".into(),"package trusted\ndefault decision := {\"decision\":\"deny\",\"reason_codes\":[]}\ndecision := {\"decision\":\"allow\",\"reason_codes\":[]} if {input.operation == \"read\"}".into())].into(),data:json!({}) };
