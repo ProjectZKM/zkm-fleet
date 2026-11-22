@@ -27,8 +27,8 @@ ACTORS: dict[AppRuntime, Any] = {AppRuntime.ZIREN_GPU: ZirenGpuProver, AppRuntim
 _SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "gpu_port_range")
 
 
-def load_apps(data: Mapping[str, Any]) -> AppsConfig:
-    return AppsConfig.parse(data)
+def load_apps(data: Mapping[str, Any], *, validate_launch: bool = True) -> AppsConfig:
+    return AppsConfig.parse(data, validate_launch=validate_launch)
 
 
 def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
@@ -113,6 +113,7 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
     """Start an admitted replica using this machine's Ray-granted resources."""
     b = bundle(spec)
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
+    actor_submitted = False
     try:
         ray.get(pg.ready(), timeout=ready_timeout_s)
         factory = ACTORS[spec.kind]
@@ -124,7 +125,7 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             # restarting Ray or any detached legacy app during bridge upgrades.
             adapter = "openshell-allocation-v1" if spec.app.runtime.driver == "openshell" else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
             extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
-        actor: ActorHandle[Any] = factory.options(
+        options = factory.options(
             name=spec.name,
             namespace=NAMESPACE,
             lifetime="detached",
@@ -135,13 +136,19 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             memory=b.memory,
             scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
             **extra,
-        ).remote(spec)
+        )
+        actor_submitted = True
+        actor: ActorHandle[Any] = options.remote(spec)
         health_of(actor, ready_timeout_s)
     except BaseException:
+        if not actor_submitted:
+            # No process can own this group yet. Retaining it leaks resources
+            # every time placement times out before actor submission.
+            remove_placement_group(pg)
         # Legacy cleanup removes its detached group. Shim retains reservations
         # until its durable allocation has confirmed cleanup.
         try:
-            if not (spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM):
+            if actor_submitted and not (spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM):
                 stop(spec.name)
             # Shim allocations retain reservations until node-owned cleanup
             # confirms the persisted execution is gone.

@@ -237,6 +237,7 @@ impl WorkloadController {
     /// An app's container settings as its record shows them, with the nodes it runs on.
     fn spec_value(app: &WorkloadTemplate) -> Value {
         let mut settings = app.spec.0.clone();
+        EntryMut(&mut settings).redact_private_environment();
         if let Some(o) = settings.as_object_mut() {
             for key in ["name", "namespace", "namespace_ref", "priority", "disabled", "tag", "app", "elf_id"] {
                 o.remove(key);

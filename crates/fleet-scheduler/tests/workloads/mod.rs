@@ -69,9 +69,11 @@ async fn runtime_instances_are_exact_scoped_live_allocations() {
     report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http", "control"],
         "execution":{"namespace":ns,"workload":"model","allocation_id":"model-0","lease_id":"lease","generation":1,"node_id":"machine"}}])).unwrap();
     let mut bad=report.clone();bad.runtime_instances[0].execution.node_id="other-machine".into();
-    assert!(c.report("gpu","session",bad).await.is_err());
+    c.report("gpu","session",bad).await.unwrap();
+    assert!(c.inner.lock().workers["gpu"].report.runtime_instances.is_empty());
     let mut bad=report.clone();bad.runtime_instances[0].services=vec!["unapproved".into()];
-    assert!(c.report("gpu","session",bad).await.is_err());
+    c.report("gpu","session",bad).await.unwrap();
+    assert!(c.inner.lock().workers["gpu"].report.runtime_instances.is_empty());
     c.report("gpu","session",report.clone()).await.unwrap();
     assert_eq!(c.app_resources(&ns,"model",Some("scope=default"))["runtime_instances"][0]["execution"]["lease_id"],"lease");
     assert_eq!(c.app_resources(&ns,"model",Some("scope=other"))["runtime_instances"],json!([]));
@@ -2295,7 +2297,35 @@ async fn shim_placement_and_pending_commands_require_explicit_node_capability() 
         i.workers.get_mut("new").unwrap().report.runtime_capabilities.clear();
         assert!(heartbeat_commands(&i,"new").is_empty(), "downgrade cannot execute a queued shim command as legacy");
         assert!(!i.commands[&id].done, "retain the original command and allocation");
+        let mut command=i.commands[&id].clone(); command.done=true; i.commands.insert(id.clone(),command);
     }
+    let stop=c.command("new",NodeOperation::SetApp,message::set_app(&entry,true)).unwrap();
+    let mut i=c.inner.lock();
+    let mut command=i.commands[&stop].clone(); command.admitted=true; i.commands.insert(stop.clone(),command);
+    i.workers.get_mut("new").unwrap().report.runtime_capabilities=vec!["shim-cleanup-v1".into()];
+    let commands=heartbeat_commands(&i,"new");
+    assert_eq!(commands.len(),1);
+    assert_eq!(commands[0].id,stop,"cleanup survives loss of launch capabilities");
+}
+
+#[tokio::test]
+async fn invalid_prover_entry_does_not_suppress_other_workloads_and_ingress_secrets_stay_local() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["env"]=json!({"TOKEN":"private-ingress-bearer","PUBLIC":"visible"});
+    report.apps[0]["ingress"]=json!({"http":{"bearer_env":"TOKEN"}});
+    report.apps.push(json!({"name":"broken","app":"broken","namespace":ns,"kind":"ziren-gpu",
+        "runtime":{"executor":"shim","driver":"docker"},"image":"prover:2","ready":true}).into());
+    c.report("gpu","session",report).await.unwrap();
+    let i=c.inner.lock();
+    assert!(!i.workers["gpu"].report.apps[1]["runtime_error"].is_null());
+    assert!(i.deployments.contains_key("gpu-model"));
+    assert!(!i.deployments.contains_key("gpu-broken"));
+    let app=i.apps["model"].clone(); drop(i);
+    let view=c.app_value(&app,None)["spec"].clone();
+    assert!(!view.to_string().contains("private-ingress-bearer"));
+    assert_eq!(view["env"]["PUBLIC"],"visible");
+    assert_eq!(view["env"]["TOKEN"],"@fleet-local-env:TOKEN");
 }
 
 #[tokio::test]

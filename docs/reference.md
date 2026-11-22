@@ -1069,22 +1069,42 @@ sha256, enabled}`. The first policy activates identity enforcement for that rela
 `workload: "*"` supplies a default within one exact namespace and service; an exact
 workload policy always wins, including `enabled: false`. Requests cannot use a
 wildcard target. Upgrade both Fleet and the relay before publishing defaults.
-Relays advertise `x-fleet-router-capabilities: workload-defaults-v1` on every sync;
+Relays advertise `x-fleet-router-capabilities: workload-defaults-v1,scoped-revocations-v1` on every sync;
 Fleet records this on the enrolled router and rejects a new default policy with
 409 until support has been reported. A relay without that capability cannot
 renew a router that already has default policies. The header leaves older Fleet's
 closed JSON request unchanged. Token rotation clears the stored capabilities;
 the replacement relay must sync before publishing new defaults.
+The reserved `control` service requires an exact workload policy; wildcard control
+policies cannot grant access and legacy enabled entries are withdrawn on sync.
+Delegate subject revocations carry `application_only: true`; operator revocations
+can cover control too. Fleet rejects scoped revocation until the relay advertises
+support, and rejects a capability downgrade once scoped records exist.
+New authorization records have a 64-record namespace budget within the existing
+1024-record router limit (at most 16 fully reserved namespace shares). Historical
+larger namespaces remain readable; policy replacement retains its existing slot.
+
 Changing an existing policy requires a higher version. New agents can inherit
 defaults without letting application backends write infrastructure policy. Defaults
 also apply to existing workloads without an exact entry; publish explicit disabled
 entries first for workloads that must remain denied.
 
-Schema 19 normalizes existing schema 17/18 router JSON before compare-and-swap
-writes and records relay capabilities. Epochs, revocations, acknowledgments, jobs
-and allocations are retained. Schedulers supporting only schema 18 or earlier
+OpenShell startup retries resubmit the same proof ID and witness after an uncertain
+submission. Proof cryptography runs before the Fleet allocation lock; the short
+ledger commit still rechecks live ownership and the staged epoch under that lock.
+Private delivery credentials are reproducible for the same ticket and validity,
+with durable revocation tombstones. Queued payloads can be restored after a crash;
+claimed deliveries are never automatically sent twice. Expired attempts can be
+renewed only before dispatch, with unchanged inputs and a new proof ID. After
+dispatch, a fresh owned observation can complete startup after grant expiry.
+Readiness and list/watch work select live allocations rather than historical
+launches; queued delivery expiry uses an index while durable history is retained.
+
+Schema 20 retains the schema 19 normalization of existing 17/18 router JSON
+for compare-and-swap writes and adds application-scoped revocation support. Epochs, revocations, acknowledgments, jobs
+and allocations are retained. Schedulers supporting only schema 19 or earlier
 reject this database at startup, including rollback builds that cannot interpret
-wildcard policies. Keep a schema-19-compatible build for rollback.
+scoped revocations. Keep a schema-20-compatible build for rollback.
 
 A backend's namespace-wide `read,router_delegate` credential may request an
 opaque connection binding at `POST /routers/ID/authorize` after it authenticates
@@ -1368,7 +1388,10 @@ to drain live streams before releasing the port and Ray reservation.
 
 The explicit Docker shim executor can declare the reserved `control` service for node-local administration. It maps to the shim's control endpoint; the central connection gateway requires Fleet administrator permission to issue that service's access grant. Application ingress is an administrator-only `ingress` map in the existing app spec, keyed by a declared service name (excluding `control`), with exact `paths`, allowed `methods`, and optional `bearer_env`. The shim injects that container environment credential locally after verifying the execution grant. A normal service with no ingress rule still maps directly to the app's port.
 
-`port_base: 0` plus an explicit `container_port` asks the shim to reserve a host loopback port per allocation. `{port}` in shim command/environment templates denotes `container_port` when one is set; readiness and node reports use the actual host port returned by the shim. The reservation survives restart and is released only after confirmed cleanup. Runtime management/ingress requires `shim-management-v1`; automatic ports require `shim-automatic-port-v1`. Older nodes are ineligible. The bridge supervises a failed connector process without replacing the runtime. These capabilities require trusted-shim #5 and trusted-data-router #4.
+`port_base: 0` plus an explicit `container_port` asks the shim to reserve a host loopback port per allocation. `{port}` in shim command/environment templates denotes `container_port` when one is set; readiness and node reports use the actual host port returned by the shim. The reservation survives restart and is released only after confirmed cleanup. Capability requirements compose: automatic ports with services also require network support; container ports and entrypoints require the modern runtime adapter. The bridge rechecks these requirements on actor restart. Cleanup uses `shim-cleanup-v1` independently of launch support and reads persisted runtime ownership. Invalid runtime observations are quarantined per application while the node heartbeat and command results continue.
+
+Ingress `bearer_env` values remain node-local. Reports and app views contain `@fleet-local-env:NAME` references; node configuration updates resolve those against the existing local value. A move to a node without that credential fails before writing configuration. Nodes must advertise `shim-private-env-v1` for these workloads.
+ Runtime management/ingress requires `shim-management-v1`; automatic ports require `shim-automatic-port-v1`. Older nodes are ineligible. The bridge supervises a failed connector process without replacing the runtime. These capabilities require trusted-shim #5 and trusted-data-router #4.
 
 Installing this support does not select it for legacy apps. Proof-required policy/TEE execution and the OpenShell driver are still not accepted by this Docker lifecycle path; requesting unsupported trust modes fails validation.
 

@@ -55,8 +55,23 @@ def required_capability(spec: AppReplicaSpec) -> str:
     return CAPABILITY
 
 
+def required_capabilities(spec: AppReplicaSpec) -> set[str]:
+    """Requirements compose; automatic ports never replace network support."""
+    app = spec.app
+    required = {required_capability(spec)}
+    if app.runtime and app.runtime.driver == "docker":
+        required.update(name for name, needed in (
+            ("shim-network-v1", bool(app.services)),
+            ("shim-runtime-v2", app.container_port is not None or app.entrypoint is not None),
+            ("shim-automatic-port-v1", app.port_base == 0),
+            ("shim-private-env-v1", any(r.bearer_env for r in app.ingress.values())),
+        ) if needed)
+    return required
+
+
 def capabilities(config: ControlPlaneConfig) -> list[str]:
-    if not config.shim_binary or not config.shim_state_dir:
+    if not all(isinstance(p, str) and os.path.isabs(p) and "\x00" not in p
+               for p in (config.shim_binary, config.shim_state_dir)):
         return []
     try:
         if config.shim_daemon:
@@ -64,7 +79,9 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         else:
             result = subprocess.run([config.shim_binary, "--capabilities"], capture_output=True, timeout=5, check=True)
             value = json.loads(result.stdout)
-        if value.get("protocol") != 1 or "docker" not in value.get("drivers", []):
+        if (not isinstance(value, dict) or type(value.get("protocol")) is not int or value["protocol"] != 1
+                or any(not isinstance(value.get(k, []), list) or not all(isinstance(v, str) for v in value.get(k, []))
+                       for k in ("drivers", "features")) or "docker" not in value.get("drivers", [])):
             return []
         features = value.get("features", [])
         modern = "data-plane-v1" in features
@@ -79,11 +96,13 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
                 if config.shim_network and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
         return native + [name for name, supported in (
+            ("shim-cleanup-v1", True),
+            ("shim-private-env-v1", managed_network),
             ("shim-prover-v1", modern and management),
             ("shim-tcp-v1", managed_network),
             ("shim-single-use-ingress-v1", managed_network and "single-use-ingress-v1" in features),
             (CAPABILITY, True),
-            ("shim-automatic-port-v1", management),
+            ("shim-automatic-port-v1", modern and management),
             ("shim-runtime-v2", modern),
             ("shim-network-v1", network),
             ("shim-management-v1", managed_network),
@@ -262,6 +281,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
 class _ShimApp:
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
+        if not required_capabilities(spec).issubset(capabilities(spec.cluster)):
+            raise RuntimeError("shim no longer supports the admitted runtime")
         self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
         status = self.call({"operation": "launch", "request": request})

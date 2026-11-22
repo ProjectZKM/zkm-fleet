@@ -17,7 +17,7 @@ use fleet_proto::{
     },
     models::{
         valid_route_id, valid_router_id, MAX_ROUTER_REVOCATIONS, ROUTER_CAPABILITIES_HEADER,
-        ROUTER_WORKLOAD_DEFAULTS,
+        ROUTER_WORKLOAD_DEFAULTS, ROUTER_SCOPED_REVOCATIONS,
     },
 };
 
@@ -33,8 +33,9 @@ pub fn router(state: HttpState) -> Router {
 }
 
 type Result<T> = std::result::Result<T, StatusCode>;
-fn unavailable(_: anyhow::Error) -> StatusCode {
-    StatusCode::SERVICE_UNAVAILABLE
+fn unavailable(error: anyhow::Error) -> StatusCode {
+    if error.is::<crate::store::RouterTokenInUse>() { StatusCode::CONFLICT }
+    else { StatusCode::SERVICE_UNAVAILABLE }
 }
 
 async fn status(State(s): State<HttpState>, Path(id): Path<String>) -> Result<Json<RouterControl>> {
@@ -206,6 +207,10 @@ async fn sync(
         }
         let mut next = previous.clone();
         next.capabilities = capabilities.clone();
+        if next.authorization.as_ref().is_some_and(|a| a.revoked_subjects.iter().any(|r|r.application_only == Some(true)))
+            && !next.capabilities.iter().any(|c|c == ROUTER_SCOPED_REVOCATIONS) {
+            return Err(StatusCode::CONFLICT);
+        }
         next.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
         if next
             .authorization
@@ -222,6 +227,13 @@ async fn sync(
         // relay withdraws existing streams and a later resume cannot revive old
         // grants. An administrator must explicitly publish a new enabled policy.
         if let Some(auth) = &mut next.authorization {
+            // Withdraw legacy wildcard control grants even from an older relay.
+            // Monotonic versions make that withdrawal durable across reconnects.
+            for p in auth.policies.iter_mut().filter(|p| p.enabled && p.workload == "*" && p.service == "control") {
+                p.version = p.version.checked_add(1).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+                p.enabled = false;
+                auth.revision = auth.revision.checked_add(1).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+            }
             let suspended: std::collections::HashSet<_> = auth
                 .policies
                 .iter()
@@ -324,6 +336,9 @@ async fn set_policy(
     Json(policy): Json<RouterAccessPolicy>,
 ) -> Result<Json<RouterAuthorization>> {
     policy.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+    if policy.enabled && policy.service == "control" && policy.workload == "*" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let _policies = s.fleet.router_policy_ops.lock().await;
     namespace_scope(&s, None, &policy.namespace, !policy.enabled)?;
     let next = update_router(&s, &id, |next| {
@@ -355,6 +370,7 @@ async fn set_policy(
             *old = policy.clone();
         } else {
             auth.policies.push(policy.clone());
+            auth.validate_namespace_capacity(&policy.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
         }
         auth.revision = auth
             .revision
@@ -371,11 +387,15 @@ async fn revoke_subject(
     State(s): State<HttpState>,
     Path(id): Path<String>,
     Extension(caller): Extension<Option<Token>>,
-    Json(revocation): Json<RouterSubjectRevocation>,
+    Json(mut revocation): Json<RouterSubjectRevocation>,
 ) -> Result<Json<RouterAuthorization>> {
     revocation.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     namespace_scope(&s, caller.as_ref(), &revocation.namespace, caller.is_none())?;
+    if caller.is_some() { revocation.application_only = Some(true); }
     let next = update_router(&s, &id, |next| {
+        if revocation.application_only == Some(true) && !next.capabilities.iter().any(|c|c == ROUTER_SCOPED_REVOCATIONS) {
+            return Err(StatusCode::CONFLICT);
+        }
         let auth = next.authorization.as_mut().ok_or(StatusCode::FORBIDDEN)?;
         if !auth
             .policies
@@ -388,6 +408,7 @@ async fn revoke_subject(
             return Ok(());
         }
         auth.revoked_subjects.push(revocation.clone());
+        auth.validate_namespace_capacity(&revocation.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
         auth.revision = auth
             .revision
             .checked_add(1)

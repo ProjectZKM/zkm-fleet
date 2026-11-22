@@ -218,13 +218,16 @@ def test_failed_start_removes_its_placement_group(monkeypatch):
     cfg = reconcile.load_apps({"apps": [{"name": "web", "kind": "app",
         "image": "web:latest", "port_base": 8080, "gpus": 0, "cpus": 2}]})
     spec = reconcile.replica_specs(cfg)["web-0"]
-    monkeypatch.setattr(reconcile, "placement_group", lambda *a, **k: Mock())
+    pg, remove = Mock(), Mock()
+    monkeypatch.setattr(reconcile, "placement_group", lambda *a, **k: pg)
+    monkeypatch.setattr(reconcile, "remove_placement_group", remove)
     monkeypatch.setattr(reconcile.ray, "get", Mock(side_effect=TimeoutError("not ready")))
     stop = Mock()
     monkeypatch.setattr(reconcile, "stop", stop)
     with pytest.raises(TimeoutError):
         reconcile.start(spec)
-    stop.assert_called_once_with(spec.name)
+    stop.assert_not_called()
+    remove.assert_called_once_with(pg)
 
 def test_worker_workdir_is_created(tmp_path, monkeypatch):
     from fleet_bridge import actors

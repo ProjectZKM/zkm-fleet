@@ -28,6 +28,32 @@ from .rayapi import alive_nodes, resources
 log = logging.getLogger(__name__)
 
 
+def private_environment(entry: dict[str, Any]) -> dict[str, str]:
+    return {rule['bearer_env']: f"@fleet-local-env:{rule['bearer_env']}"
+            for rule in entry.get('ingress', {}).values() if rule.get('bearer_env')}
+
+
+def local_settings(current: dict[str, Any], changes: dict[str, Any]) -> dict[str, Any]:
+    """Resolve reported credential references only against this node's config."""
+    target = {**current, **changes}
+    if 'env' in changes:
+        env = dict(changes['env'])
+        for key, reference in private_environment(target).items():
+            if env.get(key) == reference:
+                value = current.get('env', {}).get(key)
+                if not value or value == reference:
+                    raise ValueError('node-local ingress credential is unavailable')
+                env[key] = value
+        changes = {**changes, 'env': env}
+    return changes
+
+
+def validate_entry(data: dict[str, Any], entry: dict[str, Any]) -> None:
+    # Validate against this node before writing; no admitted command may poison
+    # the next heartbeat. Other entries need not be launchable to repair one.
+    reconcile.load_apps({**data, 'apps': [entry]})
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
@@ -389,7 +415,7 @@ class NodeExecutor:
         if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         app = p["app"]
-        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()), validate_launch=False)
         configured = next((a for a in cfg.apps if a.name == app["name"]), None)
         if configured is None:
             raise ValueError(f"{app['name']} is not configured on this node")
@@ -409,12 +435,12 @@ class NodeExecutor:
             return {"cleaned": True, "disabled": True}
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
+        cfg.validate_launch(configured)
         replicas = [s for s in reconcile.replica_specs(cfg).values() if s.app.name == configured.name]
         self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
+        capabilities = None
         for spec in replicas:
-            if shim.selected(spec) and shim.required_capability(spec) not in shim.capabilities(cfg.cluster):
-                raise ValueError("node does not support the selected shim runtime")
             if spec.name in existing:
                 health = reconcile.health_of(existing[spec.name])
                 wanted = ExecutorKind.SHIM if shim.selected(spec) else ExecutorKind.LEGACY
@@ -431,6 +457,11 @@ class NodeExecutor:
                     # cleanup; ordinary reconciliation must not abort a proof.
                     raise ValueError("native prover differs from configuration; explicit drain and cleanup required")
                 reconcile.stop(spec.name)
+            if shim.selected(spec):
+                if capabilities is None:
+                    capabilities = shim.capabilities(cfg.cluster)
+                if not shim.required_capabilities(spec).issubset(capabilities):
+                    raise ValueError("node does not support the selected shim runtime")
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
             spec = self.runtimes.bind(spec, command_id)
@@ -467,9 +498,10 @@ class NodeExecutor:
         result, and what deletes the files, for after the configuration lock."""
         nothing = lambda: {}
         if "create" in p:
-            entry = p["create"]
-            AppSpec.load(entry)
-            entries = (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []
+            entry = local_settings({}, p["create"])
+            data = yaml.safe_load(self.apps_file.read_text()) or {}
+            validate_entry(data, entry)
+            entries = data.get("apps") or []
             if any(e.get("name") == entry["name"] for e in entries):
                 raise ValueError(f"{entry['name']} is already configured on this node")
             append_entry(self.apps_file, "apps", entry)
@@ -493,20 +525,29 @@ class NodeExecutor:
             entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
             if p.get("remove") or name not in entries:
                 return {"updated": []}, nothing
-            AppSpec.load({**entries[name], **p["set"]})
-            set_fields(self.apps_file, "apps", name, p["set"])
+            changes = local_settings(entries[name], p['set'])
+            candidate = {**entries[name], **changes}
+            AppSpec.load(candidate)
+            if changes != {'disabled': True}:
+                validate_entry(yaml.safe_load(self.apps_file.read_text()), candidate)
+            set_fields(self.apps_file, "apps", name, changes)
             return {"updated": [name]}, nothing
         target = p["app"]
         namespaces = {target["namespace"], target.get("namespace_name") or target["namespace"]}
         entries = {e["name"]: e for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps", [])}
-        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()), validate_launch=False)
         apps = [a for a in cfg.apps if a.namespace in namespaces
                 and a.app == target["name"]]
         if not p.get("remove"):
+            changes = {}
             for app in apps:
-                AppSpec.load({**entries[app.name], **p["set"]})
+                changes[app.name] = local_settings(entries[app.name], p['set'])
+                candidate = {**entries[app.name], **changes[app.name]}
+                AppSpec.load(candidate)
+                if changes[app.name] != {'disabled': True}:
+                    validate_entry(cfg.raw, candidate)
             for app in apps:
-                set_fields(self.apps_file, "apps", app.name, p["set"])
+                set_fields(self.apps_file, "apps", app.name, changes[app.name])
             return {"updated": [a.name for a in apps]}, nothing
         removed = []
         for app in apps:
@@ -635,7 +676,7 @@ class NodeExecutor:
         ready = len(nodes) == 1
         total, free = resources()
         config = jobs.load_config(self.batches)
-        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()))
+        cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()), validate_launch=False)
         apps = cfg.raw.get("apps", [])
         running = reconcile.running()
         runtime_instances = []
@@ -693,7 +734,12 @@ class NodeExecutor:
                     "logs_ready": (entry / f".fleet-logs-{lease}").exists()})
             except (OSError, ValueError, SystemExit):
                 log.exception("reading local job %s", entry.name)
-        runtime_capabilities = shim.capabilities(cfg.cluster)
+        # Cleanup uses persisted executable/transport ownership, independently
+        # of current launch configuration and optional feature availability.
+        runtime_capabilities = sorted(set(shim.capabilities(cfg.cluster)) | {'shim-cleanup-v1'})
+        for app in apps:
+            if private := private_environment(app):
+                app['env'] = {**app.get('env', {}), **private}
         return {**({"runtime_capabilities": runtime_capabilities} if runtime_capabilities else {}),
             **({"runtime_instances": runtime_instances} if runtime_instances else {}),
             "version": 3, "machine": socket.gethostname(), "ready": ready,

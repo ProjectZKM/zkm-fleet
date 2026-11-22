@@ -13,6 +13,13 @@ use fleet_proto::stage::v1::Status as StageStatus;
 pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, App, Token, RouterControl};
 pub use fleet_proto::models::{kind_name, status_name};
 
+#[derive(Debug)]
+pub struct RouterTokenInUse;
+impl std::fmt::Display for RouterTokenInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("router token already enrolled") }
+}
+impl std::error::Error for RouterTokenInUse {}
+
 fn kind_from_name(n: &str) -> ProofKind {
     ProofKind::from_str_name(&format!("PROOF_KIND_{}", n.to_ascii_uppercase())).unwrap_or(ProofKind::Unspecified)
 }
@@ -89,6 +96,10 @@ impl Store for MemoryStore {
         next.validate()?;
         let mut routers = self.routers.lock();
         if routers.get(&next.router_id) != previous { return Ok(false); }
+        if previous.is_none_or(|p|p.token_id != next.token_id)
+            && routers.values().any(|r|r.router_id != next.router_id && r.token_id == next.token_id) {
+            return Err(RouterTokenInUse.into());
+        }
         routers.insert(next.router_id.clone(), next.clone());
         Ok(true)
     }
@@ -319,9 +330,9 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-// Schema 19 fences rollback to schedulers that reject wildcard policies and
-// normalizes the JSONB records used by router compare-and-swap updates.
-const SCHEMA_VERSION: i32 = 19;
+// Schema 20 fences rollback to schedulers that cannot read scoped revocations.
+// Previous migrations normalize the JSONB records used by router CAS updates.
+const SCHEMA_VERSION: i32 = 20;
 const ROUTERS: &str = "CREATE TABLE fleet_routers (id TEXT PRIMARY KEY, state JSONB NOT NULL);";
 const MIGRATE_18: &str = r#"UPDATE fleet_routers SET state =
     '{"authorization":null,"delivered_authorization_revision":null,"applied_authorization_revision":null,"capabilities":[]}'::jsonb || state;"#;
@@ -556,7 +567,7 @@ impl PgStore {
                 tracing::info!(schema = SCHEMA_VERSION, "database created");
                 Ok(())
             }
-            _ => anyhow::bail!("unsupported database schema {have:?}; reset the database before starting this scheduler (schema {SCHEMA_VERSION})"),
+            _ => anyhow::bail!("unsupported database schema {have:?}; use a compatible scheduler or restore a verified backup (schema {SCHEMA_VERSION})"),
         }
     }
 
@@ -605,14 +616,24 @@ impl Store for PgStore {
     async fn save_router_control(&self, previous: Option<&RouterControl>, next: &RouterControl) -> anyhow::Result<bool> {
         next.validate()?;
         let state = serde_json::to_value(next)?;
+        let mut tx = self.pool.begin().await?;
+        // Serialize enrollment/rotation across scheduler processes. Legacy
+        // duplicates remain readable, but no new credential sharing is admitted.
+        if previous.is_none_or(|p|p.token_id != next.token_id) {
+            sqlx::query("SELECT pg_advisory_xact_lock(721135196405)").execute(&mut *tx).await?;
+            let used: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fleet_routers WHERE id<>$1 AND state->>'token_id'=$2)")
+                .bind(&next.router_id).bind(&next.token_id).fetch_one(&mut *tx).await?;
+            if used { return Err(RouterTokenInUse.into()); }
+        }
         let result = if let Some(previous) = previous {
             anyhow::ensure!(previous.router_id == next.router_id, "router identity changed");
             sqlx::query("UPDATE fleet_routers SET state=$2 WHERE id=$1 AND state=$3")
-                .bind(&next.router_id).bind(state).bind(serde_json::to_value(previous)?).execute(&self.pool).await?
+                .bind(&next.router_id).bind(state).bind(serde_json::to_value(previous)?).execute(&mut *tx).await?
         } else {
             sqlx::query("INSERT INTO fleet_routers(id,state) VALUES($1,$2) ON CONFLICT DO NOTHING")
-                .bind(&next.router_id).bind(state).execute(&self.pool).await?
+                .bind(&next.router_id).bind(state).execute(&mut *tx).await?
         };
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 

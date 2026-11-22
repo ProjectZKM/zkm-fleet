@@ -29,7 +29,6 @@ use tokio::sync::Semaphore;
 use tonic_native::{Request, Response, Status};
 use trusted_shim::{
     contracts::Validity,
-    ledger::LedgerPermission,
     openshell_gateway::{
         control_observation,
         extension_protocol::{self, ExtensionFamily},
@@ -183,8 +182,24 @@ impl Launches {
             .cloned()
             .ok_or(Error::Rejected)
     }
+    fn active_records(&self, c: &WorkloadController) -> Vec<Record> {
+        let names = c.active_native_names();
+        let records = self.records.lock();
+        names
+            .into_iter()
+            .filter_map(|name| records.get(&name))
+            .filter(|r| r.sandbox_id.is_some())
+            .cloned()
+            .collect()
+    }
     fn update(&self, record: Record) -> Result<()> {
         let mut records = self.records.lock();
+        if records
+            .get(&record.name)
+            .is_none_or(|old| old.preparation != record.preparation)
+        {
+            return Err(Error::Conflict);
+        }
         // Fence memory before an ambiguous rename/fsync result as well.
         records.insert(record.name.clone(), record.clone());
         self.readiness.remove(&record.name);
@@ -293,7 +308,21 @@ fn prepare_inner(
         }
         if let Some(old) = records.get(&record.name) {
             if old.preparation != record.preparation {
-                return Err(Error::Conflict);
+                let mut renewed = old.preparation.clone();
+                renewed.expires_at = record.preparation.expires_at;
+                // Renew only expired pre-grant attempts with identical inputs.
+                // Once delivery may have happened, a new allocation is required.
+                if !matches!(old.phase.as_str(), "prepared" | "bound" | "proving")
+                    || old.preparation.expires_at > now()
+                    || renewed != record.preparation
+                {
+                    return Err(Error::Conflict);
+                }
+                if store.running.lock().contains(&record.name) {
+                    return Err(Error::Conflict);
+                }
+                store.save(&record)?;
+                records.insert(record.name.clone(), record.clone());
             }
         } else {
             store.save(&record)?;
@@ -425,6 +454,30 @@ impl Compute {
         if r.phase == "created" {
             return Ok(self.observe(&r)?.status.unwrap().instance_id);
         }
+        // After private dispatch, observation is safe even after grant expiry.
+        // Never mint credentials here for an expired attempt.
+        if matches!(r.phase.as_str(), "dispatching" | "delivered") {
+            if r.phase == "dispatching"
+                && r.job_id.as_ref().is_some_and(|id| {
+                    self.0.deliveries.record(id).is_ok_and(|d| {
+                        matches!(
+                            d.state.as_str(),
+                            "dispatched" | "acknowledged" | "uncertain"
+                        ) && crate::policy_gateway::identity(d.offer.execution) == launch.execution
+                    })
+                })
+            {
+                r.phase = "delivered".into();
+                store.update(r.clone())?;
+            }
+            if let Ok(s) = self.observe(&r) {
+                let instance = s.status.unwrap().instance_id;
+                r.instance_id = Some(instance.clone());
+                r.phase = "created".into();
+                store.update(r)?;
+                return Ok(instance);
+            }
+        }
         r.current()?;
         let policy = self.0.policy.as_ref().ok_or(Error::Unavailable)?;
         let network = policy.network.clone().ok_or(Error::Unavailable)?;
@@ -435,7 +488,11 @@ impl Compute {
             }
             let id = commitment(
                 "fleet.openshell.startup.v1",
-                &(&launch.execution, native.native_sha256()),
+                &(
+                    &launch.execution,
+                    native.native_sha256(),
+                    r.preparation.expires_at,
+                ),
             )?;
             let time = now();
             r.request = Some(EvaluationRequest {
@@ -491,22 +548,33 @@ impl Compute {
             })
             .await
             .map_err(|_| Error::Unavailable)??;
+            r.phase = "proving".into();
+            store.update(r.clone())?;
+        }
+        if matches!(r.phase.as_str(), "proving" | "dispatching") {
+            // Fleet proof submission is idempotent for the same ID and inputs.
+            // Re-submit on Create retry, including a crash before the first send.
             let proof = ProofRequest {
                 request_id: id.clone(),
                 program: policy.program.clone(),
                 witness: RegorusEngine.encode_witness(approved, &request)?,
                 expected_public_values: encode_public_values(&decision)?,
             };
-            r.phase = "proving".into();
-            store.update(r.clone())?; // durable claim BEFORE network submission
-                                      // A lost reply is reconciled by polling this same ID, never resubmitted.
-            if let Ok(returned) = network.submit(&proof).await {
-                if returned != id {
-                    return Err(Error::Rejected);
+            match network.submit(&proof).await {
+                Ok(returned) if returned != id => return Err(Error::Rejected),
+                // A lost reply may already have queued the job. Poll once;
+                // unknown/rejected submission returns retryable, never strands
+                // this launch in a permanently unsubmitted state.
+                Err(_)
+                    if !matches!(
+                        network.status(&id).await,
+                        Ok(ProofStatus::Pending | ProofStatus::Complete(_))
+                    ) =>
+                {
+                    return Err(Error::Unavailable)
                 }
+                _ => (),
             }
-        }
-        if r.phase == "proving" {
             let receipt = loop {
                 r.current()?;
                 self.0
@@ -520,7 +588,7 @@ impl Compute {
                 }
             };
             r.phase = "dispatching".into();
-            store.update(r.clone())?; // never remint delivery after an ambiguous restart
+            store.update(r.clone())?;
             let c = self.0.clone();
             let launch = launch.clone();
             let request = request.clone();
@@ -529,14 +597,17 @@ impl Compute {
             let id = id.clone();
             tokio::task::spawn_blocking(move || {
                 let p = c.policy.as_ref().ok_or(Error::Unavailable)?;
+                // Cryptography runs outside Fleet's allocation mutex. Commit
+                // rechecks the staged epoch under the live allocation fence.
+                let verified =
+                    p.ledger
+                        .verify_reservation(&decision, &receipt.encoded_receipt, None)?;
                 let (grant, token) =
                     c.with_runtime_delivery(&launch.execution, None, Some(&launch), |_| {
-                        let grant = p
-                            .ledger
-                            .reserve_proven(&decision, &receipt.encoded_receipt)?;
-                        let token = p.ledger.issue_access(
+                        let grant = p.ledger.commit_reservation(verified, None)?;
+                        let token = p.ledger.issue_delivery_access(
+                            &id,
                             &launch.execution,
-                            LedgerPermission::Execution,
                             &request.validity,
                         )?;
                         Ok((grant, token))
@@ -557,13 +628,11 @@ impl Compute {
             r.phase = "delivered".into();
             store.update(r.clone())?;
         }
-        // A persisted dispatch claim may have minted or consumed authority.
-        // Never reconstruct credentials or wait on observations to bypass it.
+        // Staging an identical payload cannot resend a dispatched ticket.
         if r.phase != "delivered" {
             return Err(Error::Conflict);
         }
         loop {
-            r.current()?;
             if let Ok(s) = self.observe(&r) {
                 let instance = s.status.unwrap().instance_id;
                 r.instance_id = Some(instance.clone());
@@ -571,6 +640,7 @@ impl Compute {
                 store.update(r)?;
                 return Ok(instance);
             }
+            r.current()?;
             let delivery = self.0.deliveries.record(&id)?;
             if !matches!(
                 delivery.state.as_str(),
@@ -681,14 +751,7 @@ impl compute_driver_server::ComputeDriver for Compute {
         &self,
         _: Request<ListSandboxesRequest>,
     ) -> std::result::Result<Response<ListSandboxesResponse>, Status> {
-        let records: Vec<_> = launches(&self.0)
-            .map_err(status)?
-            .records
-            .lock()
-            .values()
-            .filter(|r| r.sandbox_id.is_some())
-            .cloned()
-            .collect();
+        let records = launches(&self.0).map_err(status)?.active_records(&self.0);
         Ok(Response::new(ListSandboxesResponse {
             sandboxes: records.iter().map(|r| self.snapshot(r)).collect(),
         }))
@@ -700,14 +763,18 @@ impl compute_driver_server::ComputeDriver for Compute {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let this = self.clone();
         tokio::spawn(async move {
+            let mut previous = BTreeSet::new();
             while let Ok(store) = launches(&this.0) {
-                let records: Vec<_> = store
-                    .records
-                    .lock()
-                    .values()
-                    .filter(|r| r.sandbox_id.is_some())
-                    .cloned()
-                    .collect();
+                let mut records = store.active_records(&this.0);
+                let active: BTreeSet<_> = records.iter().map(|r| r.name.clone()).collect();
+                // Deliver one final unavailable observation when a live owner
+                // disappears, without rescanning its history on every tick.
+                records.extend(
+                    previous
+                        .difference(&active)
+                        .filter_map(|name| store.get(name).ok()),
+                );
+                previous = active;
                 for r in records {
                     let s = this.snapshot(&r);
                     if tx

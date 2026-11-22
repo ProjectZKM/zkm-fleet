@@ -32,11 +32,15 @@ struct Network {
     submitted: AtomicUsize,
     done: AtomicBool,
     forged: AtomicBool,
+    reject_next: AtomicBool,
     public: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 #[async_trait::async_trait]
 impl trusted_shim::proof::ProofNetwork for Network {
     async fn submit(&self, r: &trusted_shim::proof::ProofRequest) -> trusted_shim::Result<String> {
+        if self.reject_next.swap(false, Ordering::SeqCst) {
+            return Err(trusted_shim::Error::Unavailable);
+        }
         self.submitted.fetch_add(1, Ordering::SeqCst);
         let public = evaluate_witness(&r.witness).unwrap();
         assert_eq!(public, r.expected_public_values);
@@ -49,6 +53,9 @@ impl trusted_shim::proof::ProofNetwork for Network {
     }
     async fn status(&self, id: &str) -> trusted_shim::Result<trusted_shim::proof::ProofStatus> {
         use trusted_shim::proof::ProofStatus;
+        if !self.public.lock().unwrap().contains_key(id) {
+            return Err(trusted_shim::Error::Unavailable);
+        }
         if !self.done.load(Ordering::SeqCst) {
             return Ok(ProofStatus::Pending);
         }
@@ -368,6 +375,11 @@ async fn startup(forged: bool, stock: bool) {
         .status(),
         401
     );
+    if !stock && !forged {
+        let mut short = input.clone(); short["expires_at"] = json!(crate::workloads::now() as u64 + 1);
+        assert_eq!(admin(&c,"POST","/policy/openshell/launches",short).await.status(),200);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     let prepared =
         json_body(admin(&c, "POST", "/policy/openshell/launches", input.clone()).await).await;
     let wire = STANDARD
@@ -430,6 +442,12 @@ async fn startup(forged: bool, stock: bool) {
     } else {
         None
     };
+    if !stock && !forged {
+        network.reject_next.store(true, Ordering::SeqCst);
+        assert!(client.create_sandbox(CreateSandboxRequest {sandbox:Some(sandbox.clone())}).await.is_err());
+        assert!(c.deliveries.offers("gpu").is_empty());
+        assert_eq!(network.submitted.load(Ordering::SeqCst),0);
+    }
     let mut creation = if let Some((_, public_client)) = gateway.as_mut() {
         public_client
             .create_workspace(protocol::CreateWorkspaceRequest {

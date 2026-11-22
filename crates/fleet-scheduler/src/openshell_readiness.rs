@@ -118,7 +118,7 @@ impl Observer {
             .0
             .lock()
             .retain(|_, v| v.started.elapsed() < FRESHNESS);
-        let records: Vec<_> = store.records.lock().values().cloned().collect();
+        let records = store.active_records(c);
         let mut tasks = tokio::task::JoinSet::new();
         for record in records {
             if tasks.len() >= 16 {

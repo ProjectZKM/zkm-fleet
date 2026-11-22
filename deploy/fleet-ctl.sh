@@ -24,6 +24,7 @@ ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
 PREFIX=${FLEET_PREFIX:-$(dirname "$(dirname "$SELF")")}
 NODE_SSH=${FLEET_NODE_SSH:-}; NODE_PREFIX=${FLEET_NODE_PREFIX:-\$HOME/app/fleet}
 NODE_UNIT=${FLEET_NODE_UNIT:-zkm-fleet-node.service}
+NODE_SCRIPTS=(node-start.sh ray-start.sh fleet-watchdog.sh shim-start.sh ray-watch.sh install-node-services.sh)
 [ -n "${FLEET_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_TOKEN_FILE=$PREFIX/etc/admin.token
 DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }
@@ -183,7 +184,8 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
     fi
     if [ -n "$scripts" ]; then
       run ssh "$NODE_SSH" "mkdir -p $stage/scripts"
-      run scp -q "$scripts"/node-start.sh "$scripts"/ray-start.sh "$scripts"/fleet-watchdog.sh "$NODE_SSH:$stage/scripts/"
+      local files=(); local s; for s in "${NODE_SCRIPTS[@]}"; do files+=("$scripts/$s"); done
+      run scp -q "${files[@]}" "$NODE_SSH:$stage/scripts/"
       # Keep the third argument reserved for the optional proof-app binary.
       [ -n "$proof_app" ] || args+=("")
       args+=("$stage/scripts")
@@ -200,7 +202,7 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
   if [ -n "$scripts" ]; then
     run mkdir -p "$b/scripts"
-    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+    local s; for s in "${NODE_SCRIPTS[@]}"; do
       [ ! -f "$PREFIX/deploy/$s" ] || run cp -a "$PREFIX/deploy/$s" "$b/scripts/"
     done
   fi
@@ -210,7 +212,7 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   run cp -a "$bridge/fleet_bridge/." "$PREFIX/bridge/fleet_bridge/"
   if [ -n "$scripts" ]; then
     run mkdir -p "$PREFIX/deploy"
-    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+    local s; for s in "${NODE_SCRIPTS[@]}"; do
       run install -m 755 "$scripts/$s" "$PREFIX/deploy/$s"
     done
   fi
@@ -224,8 +226,8 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   fi
   echo "node upgraded; previous files in $b"
 }
-launch_scripts_dir() { # a directory holding the node's three launch scripts
-  local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+launch_scripts_dir() { # the complete node/companion deployment bundle
+  local s; for s in "${NODE_SCRIPTS[@]}"; do
     [ -f "$1/$s" ] || return 1
   done
   return 0
@@ -247,7 +249,7 @@ node_rollback() {
   run cp -a "$b/bridge/." "$PREFIX/bridge/"
   if [ -d "$b/scripts" ]; then
     run mkdir -p "$PREFIX/deploy"
-    local s; for s in node-start.sh ray-start.sh fleet-watchdog.sh; do
+    local s; for s in "${NODE_SCRIPTS[@]}"; do
       [ ! -f "$b/scripts/$s" ] || run install -m 755 "$b/scripts/$s" "$PREFIX/deploy/$s"
     done
   fi

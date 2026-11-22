@@ -157,13 +157,20 @@ EOF
       install -m 640 "$PROOF_ROOTS" "$ETC/proof-storage-roots"
     fi
   fi
-  if [ ! -f "$ETC/watchdog.env" ]; then {
+  WATCHDOG_STAGE=$(mktemp "$ETC/watchdog.env.XXXXXX")
+  {
+    # Refresh install-owned settings while retaining custom settings and the
+    # independent service-supervision flag. Never source operator shell here.
+    if [ -f "$ETC/watchdog.env" ]; then
+      awk '!/^(export )?(FLEET_HOME|FLEET_ETC|FLEET_LOG|FLEET_WORKDIR|FLEET_SCHEDULER|FLEET_NODE_NAME|FLEET_JOBS_DIR|FLEET_SCHEDULER_CA|FLEET_PROOF_STORAGE_ROOTS_FILE|RAY_NUM_CPUS|CUDA_VISIBLE_DEVICES)=/' "$ETC/watchdog.env"
+    fi
     printf 'FLEET_HOME=%q\nFLEET_ETC=%q\nFLEET_LOG=%q\nFLEET_WORKDIR=%q\n' "$PREFIX" "$ETC" "$WORKDIR/logs" "$WORKDIR"
     printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_JOBS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$JOBS_DIR" "$CA"
     [ ! -f "$ETC/proof-storage-roots" ] || printf 'FLEET_PROOF_STORAGE_ROOTS_FILE=%q\n' "$ETC/proof-storage-roots"
     printf 'RAY_NUM_CPUS=%q\nCUDA_VISIBLE_DEVICES=%q\n' "$CPUS" "$CUDA"
-  } > "$ETC/watchdog.env"
-  fi
+  } > "$WATCHDOG_STAGE"
+  if [ -f "$ETC/watchdog.env" ]; then chmod --reference="$ETC/watchdog.env" "$WATCHDOG_STAGE"; fi
+  mv "$WATCHDOG_STAGE" "$ETC/watchdog.env"
   if [ "$WITH_SHIM" = 1 ]; then
     bash "$PREFIX/deploy/install-node-services.sh" "$PREFIX" "$ETC" "$WORKDIR" "$BIN/trusted-shim-runtime"
   else

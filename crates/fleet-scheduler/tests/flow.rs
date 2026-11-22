@@ -187,6 +187,9 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
             .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
         assert_eq!(published["revision"],2, "repeating a policy must not advance its authorization revision");
     }
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .header("x-fleet-router-capabilities", "scoped-revocations-v1")
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().status(),200);
     let revocation=json!({"namespace":namespace,"principal":access["principal"],"session":access["session"]});
     assert_eq!(h.client.post(format!("{base}/revoke-subject")).bearer_auth(&other).json(&revocation).send().await.unwrap().status(),403);
     for _ in 0..2 {
@@ -196,14 +199,14 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     let mut second=access.clone(); second["session"]=json!("ee".repeat(32));
     let second_binding:Value=h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&second).send().await.unwrap().json().await.unwrap();
     assert_eq!(second_binding["policy_version"],2);
-    let snapshot:Value=h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+    let snapshot:Value=h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).header("x-fleet-router-capabilities", "scoped-revocations-v1")
         .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().json().await.unwrap();
     assert_eq!(snapshot["revision"],0); // authorization never increments runtime generations or route tombstones
     assert_eq!(snapshot["authorization"]["revision"],3);
     let mut ack=json!({"epoch":snapshot["epoch"],"after_revision":0,"applied_revision":0,"applied_authorization_revision":4});
-    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).json(&ack).send().await.unwrap().status(),409);
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).header("x-fleet-router-capabilities", "scoped-revocations-v1").json(&ack).send().await.unwrap().status(),409);
     ack["applied_authorization_revision"]=json!(3);
-    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).json(&ack).send().await.unwrap().status(),200);
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).header("x-fleet-router-capabilities", "scoped-revocations-v1").json(&ack).send().await.unwrap().status(),200);
     let state:Value=h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
     assert_eq!(state["applied_authorization_revision"],3);
     let user_revoke=json!({"namespace":namespace,"principal":access["principal"],"session":null});
@@ -211,20 +214,22 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&second).send().await.unwrap().status(),403);
     policy["service"]=json!("control");
     h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
-    let mut operator=second.clone(); operator["service"]=json!("control"); operator["principal"]=json!("12".repeat(32));
+    let mut operator=second.clone(); operator["service"]=json!("control"); operator["principal"]=access["principal"].clone();
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&operator).send().await.unwrap().status(),403);
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&h.admin).json(&operator).send().await.unwrap().status(),200);
+    let mut wildcard_control = policy.clone(); wildcard_control["workload"] = json!("*");
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&wildcard_control).send().await.unwrap().status(),400);
     // New workloads inherit an operator-approved namespace/service default.
     // An exact disabled entry must still win over that default.
     policy["workload"]=json!("*"); policy["service"]=json!("chat");
     assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().status(),409);
     assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
-        .header("x-fleet-router-capabilities", "workload-defaults-v1")
+        .header("x-fleet-router-capabilities", "workload-defaults-v1,scoped-revocations-v1")
         .json(&ack).send().await.unwrap().status(),200);
     h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
     assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
         .json(&ack).send().await.unwrap().status(),409, "a downgraded relay cannot renew after defaults are published");
-    let mut fresh=operator.clone(); fresh["workload"]=json!("new-agent"); fresh["service"]=json!("chat");
+    let mut fresh=operator.clone(); fresh["principal"]=json!("12".repeat(32)); fresh["workload"]=json!("new-agent"); fresh["service"]=json!("chat");
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),200);
     policy["workload"]=fresh["workload"].clone(); policy["enabled"]=json!(false);
     h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
@@ -257,6 +262,9 @@ async fn shared_router_redacts_delegates_and_suspension_withdraws_policies_durab
     assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&token).send().await.unwrap().status(),201);
     let base = format!("{}/routers/shared",h.http);
     assert_eq!(h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)})).send().await.unwrap().status(),201);
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .header("x-fleet-router-capabilities", "scoped-revocations-v1")
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().status(),200);
     let policy = |i:usize| json!({"namespace":namespaces[i],"workload":"agent","service":"chat","version":1,"sha256":"ab".repeat(32),"enabled":true});
     let revoke = |i:usize| json!({"namespace":namespaces[i],"principal":format!("{}",i+3).repeat(64),"session":null});
     for i in 0..2 {
@@ -274,7 +282,7 @@ async fn shared_router_redacts_delegates_and_suspension_withdraws_policies_durab
     }
     let pause = format!("{}/namespaces/other/suspended",h.http);
     assert_eq!(h.client.put(&pause).bearer_auth(&h.admin).send().await.unwrap().status(),200);
-    let snapshot: Value = h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+    let snapshot: Value = h.client.post(format!("{base}/sync")).bearer_auth(&sync_token).header("x-fleet-router-capabilities", "scoped-revocations-v1")
         .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
     let policies = snapshot["authorization"]["policies"].as_array().unwrap();
     assert_eq!(policies.iter().find(|p|p["namespace"]==namespaces[0]).unwrap()["enabled"],true);
@@ -313,6 +321,8 @@ async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
     let base = format!("{}/routers/relay-a",h.http);
     let enrolled: fleet_proto::model::v1::RouterControl = h.client.put(&base).bearer_auth(&h.admin)
         .json(&json!({"issuer":"gateway", "token_id":"ac".repeat(16)})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(h.client.put(format!("{}/routers/second-router",h.http)).bearer_auth(&h.admin)
+        .json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)})).send().await.unwrap().status(),409);
     let poll = |secret: &str, body: &serde_json::Value| h.client.post(format!("{base}/sync")).bearer_auth(secret).json(&body);
     let initial = json!({"epoch":null,"after_revision":0,"applied_revision":null});
     assert_eq!(poll(&other_token,&initial).send().await.unwrap().status(),403);

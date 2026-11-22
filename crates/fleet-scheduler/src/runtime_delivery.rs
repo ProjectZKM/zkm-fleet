@@ -16,7 +16,7 @@ use fleet_proto::model::v1::{RuntimeDeliveryAck, RuntimeDeliveryOffer, RuntimeDe
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::PathBuf,
     sync::Arc,
@@ -30,6 +30,7 @@ use trusted_shim::{
 struct QueueState {
     records: BTreeMap<String, RuntimeDeliveryRecord>,
     payloads: BTreeMap<String, Vec<u8>>,
+    queued: BTreeSet<(u64, String)>,
 }
 pub(crate) struct DeliveryQueue {
     dir: PathBuf,
@@ -92,6 +93,9 @@ impl DeliveryQueue {
                     ),
                 "invalid delivery record"
             );
+            if r.state == "queued" {
+                inner.queued.insert((r.expires_at, r.offer.ticket.clone()));
+            }
             inner.records.insert(r.offer.ticket.clone(), r);
         }
         Ok(Self {
@@ -108,16 +112,19 @@ impl DeliveryQueue {
         .map_err(|_| Error::Unavailable)
     }
     fn expire(&self, i: &mut QueueState) -> Result<()> {
-        for r in i
-            .records
-            .values_mut()
-            .filter(|r| r.state == "queued" && r.expires_at <= now())
+        let time = now();
+        while let Some((expires, ticket)) = i
+            .queued
+            .first()
+            .cloned()
+            .filter(|(expires, _)| *expires <= time)
         {
-            let mut expired = r.clone();
+            let mut expired = i.records[&ticket].clone();
             expired.state = "expired".into();
             self.save(&expired)?;
-            *r = expired;
-            i.payloads.remove(&r.offer.ticket);
+            i.records.insert(ticket.clone(), expired);
+            i.payloads.remove(&ticket);
+            i.queued.remove(&(expires, ticket));
         }
         Ok(())
     }
@@ -142,6 +149,7 @@ impl DeliveryQueue {
             return Err(Error::Unavailable);
         }
         self.save(&r)?; // Crash here leaves a queued record awaiting the exact payload.
+        i.queued.insert((r.expires_at, r.offer.ticket.clone()));
         i.records.insert(r.offer.ticket.clone(), r.clone());
         i.payloads.insert(r.offer.ticket.clone(), bytes);
         Ok(r)
@@ -156,8 +164,9 @@ impl DeliveryQueue {
         if self.expire(&mut i).is_err() {
             return vec![];
         }
-        i.records
-            .values()
+        i.payloads
+            .keys()
+            .filter_map(|ticket| i.records.get(ticket))
             .filter(|r| {
                 r.worker == worker
                     && r.state == "queued"
@@ -193,6 +202,7 @@ impl DeliveryQueue {
         // Fence memory too if rename succeeded but fsync reports an error.
         // No later request in this process may dispatch an ambiguous write.
         i.records.insert(ticket.into(), r.clone());
+        i.queued.remove(&(r.expires_at, ticket.into()));
         let bytes = i.payloads.remove(ticket).unwrap();
         self.save(&r)?; // Persist uncertainty BEFORE any credential leaves the process.
         Ok(bytes)
@@ -234,6 +244,7 @@ impl DeliveryQueue {
         }
         r.state = "cancelled".into();
         self.save(&r)?;
+        i.queued.remove(&(r.expires_at, ticket.into()));
         i.records.insert(ticket.into(), r.clone());
         i.payloads.remove(ticket);
         Ok(r)
@@ -313,7 +324,6 @@ pub(crate) fn stage_payload(
         )
     })
 }
-
 
 async fn stage(
     State(c): State<Arc<WorkloadController>>,

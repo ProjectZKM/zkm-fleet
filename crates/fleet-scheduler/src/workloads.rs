@@ -884,7 +884,7 @@ impl WorkloadController {
         &self,
         worker_id: &str,
         session: &str,
-        report: NodeReport,
+        mut report: NodeReport,
     ) -> anyhow::Result<Vec<String>> {
         if !is_safe_id(worker_id)
             || worker_id.len() > 63
@@ -907,16 +907,38 @@ impl WorkloadController {
         {
             return Err(fail(400, "invalid capacity"));
         }
-        report.validate_runtime_instances().map_err(|e| fail(400,e.to_string()))?;
-        if report.entries().any(|e| e.0.get("prover_binary").is_some_and(|v| !v.is_null())) {
-            return Err(fail(400, "prover_binary was removed; drain and migrate the entry to a packaged runtime"));
+        // Bad local runtime data withdraws that app's authority, but must not
+        // suppress command acknowledgments or the other workloads' heartbeat.
+        if report.runtime_instances.len() > 1024 { return Err(fail(400, "too many runtime instances")); }
+        for raw in &mut report.apps {
+            EntryMut(raw).redact_private_environment();
+            let e = Entry(raw);
+            let invalid = e.0.get("prover_binary").is_some_and(|v| !v.is_null())
+                || e.is_prover() && e.0.get("runtime").is_some() && e.0.as_object().is_none_or(|o|
+                    fleet_proto::model::v1::RegisterAppRequest::validate_transport(o).is_err());
+            if invalid && raw.is_object() {
+                raw["runtime_error"] = json!("invalid runtime manifest; repair or drain this entry");
+                raw["ready"] = json!(false);
+                raw["cleaned"] = json!(false);
+            }
         }
-        for entry in report.entries().filter(|e| e.is_prover() && e.0.get("runtime").is_some()) {
-            fleet_proto::model::v1::RegisterAppRequest::validate_transport(
-                entry.0.as_object().ok_or_else(|| fail(400,"invalid proof runtime"))?)
-                .map_err(|e| fail(400,e.to_string()))?;
+        let instances = std::mem::take(&mut report.runtime_instances);
+        let mut probe = report.clone();
+        for instance in &instances {
+            probe.runtime_instances = vec![instance.clone()];
+            let duplicate = instances.iter().filter(|other| other.execution.namespace == instance.execution.namespace
+                && other.execution.allocation_id == instance.execution.allocation_id
+                && other.execution.node_id == instance.execution.node_id).count() != 1;
+            if !duplicate && probe.validate_runtime_instances().is_ok()
+                && report.entry(&instance.entry_name).is_some_and(|e| e.0.get("runtime_error").is_none()) {
+                report.runtime_instances.push(instance.clone());
+            } else {
+                if let Some(entry) = report.apps.iter_mut().find(|e| Entry(e).name() == instance.entry_name) {
+                    entry["ready"] = json!(false);
+                }
+                tracing::warn!(worker = worker_id, entry = %instance.entry_name, "quarantined invalid runtime observation");
+            }
         }
-        let mut report = report;
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()
                 .unwrap_or(crate::store::SYSTEM_NAMESPACE)
@@ -967,7 +989,7 @@ impl WorkloadController {
             report
                 .apps
                 .iter()
-                .filter(|s| Entry(s).is_container())
+                .filter(|s| Entry(s).is_container() && s.get("runtime_error").is_none())
                 .map(|s| (Entry(s).name().into(), s.clone())),
         ) {
             if !is_safe_id(&name) || !spec.is_object() {
@@ -1010,6 +1032,7 @@ impl WorkloadController {
         for observed in report.entries() {
             let name = observed.name();
             if !is_safe_id(name)
+                || observed.0.get("runtime_error").is_some()
                 || !matches!(observed.kind(), "app" | "ziren-gpu" | "ziren-cpu")
                 || observed.is_container() && self.inner.lock().apps.get(name).is_some_and(|a| !a.removed && !a.persistent)
             {
@@ -1055,7 +1078,7 @@ impl WorkloadController {
                 intent
             };
             // An older/downgraded bridge cannot attest cleanup of a shim allocation.
-            if !report.supports_runtime(intent.entry()) {
+            if !(if intent.disabled { report.supports_cleanup(intent.entry()) } else { report.supports_runtime(intent.entry()) }) {
                 continue;
             }
             if observed.holds_allocation() {
@@ -1808,13 +1831,15 @@ fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
     i.commands.open()
         .filter(|c| c.worker == worker && !c.done && c.admitted)
         .filter(|c| i.workers.get(worker).is_some_and(|w| {
-            w.report.supports_runtime(Entry(&c.parameters["app"]))
-                && w.report.supports_runtime(Entry(&c.parameters["create"]))
-                && w.report.supports_runtime(Entry(&c.parameters["set"]))
+            let cleanup = c.stops() || c.parameters["remove"] == true || c.parameters["set"] == json!({"disabled":true});
+            let supported = |entry| if cleanup { w.report.supports_cleanup(entry) } else { w.report.supports_runtime(entry) };
+            supported(Entry(&c.parameters["app"]))
+                && supported(Entry(&c.parameters["create"]))
+                && supported(Entry(&c.parameters["set"]))
                 && i.deployments.values().filter(|d| d.worker == worker
                     && (c.changes_entry(worker, d.entry().name()) || c.changed_entry() == d.entry().name()
                         || c.removes_app(d.entry().app())))
-                    .all(|d| w.report.supports_runtime(d.entry()))
+                    .all(|d| supported(d.entry()))
         }))
         .take(16)
         .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })

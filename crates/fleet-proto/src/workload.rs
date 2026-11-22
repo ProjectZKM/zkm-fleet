@@ -42,7 +42,7 @@ impl<'a> Entry<'a> {
                 else if self.0["ingress"].as_object().is_some_and(|i| !i.is_empty()) || self.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")) { "shim-management-v1" }
                 else if self.0["port_base"].as_u64() == Some(0) { "shim-automatic-port-v1" }
                 else if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }
-                else if self.0.get("container_port").is_some() || self.0.get("entrypoint").is_some() { "shim-runtime-v2" }
+                else if self.0.get("container_port").is_some_and(|v| !v.is_null()) || self.0.get("entrypoint").is_some_and(|v| !v.is_null()) { "shim-runtime-v2" }
                 else { "shim-docker-v1" }),
             Some(_) => Some("unsupported-runtime"),
         }
@@ -150,6 +150,14 @@ impl<'a> Entry<'a> {
 pub struct EntryMut<'a>(pub &'a mut Value);
 
 impl EntryMut<'_> {
+    /// Heartbeats carry node-local references, never the ingress bearer itself.
+    pub fn redact_private_environment(&mut self) {
+        let names: Vec<_> = self.0["ingress"].as_object().into_iter().flat_map(|r| r.values())
+            .filter_map(|r| r["bearer_env"].as_str().map(str::to_owned)).collect();
+        if let Some(env) = self.0.get_mut("env").and_then(Value::as_object_mut) {
+            for name in names { env.insert(name.clone(), json!(format!("@fleet-local-env:{name}"))); }
+        }
+    }
     pub fn set_disabled(&mut self, disabled: bool) {
         self.0["disabled"] = json!(disabled);
     }
@@ -220,7 +228,19 @@ impl NodeReport {
                 && r.execution.generation > 0 && (r.ready || r.services.is_empty())))
     }
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
-        entry.runtime_capability().is_none_or(|cap| self.runtime_capabilities.iter().any(|v| v == cap))
+        let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
+        if !entry.runtime_capability().is_none_or(has) { return false; }
+        if entry.0["runtime"]["driver"] != "docker" { return true; }
+        [
+            ("shim-network-v1", entry.0["services"].as_array().is_some_and(|s| !s.is_empty())),
+            ("shim-runtime-v2", entry.0.get("container_port").is_some_and(|v| !v.is_null()) || entry.0.get("entrypoint").is_some_and(|v| !v.is_null())),
+            ("shim-automatic-port-v1", entry.0["port_base"].as_u64() == Some(0)),
+            ("shim-private-env-v1", entry.0["ingress"].as_object().is_some_and(|i| i.values().any(|r| r["bearer_env"].is_string()))),
+        ].into_iter().all(|(cap, needed)| !needed || has(cap))
+    }
+    pub fn supports_cleanup(&self, entry: Entry<'_>) -> bool {
+        entry.runtime_capability().is_none() || self.supports_runtime(entry)
+            || self.runtime_capabilities.iter().any(|c| c == "shim-cleanup-v1")
     }
     /// The entries the node configures, with how each runs there.
     pub fn entries(&self) -> impl Iterator<Item = Entry<'_>> {

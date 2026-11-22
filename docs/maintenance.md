@@ -20,12 +20,12 @@ deploy/fleet-ctl.sh -n scheduler upgrade v0.1.6  # -n prints every step and chan
 
 ### Control host
 
-For the runtime migration release (database schema 19), take a database backup
-and validate the schema 17/18 upgrade against a copy before changing production.
+For the runtime migration release (database schema 20), take a database backup
+and validate the schema 17/18/19 upgrade against a copy before changing production.
 This migration retains router identities, tombstones and policy acknowledgments;
-it normalizes old JSON records so subsequent syncs can update them. Schema 18
+it normalizes old JSON records so subsequent syncs can update them. Schema 19
 and older binaries cannot be used as rollback builds after migration. Keep a
-validated schema-19-compatible build available instead of resetting the database
+validated schema-20-compatible build available instead of resetting the database
 or restoring stale router authorization over live grants.
 
 Upgrade the independent data-router relay before publishing `workload: "*"`
@@ -33,6 +33,12 @@ policies. Its next authenticated poll must advertise `workload-defaults-v1` in
 `GET /routers/ID`'s `capabilities`; publication otherwise returns 409. The updated
 relay also works with the previous Fleet JSON API. Once a default is stored, keep
 that relay capability through rollback, even if the default is disabled.
+The relay must also advertise `scoped-revocations-v1` before application delegates
+can revoke sessions. These revocations affect application services; operator
+control revocation remains an administrative action. Use a distinct `router_sync`
+token for each router. Existing duplicate bindings remain readable but cannot be
+created or rotated into a shared token.
+
 
 The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
@@ -68,13 +74,26 @@ deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
 ```
 
 It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scripts
-(`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`) around a short stop and start
+(`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`, `shim-start.sh`,
+`ray-watch.sh`, `install-node-services.sh`) around a short stop and start
 of the agent's unit, after checking that the new bridge imports in the node's venv,
 and waits for the node to reconnect. `node rollback` restores everything the last
 upgrade replaced. In the local form, the last two arguments are optional: the proof
 app binary staged for its next explicit endpoint restart, and the launch scripts'
 directory. Running proof endpoints keep their current processes; node upgrades
 and rollbacks no longer restart `FLEET_PROOF_APP_UNITS`.
+
+The companion installer refreshes only recognized generated units, preserving
+operator edits and drop-ins. Ray uses `KillMode=process`: losing its watchdog does
+not kill the Ray processes. Before any service starts, an install failure restores
+configuration and partial unit changes. Once service startup begins, configuration
+is committed; repair the reported failure and rerun the installer. It must not
+restore stale YAML over writes from a newly started agent. A former oneshot Ray
+unit needs a watchdog restart after unit conversion; schedule this during the
+maintenance window after checking that `KillMode=process` is loaded.
+Re-running `install.sh node` refreshes install-owned watchdog settings from its
+arguments and retains custom settings and supervision ownership.
+
 
 Ray keeps running, and so do apps and batches, through the agent restart. The upgrade
 touches neither `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`;

@@ -35,6 +35,17 @@ def test_compose_uses_the_release_file_alone(tmp_path):
     assert calls == [f"compose --env-file {prefix}/compose.env -p zkm-fleet -f {prefix}/deploy/docker-compose.yml ps"]
 
 
+def test_ray_watch_retries_a_failed_pass_without_exiting(tmp_path):
+    calls=tmp_path/'calls'; home=tmp_path/'node'; commands=tmp_path/'bin'
+    executable(home/'deploy/fleet-watchdog.sh', f'echo pass >> {calls}\n[ "$(wc -l < {calls})" -gt 1 ]\n')
+    executable(commands/'sleep', f'if [ "$(wc -l < {calls})" -ge 2 ]; then kill -TERM "$PPID"; fi\n')
+    env=tmp_path/'watchdog.env';env.write_text(f'FLEET_HOME={home}\n')
+    result=subprocess.run(['bash',str(ROOT/'deploy/ray-watch.sh')],
+        env={**os.environ,'PATH':str(commands)+':'+os.environ['PATH'],'FLEET_ENV':str(env)},capture_output=True,text=True,timeout=10)
+    assert calls.read_text().splitlines() == ['pass','pass']
+    assert 'retaining Ray and retrying' in result.stderr
+
+
 def test_compose_applies_the_site_override_after_the_release_file(tmp_path):
     override = tmp_path / "fleet/deploy/docker-compose.override.yml"
     override.parent.mkdir(parents=True)
@@ -122,7 +133,8 @@ def node_fixture(tmp_path):
     executable(prefix / "bin/fleet-node", "echo old-node\n")
     executable(prefix / "venv/bin/python", "exit 0\n")
     for name, body in [("node-start.sh", "old node-start"), ("ray-start.sh", "old ray-start"),
-                       ("fleet-watchdog.sh", "old watchdog")]:
+                       ("fleet-watchdog.sh", "old watchdog"), ("shim-start.sh", "old shim"),
+                       ("ray-watch.sh", "old ray watch"), ("install-node-services.sh", "old install")]:
         (prefix / "deploy" / name).write_text(body + "\n")
     commands = tmp_path / "bin"
     executable(commands / "sudo", "exec \"$@\"\n")
@@ -140,7 +152,7 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     (newbridge / "fleet_bridge" / "__init__.py").write_text("")
     newscripts = tmp_path / "scripts"
     newscripts.mkdir()
-    for name in ["node-start.sh", "ray-start.sh", "fleet-watchdog.sh"]:
+    for name in ["node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
         (newscripts / name).write_text(f"new {name}\n")
     environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
                    "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_CTL_ON_NODE": "1", "FLEET_NODE_SSH": ""}
@@ -148,6 +160,8 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     result = subprocess.run(args, env=environment, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert (prefix / "deploy/ray-start.sh").read_text() == "new ray-start.sh\n"
+    for name in ["shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
+        assert (prefix / "deploy" / name).read_text() == f"new {name}\n"
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho new-node\n"
     backup = next((prefix / "backup").glob("node-*"))
     assert (backup / "scripts/ray-start.sh").read_text() == "old ray-start\n"
@@ -156,6 +170,9 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     assert result.returncode == 0, result.stderr
     assert (prefix / "deploy/ray-start.sh").read_text() == "old ray-start\n"
     assert (prefix / "deploy/fleet-watchdog.sh").read_text() == "old watchdog\n"
+    assert (prefix / "deploy/shim-start.sh").read_text() == "old shim\n"
+    assert (prefix / "deploy/ray-watch.sh").read_text() == "old ray watch\n"
+    assert (prefix / "deploy/install-node-services.sh").read_text() == "old install\n"
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho old-node\n"
 
 
@@ -265,7 +282,7 @@ def test_remote_upgrade_preserves_scripts_position_without_a_proof_app(tmp_path)
     (newbridge / "fleet_bridge").mkdir(parents=True)
     newscripts = tmp_path / "scripts"
     newscripts.mkdir()
-    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh"):
+    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "install-node-services.sh"):
         (newscripts / name).write_text("#!/bin/bash\n")
     remote_command = tmp_path / "remote-command"
     executable(commands / "scp", "exit 0\n")

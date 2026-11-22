@@ -7,6 +7,7 @@ use serde_json::Value;
 pub const MAX_ROUTER_REVOCATIONS: usize = 4096;
 pub const ROUTER_CAPABILITIES_HEADER: &str = "x-fleet-router-capabilities";
 pub const ROUTER_WORKLOAD_DEFAULTS: &str = "workload-defaults-v1";
+pub const ROUTER_SCOPED_REVOCATIONS: &str = "scoped-revocations-v1";
 pub fn valid_router_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -37,6 +38,7 @@ impl RouterControl {
 }
 
 pub const MAX_ROUTER_AUTHORIZATION_RECORDS: usize = 1024;
+pub const ROUTER_NAMESPACE_RECORDS: usize = 64;
 fn router_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
@@ -91,20 +93,34 @@ impl RouterAuthorization {
         let mut subjects = std::collections::HashSet::new();
         for r in &self.revoked_subjects {
             r.validate()?;
-            anyhow::ensure!(subjects.insert((&r.namespace, &r.principal, &r.session)), "duplicate subject revocation");
+            anyhow::ensure!(subjects.insert((&r.namespace, &r.principal, &r.session, r.application_only == Some(true))), "duplicate subject revocation");
         }
         Ok(())
     }
     pub fn authorize(&self, request: &RouterAuthorizeRequest) -> anyhow::Result<RouterAccessBinding> {
         request.validate()?;
         anyhow::ensure!(!self.revoked_subjects.iter().any(|r| r.namespace == request.namespace && r.principal == request.principal
+            && (request.service != "control" || r.application_only != Some(true))
             && r.session.as_ref().is_none_or(|s| s == &request.session)), "subject revoked");
         let scoped = |p: &&RouterAccessPolicy| p.namespace == request.namespace && p.service == request.service;
         let policy = self.policies.iter().filter(scoped).find(|p| p.workload == request.workload)
-            .or_else(|| self.policies.iter().filter(scoped).find(|p| p.workload == "*"))
+            .or_else(|| self.policies.iter().filter(scoped).find(|p| p.workload == "*" && request.service != "control"))
             .filter(|p| p.enabled).ok_or_else(|| anyhow::anyhow!("service not authorized"))?;
         Ok(RouterAccessBinding {principal: request.principal.clone(), session: request.session.clone(),
             policy_version: policy.version, policy_sha256: policy.sha256.clone()})
+    }
+
+    /// Reserve capacity per namespace at policy admission. Existing oversized
+    /// namespaces keep their records; new writes cannot consume another's share.
+    pub fn validate_namespace_capacity(&self, changed: &str) -> anyhow::Result<()> {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for ns in self.policies.iter().map(|p|p.namespace.as_str()).chain(self.revoked_subjects.iter().map(|r|r.namespace.as_str())) {
+            *counts.entry(ns).or_default() += 1;
+        }
+        anyhow::ensure!(counts.get(changed).copied().unwrap_or(0) <= ROUTER_NAMESPACE_RECORDS
+            && counts.values().map(|n| (*n).max(ROUTER_NAMESPACE_RECORDS)).sum::<usize>() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
+            "namespace authorization capacity exceeded");
+        Ok(())
     }
 }
 
@@ -580,6 +596,44 @@ mod tests {
             bad["spec"]["services"] = json!(["public"]);
             assert!(serde_json::from_value::<RegisterAppRequest>(bad).unwrap().validate().is_err());
         }
+    }
+
+    #[test]
+    fn namespace_capacity_and_scoped_revocations_preserve_operator_control() {
+        let ns = "ab".repeat(16);
+        let mut auth = RouterAuthorization { revision:1, policies:vec![], revoked_subjects:vec![] };
+        for n in 0..ROUTER_NAMESPACE_RECORDS {
+            auth.policies.push(RouterAccessPolicy {namespace:ns.clone(),workload:format!("app-{n}"),
+                service:"control".into(),version:1,sha256:"12".repeat(32),enabled:true});
+        }
+        auth.validate_namespace_capacity(&ns).unwrap();
+        let mut other = auth.policies[0].clone(); other.namespace = "cd".repeat(16);
+        auth.policies.push(other.clone());
+        auth.validate_namespace_capacity(&other.namespace).unwrap();
+        let request = RouterAuthorizeRequest {namespace:other.namespace.clone(),workload:other.workload.clone(),service:"control".into(),
+            principal:"34".repeat(32),session:"56".repeat(32)};
+        auth.revoked_subjects.push(RouterSubjectRevocation {namespace:other.namespace.clone(),principal:request.principal.clone(),
+            session:None,application_only:Some(true)});
+        assert!(auth.authorize(&request).is_ok());
+        auth.revoked_subjects[0].application_only = None;
+        assert!(auth.authorize(&request).is_err());
+        other.namespace = ns.clone(); other.workload = "overflow".into(); auth.policies.push(other);
+        assert!(auth.validate_namespace_capacity(&ns).is_err());
+    }
+
+    #[test]
+    fn automatic_port_services_compose_requirements_and_cleanup_is_independent() {
+        let raw = json!({"runtime":{"executor":"shim","driver":"docker"},"port_base":0,
+            "container_port":8080,"services":["http"]});
+        let entry = crate::workload::Entry(&raw);
+        let mut report = NodeReport::default();
+        report.runtime_capabilities = vec!["shim-automatic-port-v1".into(),"shim-runtime-v2".into()];
+        assert!(!report.supports_runtime(entry));
+        report.runtime_capabilities.push("shim-network-v1".into());
+        assert!(report.supports_runtime(entry));
+        report.runtime_capabilities = vec!["shim-cleanup-v1".into()];
+        assert!(!report.supports_runtime(entry));
+        assert!(report.supports_cleanup(entry));
     }
 
     #[test]

@@ -115,6 +115,8 @@ def from_dict(cls: type[T], data: Mapping[str, Any], *, strict: bool = False, wh
     """A `cls` from a mapping; missing fields take their defaults, extra keys are
     ignored (strict=False) or refused."""
     where = where or cls.__name__
+    if not isinstance(data, Mapping):
+        raise ModelError(f"{where}: expected a mapping")
     hints = _hints(cls)
     names = {f.name for f in fields(cls)}  # type: ignore[arg-type]
     extra = set(data) - names
@@ -630,7 +632,7 @@ class AppSpec(Record):
             raise ModelError("ingress bearer environment is missing")
         if self.container_port is not None and not 1 <= self.container_port <= 65535:
             raise ModelError("invalid container_port")
-        if self.port_base == 0 and (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM or self.container_port is None):
+        if self.port_base == 0 and self.runtime and self.runtime.executor is ExecutorKind.SHIM and self.container_port is None:
             raise ModelError("automatic host ports require shim and container_port")
         if self.runtime is not None and self.kind is not AppRuntime.APP:
             if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker") or self.worker_command:
@@ -674,7 +676,7 @@ class AppsConfig(Record):
     raw: dict[str, Any] = field(default_factory=dict)  # the file's own mapping, for the spec hash
 
     @classmethod
-    def parse(cls, data: Mapping[str, Any]) -> AppsConfig:
+    def parse(cls, data: Mapping[str, Any], *, validate_launch: bool = True) -> AppsConfig:
         cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
         apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
         for a in data.get("apps", []):
@@ -682,14 +684,21 @@ class AppsConfig(Record):
                 raise ModelError("prover_binary was removed; drain and migrate this entry with deploy/migrate-proof-runtime.py")
             if "runtime" in a:
                 from_dict(RuntimeSelection, a["runtime"], strict=True)
-        if any(a.runtime and a.runtime.executor is ExecutorKind.SHIM for a in apps):
+        result = cls(cluster=cluster, apps=apps, raw=dict(data))
+        if validate_launch:
+            for app in apps:
+                result.validate_launch(app)
+        return result
+
+    def validate_launch(self, app: AppSpec) -> None:
+        cluster = self.cluster
+        if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
             if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
-        if any(a.services for a in apps) and cluster.shim_network is None:
+        if app.services and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
-        if any(a.runtime and a.runtime.driver == "openshell" for a in apps) and (not cluster.shim_daemon or cluster.shim_openshell is None):
+        if app.runtime and app.runtime.driver == "openshell" and (not cluster.shim_daemon or cluster.shim_openshell is None):
             raise ModelError("OpenShell requires the configured persistent companion")
-        return cls(cluster=cluster, apps=apps, raw=dict(data))
 
 
 @dataclass(kw_only=True)

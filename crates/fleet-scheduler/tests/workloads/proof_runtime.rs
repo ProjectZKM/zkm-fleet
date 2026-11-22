@@ -16,7 +16,7 @@ async fn packaged_prover_cutover_drains_and_preserves_jobs_and_app_identity() {
         .request_update(&ns, PROOF, None, update.clone())
         .await
         .is_err());
-    report.runtime_capabilities = vec!["shim-prover-v1".into()];
+    report.runtime_capabilities = vec!["shim-prover-v1".into(),"shim-runtime-v2".into(),"shim-automatic-port-v1".into()];
     c.report("gpu", "session", report.clone()).await.unwrap();
     assert_eq!(c.inner.lock().deployments["gpu-model"].spec, original);
 

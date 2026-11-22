@@ -716,7 +716,7 @@ impl WorkloadController {
                             s.name() == target.name()
                                 && s.same_resources(target)
                                 && s.disabled() == scale.disabled
-                                && if scale.disabled { s.cleaned() } else { s.ready() }
+                                && if scale.disabled { s.cleaned() } else { s.ready() || w.report.native_allocated(s) }
                         })
                     }),
                 )

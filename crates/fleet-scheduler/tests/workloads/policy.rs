@@ -295,6 +295,44 @@ async fn policy_setup() -> (
     policy_setup_with_driver("docker").await
 }
 
+#[tokio::test]
+async fn native_reservation_completes_starting_before_application_readiness() {
+    let (_dir,c,report,_,_) = policy_setup_with_driver("openshell").await;
+    assert!(!report.apps[0]["ready"].as_bool().unwrap());
+    let mut intent = c.inner.lock().deployments["gpu-model"].clone();
+    let id = c.command("gpu",NodeOperation::SetApp,message::set_app(&intent.spec,false)).unwrap();
+    let mut scale = scaling::new_scale(intent.spec.clone(),false);
+    scale.phase = fleet_proto::model::v1::ScalePhase::Starting as i32;
+    scale.start = Some(id.clone());
+    scale.ready_since = Some(now()-10_000.0);
+    intent.scale = Some(scale);
+    {
+        let mut i=c.inner.lock();
+        let mut command=i.commands[&id].clone();command.done=true;command.result=json!({"ready":false,"disabled":false}).into();
+        i.commands.insert(id,command);
+        i.deployments.insert("gpu-model".into(),intent);
+    }
+    c.dispatch().await.unwrap();
+    let i=c.inner.lock();
+    assert!(!i.deployments["gpu-model"].disabled);
+    assert_eq!(i.deployments["gpu-model"].scale.as_ref().unwrap().phase(),fleet_proto::model::v1::ScalePhase::Complete);
+}
+
+#[tokio::test]
+async fn ended_worker_history_does_not_ambiguitize_live_policy_owner() {
+    let (_dir,c,report,p,r) = policy_setup_with_driver("openshell").await;
+    let historical = NodeSession {session:"old-session".into(), seen:now(), report:report.clone(), draining:false, ended:true};
+    c.inner.lock().workers.insert("old-worker-id".into(),historical);
+    activate(&c,&p,&r).await;
+    c.with_runtime_delivery(&r.execution,None,None, |_| Ok(())).unwrap();
+    // Two live workers for one machine must still fail closed.
+    c.inner.lock().workers.get_mut("old-worker-id").unwrap().ended = false;
+    assert!(c.with_runtime_delivery(&r.execution,None,None, |_| Ok(())).is_err());
+    c.inner.lock().workers.get_mut("old-worker-id").unwrap().seen = 0.0;
+    c.report("gpu","session",report).await.unwrap();
+    c.with_runtime_delivery(&r.execution,None,None, |_| Ok(())).unwrap();
+}
+
 async fn admin(c: &Arc<WorkloadController>, method: &str, path: &str, value: Value) -> Response {
     serve(
         c,

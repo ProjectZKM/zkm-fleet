@@ -59,6 +59,7 @@ def test_tcp_service_uses_tcp_health_and_requires_new_capability(tmp_path, monke
     monkeypatch.setattr(shim._ShimApp, "call", lambda self, command: {"state":"ready","port":12345})
     monkeypatch.setattr(shim._ShimApp, "start_network", lambda self: None)
     # Initial admission must use the same probe as subsequent heartbeats.
+    monkeypatch.setattr(shim, "capabilities", lambda _: list(shim.required_capabilities(bound)))
     assert shim._ShimApp(bound).port == 12345
     assert connected.call_count == 2
     connected.side_effect = OSError()
@@ -82,6 +83,67 @@ def config(tmp_path, selected=True):
 
 def spec(tmp_path):
     return reconcile.replica_specs(reconcile.load_apps(config(tmp_path)))["web-0"]
+
+
+@pytest.mark.parametrize("value", [[], None, {"protocol":True,"drivers":["docker"]},
+    {"protocol":1,"drivers":None}, {"protocol":1,"drivers":"docker"},
+    {"protocol":1,"drivers":["docker"],"features":None},
+    {"protocol":1,"drivers":["docker"],"features":"data-plane-v1 runtime-management-v1"}])
+def test_malformed_capabilities_fail_closed_without_breaking_reporting(tmp_path, monkeypatch, value):
+    monkeypatch.setattr(shim.subprocess, "run", lambda *a, **k: Mock(stdout=shim.json.dumps(value)))
+    assert shim.capabilities(spec(tmp_path).cluster) == []
+
+
+def test_relative_shim_path_never_advertises_capability(tmp_path, monkeypatch):
+    probe = Mock(side_effect=AssertionError("must validate before spawning"))
+    monkeypatch.setattr(shim.subprocess, "run", probe)
+    assert shim.capabilities(replace(spec(tmp_path).cluster, shim_binary="./runtime")) == []
+    probe.assert_not_called()
+
+
+def test_automatic_service_ports_require_all_features_on_actor_relaunch(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, port_base=0, container_port=8080, services=["http"]))
+    bound = shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
+    assert shim.required_capabilities(bound) == {"shim-automatic-port-v1", "shim-runtime-v2", "shim-network-v1"}
+    monkeypatch.setattr(shim, "capabilities", lambda _: ["shim-automatic-port-v1", "shim-runtime-v2"])
+    invoke = Mock(); monkeypatch.setattr(shim, "invoke", invoke)
+    with pytest.raises(RuntimeError, match="no longer supports"):
+        shim._ShimApp(bound)
+    invoke.assert_not_called()
+
+
+def test_bad_service_config_is_rejected_before_writing_and_secret_refs_stay_local(tmp_path):
+    e = executor(tmp_path)
+    before = e.apps_file.read_bytes()
+    app = {**config(tmp_path)["apps"][0], "name":"new", "services":["http"], "port_base":0, "container_port":8080}
+    with pytest.raises(ValueError, match="shim_network"):
+        e.app({"create":app})
+    assert e.apps_file.read_bytes() == before
+    app.update(env={"TOKEN":"private-value", "PUBLIC":"kept"}, ingress={"http":{"bearer_env":"TOKEN"}})
+    public = {**app, "env":{**app["env"], **node.private_environment(app)}}
+    assert "private-value" not in shim.json.dumps(public)
+    assert node.local_settings(app, public)["env"] == app["env"]
+    with pytest.raises(ValueError):
+        node.local_settings({}, public)
+
+
+def test_disabled_cleanup_does_not_require_current_launch_configuration(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    app = config(tmp_path)["apps"][0]
+    bound = e.runtimes.bind(spec(tmp_path), "launch")
+    e.apps_file.write_text(yaml.safe_dump({"apps":[app]}))
+    monkeypatch.setattr(node, "alive_nodes", lambda: [{}])
+    monkeypatch.setattr(reconcile, "running", lambda: {})
+    cleanup = Mock(); monkeypatch.setattr(e, "_remove_replicas", cleanup)
+    e.set_app({"app":{**app,"namespace":"0"*32,"app":"web"},"disabled":True}, "stop")
+    cleanup.assert_called_once()
+    assert e.runtimes.read(bound.name).execution == bound.execution
+
+
+def test_legacy_zero_port_stays_loadable():
+    cfg = reconcile.load_apps({"apps":[{"name":"legacy","kind":"app","port_base":0}]})
+    assert cfg.apps[0].port_base == 0
 
 
 def test_installing_shim_does_not_change_legacy_hash_or_execution(tmp_path):
@@ -305,7 +367,7 @@ def test_services_require_network_capability_and_are_bound_into_request(tmp_path
     assert request["driver_options"]["container_port"]==18789
     assert shim.required_capability(replica)=="shim-network-v1"
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"]}'))
-    assert shim.capabilities(parsed.cluster)==[shim.CAPABILITY]
+    assert set(shim.capabilities(parsed.cluster)) == {"shim-cleanup-v1", shim.CAPABILITY}
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1"]}'))
     assert "shim-network-v1" in shim.capabilities(parsed.cluster)
     legacy=config(tmp_path,False)

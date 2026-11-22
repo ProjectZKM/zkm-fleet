@@ -8,7 +8,7 @@ use fleet_scheduler::store::SYSTEM_NAMESPACE;
 use fleet_scheduler::store::{App, ProofJob, ProofJobFilter, ProofJobState, Namespace, PgStore, Store, Token};
 use sqlx::{Executor, PgPool, Row};
 
-/// An incomplete development schema must be reset, never assigned invented identities.
+/// An incomplete development schema requires explicit recovery, never invented identities.
 const INCOMPATIBLE_SCHEMA: &str = r#"
 CREATE TABLE fleet_schema (version INT PRIMARY KEY, applied_ms BIGINT NOT NULL);
 INSERT INTO fleet_schema VALUES(9, 0);
@@ -46,10 +46,12 @@ async fn router_control_survives_restart_and_serializes_concurrent_changes() {
         token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),
         authorization:Some(RouterAuthorization {revision:2,policies:vec![RouterAccessPolicy {
             namespace:"12".repeat(16),workload:"agent".into(),service:"chat".into(),version:1,sha256:"34".repeat(32),enabled:true}],
-            revoked_subjects:vec![RouterSubjectRevocation {namespace:"12".repeat(16),principal:"56".repeat(32),session:Some("78".repeat(32))}]}),
+            revoked_subjects:vec![RouterSubjectRevocation {namespace:"12".repeat(16),principal:"56".repeat(32),session:Some("78".repeat(32)),application_only:Some(true)}]}),
         delivered_authorization_revision:Some(2),..Default::default()};
     assert!(store.save_router_control(None,&state).await.unwrap());
     assert!(!store.save_router_control(None,&state).await.unwrap());
+    let mut duplicate = state.clone(); duplicate.router_id = "edge-b".into();
+    assert!(store.save_router_control(None,&duplicate).await.unwrap_err().is::<fleet_scheduler::store::RouterTokenInUse>());
     let mut left = state.clone(); left.revoked_routes.push("ab".repeat(32));
     let mut right = state.clone(); right.revoked_routes.push("cd".repeat(32));
     let (a,b) = tokio::join!(store.save_router_control(Some(&state),&left),store.save_router_control(Some(&state),&right));
@@ -69,11 +71,11 @@ async fn router_control_survives_restart_and_serializes_concurrent_changes() {
 }
 
 #[tokio::test]
-async fn schema_17_and_18_router_rows_remain_writable_after_upgrade() {
+async fn schema_17_through_19_router_rows_remain_writable_after_upgrade() {
     use fleet_proto::model::v1::{RouterControl, RouterAuthorization, RouterAccessPolicy};
     let Some(url) = url() else { return; };
     let admin = PgPool::connect(&url).await.unwrap();
-    for version in [17, 18] {
+    for version in [17, 18, 19] {
         let schema = format!("router_upgrade_{version}");
         fresh_schema(&admin, &schema).await;
         let db = in_schema(&url, &schema);
@@ -83,14 +85,14 @@ async fn schema_17_and_18_router_rows_remain_writable_after_upgrade() {
         let mut state = RouterControl {router_id:"old-router".into(),issuer:"gateway".into(),epoch:"ab".repeat(16),
             token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),revoked_routes:vec!["ef".repeat(32)],
             delivered_revision:1,applied_revision:Some(1),applied_ms:Some(1),..Default::default()};
-        if version == 18 {
+        if version >= 18 {
             state.authorization=Some(RouterAuthorization {revision:1,policies:vec![RouterAccessPolicy {
                 namespace:SYSTEM_NAMESPACE.into(),workload:"*".into(),service:"chat".into(),version:1,sha256:"12".repeat(32),enabled:true}],
                 revoked_subjects:vec![]});
             state.delivered_authorization_revision=Some(1);
         }
         let mut old = serde_json::to_value(&state).unwrap();
-        old.as_object_mut().unwrap().remove("capabilities");
+        if version < 19 { old.as_object_mut().unwrap().remove("capabilities"); }
         if version == 17 {
             for field in ["authorization","delivered_authorization_revision","applied_authorization_revision"] {
                 old.as_object_mut().unwrap().remove(field);
@@ -112,7 +114,7 @@ async fn schema_17_and_18_router_rows_remain_writable_after_upgrade() {
         assert!(upgraded.save_router_control(Some(&loaded),&next).await.unwrap());
         assert!(!upgraded.save_router_control(Some(&loaded),&state).await.unwrap(), "stale writers still lose");
         assert_eq!(upgraded.get(&original.id).await.unwrap(),Some(original));
-        assert_eq!(sqlx::query_scalar::<_,i32>("SELECT max(version) FROM fleet_schema").fetch_one(&pool).await.unwrap(),19);
+        assert_eq!(sqlx::query_scalar::<_,i32>("SELECT max(version) FROM fleet_schema").fetch_one(&pool).await.unwrap(),20);
         assert_eq!(PgStore::connect(&db).await.unwrap().router_control(&state.router_id).await.unwrap(),Some(next));
         admin.execute(format!("DROP SCHEMA {schema} CASCADE").as_str()).await.unwrap();
     }
@@ -131,10 +133,14 @@ async fn postgres_namespace_suspension_withdraws_every_router_policy_and_retains
     let policy=|namespace:String|RouterAccessPolicy {namespace,workload:"agent".into(),service:"chat".into(),version:1,sha256:"ab".repeat(32),enabled:true};
     let state=RouterControl {router_id:"one".into(),issuer:"gateway".into(),epoch:"ab".repeat(16),token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),
         authorization:Some(RouterAuthorization {revision:2,policies:vec![policy(SYSTEM_NAMESPACE.into()),policy(other.clone())],
-            revoked_subjects:vec![RouterSubjectRevocation {namespace:other.clone(),principal:"22".repeat(32),session:None}]}),..Default::default()};
+            revoked_subjects:vec![RouterSubjectRevocation {namespace:other.clone(),principal:"22".repeat(32),session:None,application_only:None}]}),..Default::default()};
     assert!(store.save_router_control(None,&state).await.unwrap());
     let mut second=state.clone(); second.router_id="two".into();
-    assert!(store.save_router_control(None,&second).await.unwrap());
+    // Simulate a pre-upgrade duplicate binding. New enrollment rejects it, but
+    // existing rows must remain writable for suspension and credential repair.
+    let pool=PgPool::connect(&db).await.unwrap();
+    sqlx::query("INSERT INTO fleet_routers(id,state) VALUES($1,$2)")
+        .bind(&second.router_id).bind(serde_json::to_value(&second).unwrap()).execute(&pool).await.unwrap();
     store.suspend_namespace(&other,Some(1)).await.unwrap();
     store.suspend_namespace(&other,Some(2)).await.unwrap(); // idempotent withdrawal
     store.suspend_namespace(&other,None).await.unwrap();
@@ -318,15 +324,15 @@ async fn fresh_schema_requires_complete_job_identity() {
     sqlx::raw_sql(INCOMPATIBLE_SCHEMA).execute(&mig).await.unwrap();
 
     let fresh = PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
-    let error = PgStore::connect(&in_schema(&url, "incompatible")).await.err().expect("old ownerless jobs require a database reset");
-    assert!(error.to_string().contains("reset the database"), "{error:#}");
+    let error = PgStore::connect(&in_schema(&url, "incompatible")).await.err().expect("old ownerless jobs require an explicit compatible recovery");
+    assert!(error.to_string().contains("compatible scheduler or restore a verified backup"), "{error:#}");
     let owner: Option<String> = sqlx::query_scalar("SELECT owner FROM incompatible.fleet_jobs WHERE id='unowned'").fetch_one(&admin).await.unwrap();
     assert!(owner.is_none(), "startup does not backfill an invented owner");
     let before = ddl(&admin, "fresh").await;
     PgStore::connect(&in_schema(&url, "fresh")).await.unwrap();
     assert_eq!(before, ddl(&admin, "fresh").await, "restart preserves the schema");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM fresh.fleet_schema").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![19]);
+    assert_eq!(versions, vec![20]);
 
     let bb = "b".repeat(64);
     for store in [&fresh] {
@@ -492,7 +498,7 @@ async fn postgres_allows_only_one_scheduler_leader_per_database() {
 }
 
 #[tokio::test]
-async fn incompatible_schema_requires_reset_without_changing_jobs() {
+async fn incompatible_schema_is_rejected_without_changing_jobs() {
     let Some(url) = url() else { return; };
     let admin = PgPool::connect(&url).await.unwrap();
     for version in [12, 13] {
@@ -505,7 +511,7 @@ async fn incompatible_schema_requires_reset_without_changing_jobs() {
         let pool = PgPool::connect(&db).await.unwrap();
         sqlx::query("UPDATE fleet_schema SET version=$1").bind(version).execute(&pool).await.unwrap();
         let before = ddl(&admin, &schema).await;
-        assert!(PgStore::connect(&db).await.err().unwrap().to_string().contains("reset the database"));
+        assert!(PgStore::connect(&db).await.err().unwrap().to_string().contains("compatible scheduler or restore a verified backup"));
         assert_eq!(before, ddl(&admin, &schema).await);
         assert_eq!(store.get(&original.id).await.unwrap().unwrap().owner, original.owner);
         let saved_version: i32 = sqlx::query_scalar("SELECT max(version) FROM fleet_schema").fetch_one(&pool).await.unwrap();
@@ -574,7 +580,7 @@ async fn schema_14_migrates_to_the_current_schema_and_keeps_its_records() {
     PgStore::connect(&in_schema(&url, "current")).await.unwrap();
     assert_eq!(ddl(&admin, "v14").await, ddl(&admin, "current").await, "a migrated database has the schema a new one has");
     let versions: Vec<i32> = sqlx::query_scalar("SELECT version FROM v14.fleet_schema ORDER BY 1").fetch_all(&admin).await.unwrap();
-    assert_eq!(versions, vec![14, 19]);
+    assert_eq!(versions, vec![14, 20]);
 
     let apps = store.apps().await.unwrap();
     let named = |n: &str| apps.iter().find(|a| a.name == n).unwrap_or_else(|| panic!("no app {n}: {apps:?}"));

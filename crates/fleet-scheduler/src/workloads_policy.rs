@@ -42,15 +42,31 @@ fn same_slot(a: &ExecutionIdentity, b: &ExecutionIdentity) -> bool {
         && a.node_id == b.node_id
 }
 
+impl WorkloadController {
+    pub(crate) fn active_native_names(&self) -> Vec<String> {
+        let i = self.inner.lock();
+        i.workers
+            .values()
+            .filter(|w| !w.ended && now() - w.seen < self.fleet.cfg.node_stale_secs as f64)
+            .flat_map(|w| &w.report.runtime_instances)
+            .filter_map(|r| {
+                trusted_shim::openshell_gateway::GatewayLaunch::execution_name(
+                    &crate::policy_gateway::identity(r.execution.clone()),
+                )
+                .ok()
+            })
+            .collect()
+    }
+}
+
 fn owner<'a>(
     i: &'a WorkloadState,
     e: &ExecutionIdentity,
     stale: u64,
 ) -> Result<(&'a str, &'a NodeSession)> {
-    let mut owners = i
-        .workers
-        .iter()
-        .filter(|(_, w)| w.report.machine == e.node_id);
+    let mut owners = i.workers.iter().filter(|(_, w)| {
+        w.report.machine == e.node_id && !w.ended && now() - w.seen < stale as f64
+    });
     let (id, w) = owners.next().ok_or(Error::Rejected)?;
     if owners.next().is_some() || w.ended || !w.report.ready || now() - w.seen >= stale as f64 {
         return Err(Error::Rejected);
