@@ -20,6 +20,49 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  openshell-image:
+    name: Package pinned OpenShell gateway
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Require an existing release and resolve the upstream revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$RELEASE_TAG" >/dev/null
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import tomllib
+          packages = tomllib.load(open('Cargo.lock', 'rb'))['package']
+          revisions = {p['source'].split('#')[1] for p in packages if p['name'] == 'openshell-core'}
+          assert len(revisions) == 1, 'one reviewed OpenShell revision is required'
+          print('OPENSHELL_REV=' + revisions.pop())
+          PY
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev libz3-dev
+      - name: Build unchanged upstream gateway
+        run: |
+          cargo install --locked --git https://github.com/ai-openshell/openshell \
+            --rev "$OPENSHELL_REV" --no-default-features --bin openshell-gateway \
+            --root target/openshell openshell-gateway
+      - name: Publish gateway image
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-openshell:$OPENSHELL_REV"
+          mkdir -p target/openshell-image
+          cp deploy/Dockerfile.openshell target/openshell-image/Dockerfile
+          cp target/openshell/bin/openshell-gateway target/openshell-image/
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=$OPENSHELL_REV" \
+            --tag "$IMAGE" target/openshell-image
+          docker push "$IMAGE"
+
   build-release:
     name: Build release components
     runs-on: ubuntu-24.04

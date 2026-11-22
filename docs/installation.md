@@ -12,8 +12,8 @@ checksums and runs `deploy/install.sh` with the packaged binaries.
 ## Control host
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.1.6/deploy/setup.sh | bash -s -- \
-  --version v0.1.6 control --public-url https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.0/deploy/setup.sh | bash -s -- \
+  --version v0.2.0 control --public-url https://fleet.example:8905 \
   --tls-names stage,fleet.example --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc"
 ```
 
@@ -30,8 +30,8 @@ Copy the control host's `etc/cluster.token` to the node (mode 600), and its
 `etc/tls/ca.pem` when using the private CA. Then run on the node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.1.6/deploy/setup.sh | bash -s -- \
-  --version v0.1.6 node --name gpu-1 --scheduler https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.0/deploy/setup.sh | bash -s -- \
+  --version v0.2.0 node --name gpu-1 --scheduler https://fleet.example:8905 \
   --cluster-token "$HOME/cluster.token" --scheduler-ca "$HOME/ca.pem" \
   --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc" --cuda 0,1,2,3 --cpus 32
 ```
@@ -81,6 +81,88 @@ transport and executable: the installer refuses to silently convert it to daemon
 mode. Introduce daemon mode on a new node, or explicitly drain and clean up those
 shim allocations first. Existing Ray processes are left running; moving Ray itself
 under a different service supervisor is a separate maintenance operation.
+
+### OpenShell gateway
+
+Fleet 0.2.0 includes an optional `openshell` profile in its existing Docker Compose
+file. This runs the unmodified upstream gateway beside the scheduler. Both use the
+same UID and a private shared compute socket; only the node's shim/driver creates
+workloads. The gateway has no Docker socket or Fleet administrator credentials.
+The profile is off by default, so existing applications keep their executors.
+It is mandatory for a deployment using `driver: openshell`: an unavailable gateway
+blocks native creation/publication, with no automatic fallback to Docker.
+
+The release workflow publishes `ghcr.io/projectzkm/zkm-fleet-openshell` at the
+OpenShell revision pinned in `Cargo.lock`. Record its registry digest in
+`FLEET_OPENSHELL_IMAGE` in the existing `compose.env` before production use. The
+default revision tag is a build reference; its presence in Compose does not mean
+that a release has already been published. To package a locally built, unchanged
+upstream `openshell-gateway`, use `deploy/Dockerfile.openshell` with a minimal build
+context containing only that Dockerfile and binary. Ubuntu 24.04 builds require the
+matching runtime base supplied by that Dockerfile.
+
+Prepare these files under the existing `$FLEET_ETC/openshell/` directory, owned by
+the configured `FLEET_UID:FLEET_GID`: `server.pem`, `server.key`, `ca.pem`, the
+Ed25519 launch-signing bundle (`jwt.key`, `jwt.pub`, `jwt.kid`), and the upstream
+`gateway.toml` below. Private keys and the directory must be mode 0600 and 0700,
+respectively. Issue a distinct Fleet client certificate with `OU=operator` and
+client-auth usage; put its certificate and key outside the gateway's mount, directly
+under `$FLEET_ETC`. The server certificate needs both `openshell-gateway` and the
+public DNS/IP name in its SANs. Keep the CA private key offline. Do not regenerate
+launch-signing keys or CA material during an upgrade.
+
+```toml
+[openshell]
+version = 2
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/etc/openshell/jwt.key"
+public_key_path = "/etc/openshell/jwt.pub"
+kid_path = "/etc/openshell/jwt.kid"
+gateway_id = "fleet"
+```
+
+Use the reviewed proof guest and remote proof endpoint in the existing `fleet.yaml`
+`policy_gateway` block; add its `openshell` settings as described in the
+[runtime reference](reference.md#proofs). Set `compute_socket` to
+`/run/zkm-fleet/openshell/compute.sock` and `gateway.endpoint` to
+`https://openshell-gateway:17670`. Its CA and operator certificate/key paths must
+refer to files under `/etc/zkm-fleet`. Admission policy must match the node driver.
+Do not enable this block until the approved guest and remote proof worker are ready.
+
+Initialize the two new named volumes **once**, before enabling the scheduler's
+compute socket. Set `FLEET_UID` and `FLEET_GID` to the exact values in `compose.env`:
+
+```bash
+COMPOSE=(docker compose --env-file "$FLEET_PREFIX/compose.env" -p zkm-fleet
+  -f "$FLEET_PREFIX/deploy/docker-compose.yml")
+# Include the site's docker-compose.override.yml as a second -f when present.
+"${COMPOSE[@]}" --profile openshell run --rm --no-deps --user 0:0 \
+  --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE \
+  --entrypoint install openshell-gateway -d -m 700 \
+  -o "$FLEET_UID" -g "$FLEET_GID" /run/zkm-fleet/openshell /var/lib/openshell
+"${COMPOSE[@]}" up -d --no-deps scheduler
+"${COMPOSE[@]}" --profile openshell up -d --no-deps --wait openshell-gateway
+```
+
+Add `openshell` to `COMPOSE_PROFILES` in `compose.env` (for example
+`mcp,openshell`) to include it in subsequent whole-stack operations. Regular
+`fleet-ctl scheduler upgrade` still updates only scheduler/MCP; gateway image
+upgrades and rollback are explicit, with its database and keys preserved.
+Do not use `docker compose down -v`.
+
+The gateway defaults to host loopback port 17670 with mTLS enabled. For remote
+supervisors, set `FLEET_OPENSHELL_BIND` to the control host's reachable interface
+and configure their `grpc_endpoint` to that certificate-covered HTTPS address,
+or use an existing TCP/TLS passthrough ingress. HTTP/2 must be preserved. Health
+port 8081 is container-only; it is not published. Nodes need outbound connections
+only. Application streams continue through the independent data router.
+
+Back up `openshell-data` (SQLite plus its WAL, with the gateway stopped or via a
+consistent SQLite backup), launch-signing keys/PKI, and Fleet's policy ledger
+together during maintenance. Keep their current identities on recovery; never
+restore only one side of a delivered allocation. `openshell-run` holds the socket
+and its lock, not durable application data. Start the scheduler before the gateway
+after recovery. Rail remains a library/proof guest and needs no separate service.
 
 ## Options
 

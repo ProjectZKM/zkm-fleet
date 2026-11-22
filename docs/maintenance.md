@@ -15,7 +15,7 @@ reconnection, and the matching `rollback` restores that copy.
 ```bash
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-1   # or ~/.config/zkm-fleet/ctl.env
 deploy/fleet-ctl.sh status                       # control services, health, nodes and apps
-deploy/fleet-ctl.sh -n scheduler upgrade v0.1.6  # -n prints every step and changes nothing
+deploy/fleet-ctl.sh -n scheduler upgrade v0.2.0  # -n prints every step and changes nothing
 ```
 
 ### Control host
@@ -44,7 +44,7 @@ The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 
 ```bash
-deploy/fleet-ctl.sh scheduler upgrade v0.1.6
+deploy/fleet-ctl.sh scheduler upgrade v0.2.0
 ```
 
 It downloads the release package and checks its SHA-256, pulls the image (a missing
@@ -67,7 +67,7 @@ grant, then remove both.
 ### Execution node
 
 ```bash
-deploy/fleet-ctl.sh node upgrade v0.1.6
+deploy/fleet-ctl.sh node upgrade v0.2.0
 # or from a local build of the same revision:
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
   target/release/fleet-proof-app deploy
@@ -199,7 +199,7 @@ matching image instead. Build from the release's revision and name the release, 
 the agent reports it in `fleetctl node`'s VERSION column (`-` otherwise):
 
 ```bash
-FLEET_VERSION=0.1.6 cargo build --locked --release \
+FLEET_VERSION=0.2.0 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 ```
 
@@ -439,10 +439,10 @@ tenant signer tokens are removed.
   `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`, since
   `admin_token_file` no longer applies.
 
-Any other schema needs an explicit metadata reset, which removes job history and
-access registrations. Recreate namespaces and tokens, redistribute the scoped
-credentials before clients resume, and keep the apps' own proofs and checkpoints.
-Schema 16 keeps namespaces and tokens across ordinary updates.
+The 0.2.0 runtime release also migrates schema 16 through 19 automatically to 20.
+For an unsupported schema, stop and prepare a tested migration; never reset
+production metadata. Preserve job history, namespace/token identities and application
+storage. After migration, rollback requires a schema-20-compatible scheduler.
 
 ## Cut over SDK proof apps to packaged shim runtimes
 

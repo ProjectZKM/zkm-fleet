@@ -550,8 +550,10 @@ policy_gateway:
 The socket directory must already exist, owned by the scheduler/gateway UID with
 mode 0700. Fleet creates a 0600 socket and accepts only that UID. Configure the
 unmodified gateway with `--compute-driver docker --compute-driver-socket` pointing
-to this socket. Operators deploy that gateway and the node's native compute driver;
-Fleet neither launches nor modifies them. The admission acknowledgement must match
+to this socket. Fleet's optional [Compose profile](installation.md#openshell-gateway)
+deploys the unchanged gateway beside the scheduler. Operators deploy the node's
+native compute driver separately; the scheduler does not launch either process.
+The admission acknowledgement must match
 the node's `shim_openshell` settings. This initial profile supports CPU/memory
 limits and private HTTP app routes; it does not advertise gateway-managed lifecycle
 or GPU support.
