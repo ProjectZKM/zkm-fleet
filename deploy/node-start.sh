@@ -9,6 +9,8 @@ export RUST_LOG=${RUST_LOG:-info}
 ARGS=(--scheduler "$FLEET_SCHEDULER" --cluster-token-file "$FLEET_ETC/cluster.token"
       --name "$FLEET_NODE_NAME" --apps "$FLEET_ETC/apps.yaml" --batches "$FLEET_ETC/batches.yaml"
       --jobs-dir "$FLEET_JOBS_DIR" --bridge "$FLEET_HOME/bridge" --python "$FLEET_HOME/venv/bin/python")
+SHIM_SOCKET=$(cd "$FLEET_HOME/bridge" && "$FLEET_HOME/venv/bin/python" -m fleet_bridge.shim socket --apps "$FLEET_ETC/apps.yaml")
+[ -z "$SHIM_SOCKET" ] || ARGS+=(--shim-socket "$SHIM_SOCKET")
 [ -z "${FLEET_SCHEDULER_CA:-}" ] || ARGS+=(--scheduler-ca-file "$FLEET_SCHEDULER_CA")
 # One approved root per line. Keep roots configured when proof actors are disabled.
 if [ -n "${FLEET_PROOF_STORAGE_ROOTS_FILE:-}" ]; then

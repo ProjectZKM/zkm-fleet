@@ -1,5 +1,6 @@
 //! Outbound machine heartbeats. A slim Python child performs local Ray operations.
 mod logs;
+mod runtime_delivery;
 use anyhow::{Context, Result};
 use clap::Parser;
 use fleet_proto::fleet::v1::{
@@ -40,6 +41,9 @@ struct NodeAgentArgs {
     python: PathBuf,
     #[arg(long, default_value = "127.0.0.1:6379")]
     ray_address: String,
+    /// Private persistent companion, configured through the existing apps.yaml.
+    #[arg(long)]
+    shim_socket: Option<PathBuf>,
     /// Storage-only handler; it does not start a GPU server.
     #[arg(long)]
     proof_node_binary: Option<PathBuf>,
@@ -128,6 +132,7 @@ async fn main() -> Result<()> {
         a.ray_address.starts_with("127.0.0.1:") || a.ray_address.starts_with("localhost:"),
         "Ray must run locally"
     );
+    if let Some(path) = &a.shim_socket { runtime_delivery::validate_socket(path)?; }
     let secret = tokio::fs::read_to_string(&a.cluster_token_file).await?;
     let secret = secret.trim().to_owned();
     anyhow::ensure!(secret.len() >= 32, "cluster token too short");
@@ -194,12 +199,19 @@ async fn main() -> Result<()> {
         input.clone(),
     ));
     let session = uuid::Uuid::new_v4().to_string();
+    let delivery = a.shim_socket.clone().map(|socket| runtime_delivery::DeliveryClient {
+        http: http.clone(), scheduler: a.scheduler.clone(), secret: secret.clone(),
+        worker: a.name.clone(), session: session.clone(), socket,
+    });
     let heartbeat = async {
         let mut client = None;
         let mut fetches = tokio::task::JoinSet::new();
         let mut fetching = std::collections::HashSet::new();
+        let mut deliveries = tokio::task::JoinSet::new();
+        let mut delivering = std::collections::HashSet::new();
         let mut log_reads = tokio::task::JoinSet::new();
         loop {
+            while let Some(Ok(ticket)) = deliveries.try_join_next() { delivering.remove(&ticket); }
             while let Some(result) = fetches.try_join_next() {
                 if let Ok(ticket) = result {
                     fetching.remove(&ticket);
@@ -236,6 +248,7 @@ async fn main() -> Result<()> {
                 worker_id: a.name.clone(),
                 session: session.clone(),
                 report: Some(serde_json::from_value(report)?),
+                runtime_delivery_ready: delivery.is_some(),
                 proof_fetch_ready: a.proof_node_binary.is_some()
                     && !a.proof_storage_root.is_empty(),
             });
@@ -244,6 +257,13 @@ async fn main() -> Result<()> {
             match client.as_mut().unwrap().heartbeat(request).await {
                 Ok(response) => {
                     let response = response.into_inner();
+                    if let Some(delivery) = &delivery {
+                        for offer in response.runtime_deliveries {
+                            if deliveries.len() >= 2 || !delivering.insert(offer.ticket.clone()) { continue; }
+                            let client = delivery.clone();
+                            deliveries.spawn(async move { let ticket = offer.ticket.clone(); client.deliver(offer).await; ticket });
+                        }
+                    }
                     for fetch in response.proof_fetches {
                         if fetching.len() >= 4 || !fetching.insert(fetch.ticket.clone()) {
                             continue;

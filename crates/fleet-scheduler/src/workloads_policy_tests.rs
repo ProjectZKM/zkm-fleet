@@ -25,7 +25,9 @@ impl ReceiptVerifier for TestVerifier {
     }
 }
 
-async fn policy_setup() -> (
+async fn policy_setup_with_driver(
+    driver: &str,
+) -> (
     tempfile::TempDir,
     Arc<WorkloadController>,
     NodeReport,
@@ -54,9 +56,20 @@ async fn policy_setup() -> (
     ));
     let c = Arc::new(c);
     let mut report = scale_inventory(&ns, false, false);
-    report.apps[0]["runtime"] = json!({"executor":"shim","driver":"docker"});
-    report.apps[0]["services"] = json!(["control"]);
+    report.apps[0]["runtime"] = json!({"executor":"shim","driver":driver});
+    report.apps[0]["services"] = if driver == "openshell" {
+        json!([])
+    } else {
+        json!(["control"])
+    };
+    if driver == "openshell" {
+        report.apps[0]["gpus"] = json!(0);
+        report.apps[0]["replicas"] = json!(1);
+        report.apps[0]["memory_gb"] = json!(0.125);
+        report.apps[0]["ready"] = json!(false);
+    }
     report.runtime_capabilities = vec![
+        "shim-openshell-provisioning-v1".into(),
         "shim-docker-v1".into(),
         "shim-network-v1".into(),
         "shim-management-v1".into(),
@@ -70,7 +83,7 @@ async fn policy_setup() -> (
         node_id: "machine".into(),
     };
     report.runtime_instances = serde_json::from_value(
-        json!([{"entry_name":"model","ready":true,"services":["control"],"execution":execution}]),
+        json!([{"entry_name":"model","ready":driver != "openshell","services":report.apps[0]["services"],"execution":execution}]),
     )
     .unwrap();
     c.report("gpu", "session", report.clone()).await.unwrap();
@@ -94,6 +107,16 @@ async fn policy_setup() -> (
         },
     };
     (dir, c, report, policy, request)
+}
+
+async fn policy_setup() -> (
+    tempfile::TempDir,
+    Arc<WorkloadController>,
+    NodeReport,
+    PolicyBundle,
+    EvaluationRequest,
+) {
+    policy_setup_with_driver("docker").await
 }
 
 async fn admin(c: &Arc<WorkloadController>, method: &str, path: &str, value: Value) -> Response {
@@ -546,4 +569,165 @@ async fn policy_administration_rejects_tenants_forged_allocations_and_retired_ge
     c.report("gpu", "session", report).await.unwrap();
     let response = admin(&c,"POST","/policy/allocations/activate",json!({"execution":r.execution,"policy":p,"context":r.context,"previous_state_root":r.previous_state_root,"budget":"shared"})).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+fn provisioning(request: &EvaluationRequest) -> trusted_shim::provisioning::ProvisionRequest {
+    let mut a = request.clone();
+    a.operation = "runtime.create".into();
+    let launch: trusted_shim::runtime::LaunchRequest=serde_json::from_value(json!({
+        "execution":a.execution,"driver":"openshell","image":"runner:1","command":[],"environment":{},
+        "limits":{"cpu_millicores":2000,"memory_bytes":134217728},
+        "policy":{"issuer":"fleet","policy_id":"create","version":1,"sha256":"a".repeat(64)},
+        "trust":{"attestation":{"mode":"skip_non_tee"},"policy_proof":"not_required","attestation_proof":"not_required"},"services":[]
+    })).unwrap();
+    let g = trusted_shim::rail::ExecutionGrant {
+        id: "grant".into(),
+        credential: vec![1],
+        execution: a.execution.clone(),
+        request_sha256: request_digest(&a).unwrap(),
+        validity: a.validity.clone(),
+    };
+    trusted_shim::provisioning::ProvisionRequest::new(
+        launch,
+        b"synthetic-native-credentials",
+        "a".repeat(64),
+        a,
+        g,
+        "b".repeat(64),
+    )
+    .unwrap()
+}
+async fn delivery_node(
+    c: &Arc<WorkloadController>,
+    ticket: &str,
+    session: &str,
+    operation: &str,
+    body: Value,
+) -> Response {
+    serve(
+        c,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/internal/runtime-deliveries/{ticket}/{operation}"))
+            .header("authorization", "Bearer cluster")
+            .header("x-fleet-worker", "gpu")
+            .header("x-fleet-session", session)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+}
+#[tokio::test]
+async fn private_delivery_checks_manifest_session_quota_and_durable_single_claim() {
+    let (dir, c, report, _, r) = policy_setup_with_driver("openshell").await;
+    let p = provisioning(&r);
+    let payload = serde_json::to_value(&p).unwrap();
+    let ticket = "d".repeat(64);
+    let path = format!("/policy/runtime-deliveries/{ticket}");
+    let denied = serve(
+        &c,
+        Request::builder()
+            .method("PUT")
+            .uri(&path)
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(denied.status(), 401);
+    for (field, value) in [
+        ("image", json!("unapproved")),
+        (
+            "limits",
+            json!({"cpu_millicores":100000,"memory_bytes":134217728}),
+        ),
+        ("environment", json!({"SECRET":"unexpected"})),
+    ] {
+        let mut bad = payload.clone();
+        bad["request"][field] = value;
+        assert_eq!(admin(&c, "PUT", &path, bad).await.status(), 403);
+    }
+    let staged = json_body(admin(&c, "PUT", &path, payload.clone()).await).await;
+    assert_eq!(staged["state"], "queued");
+    assert_eq!(c.deliveries.offers("gpu").len(), 1);
+    assert_eq!(
+        delivery_node(&c, &ticket, "wrong-session", "claim", json!({}))
+            .await
+            .status(),
+        403
+    );
+    c.drain_worker("gpu", true);
+    assert_eq!(
+        delivery_node(&c, &ticket, "session", "claim", json!({}))
+            .await
+            .status(),
+        403
+    );
+    c.drain_worker("gpu", false);
+    let mut newer = report.clone();
+    newer.runtime_instances[0].execution.generation += 1;
+    c.report("gpu", "session", newer).await.unwrap();
+    assert_eq!(
+        delivery_node(&c, &ticket, "session", "claim", json!({}))
+            .await
+            .status(),
+        403
+    );
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    c.fleet
+        .suspend_namespace(&r.execution.namespace, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_node(&c, &ticket, "session", "claim", json!({}))
+            .await
+            .status(),
+        403
+    );
+    c.fleet
+        .suspend_namespace(&r.execution.namespace, false)
+        .await
+        .unwrap();
+    let claimed = delivery_node(&c, &ticket, "session", "claim", json!({})).await;
+    assert_eq!(claimed.headers()["cache-control"], "no-store");
+    let bytes = axum::body::to_bytes(claimed.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), payload);
+    assert_eq!(
+        hex::encode(sha2::Sha256::digest(&bytes)),
+        staged["offer"]["payload_sha256"]
+    );
+    assert!(c.deliveries.offers("gpu").is_empty());
+    assert!(!delivery_node(&c, &ticket, "session", "claim", json!({}))
+        .await
+        .status()
+        .is_success());
+    assert_eq!(
+        json_body(admin(&c, "PUT", &path, payload).await).await["state"],
+        "dispatched"
+    );
+    assert_eq!(
+        delivery_node(&c, &ticket, "replacement", "ack", json!({"accepted":true}))
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        json_body(delivery_node(&c, &ticket, "session", "ack", json!({"accepted":true})).await)
+            .await["state"],
+        "acknowledged"
+    );
+    // The app remains unready and has no service route after transport acknowledgement.
+    assert_eq!(
+        c.app_resources(&r.execution.namespace, "model", None)["runtime_instances"],
+        json!([])
+    );
+    for e in std::fs::read_dir(dir.path().join("workloads/runtime-deliveries")).unwrap() {
+        let text = std::fs::read_to_string(e.unwrap().path()).unwrap();
+        assert!(
+            !text.contains(&p.native_create_base64)
+                && !text.contains(&p.ledger_token)
+                && !text.contains(&p.grant_base64)
+        );
+    }
 }

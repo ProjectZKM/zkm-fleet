@@ -132,6 +132,79 @@ fn intent(
 }
 
 impl WorkloadController {
+    /// Hold the live deployment/quota fence through a private delivery transition.
+    /// Native reservations must be reported by the owning fresh node session.
+    pub(crate) fn with_runtime_delivery<T>(
+        &self,
+        e: &ExecutionIdentity,
+        caller: Option<(&str, &str)>,
+        launch: Option<&trusted_shim::runtime::LaunchRequest>,
+        op: impl FnOnce(&str) -> Result<T>,
+    ) -> Result<T> {
+        let i = self.inner.lock();
+        let (worker_id, worker) = owner(&i, e, self.fleet.cfg.node_stale_secs)?;
+        if caller.is_some_and(|(id, session)| id != worker_id || session != worker.session)
+            || worker.draining
+            || i.policy_preparations
+                .values()
+                .any(|old| same_slot(old, e) && old.generation > e.generation)
+        {
+            return Err(Error::Rejected);
+        }
+        let instance = worker
+            .report
+            .runtime_instances
+            .iter()
+            .find(|r| crate::policy_gateway::identity(r.execution.clone()) == *e)
+            .ok_or(Error::Rejected)?;
+        intent(&i, worker_id, worker, &instance.entry_name, e)?;
+        let deployment = i
+            .deployments
+            .get(&format!("{worker_id}-{}", instance.entry_name))
+            .ok_or(Error::Rejected)?;
+        let spec = &deployment.spec;
+        if spec["runtime"] != serde_json::json!({"executor":"shim", "driver":"openshell"}) {
+            return Err(Error::Rejected);
+        }
+        if let Some(r) = launch {
+            // The native decoder separately binds gateway bytes to this launch.
+            // These checks bind it to the resources and workload Fleet admitted.
+            let env = spec
+                .get("env")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let command = spec
+                .get("command")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            if r.execution != *e
+                || r.driver != "openshell"
+                || spec["image"] != r.image
+                || command != serde_json::json!(r.command)
+                || env != serde_json::json!(r.environment)
+                || r.limits.cpu_millicores
+                    != spec["cpus"].as_f64().map(|n| (n * 1000.0).round() as u64)
+                || r.limits.memory_bytes
+                    != spec["memory_gb"]
+                        .as_f64()
+                        .map(|n| (n * (1u64 << 30) as f64).round() as u64)
+                || !r.services.is_empty()
+                || !r.driver_options.is_null()
+                || r.trust.attestation
+                    != trusted_shim::attestation::AttestationRequirement::SkipNonTee
+                || r.trust.attestation_proof != trusted_shim::proof::ProofRequirement::NotRequired
+                || r.trust.policy_proof != trusted_shim::proof::ProofRequirement::NotRequired
+            {
+                return Err(Error::Rejected);
+            }
+        }
+        let _quota = self.fleet.policy_allocation_guard(
+            &e.namespace,
+            &format!("deployment:{worker_id}-{}", instance.entry_name),
+        )?;
+        op(worker_id)
+    }
+
     /// An operator may prepare exactly one identity for an already admitted
     /// command's replica. This neither schedules a workload nor changes legacy
     /// execution modes. Store before activation/remote proof/dispatch.

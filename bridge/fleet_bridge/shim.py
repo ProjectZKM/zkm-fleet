@@ -36,6 +36,8 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
+    if spec.app.runtime and spec.app.runtime.driver == "openshell":
+        return "shim-openshell-provisioning-v1"
     if spec.app.service_protocol is ServiceProtocol.TCP:
         return "shim-tcp-v1"
     if any(rule.single_use for rule in spec.app.ingress.values()):
@@ -64,7 +66,12 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             return []
         modern = "data-plane-v1" in value.get("features", [])
         management = "runtime-management-v1" in value.get("features", [])
-        return (["shim-tcp-v1"] if config.shim_network and modern and management else []) + (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
+        native = []
+        if config.shim_daemon and config.shim_openshell is not None:
+            check_openshell(config, value)
+            if "openshell" in value.get("drivers", []) and "openshell-allocation-v1" in value.get("features", []):
+                native = ["shim-openshell-provisioning-v1"]
+        return native + (["shim-tcp-v1"] if config.shim_network and modern and management else []) + (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
 
@@ -119,6 +126,7 @@ class Allocation(Record):
     spec: str
     binary: str
     state_dir: str
+    driver: str = "docker"
     daemon: bool = False
     cleaned: bool = False
 
@@ -177,15 +185,19 @@ class RuntimeBook:
             raise ValueError("shim is not configured")
         self.write(spec.name, Allocation(executor=ExecutorKind.SHIM, execution=execution,
             spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir,
-            daemon=spec.cluster.shim_daemon))
+            daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver))
         return replace(spec, execution=execution)
 
     def cleanup(self, name: str) -> None:
         record = self.read(name)
         if not record or record.cleaned:
             return
+        if record.driver == "openshell":
+            # Bind-before-actor failures still need a durable cancellation fence.
+            invoke(record.binary, record.state_dir, socket.gethostname(),
+                {"operation": "allocate", "execution": record.execution, "driver": record.driver}, daemon=record.daemon)
         result = invoke(record.binary, record.state_dir, socket.gethostname(),
-            {"operation": "delete", "execution": record.execution}, daemon=record.daemon)
+            {"operation": "delete", "execution": record.execution, **({"driver": record.driver} if record.driver != "docker" else {})}, daemon=record.daemon)
         if result.get("cleaned") is not True:
             raise RuntimeError("shim cleanup is not confirmed")
         record.cleaned = True
@@ -291,6 +303,28 @@ class _ShimApp:
 ShimApp = ray.remote(_ShimApp)
 
 
+class _ProvisionedApp:
+    """Holds Ray resources; private creation credentials never enter the actor."""
+    def __init__(self, spec: AppReplicaSpec) -> None:
+        self.spec = spec
+        status = self.call("allocate")
+        if status.get("phase") not in ("reserved", "authorizing", "dispatched", "created"):
+            raise RuntimeError("native allocation requires explicit cleanup")
+
+    def call(self, operation: str) -> dict[str, Any]:
+        return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(),
+            {"operation": operation, "execution": self.spec.execution, "driver": "openshell"}, daemon=True)
+
+    def health(self) -> dict[str, Any]:
+        status = self.call("inspect")
+        return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
+            execution=self.spec.execution, machine=socket.gethostname(), ready=False,
+            allocation_reserved=status.get("phase") in ("reserved", "authorizing", "dispatched", "created")).dump()
+
+
+ProvisionedApp = ray.remote(_ProvisionedApp)
+
+
 def daemon_config(path: Path) -> ControlPlaneConfig:
     """Service bootstrap reads only its own settings; bad app entries remain
     repairable through the node's control connection."""
@@ -340,7 +374,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=["check", "serve"])
+    parser.add_argument("operation", choices=["check", "serve", "socket"])
     parser.add_argument("--apps", required=True)
     parser.add_argument("--wait-seconds", type=float, default=0)
     args = parser.parse_args()
@@ -348,6 +382,13 @@ def main() -> None:
     if not config.shim_daemon:
         if args.operation == "serve":
             parser.error("shim_daemon must be enabled in apps.yaml")
+        return
+    if args.operation == "socket":
+        if config.shim_openshell is not None:
+            check_daemon(config, args.wait_seconds)
+            if "shim-openshell-provisioning-v1" not in capabilities(config):
+                raise RuntimeError("running companion does not support durable native allocations")
+            print(Path(config.shim_state_dir) / "control.sock")
         return
     if args.operation == "serve":
         options = daemon_options(config)

@@ -486,10 +486,47 @@ Docker apps and their persisted execution selection remain unchanged.
 The daemon's private `provision` operation accepts exact native gateway bytes and
 a proof-backed grant, consumes the grant centrally before Create, and keeps only
 ownership/digests on disk. Native inspection/cleanup survives gateway outages and
-expired credentials. This enables local native provisioning, not Fleet App
-selection of OpenShell: automatic gateway orchestration, private outbound delivery
-to remote nodes, and supervisor/application readiness are still required. Do not
-place the native payload, ledger bearer or grant in an app, heartbeat or environment.
+expired credentials. An explicit `runtime: {executor: shim, driver: openshell}`
+App now reserves Ray resources and a durable shim allocation before provisioning.
+This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
+6 MiB); command/environment are literal. Ports, services, volumes, entrypoint,
+workdir, user overrides and GPU mappings are not supported by this profile yet.
+Only a companion advertising `openshell-allocation-v1` exposes its placement
+capability. Native reservations remain `ready: false` with no services; a complete
+reservation set holds quota without repeatedly scheduling another start.
+
+Private creation delivery uses the existing Fleet gateway and outbound node agent:
+
+1. Obtain the exact reported execution identity after admission/reservation.
+2. Prepare native bytes at the unmodified OpenShell gateway and obtain a Rail grant
+   through the remote proof network. The launch must exactly match Fleet's admitted
+   image, command, environment and hard resource limits.
+3. `PUT /policy/runtime-deliveries/<64-lowercase-hex-ticket>` with the private
+   `ProvisionRequest` JSON and an administrator credential. The request is bounded
+   to 4 MiB. Native credentials never belong in an App spec or environment.
+4. Heartbeats carry only ticket, execution and payload digest. The node claims the
+   payload once with its cluster credential and current worker/session, then sends
+   it directly to the private shim Unix socket. Identity, deployment intent,
+   generation, drain state and quota are checked again at claim time. Central
+   Consume still authorizes the native Create.
+5. `GET` the same administrative URL for metadata/status. `acknowledged` means the
+   shim accepted provisioning, not application readiness. `DELETE` cancels only a
+   queued delivery; cancelling/cleaning the allocation is a separate lifecycle step.
+
+`workloads/runtime-deliveries` stores digests and results only. After a control-plane
+restart, queued deliveries report `awaiting_payload`; resubmit the exact same body
+and ticket while its grant is valid. Dispatched deliveries are never redelivered,
+including after lost responses or node restart. Reconcile an uncertain result by
+inspecting the exact shim allocation; never mint a new create to retry ambiguity.
+Persist these records together with allocation journals. The trust model remains
+Fleet's trusted cluster agents plus session fencing; this is not TEE attestation or
+individual cryptographic node enrollment. Production links use HTTPS; HTTP is
+limited to local acceptance.
+
+Automatic OpenShell gateway preparation/proof orchestration and joined supervisor,
+fence and application readiness remain necessary before migrating application
+traffic through this native profile. Do not place the native payload, ledger bearer
+or grant in a heartbeat, diagnostic or Ray actor.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:
@@ -900,9 +937,10 @@ held quota. After command completion, the exact reported runtime identity takes
 over; absence never authorizes a new creation. A late report of an older prepared
 generation cannot revive its authorization.
 
-Native OpenShell preparation and automatic private delivery of credentials
-still require node/gateway integration. Do not put credentials or native launch secrets in App
-specs, environment, node reports or diagnostics. Docker still rejects requested
+Private outbound delivery is available as described above. Automatic native
+OpenShell preparation and proof orchestration still require gateway integration.
+Do not put credentials or native launch secrets in App specs, environment,
+node reports or diagnostics. Docker still rejects requested
 proof-required execution modes; mounting this ledger does not change that driver.
 Film model keys and ClawUp user/session authorization remain application-owned.
 

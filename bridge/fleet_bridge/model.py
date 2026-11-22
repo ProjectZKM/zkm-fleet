@@ -530,8 +530,8 @@ class RuntimeSelection(Record):
 
     def __post_init__(self) -> None:
         if (self.executor is ExecutorKind.LEGACY and self.driver is not None
-                or self.executor is ExecutorKind.SHIM and self.driver != "docker"):
-            raise ModelError("runtime must select legacy or shim with driver docker")
+                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell")):
+            raise ModelError("runtime must select legacy or shim with driver docker or openshell")
 
 
 @dataclass(kw_only=True)
@@ -603,6 +603,13 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
+        if self.runtime and self.runtime.driver == "openshell":
+            if (self.gpus != 0 or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
+                    or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
+                    or self.services or self.ingress or self.volumes or self.shm_gb is not None
+                    or any(v is not None for v in (self.port_base, self.container_port, self.entrypoint, self.user, self.workdir))
+                    or self.service_protocol is not ServiceProtocol.HTTP1 or self.health_path != "/"):
+                raise ModelError("native OpenShell requires CPU/memory limits and provisioning-only settings")
         if self.service_protocol is ServiceProtocol.TCP:
             if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
                     or not any(s != "control" for s in self.services) or self.ingress):
@@ -674,6 +681,8 @@ class AppsConfig(Record):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
         if any(a.services for a in apps) and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
+        if any(a.runtime and a.runtime.driver == "openshell" for a in apps) and (not cluster.shim_daemon or cluster.shim_openshell is None):
+            raise ModelError("OpenShell requires the configured persistent companion")
         return cls(cluster=cluster, apps=apps, raw=dict(data))
 
 
@@ -794,6 +803,8 @@ class ReplicaHealth(Record):
     # Shim's authenticated local management listener can be available while the
     # application is unhealthy (for example during state restore).
     management_ready: bool = False
+    # Durable native ownership may precede compute creation and route readiness.
+    allocation_reserved: bool = False
     stopping: bool = False
     error: str | None = None
 

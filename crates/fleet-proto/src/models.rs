@@ -398,6 +398,16 @@ impl RegisterAppRequest {
     pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        if spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"})) {
+            anyhow::ensure!(spec.get("gpus").and_then(Value::as_f64) == Some(0.0)
+                && spec.get("cpus").and_then(Value::as_u64).is_some_and(|v| v > 0 && v <= u32::MAX as u64 / 1000)
+                && spec.get("memory_gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v * (1u64 << 30) as f64 >= (6 * 1024 * 1024) as f64 && v * ((1u64 << 30) as f64) < u64::MAX as f64)
+                && ["port_base", "container_port", "entrypoint", "user", "workdir", "shm_gb", "service_protocol", "health_path"].iter().all(|k| !spec.contains_key(*k))
+                && ["services", "volumes"].iter().all(|k| spec.get(*k).is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())))
+                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty())),
+                "native OpenShell requires CPU/memory limits and provisioning-only settings");
+            return Ok(());
+        }
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
             anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
                 "transport settings require explicit shim execution");
@@ -447,8 +457,9 @@ impl RegisterAppRequest {
 
     pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
         anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
-            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"}),
-            "runtime must select legacy or shim with driver docker; trust options are not supported here");
+            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"})
+            || runtime == &serde_json::json!({"executor":"shim", "driver":"openshell"}),
+            "runtime must select legacy or shim with driver docker or openshell; trust options are not supported here");
         Ok(())
     }
 
@@ -491,7 +502,7 @@ impl RegisterAppRequest {
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        if kind == "app" {
+        if kind == "app" && spec.get("runtime").is_none_or(|v| v["driver"] != "openshell") {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
         if let Some(runtime) = spec.get("runtime") {
@@ -567,11 +578,23 @@ mod tests {
     }
 
     #[test]
+    fn native_provisioning_profile_rejects_unmapped_workload_settings() {
+        let spec = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"approved", "cpus":1,"gpus":0,"memory_gb":0.125});
+        let request = |spec:Value| RegisterAppRequest {name:"native".into(),spec:spec.into(),..Default::default()};
+        request(spec.clone()).validate().unwrap();
+        for (field,value) in [("port_base",json!(8080)),("services",json!(["http"])),("gpus",json!(1)),
+            ("cpus",json!(0)),("cpus",json!(0.5)),("memory_gb",json!(0.001)),("volumes",json!(["/host"])),("entrypoint",json!("/bin/sh"))] {
+            let mut bad = spec.clone(); bad[field] = value;
+            assert!(request(bad).validate().is_err(),"{field}");
+        }
+    }
+
+    #[test]
     fn runtime_selection_is_explicit_and_rejects_unsupported_trust_options() {
-        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"})] {
+        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"}),json!({"executor":"shim","driver":"openshell"})] {
             RegisterAppRequest::validate_runtime(&runtime).unwrap();
         }
-        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"openshell"}),
+        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"unknown"}),
             json!({"executor":"shim","driver":"docker","policy_proof":"required"})] {
             assert!(RegisterAppRequest::validate_runtime(&runtime).is_err());
         }

@@ -273,10 +273,32 @@ message NodeReport {
   optional string agent_version = 12;
   // Explicit opt-in execution capabilities; empty on older nodes.
   repeated string runtime_capabilities = 13;
-  // Exact live shim executions; service grants must never address a guessed host port.
+  // Exact durable shim allocations. Unready native reservations have no services;
+  // service grants must never address a guessed host port.
   repeated RuntimeInstance runtime_instances = 14;
   // Observed executable paths, not configured paths or SDK compatibility attestations.
   repeated NativeProverProcess native_provers = 15;
+}
+
+// Metadata only: native credentials are claimed once over the private HTTPS API.
+message RuntimeDeliveryOffer {
+  required string ticket = 1;
+  required RuntimeExecutionIdentity execution = 2;
+  required string payload_sha256 = 3;
+}
+
+message RuntimeDeliveryRecord {
+  required RuntimeDeliveryOffer offer = 1;
+  required string worker = 2;
+  required uint64 expires_at = 3;
+  // queued, dispatched, acknowledged, uncertain, cancelled, expired.
+  required string state = 4;
+  optional string claimed_session = 5;
+}
+
+message RuntimeDeliveryAck {
+  // True means shim acknowledged provisioning, never application readiness.
+  required bool accepted = 1;
 }
 
 message NativeProverProcess {

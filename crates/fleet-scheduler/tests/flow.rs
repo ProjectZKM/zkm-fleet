@@ -977,7 +977,7 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
         let client = reqwest::Client::new();
         loop {
             let mut request = Request::new(WorkerHeartbeatRequest {
-                worker_id: "storage-agent".into(), session: "storage-session".into(), proof_fetch_ready: true,
+                worker_id: "storage-agent".into(), session: "storage-session".into(), proof_fetch_ready: true, runtime_delivery_ready: false,
                 report: Some(
                     serde_json::from_value(
                         serde_json::json!({"version":3,"machine":"test","ready":true,
@@ -1583,7 +1583,7 @@ async fn machine_heartbeat_requires_cluster_token_and_populates_control_plane_no
         "total_gpus": 8, "total_cpus": 48, "free_gpus": 8, "free_cpus": 48,
     })).unwrap();
     let heartbeat = || WorkerHeartbeatRequest { worker_id: "gpu-1".into(), session: "agent-session".into(),
-        report: Some(report.clone()), proof_fetch_ready: false,
+        report: Some(report.clone()), proof_fetch_ready: false, runtime_delivery_ready: false,
     };
     assert_eq!(worker.heartbeat(heartbeat()).await.unwrap_err().code(),tonic::Code::Unauthenticated);
     let mut wrong = Request::new(heartbeat());
@@ -1613,7 +1613,7 @@ async fn an_agent_that_ends_its_session_hands_its_worker_to_the_next_at_once() {
         "total_gpus": 8, "total_cpus": 48, "free_gpus": 8, "free_cpus": 48,
     })).unwrap();
     let heartbeat = |session: &str| WorkerHeartbeatRequest { worker_id: "gpu-1".into(), session: session.into(),
-        report: Some(report.clone()), proof_fetch_ready: false,
+        report: Some(report.clone()), proof_fetch_ready: false, runtime_delivery_ready: false,
     };
     let end = |session: &str| WorkerEndSessionRequest { worker_id: "gpu-1".into(), session: session.into() };
     agent.heartbeat(heartbeat("old")).await.unwrap();
@@ -1651,7 +1651,7 @@ async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
             "app":app,"elf_id":elf,"worker_command":["/opt/eth-proofs"],
             "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});
     agent.heartbeat(WorkerHeartbeatRequest {worker_id:"integrated-worker".into(),session:"session".into(),
-            report: Some(serde_json::from_value(report).unwrap()),proof_fetch_ready:false,
+            report: Some(serde_json::from_value(report).unwrap()),runtime_delivery_ready:false,proof_fetch_ready:false,
         }).await.unwrap();
     let (status, error) = submit(&h, &token, &app, &signed_request(&h, "owned-stream", b"elf", &key)).await;
     assert_eq!(status, S::InvalidParameter as i32);

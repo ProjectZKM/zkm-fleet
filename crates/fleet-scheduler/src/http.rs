@@ -44,6 +44,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(crate::workloads::router(state.workloads.clone()))
         .merge(crate::router_control::router(state.clone()))
         .merge(crate::policy_gateway::admin_router(state.workloads.clone()))
+        .merge(crate::runtime_delivery::admin_router(state.workloads.clone()))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/access", get(access))
@@ -53,6 +54,7 @@ pub fn router(state: HttpState) -> Router {
         .merge(crate::proof_fetch::router(state.clone()))
         .merge(crate::log_relay::router(state.clone()))
         .merge(crate::policy_gateway::node_router(state.workloads.clone()))
+        .merge(crate::runtime_delivery::node_router(state.workloads.clone()))
         .merge(crate::workloads::internal_router(state.workloads))
 }
 

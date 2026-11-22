@@ -387,3 +387,76 @@ def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path)
             process.terminate()
             process.communicate(timeout=15)
         assert process.returncode == 0
+
+
+def native_config(tmp_path):
+    data = config(tmp_path)
+    data.update(shim_daemon=True, shim_openshell={"socket":str(tmp_path/"compute.sock"),
+        "admission_policy":"approved", "ledger_endpoint":"http://127.0.0.1:8905"})
+    app = data["apps"][0]
+    app.pop("port_base")
+    app["cpus"] = 1
+    app["runtime"]["driver"] = "openshell"
+    return data
+
+
+def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_path, monkeypatch):
+    data = native_config(tmp_path)
+    spec = reconcile.replica_specs(reconcile.load_apps(data))["web-0"]
+    book = shim.RuntimeBook(tmp_path/"book")
+    spec = book.bind(spec, "launch")
+    calls = []
+    def invoke(binary, state, node, command, **kwargs):
+        assert kwargs == {"daemon":True}
+        assert command["driver"] == "openshell"
+        assert command["execution"] == spec.execution
+        calls.append(command["operation"])
+        return {"phase":"created", "platform_ready":True, "cleaned":True}
+    monkeypatch.setattr(shim,"invoke",invoke)
+    actor = shim._ProvisionedApp(spec)
+    health = ReplicaHealth.load(actor.health())
+    assert health.allocation_reserved and not health.is_ready and not health.management_ready
+    assert reconcile.matches(spec,health)
+    assert calls == ["allocate", "inspect"]
+    assert book.read(spec.name).driver == "openshell"
+    book.cleanup(spec.name)
+    assert calls[-2:] == ["allocate", "delete"]
+    assert book.read(spec.name).cleaned
+    with pytest.raises(ValueError): book.bind(spec,"launch")
+    next_spec = book.bind(spec,"replacement")
+    assert next_spec.execution.generation == spec.execution.generation + 1
+
+
+@pytest.mark.parametrize("key,value", [("port_base",123), ("services",["http"]), ("gpus",1),
+    ("volumes",["/tmp"]),("memory_gb",0),("cpus",0.5),("user","root"),("entrypoint","/bin/sh")])
+def test_native_profile_rejects_unmapped_settings(tmp_path,key,value):
+    data=native_config(tmp_path);data["apps"][0][key]=value
+    with pytest.raises(ValueError): reconcile.load_apps(data)
+
+
+def test_native_capability_requires_matching_configuration_and_allocation_protocol(tmp_path,monkeypatch):
+    config=reconcile.load_apps(native_config(tmp_path)).cluster
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.to_dict(config.shim_openshell),sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-provisioning-v1" not in shim.capabilities(config)
+    value["features"].append("openshell-allocation-v1")
+    assert "shim-openshell-provisioning-v1" in shim.capabilities(config)
+    value["openshell_config_sha256"]="wrong"
+    assert shim.capabilities(config)==[]
+
+
+def test_native_selection_cannot_be_swapped_for_docker_in_admitted_command(tmp_path,monkeypatch):
+    import yaml
+    data=native_config(tmp_path)
+    apps=tmp_path/"apps.yaml";apps.write_text(yaml.safe_dump(data))
+    batches=tmp_path/"batches.yaml";batches.write_text("batches: {}\n")
+    executor=node.NodeExecutor(str(apps),str(batches),str(tmp_path/"jobs"))
+    monkeypatch.setattr(node,"alive_nodes",lambda:[{"Alive":True,"NodeManagerAddress":"127.0.0.1"}])
+    app=copy.deepcopy(data["apps"][0]);app.update(namespace="0"*32,app="web")
+    app["runtime"]["driver"]="docker"
+    try:
+        with pytest.raises(ValueError,match="runtime selection differs"):
+            executor.set_app({"app":app,"disabled":False},"bad-command")
+    finally: executor.pool.shutdown()

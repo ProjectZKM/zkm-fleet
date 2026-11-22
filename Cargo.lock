@@ -2062,10 +2062,15 @@ name = "fleet-node"
 version = "0.1.10"
 dependencies = [
  "anyhow",
+ "axum 0.7.9",
  "clap",
  "fleet-proto",
+ "hex",
+ "libc",
  "reqwest 0.12.28",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tonic 0.12.3",
  "tracing",
@@ -6918,7 +6923,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/BotMesh/trusted-shim?rev=7aba46f3eebf36b917a552f0e630655fe6c06d0d#7aba46f3eebf36b917a552f0e630655fe6c06d0d"
+source = "git+https://github.com/BotMesh/trusted-shim?rev=d29a7eab6ba3b1e9fd0d63cb1caa38623234ce7b#d29a7eab6ba3b1e9fd0d63cb1caa38623234ce7b"
 dependencies = [
  "alloy-primitives",
  "async-trait",
