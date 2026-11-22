@@ -7,7 +7,6 @@ Namespace validation, quotas, draining and preemption stay in the control plane.
 from __future__ import annotations
 
 import logging
-import os
 import uuid
 from typing import Any, Mapping, Callable
 
@@ -46,17 +45,17 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
             continue
         if is_job_actor(app.name):
             raise ValueError(f"app {app.name}: the job- prefix is reserved for batch job actors")
-        # Resolve the selection before Ray dispatch using the established field.
-        # Preserve historical hashes unless the administrator selects an override.
-        cluster = file.cluster.merged(node_binary=app.prover_binary) if app.prover_binary else file.cluster
+        cluster = file.cluster
         for i in range(app.replicas):
             name = f"{app.name}-{i}"
             config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
-            if app.prover_binary:
-                config["node_binary"] = cluster.node_binary
             if app.kind is AppRuntime.APP:
                 config["index"] = i
             if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+                # Container workers carry their own executable; host SDK upgrades
+                # must not change a packaged workload's deployment identity.
+                if app.kind is not AppRuntime.APP:
+                    config.pop("node_binary", None)
                 config.update(shim_binary=file.cluster.shim_binary, shim_state_dir=file.cluster.shim_state_dir)
                 if app.services:
                     config["shim_network"] = file.cluster.shim_network.dump() if file.cluster.shim_network else None
@@ -98,11 +97,9 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
 
 
 def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
-    """Only explicit overrides require executable evidence from a new actor."""
+    """Compare the admitted deployment and its observed readiness."""
     from .actors import spec_hash
-    return ((health.is_ready or (spec.app.runtime and spec.app.runtime.driver == "openshell" and health.allocation_reserved)) and health.spec == spec_hash(spec)
-            and (not spec.app.prover_binary
-                 or health.prover_binary == os.path.realpath(spec.cluster.node_binary)))
+    return (health.is_ready or (spec.app.runtime and spec.app.runtime.driver == "openshell" and health.allocation_reserved)) and health.spec == spec_hash(spec)
 
 
 def _pg_name(actor: str) -> str:
@@ -127,9 +124,6 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             # restarting Ray or any detached legacy app during bridge upgrades.
             adapter = "openshell-allocation-v1" if spec.app.runtime.driver == "openshell" else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
             extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
-        elif spec.app.prover_binary:
-            # Newly selected provers load the updated actor without restarting Ray.
-            extra["runtime_env"] = {"env_vars": {"FLEET_PROVER_ADAPTER": "executable-v1"}}
         actor: ActorHandle[Any] = factory.options(
             name=spec.name,
             namespace=NAMESPACE,

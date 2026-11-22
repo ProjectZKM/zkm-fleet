@@ -16,6 +16,7 @@ prover-runtime = ["dep:zkm-sdk", "dep:zkm-prover", "dep:zkm-cuda"]
 [dependencies]
 fleet-proto.workspace = true
 anyhow.workspace = true
+axum.workspace = true
 bincode.workspace = true
 clap.workspace = true
 lru.workspace = true

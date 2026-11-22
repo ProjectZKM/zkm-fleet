@@ -109,33 +109,6 @@ impl RouterAuthorization {
 }
 
 impl NodeReport {
-    pub fn validate_native_provers(&self) -> anyhow::Result<()> {
-        for entry in self.entries() {
-            if let Some(binary) = entry.0.get("prover_binary").filter(|v| !v.is_null()) {
-                anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu")
-                    && !entry.integrated_worker() && !entry.machine().is_empty()
-                    && entry.machine() == self.machine
-                    && binary.as_str().is_some_and(|p| p.starts_with('/') && p.len() <= 4096
-                        && !p.chars().any(char::is_control)),
-                    "prover_binary requires an absolute path and a native prover pinned to the reporting machine");
-            }
-        }
-        anyhow::ensure!(self.native_provers.len() <= 1024, "too many native prover processes");
-        let mut seen = std::collections::HashSet::new();
-        for process in &self.native_provers {
-            let entry = self.entry(&process.entry_name)
-                .ok_or_else(|| anyhow::anyhow!("native prover process has no app"))?;
-            let prefix = format!("{}-", entry.name());
-            anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu") && !entry.integrated_worker()
-                && process.replica_name.strip_prefix(&prefix).and_then(|s| s.parse::<u64>().ok())
-                    .is_some_and(|index| index < entry.replicas() && process.replica_name == format!("{prefix}{index}"))
-                && process.executable.starts_with('/') && process.executable.len() <= 4096
-                && !process.executable.chars().any(char::is_control)
-                && seen.insert(&process.replica_name), "invalid native prover process");
-        }
-        Ok(())
-    }
-
     pub fn validate_runtime_instances(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.runtime_instances.len() <= 1024, "too many runtime instances");
         let mut seen = std::collections::HashSet::new();
@@ -144,7 +117,7 @@ impl NodeReport {
             let e = &instance.execution;
             let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
             anyhow::ensure!(instance.native_observation_base64.is_none() || entry.0["runtime"]["driver"] == "openshell", "native observation requires OpenShell runtime");
-            anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && entry.is_container()
+            anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && (entry.is_container() || entry.is_prover())
                 && e.node_id == self.machine && e.generation > 0
                 && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
                 && [&e.namespace,&e.workload,&e.allocation_id,&e.lease_id,&e.node_id].iter().all(|v| !v.is_empty() && v.len() <= 256 && !v.chars().any(char::is_control))
@@ -424,6 +397,16 @@ impl RegisterAppRequest {
     pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        if spec.get("kind").and_then(Value::as_str).is_some_and(|k| k.starts_with("ziren-")) && spec.contains_key("runtime") {
+            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"}))
+                && spec.get("port_base").is_some_and(|p| p.as_u64().is_some_and(|p| p <= 65535))
+                && spec.contains_key("container_port")
+                && spec.get("services").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
+                && spec.get("service_protocol").is_none_or(|v| v == "http1")
+                && spec.get("worker_command").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
+                "packaged provers require shim Docker, a private HTTP health port and an image-owned worker");
+        }
         let native = spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"}));
         if native {
             let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
@@ -515,12 +498,14 @@ impl RegisterAppRequest {
         );
         let spec = self.spec.as_object().ok_or_else(|| anyhow::anyhow!("spec must be a JSON object of settings"))?;
         let kind = self.kind();
+        let packaged = kind != "app" && spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"}));
         let own: &[&str] = match kind {
             "app" => &Self::CONTAINER_SETTINGS,
             "ziren-gpu" | "ziren-cpu" => &Self::PROVER_SETTINGS,
             _ => anyhow::bail!("kind must be app, ziren-gpu or ziren-cpu"),
         };
-        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str()) && !own.contains(&k.as_str())) {
+        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str()) && !own.contains(&k.as_str())
+            && !(packaged && Self::CONTAINER_SETTINGS.contains(&k.as_str()))) {
             anyhow::bail!("unknown setting {key} for a {kind} app; it takes {}, {}", Self::SPEC_SETTINGS.join(", "), own.join(", "));
         }
         anyhow::ensure!(
@@ -535,13 +520,15 @@ impl RegisterAppRequest {
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        if kind == "app" && spec.get("runtime").is_none_or(|v| v["driver"] != "openshell") {
+        if (kind == "app" || packaged) && spec.get("runtime").is_none_or(|v| v["driver"] != "openshell") {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
         if let Some(runtime) = spec.get("runtime") {
             Self::validate_runtime(runtime)?;
         }
-        Self::validate_transport(spec)?;
+        let mut execution = spec.clone();
+        execution.insert("kind".into(), Value::String(kind.into()));
+        Self::validate_transport(&execution)?;
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
         let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()
@@ -564,6 +551,36 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+
+    #[test]
+    fn packaged_provers_reuse_container_transport_but_require_new_adapter_capability() {
+        let source = json!({"name":"policy", "spec":{"kind":"ziren-gpu", "image":"proof:2",
+            "runtime":{"executor":"shim","driver":"docker"}, "port_base":0, "container_port":8080,
+            "command":[], "health_path":"/healthz", "proof_storage_root":"/srv/proofs"},
+            "proof":{"elf_id":"ab".repeat(32)}});
+        let request: RegisterAppRequest = serde_json::from_value(source.clone()).unwrap();
+        request.validate().unwrap();
+        let entry = crate::workload::Entry(&request.spec);
+        assert!(entry.is_prover());
+        assert!(!entry.holds_allocation(), "SDK proof jobs retain their existing per-job quota accounting");
+        assert_eq!(entry.runtime_capability(), Some("shim-prover-v1"));
+        let mut report = NodeReport::default();
+        report.runtime_capabilities = vec!["shim-runtime-v2".into(),"shim-automatic-port-v1".into()];
+        assert!(!report.supports_runtime(entry));
+        report.runtime_capabilities.push("shim-prover-v1".into());
+        assert!(report.supports_runtime(entry));
+        for key in ["port_base", "container_port"] {
+            let mut bad = source.clone();
+            bad["spec"].as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<RegisterAppRequest>(bad).unwrap().validate().is_err());
+        }
+        for explicit_kind in [true, false] {
+            let mut bad = source.clone();
+            if !explicit_kind { bad["spec"].as_object_mut().unwrap().remove("kind"); }
+            bad["spec"]["services"] = json!(["public"]);
+            assert!(serde_json::from_value::<RegisterAppRequest>(bad).unwrap().validate().is_err());
+        }
+    }
 
     #[test]
     fn namespace_service_defaults_never_override_exact_denials_or_cross_namespaces() {

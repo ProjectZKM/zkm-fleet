@@ -182,13 +182,6 @@ class _NodeProcess:
     def alive(self) -> bool:
         return self.proc.poll() is None
 
-    def executable(self) -> str | None:
-        """Observed executable, never the configured command or a guessed path."""
-        try:
-            return os.readlink(f"/proc/{self.proc.pid}/exe")
-        except OSError:
-            return None
-
     def stop(self) -> None:
         if self.alive():
             self.proc.terminate()
@@ -325,7 +318,6 @@ class _ZirenGpuProver:
         integrated = bool(self.spec.app.worker_command)
         return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), gpus=self.gpus, gpu_port=self.gpu_port,
                       gpu_ready=None if integrated else _gpu_ready(self.gpu_port),
-                      prover_binary=None if integrated else self.node.executable(),
                       ready=True if integrated else None, machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
@@ -444,8 +436,7 @@ class _ZirenCpuProver:
             return ReplicaHealth(name=self.name, stopping=True).dump()
         if not self.node.alive():
             os._exit(1)
-        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname(),
-                             prover_binary=self.node.executable()).dump()
+        return ReplicaHealth(name=self.name, spec=spec_hash(self.spec), machine=socket.gethostname()).dump()
 
     def shutdown(self) -> None:
         _STOPPING["on"] = True

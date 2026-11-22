@@ -1,6 +1,6 @@
 """Local stdio adapter to trusted-shim. No scheduling, proof or Docker implementation.
 
-Only explicit ordinary app selections enter this module. Persisted allocations
+Only explicit shim selections enter this module. Persisted allocations
 choose their cleanup executable independently of the current apps.yaml.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any
 import ray
 
 from . import actors
-from .model import AppReplicaSpec, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, ServiceProtocol, to_dict
+from .model import AppReplicaSpec, AppRuntime, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, ServiceProtocol, to_dict
 
 CAPABILITY = "shim-docker-v1"
 
@@ -36,6 +36,8 @@ def selected(spec: AppReplicaSpec) -> bool:
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
+    if spec.kind is not AppRuntime.APP:
+        return "shim-prover-v1"
     if spec.app.runtime and spec.app.runtime.driver == "openshell":
         return "shim-openshell-services-v1" if spec.app.services else "shim-openshell-provisioning-v1"
     if spec.app.service_protocol is ServiceProtocol.TCP:
@@ -77,6 +79,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
                 if config.shim_network and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
         return native + [name for name, supported in (
+            ("shim-prover-v1", modern and management),
             ("shim-tcp-v1", managed_network),
             ("shim-single-use-ingress-v1", managed_network and "single-use-ingress-v1" in features),
             (CAPABILITY, True),
@@ -222,10 +225,18 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     if spec.execution is None or app.port_base is None or not app.image:
         raise ValueError("shim needs a persisted execution, image and port_base")
     port = app.port_base + spec.index if app.port_base else 0
-    fill = {"port": app.container_port or port, "index": spec.index, "gpus": ",".join(str(i) for i in range(len(gpus)))}
+    # Explicit manifest substitution, shared by all containers. No credential
+    # contents or worker-specific environment is injected into workloads.
+    fill = {**{k: v for k, v in to_dict(app).items() if isinstance(v, (str, int, float))},
+        "port": app.container_port or port, "index": spec.index, "name": spec.name,
+        "machine": socket.gethostname(), "gpu_count": len(gpus), "cpu_count": int(app.cpus),
+        "gpus": ",".join(str(i) for i in range(len(gpus))),
+        "scheduler": spec.cluster.scheduler or "",
+        "scheduler_ca_file": spec.cluster.scheduler_ca_file or "",
+        "cluster_token_file": spec.cluster.cluster_token_file or ""}
     volumes = []
     for volume in app.volumes:
-        path, _, options = volume.partition(":")
+        path, _, options = volume.format(**fill).partition(":")
         volumes.append(f"{path}:{path}" + (f":{options}" if options else ""))
     return {"execution": spec.execution, "driver": "docker", "image": app.image,
         "command": [v.format(**fill) for v in app.command],
@@ -251,7 +262,7 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
 class _ShimApp:
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
-        self.gpus = actors._granted_gpus() if spec.app.gpus else []
+        self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
         status = self.call({"operation": "launch", "request": request})
         if status.get("state") != "ready":

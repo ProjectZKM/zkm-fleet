@@ -28,8 +28,8 @@ def inspect(name):
 
 
 @pytest.mark.skipif(not os.environ.get("TRUSTED_SHIM_TEST_BINARY"), reason="requires companion binary and local Docker")
-@pytest.mark.parametrize("daemon", [False, True])
-def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_path, daemon):
+@pytest.mark.parametrize("kind,daemon", [("app",False), ("app",True), ("ziren-cpu",True)])
+def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_path, kind, daemon):
     suffix=uuid.uuid4().hex[:8]
     legacy=f"shim-legacy-{suffix}"; modern=f"shim-optin-{suffix}"
     legacy_app={"name":legacy,"namespace":"0"*32,"app":legacy,"kind":"app", "gpus":0,"cpus":0.5,
@@ -38,6 +38,12 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
     new_app={**legacy_app,"name":modern,"app":modern,"port_base":0,"container_port":8080,
         "runtime":{"executor":"shim","driver":"docker"},
         "command":["python","-m","http.server","{port}","--bind","0.0.0.0"]}
+    storage=tmp_path/"proof-storage";storage.mkdir()
+    (storage/"input.bin").write_bytes(b"retained input")
+    if kind == "ziren-cpu":
+        # Exercise real container ownership and storage with a harmless HTTP
+        # fixture. This does not execute the Ziren SDK or generate a proof.
+        new_app.update(kind=kind,elf_id="a"*64,proof_storage_root=str(storage),volumes=[str(storage)])
     apps=tmp_path/"apps.yaml";batches=tmp_path/"batches.yaml";batches.write_text("batches: {}\n")
     cfg={"log_dir":str(tmp_path/"logs"),"apps":[legacy_app]}
     apps.write_text(yaml.safe_dump(cfg))
@@ -69,6 +75,9 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
             status=shim.invoke(allocation.binary,allocation.state_dir,socket.gethostname(),
                 {"operation":"inspect","execution":allocation.execution},daemon=allocation.daemon)
             current=inspect(status["runtime_id"])
+            if kind == "ziren-cpu":
+                subprocess.run(["docker","exec",status["runtime_id"],"python","-c",
+                    f"open({str(storage/'proof.bin')!r},'wb').write(b'retained proof fixture')"],check=True)
             assert status["port"] > 0
             assert current["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] == str(status["port"])
             assert current["HostConfig"]["NanoCpus"]==500_000_000
@@ -85,6 +94,9 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
             recovered.set_app({"app":new_app,"disabled":True},"shim-stop")
             assert recovered.runtimes.read(modern+"-0").cleaned
             assert node.container_gone(status["runtime_id"])
+            assert (storage/"input.bin").read_bytes()==b"retained input"
+            if kind == "ziren-cpu":
+                assert (storage/"proof.bin").read_bytes()==b"retained proof fixture"
             assert inspect(actors.app_container(legacy+"-0"))["Id"]==old["Id"]
         finally:
             # Only this test's named allocations; never `ray stop` or Docker prune.

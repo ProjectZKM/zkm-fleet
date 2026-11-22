@@ -19,7 +19,7 @@ impl<'a> Entry<'a> {
     pub const RESOURCES: [&'static str; 3] = ["gpus", "cpus", "replicas"];
     /// The node's own configuration of an entry: the app it runs, its program and how its
     /// worker launches. No change the scheduler sends replaces them.
-    pub const NODE_OWNED: [&'static str; 9] = ["app", "elf_id", "prover_binary", "worker_command", "worker_env_file",
+    pub const NODE_OWNED: [&'static str; 8] = ["app", "elf_id", "worker_command", "worker_env_file",
         "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root"];
     /// What a report says about an entry beside its configuration, and the namespace reference
     /// the scheduler keeps from it.
@@ -27,6 +27,9 @@ impl<'a> Entry<'a> {
 
     /// Missing selection is permanently the legacy path, including old records.
     pub fn runtime_capability(self) -> Option<&'static str> {
+        if self.is_prover() && self.0["runtime"] == json!({"executor":"shim", "driver":"docker"}) {
+            return Some("shim-prover-v1");
+        }
         match self.0.get("runtime") {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,

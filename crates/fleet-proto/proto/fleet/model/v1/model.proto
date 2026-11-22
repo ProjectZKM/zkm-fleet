@@ -278,8 +278,9 @@ message NodeReport {
   // Exact durable shim allocations. Unready native reservations have no services;
   // service grants must never address a guessed host port.
   repeated RuntimeInstance runtime_instances = 14;
-  // Observed executable paths, not configured paths or SDK compatibility attestations.
-  repeated NativeProverProcess native_provers = 15;
+  // Removed host-binary observations; runtime identity belongs to shim.
+  reserved 15;
+  reserved "native_provers";
 }
 
 // Metadata only: native credentials are claimed once over the private HTTPS API.
@@ -301,12 +302,6 @@ message RuntimeDeliveryRecord {
 message RuntimeDeliveryAck {
   // True means shim acknowledged provisioning, never application readiness.
   required bool accepted = 1;
-}
-
-message NativeProverProcess {
-  required string entry_name = 1;
-  required string replica_name = 2;
-  required string executable = 3;
 }
 
 message RuntimeExecutionIdentity {

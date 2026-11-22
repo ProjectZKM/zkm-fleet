@@ -572,7 +572,6 @@ impl WorkloadController {
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
-                "native_provers":w.report.native_provers,
                 "batches":w.report.batches.keys().collect::<Vec<_>>(),
                 "heartbeat_age_ms":((now()-w.seen)*1000.0) as u64})
         }).collect()
@@ -909,7 +908,14 @@ impl WorkloadController {
             return Err(fail(400, "invalid capacity"));
         }
         report.validate_runtime_instances().map_err(|e| fail(400,e.to_string()))?;
-        report.validate_native_provers().map_err(|e| fail(400,e.to_string()))?;
+        if report.entries().any(|e| e.0.get("prover_binary").is_some_and(|v| !v.is_null())) {
+            return Err(fail(400, "prover_binary was removed; drain and migrate the entry to a packaged runtime"));
+        }
+        for entry in report.entries().filter(|e| e.is_prover() && e.0.get("runtime").is_some()) {
+            fleet_proto::model::v1::RegisterAppRequest::validate_transport(
+                entry.0.as_object().ok_or_else(|| fail(400,"invalid proof runtime"))?)
+                .map_err(|e| fail(400,e.to_string()))?;
+        }
         let mut report = report;
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()
@@ -1020,6 +1026,8 @@ impl WorkloadController {
                 continue;
             }
             let intent = if let Some(mut intent) = existing {
+                // The removed override is never a launch input after migration.
+                if let Some(fields) = intent.spec.as_object_mut() { fields.remove("prover_binary"); }
                 // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
                 for field in Entry::NODE_OWNED {

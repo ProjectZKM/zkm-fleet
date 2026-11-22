@@ -397,40 +397,43 @@ the client binary with the image; do not mix their proof representations. CI
 compiles the full SDK/CUDA adapter as well as testing storage without the runtime.
 Use locked builds. Dependency updates must revalidate this tuple; regenerating
 the lockfile is an intentional upgrade, including its Plonky3 dependencies.
-For a staged upgrade, an administrator can set `prover_binary` to an absolute
-path and `machine` to this host in that prover's existing node-owned `apps.yaml`
-entry. Both fields are node-owned; the scheduler preserves updates and never
-automatically copies that executable selection to another machine. Other apps retain
-the shared `node_binary`. This override is not accepted through user app creation
-or settings APIs. It keeps the native prover's SDK input path; `worker_command`
-instead denotes an integrated app that owns its inputs and rejects SDK submission.
-The bridge resolves this selection before handing the replica to Ray. Its deployment
-hash covers the selected executable, so changing an unused shared `node_binary`
-does not restart a pinned prover, and an old adapter that ignored the override no
-longer makes the wrong executable look current. New explicitly selected prover
-actors load the updated adapter in a distinct Ray worker environment. Detached
-legacy actors and their deployment hashes remain unchanged.
+SDK proof apps can package the worker and GPU server into one immutable image and
+select `runtime: {executor: shim, driver: docker}` in their existing `apps.yaml`
+entry. They retain `kind: ziren-gpu` or `ziren-cpu`, their app/ELF identity and the
+existing proof submission, queue, quota and completion protocol. Execution uses the
+same durable shim Docker lifecycle as other containers. The bridge advertises
+`shim-prover-v1`; older adapters cannot receive these launches. OpenShell and
+host-side `worker_command` are not supported for this packaged SDK worker path.
+It exposes only its private HTTP health port; SDK ingress and artifact retrieval
+continue through the existing proof-app endpoint and storage protocol.
 
-Upgrade scheduler and `fleet-node` before the bridge: report v3 adds optional
-`native_provers` records (`entry_name`, `replica_name`, `executable`). Before the
-upgrade, add `machine` to entries already using `prover_binary`. The actor reads
-the running executable from `/proc/<pid>/exe`; older actors omit this evidence.
-The machine's status includes these records for operator inspection. A selected
-prover is not reported ready if its observed executable differs or is unknown.
-Reconciliation retains an existing native prover when its executable evidence or
-configuration differs, including actors from older bridges that report no path.
-It reports that explicit drain and confirmed cleanup are required; it never stops
-that actor to satisfy an automatic `SetApp` retry. Matching actors stay running.
-The bridge's readiness flag does not gate the separate proof dispatch protocol:
-disable admission and drain the affected proof app before changing its executable.
-The shared process
-role marker makes orphan cleanup work for renamed prover executables while still
-checking the exact replica name.
+`deploy/build-proof-image.sh OUTPUT_IMAGE GPU_IMAGE@sha256:DIGEST` builds the locked
+SDK worker and puts it with the operator-validated GPU base in one image. The build
+record includes the SDK revision, base image digest and worker SHA-256. The Docker
+context contains only the binary, launcher, Dockerfile and build record. The script
+does not start a prover or publish an image. Supply the registry digest of the
+compatible GPU build; a local image tag alone is insufficient. Deploy the resulting
+complete worker image by digest.
+Tini owns process reaping and signals; a failed worker or GPU server ends the
+container. The optional worker `/healthz` endpoint remains healthy during an active
+proof and is published only on node loopback through shim.
 
-Executable observations are operational metadata, not remote attestation or an
-SDK/CUDA protocol compatibility check. Scheduling still matches the circuit label;
-a validated protocol fingerprint covering the SDK, CUDA server and guest/verifier
-remains follow-up work. Operators must deploy the validated tuple above together.
+The manifest explicitly supplies environment and bind mounts. Container templates
+can reference app scalar fields and `{name}`, `{machine}`, `{index}`, `{port}`,
+`{gpus}` (container GPU ordinals), `{gpu_count}`, `{cpu_count}`, `{scheduler}`,
+`{cluster_token_file}` and `{scheduler_ca_file}`. Credential contents are never
+injected by Fleet; an administrator must approve the individual read-only mounts.
+Keep proof storage mounted at the same absolute path so persisted `file://`
+references and completed lease records remain usable. The existing host storage
+fetch handler remains available for fetching historical outputs.
+
+`prover_binary` and native executable-path reports have been removed. Existing
+native entries using the shared `node_binary` remain readable for an explicit
+cutover; a packaged worker does not use that binary. Entries with an override must
+first be drained and converted using `deploy/migrate-proof-runtime.py`. See the
+maintenance procedure for an upgrade that retains queued jobs and all stored data.
+Guest/verifier compatibility still needs validation for the pinned image tuple;
+an immutable image alone does not attest to hardware or prove compatibility.
 Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.

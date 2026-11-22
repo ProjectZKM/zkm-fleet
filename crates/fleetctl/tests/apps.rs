@@ -5,6 +5,30 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 #[test]
+fn app_update_accepts_reviewed_runtime_settings_without_losing_nested_values() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let token = token_file("runtime-settings");
+    let settings_path = token.with_extension("json");
+    let settings = serde_json::json!({"runtime":{"executor":"shim","driver":"docker"},
+        "image":"proof:2", "port_base":0, "container_port":8080,
+        "env":{"FLEET_NODE_NAME":"{name}"}, "volumes":["/srv/proofs","/private/node.token:ro"]});
+    std::fs::write(&settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
+    let server = stub(listener, 1, |_,_| (200, r#"{"state":"draining","node":"gpu"}"#.into()));
+    let output = cli().args(["app","update","policy","--url",&url,"--token-file"])
+        .arg(&token).arg("--settings").arg(&settings_path).output().unwrap();
+    let seen = server.join().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(seen[0].line.starts_with("PUT /apps/policy/settings"));
+    assert_eq!(seen[0].body, settings);
+    let conflicting = cli().args(["app","update","policy","--settings"])
+        .arg(&settings_path).args(["--image","different"]).output().unwrap();
+    assert!(!conflicting.status.success());
+    std::fs::remove_file(token).unwrap();
+    std::fs::remove_file(settings_path).unwrap();
+}
+
+#[test]
 fn batch_creation_requires_namespace_before_contacting_api() {
     let output = cli()
         .args([

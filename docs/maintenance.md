@@ -424,3 +424,69 @@ Any other schema needs an explicit metadata reset, which removes job history and
 access registrations. Recreate namespaces and tokens, redistribute the scoped
 credentials before clients resume, and keep the apps' own proofs and checkpoints.
 Schema 16 keeps namespaces and tokens across ordinary updates.
+
+## Cut over SDK proof apps to packaged shim runtimes
+
+This is a coordinated maintenance operation. Build and verify the new image before
+the downtime. The SDK worker and its matching Ziren 2.0 GPU server share one image;
+Fleet retains proof scheduling, and shim owns the container. Existing application,
+namespace and ELF identities, queued jobs, proof history and storage paths stay in
+place. Integrated `worker_command` applications own their input streams and need
+their own complete worker image; the SDK converter refuses to guess their packaging.
+
+1. Pause producers and disable each affected proof app with
+   `fleetctl --namespace NS app disable APP`. Wait for running proofs to finish,
+   their output references to be recorded, and replica cleanup to be confirmed.
+   Queued proofs remain queued. For other batch/application jobs, wait for completion
+   or use the application's own checkpoint procedure. Fleet cannot checkpoint an
+   arbitrary process's memory. Do not cancel or kill work to simulate a lossless pause.
+2. With application writes quiesced, back up PostgreSQL, the scheduler data directory,
+   each node's existing `apps.yaml`/`batches.yaml` and job journals, shim state, and all
+   application storage/checkpoints. Check backup readability and record job IDs,
+   states, output hashes and queued counts. Keep credentials private. Do not reset
+   metadata, delete apps/jobs, prune volumes, or remove shim ledgers. If the existing
+   database schema is unsupported, stop and prepare a tested schema migration.
+3. Build with `deploy/build-proof-image.sh REGISTRY/PROOF:VERSION GPU_IMAGE@sha256:DIGEST` on the build host
+   (Rust toolchain, Docker and Python 3.11+). Publish through the normal release process
+   and record the resulting registry digest. This build does not start a prover.
+   Deploy the persistent shim service and configure its existing fields in `apps.yaml`.
+4. Prepare the existing configuration while every selected entry is disabled:
+
+   ```bash
+   python3 deploy/migrate-proof-runtime.py \
+     --apps /etc/zkm-fleet/apps.yaml --name policy-prover \
+     --image REGISTRY/PROOF@sha256:DIGEST \
+     --output-dir /private/upgrade-review
+   ```
+
+   Repeat `--name` for more entries. The directory must be new; it contains a private
+   `apps.yaml` preview, an update index and one settings JSON per entry. The tool
+   leaves the source configuration, database and every storage file untouched and
+   never reads token contents. Review mounts and identities. All overrides of the
+   removed `prover_binary` field must be converted before the new bridge starts.
+5. Stop only the control agent while installing the reviewed `apps.yaml` through an
+   atomic replacement, retaining its original permissions and a backup. Upgrade the
+   scheduler, node/bridge and CLI together, then restart the control agent. This
+   removes the old executable-path report field; its protobuf number is reserved.
+   Confirm the node advertises `shim-prover-v1`. Keep each app disabled and apply its
+   settings to the existing scheduler record, selecting `--node NODE` when needed:
+
+   ```bash
+   fleetctl --namespace NS app update APP \
+     --settings /private/upgrade-review/policy-prover.settings.json
+   ```
+
+   Wait for the settings operation to complete. Do not use `app delete`/`app add`:
+   those operations would discard identity/history that an in-place update retains.
+6. Compare the backed-up job inventory and stored hashes, verify historical outputs
+   remain fetchable, then enable one app and submit its approved guest through the
+   proof network. Verify the returned proof with the matching verifier before
+   enabling the rest and resuming producers. Nodes still require only outbound
+   control/data connections; the health port is published on loopback.
+
+For rollback, drain the new runtime, confirm its cleanup, restore the previous image
+and application settings, and preserve the current database and artifact directories.
+Never overwrite newly generated proofs with an older backup. An older scheduler must
+support the current database schema; a schema-incompatible binary is not a valid
+rollback. Retain the host storage-fetch handler until all historical output retrieval
+paths have been verified after migration.

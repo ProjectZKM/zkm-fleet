@@ -117,6 +117,9 @@ enum AppCmd {
     /// takes the new settings on its node and starts again, like a scale.
     Update {
         name: String,
+        /// Complete settings object, including runtime and mounts; sent unchanged.
+        #[arg(long, conflicts_with_all = ["image", "env", "shm_gb"])]
+        settings: Option<PathBuf>,
         /// Container image.
         #[arg(long)] image: Option<String>,
         /// K=V; repeat. Replaces the app's whole environment.
@@ -1261,8 +1264,11 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
-        Some(AppCmd::Update { name, image, env, shm_gb, node }) => {
-            let mut set = json!({});
+        Some(AppCmd::Update { name, settings, image, env, shm_gb, node }) => {
+            let mut set = match settings {
+                Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+                None => json!({}),
+            };
             if let Some(v) = image { set["image"] = json!(v); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
             if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }

@@ -10,6 +10,36 @@ from fleet_bridge import actors, reconcile, shim, node
 from fleet_bridge.model import ExecutorKind, ReplicaHealth, AppSpec
 
 
+def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs(tmp_path):
+    raw = config(tmp_path)
+    raw.update(node_binary="/old/host-worker", scheduler="https://scheduler.example",
+        cluster_token_file="/private/node.token")
+    app = raw['apps'][0]
+    app.update(kind="ziren-gpu", elf_id="a" * 64, gpus=2, cpus=4,
+        proof_storage_root="/srv/proofs", port_base=0, container_port=8080,
+        env={"NAME":"{name}", "MACHINE":"{machine}", "CPUS":"{cpu_count}",
+             "GPUS":"{gpu_count}", "TOKEN_FILE":"{cluster_token_file}"},
+        volumes=["{proof_storage_root}", "{cluster_token_file}:ro"])
+    first = reconcile.replica_specs(reconcile.load_apps(raw))['web-0']
+    raw['node_binary'] = '/new/host-worker'
+    assert actors.spec_hash(first) == actors.spec_hash(reconcile.replica_specs(reconcile.load_apps(raw))['web-0'])
+    bound = shim.RuntimeBook(tmp_path / 'book').bind(first, 'admitted-command')
+    request = shim.launch_request(bound, ['4', '6'])
+    assert shim.required_capability(bound) == 'shim-prover-v1'
+    assert request['environment'] == dict(NAME='web-0', MACHINE=socket.gethostname(),
+        CPUS='4', GPUS='2', TOKEN_FILE='/private/node.token')
+    assert request['driver_options']['gpus'] == ['4', '6']
+    assert request['driver_options']['volumes'] == ['/srv/proofs:/srv/proofs', '/private/node.token:/private/node.token:ro']
+    assert request['limits']['cpu_millicores'] == 4000
+    for update in ({'prover_binary':'/old/override'}, {'worker_command':['/old/worker']},
+                   {'runtime':{'executor':'shim','driver':'openshell'}}, {'container_port':None},
+                   {'services':['http']}, {'service_protocol':'tcp'}):
+        invalid = copy.deepcopy(raw)
+        invalid['apps'][0].update(update)
+        with pytest.raises(ValueError):
+            reconcile.load_apps(invalid)
+
+
 def test_tcp_service_uses_tcp_health_and_requires_new_capability(tmp_path, monkeypatch):
     from fleet_bridge.model import ServiceProtocol
     s = spec(tmp_path)

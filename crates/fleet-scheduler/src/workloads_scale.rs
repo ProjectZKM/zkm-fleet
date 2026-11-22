@@ -238,11 +238,11 @@ impl WorkloadController {
 
     /// Settings an update may change on an app. The rest is identity, placement or the
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
-    pub(super) const APP_SETTINGS: [&'static str; 17] = ["image", "env", "command", "user", "workdir", "volumes",
+    pub(super) const APP_SETTINGS: [&'static str; 18] = ["image", "env", "command", "user", "workdir", "volumes", "port_base",
         "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
     // Apps can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
-    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 12] = ["image", "env", "command", "user", "workdir", "volumes", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
+    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 13] = ["image", "env", "command", "user", "workdir", "volumes", "port_base", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
     // A namespace's owner creates its own apps, as it does its batches: the host's
     // filesystem and user ids stay administrator settings.
     const ADMIN_CREATE_SETTINGS: [&'static str; 8] = ["user", "volumes", "proof_storage_root", "runtime", "services", "container_port", "entrypoint", "ingress"];
@@ -318,6 +318,7 @@ impl WorkloadController {
                 "ingress" => value.is_object(),
                 "command" | "volumes" | "services" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
                 "user" | "workdir" | "health_path" | "entrypoint" | "service_protocol" => value.is_string(),
+                "port_base" => value.as_u64().is_some_and(|v| v <= u16::MAX as u64),
                 "shm_gb" | "stop_timeout_s" | "container_port" => value.as_u64().is_some(),
                 "memory_gb" | "ready_timeout_s" => value.as_f64().is_some_and(|v| v.is_finite() && v > 0.0),
                 _ => return Err(fail(400, format!("{key} cannot be updated; settings: {}", Self::APP_SETTINGS.join(", ")))),
@@ -327,11 +328,11 @@ impl WorkloadController {
             }
         }
         let (key, mut intent) = self.deployment_to_change(namespace, app, node)?;
-        if set.contains_key("runtime") && !intent.entry().is_container() {
-            return Err(fail(400, "runtime selection is supported only for ordinary apps"));
+        if set.get("runtime").is_some_and(|r| r != &json!({"executor":"shim","driver":"docker"})) && intent.entry().is_prover() {
+            return Err(fail(400, "packaged provers require shim Docker"));
         }
         if let Some(runtime) = set.get("runtime") {
-            let candidate = json!({"runtime": runtime});
+            let candidate = json!({"kind":intent.entry().kind(), "runtime": runtime});
             let supported = self.inner.lock().workers.get(&intent.worker)
                 .is_some_and(|w| w.report.supports_runtime(Entry(&candidate)));
             if !supported { return Err(fail(409, "node does not support the selected runtime")); }

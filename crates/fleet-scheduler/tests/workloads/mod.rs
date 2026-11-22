@@ -5,6 +5,7 @@ use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
 mod policy;
+mod proof_runtime;
 
 /// The administrator's token the tests' scheduler has.
 const ADMIN: &str = "adminadminadminadminadminadminadminadminadminadminadminadminadmin1";
@@ -1714,47 +1715,6 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
     let path = format!("/batches/training/jobs/{}/logs?rank=1", job.id);
     let response = scale_call(c, "admin", "GET", &path, Value::Null).await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn native_prover_selection_is_node_owned_and_machine_pinned() {
-    let (_dir, c, ns) = setup().await;
-    let mut report = scale_inventory(&ns, true, false);
-    c.report("gpu", "session", report.clone()).await.unwrap();
-    report.apps[0]["prover_binary"] = json!("/opt/selected");
-    assert!(c.report("gpu", "session", report.clone()).await.is_err());
-    report.apps[0]["machine"] = json!(report.machine);
-    report.native_provers = serde_json::from_value(json!([
-        {"entry_name":"model", "replica_name":"model-0", "executable":"/opt/actual"}
-    ])).unwrap();
-    c.report("gpu", "session", report.clone()).await.unwrap();
-    let intent = c.inner.lock().deployments["gpu-model"].clone();
-    assert_eq!(intent.spec["prover_binary"], "/opt/selected");
-    assert_eq!(intent.entry().machine(), report.machine);
-    assert_eq!(c.inner.lock().workers["gpu"].report.native_provers[0].executable, "/opt/actual");
-    assert_eq!(c.worker_status()[0]["native_provers"][0]["executable"], "/opt/actual");
-    let id = c.command("gpu", NodeOperation::SetApp,
-        json!({"app":intent.spec,"disabled":false})).unwrap();
-    let command = c.inner.lock().commands[&id].clone();
-    assert!(!c.place_start(&command, false).unwrap(), "never copy a host-local binary to another node");
-    for value in [json!(null), json!("relative"), json!(42)] {
-        let mut invalid = report.clone();
-        invalid.apps[0]["prover_binary"] = value;
-        if invalid.apps[0]["prover_binary"].is_null() {
-            invalid.apps[0]["machine"] = json!("another-machine");
-            invalid.apps[0]["prover_binary"] = json!("/opt/selected");
-        }
-        assert!(c.report("gpu", "session", invalid).await.is_err());
-    }
-    let mut duplicate = report.clone();
-    duplicate.native_provers.push(duplicate.native_provers[0].clone());
-    assert!(c.report("gpu", "session", duplicate).await.is_err());
-    let mut wrong = report.clone();
-    wrong.native_provers[0].replica_name = "model-2".into();
-    assert!(c.report("gpu", "session", wrong).await.is_err());
-    report.apps[0]["prover_binary"] = Value::Null;
-    c.report("gpu", "session", report).await.unwrap();
-    assert!(c.inner.lock().deployments["gpu-model"].spec["prover_binary"].is_null());
 }
 
 #[tokio::test]

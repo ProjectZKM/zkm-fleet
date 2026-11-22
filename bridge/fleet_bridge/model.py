@@ -578,9 +578,6 @@ class AppSpec(Record):
     # GPU prover, optional for a CPU one.
     elf_id: str = ""
     proof_storage_root: str | None = None
-    # Administrator-owned node config: match this app's SDK to its GPU image.
-    # Not accepted through user app registration or settings APIs.
-    prover_binary: str | None = None
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
@@ -636,14 +633,14 @@ class AppSpec(Record):
         if self.port_base == 0 and (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM or self.container_port is None):
             raise ModelError("automatic host ports require shim and container_port")
         if self.runtime is not None and self.kind is not AppRuntime.APP:
-            raise ModelError("runtime selection is supported only for ordinary apps")
+            if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker") or self.worker_command:
+                raise ModelError("packaged provers require shim Docker and an image-owned worker")
+            if self.port_base is None or not self.container_port or not self.image:
+                raise ModelError("packaged provers require an image and health port")
+            if self.services or self.ingress or self.service_protocol is not ServiceProtocol.HTTP1:
+                raise ModelError("packaged SDK workers expose only a private HTTP health port")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
-        if self.prover_binary is not None:
-            if (self.kind is AppRuntime.APP or self.worker_command
-                    or not self.machine or not self.machine.strip()
-                    or not os.path.isabs(self.prover_binary) or "\x00" in self.prover_binary):
-                raise ModelError("prover_binary requires a machine-pinned native prover and an absolute path without worker_command")
         if self.worker_command:
             if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):
@@ -681,6 +678,8 @@ class AppsConfig(Record):
         cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
         apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
         for a in data.get("apps", []):
+            if a.get("prover_binary") is not None:
+                raise ModelError("prover_binary was removed; drain and migrate this entry with deploy/migrate-proof-runtime.py")
             if "runtime" in a:
                 from_dict(RuntimeSelection, a["runtime"], strict=True)
         if any(a.runtime and a.runtime.executor is ExecutorKind.SHIM for a in apps):
@@ -714,13 +713,6 @@ class RuntimeInstance(Record):
     ready: bool
     services: list[str] = field(default_factory=list)
     native_observation_base64: str | None = None
-
-
-@dataclass(kw_only=True)
-class NativeProverProcess(Record):
-    entry_name: str
-    replica_name: str
-    executable: str
 
 
 @dataclass(kw_only=True)
@@ -801,7 +793,6 @@ class ReplicaHealth(Record):
     executor: ExecutorKind = ExecutorKind.LEGACY
     execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
-    prover_binary: str | None = None  # observed /proc/<pid>/exe; absent on older actors
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)
     gpu_port: int | None = None
