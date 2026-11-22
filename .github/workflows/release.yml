@@ -77,7 +77,7 @@ jobs:
       - name: Build the pinned node runtime companion
         run: |
           cargo install --locked --force --git https://github.com/BotMesh/trusted-shim \
-            --rev c2fe4d907bc9dbb7081776cab84ec1e5d734b6f6 \
+            --rev a1eba4eafea5f4d1db453aa5c692d612cd7ebe61 \
             --bin trusted-shim-runtime --root target/shim
 
       - name: Publish scheduler image to GHCR
@@ -114,7 +114,7 @@ jobs:
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
-          printf 'trusted_shim_revision=c2fe4d907bc9dbb7081776cab84ec1e5d734b6f6\n' >> "$DIST/VERSION"
+          printf 'trusted_shim_revision=a1eba4eafea5f4d1db453aa5c692d612cd7ebe61\n' >> "$DIST/VERSION"
           tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
           cd dist
           sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"
