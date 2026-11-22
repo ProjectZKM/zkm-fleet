@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture
@@ -21,18 +22,11 @@ def services():
         (prefix/'venv/bin').mkdir(parents=True);etc.mkdir();commands.mkdir()
         shutil.copytree(ROOT/'bridge/fleet_bridge',prefix/'bridge/fleet_bridge')
         python=prefix/'venv/bin/python'
-        python.write_text(f'#!{sys.executable}\nimport os,sys\n'
-            'if sys.argv[1:4]==["-m","fleet_bridge.shim","check"]:sys.exit(int(os.getenv("FAIL_SHIM","0")))\n'
-            f'os.execv({sys.executable!r},[{sys.executable!r},*sys.argv[1:]])\n')
+        python.write_text(f'#!{sys.executable}\n' + (FIXTURES / 'shim_check.py').read_text())
         python.chmod(0o755)
         capture=root/'units';capture.mkdir();log=root/'calls'
         sudo=commands/'sudo'
-        sudo.write_text(f'#!{sys.executable}\nimport os,pathlib,shutil,sys\n'
-            f'with open({str(log)!r},"a") as f:f.write(" ".join(sys.argv[1:])+"\\n")\n'
-            f'capture=pathlib.Path({str(capture)!r})\n'
-            'if sys.argv[1]=="test":sys.exit(0 if (capture/pathlib.Path(sys.argv[-1]).name).exists() else 1)\n'
-            'if sys.argv[1]=="install":shutil.copy2(sys.argv[-2],capture/pathlib.Path(sys.argv[-1]).name)\n'
-            'if sys.argv[1:]==["systemctl","start","zkm-fleet-node.service"]:sys.exit(int(os.getenv("FAIL_NODE","0")))\n')
+        sudo.write_text(f'#!{sys.executable}\n' + (FIXTURES / 'sudo.py').read_text())
         sudo.chmod(0o755)
         binary=root/'trusted-shim-runtime';binary.write_bytes(b'first-runtime');binary.chmod(0o755)
         config=etc/'apps.yaml';config.write_text('# operator comment\napps: []\noperator_setting: preserve-me\n');config.chmod(0o640)
