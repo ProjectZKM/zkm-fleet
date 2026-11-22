@@ -113,6 +113,8 @@ pub struct Scheduler {
     pub cfg: SchedulerConfig,
     /// Serializes proof submissions' id reservation.
     pub submissions: tokio::sync::Mutex<()>,
+    /// Serializes policy publication with namespace suspension/resumption.
+    pub(crate) router_policy_ops: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
     pub proof_fetch: crate::proof_fetch::ProofFetcher,
     pub log_relay: crate::log_relay::LogRelay,
@@ -172,6 +174,7 @@ impl Scheduler {
     ) -> Arc<Self> {
         Arc::new(Self {
             submissions: tokio::sync::Mutex::new(()),
+            router_policy_ops: tokio::sync::Mutex::new(()),
             cfg,
             store,
             proof_fetch: crate::proof_fetch::ProofFetcher::default(),
@@ -344,6 +347,22 @@ impl Scheduler {
         all
     }
 
+    /// Keep suspension and resource release fenced through a policy ledger
+    /// transaction. Lock order is workloads -> namespaces -> allocations.
+    pub(crate) fn policy_allocation_guard(
+        &self, namespace: &str, allocation: &str,
+    ) -> trusted_shim::rail::Result<Box<dyn trusted_shim::ledger_transport::ExecutionGuard + '_>> {
+        let namespaces = self.namespaces.lock();
+        if !namespaces.values().any(|n| n.id == namespace && n.suspended_ms.is_none()) {
+            return Err(trusted_shim::rail::Error::Rejected);
+        }
+        let allocations = self.allocations.lock();
+        if !allocations.get(allocation).is_some_and(|a| a.namespace == namespace) {
+            return Err(trusted_shim::rail::Error::Rejected);
+        }
+        Ok(Box::new((namespaces, allocations)))
+    }
+
     pub async fn create_namespace(&self, name: &str, quota: Quota) -> anyhow::Result<Namespace> {
         quota.validate()?;
         anyhow::ensure!(!name.is_empty() && name.len() <= 63
@@ -387,6 +406,7 @@ impl Scheduler {
 
     pub async fn suspend_namespace(&self, reference: &str, suspended: bool,
     ) -> anyhow::Result<Namespace> {
+        let _policies = self.router_policy_ops.lock().await;
         let _ops = self.quota_ops.lock().await;
         let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
         n.suspended_ms = suspended.then(now_ms);
@@ -588,6 +608,12 @@ impl Scheduler {
     ) -> anyhow::Result<Token> {
         use crate::token::Permission;
         let permissions: Vec<String> = if permissions.is_empty() { vec!["read".into(), "submit".into()] } else { permissions };
+        let router_delegate = permissions.iter().any(|p| p == Permission::RouterDelegate.name());
+        if router_delegate {
+            anyhow::ensure!(permissions.iter().all(|p| matches!(p.as_str(), "read" | "router_delegate"))
+                && token_hash.is_some() && tag.is_none() && apps.is_none(),
+                "router_delegate requires a namespace-wide backend credential, no tag/app grants, and only optional read permission");
+        }
         let router_sync = permissions.iter().any(|p| p == Permission::RouterSync.name());
         if router_sync {
             anyhow::ensure!(permissions.len() == 1 && token_hash.is_some()
@@ -621,7 +647,7 @@ impl Scheduler {
         }
         anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
         anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
-        anyhow::ensure!(admin || router_sync || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
+        anyhow::ensure!(admin || router_sync || router_delegate || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
         anyhow::ensure!(!manage || (tag.is_some() && token_hash.is_some()), "manage tokens require a tag and API token");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");

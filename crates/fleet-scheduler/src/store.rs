@@ -274,7 +274,21 @@ impl Store for MemoryStore {
     }
 
     async fn suspend_namespace(&self, id: &str, at_ms: Option<u64>) -> anyhow::Result<()> {
-        if let Some(n) = self.namespaces.lock().get_mut(id) { n.suspended_ms = at_ms; }
+        let mut namespaces = self.namespaces.lock();
+        if let Some(n) = namespaces.get_mut(id) {
+            let mut routers = self.routers.lock();
+            if at_ms.is_some() || n.suspended_ms.is_some() {
+                let mut changed = Vec::new();
+                for router in routers.values() {
+                    let mut next = router.clone();
+                    if let Some(auth) = &mut next.authorization {
+                        if auth.suspend_namespace(id)? { changed.push(next); }
+                    }
+                }
+                for next in changed { routers.insert(next.router_id.clone(), next); }
+            }
+            n.suspended_ms = at_ms;
+        }
         Ok(())
     }
 
@@ -305,8 +319,12 @@ pub struct PgLeaderLock {
 /// The reserved namespace for operator-managed apps.
 pub const SYSTEM_NAMESPACE: &str = "00000000000000000000000000000000";
 /// The schema this scheduler writes; `fleet_schema` records what a database has.
-const SCHEMA_VERSION: i32 = 17;
+// Schema 19 fences rollback to schedulers that reject wildcard policies and
+// normalizes the JSONB records used by router compare-and-swap updates.
+const SCHEMA_VERSION: i32 = 19;
 const ROUTERS: &str = "CREATE TABLE fleet_routers (id TEXT PRIMARY KEY, state JSONB NOT NULL);";
+const MIGRATE_18: &str = r#"UPDATE fleet_routers SET state =
+    '{"authorization":null,"delivered_authorization_revision":null,"applied_authorization_revision":null,"capabilities":[]}'::jsonb || state;"#;
 const TAG_PATTERN: &str = "^[A-Za-z][A-Za-z0-9_.-]{0,62}=[A-Za-z0-9_.-]{1,63}$";
 
 fn quoted(names: impl IntoIterator<Item = String>) -> String {
@@ -416,7 +434,7 @@ COMMENT ON COLUMN fleet_tokens.permissions IS '{PERMISSIONS_COMMENT}';
 }
 
 /// The tokens' permissions, and that an administrator's token alone has no namespace.
-const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','router_sync','admin']::text[])";
+const PERMISSIONS: &str = "CONSTRAINT fleet_tokens_permissions_known CHECK (permissions <@ ARRAY['read','submit','manage','router_sync','router_delegate','admin']::text[])";
 const ADMIN_UNSCOPED: &str = "CONSTRAINT fleet_tokens_admin_unscoped CHECK (('admin' = ANY(permissions)) = (namespace IS NULL))";
 const PERMISSIONS_COMMENT: &str = "What the token may do: some of read, submit, manage within its scope; or admin, alone and with no namespace.";
 
@@ -527,7 +545,7 @@ impl PgStore {
             (Some(SCHEMA_VERSION), true) => Ok(()),
             // Every migration from the database's schema on, in one transaction.
             (Some(from @ 14..), true) if from < SCHEMA_VERSION => {
-                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15()), (16, format!("{ROUTERS} ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};"))];
+                let steps = [(14, MIGRATE_14.to_string()), (15, migrate_15()), (16, format!("{ROUTERS} ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};")), (17, format!("ALTER TABLE fleet_tokens DROP CONSTRAINT fleet_tokens_permissions_known, ADD {PERMISSIONS};")), (18, MIGRATE_18.to_string())];
                 let sql: String = steps.into_iter().filter(|(v, _)| *v >= from).map(|(_, sql)| sql + "\n").collect();
                 sqlx::raw_sql(&format!("BEGIN;\n{sql}{stamp}\nCOMMIT;")).execute(pool).await?;
                 tracing::info!(from, schema = SCHEMA_VERSION, "database migrated");
@@ -842,8 +860,26 @@ impl Store for PgStore {
     }
 
     async fn suspend_namespace(&self, id: &str, at_ms: Option<u64>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<Option<i64>> = sqlx::query_scalar("SELECT suspended_ms FROM fleet_namespaces WHERE id=$1 FOR UPDATE")
+            .bind(id).fetch_optional(&mut *tx).await?;
+        if previous.is_some() && (at_ms.is_some() || previous.flatten().is_some()) {
+            let rows: Vec<serde_json::Value> = sqlx::query_scalar(
+                "SELECT state FROM fleet_routers WHERE state->'authorization'->'policies' @> $1::jsonb ORDER BY id FOR UPDATE")
+                .bind(serde_json::json!([{"namespace":id}])).fetch_all(&mut *tx).await?;
+            for state in rows {
+                let mut next: RouterControl = serde_json::from_value(state)?;
+                if let Some(auth) = &mut next.authorization {
+                    if auth.suspend_namespace(id)? {
+                        sqlx::query("UPDATE fleet_routers SET state=$2 WHERE id=$1")
+                            .bind(&next.router_id).bind(serde_json::to_value(&next)?).execute(&mut *tx).await?;
+                    }
+                }
+            }
+        }
         sqlx::query("UPDATE fleet_namespaces SET suspended_ms = $2 WHERE id = $1")
-            .bind(id).bind(at_ms.map(|v| v as i64)).execute(&self.pool).await?;
+            .bind(id).bind(at_ms.map(|v| v as i64)).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 

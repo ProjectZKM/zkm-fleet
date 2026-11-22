@@ -43,6 +43,9 @@ pub fn router(state: HttpState) -> Router {
         .with_state(state.clone())
         .merge(crate::workloads::router(state.workloads.clone()))
         .merge(crate::router_control::router(state.clone()))
+        .merge(crate::policy_gateway::admin_router(state.workloads.clone()))
+        .merge(crate::runtime_delivery::admin_router(state.workloads.clone()))
+        .merge(crate::openshell::admin_router(state.workloads.clone()))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/access", get(access))
@@ -51,6 +54,8 @@ pub fn router(state: HttpState) -> Router {
         .merge(api)
         .merge(crate::proof_fetch::router(state.clone()))
         .merge(crate::log_relay::router(state.clone()))
+        .merge(crate::policy_gateway::node_router(state.workloads.clone()))
+        .merge(crate::runtime_delivery::node_router(state.workloads.clone()))
         .merge(crate::workloads::internal_router(state.workloads))
 }
 
@@ -61,6 +66,7 @@ pub fn router(state: HttpState) -> Router {
 pub fn required(method: &Method, path: &str) -> Permission {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
+        (&Method::POST, ["routers", _, "authorize" | "revoke-subject"]) => Permission::RouterDelegate,
         (&Method::POST, ["routers", _, "sync"]) => Permission::RouterSync,
         (&Method::GET, ["namespaces"] | ["namespaces", _]) => Permission::Read,
         (&Method::GET, ["apps" | "batches", ..]) => Permission::Read,
