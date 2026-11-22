@@ -2646,7 +2646,7 @@ async fn internal_logs(
 }
 
 #[cfg(test)]
-#[path = "workloads_tests.rs"]
+#[path = "../tests/workloads/mod.rs"]
 mod tests;
 
 #[path = "workloads_scale.rs"]

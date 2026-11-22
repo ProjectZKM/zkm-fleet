@@ -2,7 +2,7 @@
 use super::*;
 use std::{path::Path, process::Command};
 
-#[path = "workloads_openshell_route_test.rs"]
+#[path = "route.rs"]
 mod route;
 
 // Every Docker operation is scoped to this test's unique operator namespace.
@@ -93,7 +93,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
         "python3".to_string(),
         "-u".into(),
         "-c".into(),
-        include_str!("../tests/fixtures/openshell_app.py").into(),
+        include_str!("../../fixtures/openshell_app.py").into(),
     ];
     let (dir, c, mut report, mut policy, mut request) =
         policy_setup_with_inventory("openshell", |report| {

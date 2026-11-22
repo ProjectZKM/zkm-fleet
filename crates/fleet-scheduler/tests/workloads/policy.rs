@@ -1,7 +1,7 @@
 //! Full HTTP administration + HTTP/2 node RPC on the same listener. The fake
 //! receipt verifier isolates orchestration; production pins the Ziren verifier.
 use super::*;
-#[path = "workloads_openshell_tests.rs"]
+#[path = "openshell/mod.rs"]
 mod openshell_startup;
 use trusted_shim::{
     contracts::{ExecutionIdentity, PolicyRef, ProofKind, Validity},

@@ -19,7 +19,7 @@ use trusted_shim::openshell_gateway::{
 };
 
 // Exercise the actual production node forwarder against this local cluster.
-#[path = "../../fleet-node/src/runtime_delivery.rs"]
+#[path = "../../../../fleet-node/src/runtime_delivery.rs"]
 mod node_delivery;
 
 fn admission() -> String {
@@ -261,10 +261,8 @@ async fn stock_gateway_startup_through_fleet_and_persistent_shim() {
     startup(false, true).await;
 }
 
-#[path = "workloads_openshell_docker_test.rs"]
 mod docker;
 
-#[path = "workloads_openshell_gateway_test.rs"]
 mod gateway;
 
 async fn startup(forged: bool, stock: bool) {

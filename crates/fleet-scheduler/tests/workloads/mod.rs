@@ -4,7 +4,6 @@ use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
-#[path = "workloads_policy_tests.rs"]
 mod policy;
 
 /// The administrator's token the tests' scheduler has.
