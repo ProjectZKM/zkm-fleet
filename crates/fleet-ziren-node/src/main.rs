@@ -125,6 +125,7 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
     let mut endpoint =
         Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5));
     if endpoint.uri().scheme_str() == Some("https") {
+        fleet_proto::initialize_tls();
         let host = endpoint
             .uri()
             .host()

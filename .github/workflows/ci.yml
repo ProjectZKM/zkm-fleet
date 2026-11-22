@@ -62,6 +62,8 @@ jobs:
               exit 1
             fi
           done
+      - name: Check policy evaluator matches the proof guest
+        run: python3 scripts/check_policy_features.py
 
   prover-check:
     name: Prover runtime and artifact storage

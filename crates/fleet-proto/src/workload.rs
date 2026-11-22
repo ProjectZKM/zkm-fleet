@@ -19,7 +19,7 @@ impl<'a> Entry<'a> {
     pub const RESOURCES: [&'static str; 3] = ["gpus", "cpus", "replicas"];
     /// The node's own configuration of an entry: the app it runs, its program and how its
     /// worker launches. No change the scheduler sends replaces them.
-    pub const NODE_OWNED: [&'static str; 8] = ["app", "elf_id", "worker_command", "worker_env_file",
+    pub const NODE_OWNED: [&'static str; 9] = ["app", "elf_id", "prover_binary", "worker_command", "worker_env_file",
         "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root"];
     /// What a report says about an entry beside its configuration, and the namespace reference
     /// the scheduler keeps from it.
@@ -30,8 +30,15 @@ impl<'a> Entry<'a> {
         match self.0.get("runtime") {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,
+            Some(v) if v == &json!({"executor":"shim", "driver":"openshell"}) => Some(
+                if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" }
+                else { "shim-openshell-provisioning-v1" }),
             Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
-                if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }
+                if self.0["service_protocol"] == "tcp" { "shim-tcp-v1" }
+                else if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
+                else if self.0["ingress"].as_object().is_some_and(|i| !i.is_empty()) || self.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")) { "shim-management-v1" }
+                else if self.0["port_base"].as_u64() == Some(0) { "shim-automatic-port-v1" }
+                else if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }
                 else if self.0.get("container_port").is_some() || self.0.get("entrypoint").is_some() { "shim-runtime-v2" }
                 else { "shim-docker-v1" }),
             Some(_) => Some("unsupported-runtime"),
@@ -196,6 +203,19 @@ impl ScaleStatus {
 }
 
 impl NodeReport {
+    /// Native provisioning holds resources before there is an application route.
+    /// Only a complete set of exact, durable replica reservations counts here.
+    pub fn native_allocated(&self, entry: Entry<'_>) -> bool {
+        if !matches!(entry.runtime_capability(), Some("shim-openshell-provisioning-v1" | "shim-openshell-services-v1")) || entry.disabled() {
+            return false;
+        }
+        let instances: Vec<_> = self.runtime_instances.iter().filter(|r| r.entry_name == entry.name()).collect();
+        instances.len() as u64 == entry.replicas() && (0..entry.replicas()).all(|index|
+            instances.iter().any(|r| r.execution.allocation_id == format!("{}-{index}", entry.name())
+                && r.execution.node_id == self.machine && r.execution.workload == entry.app()
+                && (r.execution.namespace == entry.namespace() || Some(r.execution.namespace.as_str()) == entry.namespace_reference())
+                && r.execution.generation > 0 && (r.ready || r.services.is_empty())))
+    }
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         entry.runtime_capability().is_none_or(|cap| self.runtime_capabilities.iter().any(|v| v == cap))
     }
