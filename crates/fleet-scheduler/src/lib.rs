@@ -12,6 +12,9 @@ pub mod workloads;
 pub mod store;
 pub mod token;
 pub mod router_control;
+pub mod policy_gateway;
+mod runtime_delivery;
+mod openshell;
 
 use std::future::IntoFuture;
 use std::sync::Arc;
@@ -97,6 +100,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
     let control_addr = cfg.control_addr.parse()?;
     let mut control_server = Server::builder();
     if let Some(tls) = &cfg.control_tls {
+        fleet_proto::initialize_tls();
         let identity = Identity::from_pem(
             std::fs::read(&tls.cert_path)?,
             std::fs::read(&tls.key_path)?,
@@ -120,6 +124,24 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
 
     tracing::info!(control = %cfg.control_addr, http = %cfg.http_addr, "listening");
     let dispatcher = tokio::spawn(fleet.clone().dispatch_loop());
+    let policy = workloads.policy.clone();
+    let compute_controller = workloads.clone();
+    let readiness_controller = workloads.clone();
+    let readiness_observer = cfg.policy_gateway.as_ref().and_then(|p| p.openshell.as_ref())
+        .and_then(|o| o.gateway.as_ref()).map(openshell::Observer::new).transpose()?;
+    let readiness_loop = async move {
+        if let Some(observer) = readiness_observer { observer.run(readiness_controller).await; }
+        std::future::pending::<()>().await;
+    };
+    let compute_socket = cfg.policy_gateway.as_ref().and_then(|p| p.openshell.as_ref()).map(|o| o.compute_socket.clone());
+    let compute_loop = async move {
+        if let Some(path) = compute_socket { return openshell::serve(compute_controller,path).await; }
+        std::future::pending::<anyhow::Result<()>>().await
+    };
+    let receipt_loop = async move {
+        if let Some(policy) = policy { policy.receipt_loop().await; }
+        std::future::pending::<()>().await;
+    };
     let dispatch_loop = tokio::spawn(workloads.dispatch_loop());
     let f = fleet.clone();
     tokio::spawn(async move {
@@ -140,6 +162,9 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = servers => r?,
         r = dispatcher => r?,
         r = dispatch_loop => r??,
+        _ = receipt_loop => anyhow::bail!("policy receipt worker stopped"),
+        _ = readiness_loop => anyhow::bail!("OpenShell readiness observer stopped"),
+        r = compute_loop => { r?; anyhow::bail!("OpenShell compute extension stopped"); },
     }
     Ok(())
 }

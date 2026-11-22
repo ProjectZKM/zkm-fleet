@@ -238,11 +238,11 @@ impl WorkloadController {
 
     /// Settings an update may change on an app. The rest is identity, placement or the
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
-    pub(super) const APP_SETTINGS: [&'static str; 16] = ["image", "env", "command", "user", "workdir", "volumes",
-        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime", "services", "container_port", "entrypoint", "ingress"];
+    pub(super) const APP_SETTINGS: [&'static str; 17] = ["image", "env", "command", "user", "workdir", "volumes",
+        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
     // Apps can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
-    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 11] = ["image", "env", "command", "user", "workdir", "volumes", "runtime", "services", "container_port", "entrypoint", "ingress"];
+    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 12] = ["image", "env", "command", "user", "workdir", "volumes", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
     // A namespace's owner creates its own apps, as it does its batches: the host's
     // filesystem and user ids stay administrator settings.
     const ADMIN_CREATE_SETTINGS: [&'static str; 8] = ["user", "volumes", "proof_storage_root", "runtime", "services", "container_port", "entrypoint", "ingress"];
@@ -317,7 +317,7 @@ impl WorkloadController {
                 "env" => value.as_object().is_some_and(|o| o.values().all(Value::is_string)),
                 "ingress" => value.is_object(),
                 "command" | "volumes" | "services" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
-                "user" | "workdir" | "health_path" | "entrypoint" => value.is_string(),
+                "user" | "workdir" | "health_path" | "entrypoint" | "service_protocol" => value.is_string(),
                 "shm_gb" | "stop_timeout_s" | "container_port" => value.as_u64().is_some(),
                 "memory_gb" | "ready_timeout_s" => value.as_f64().is_some_and(|v| v.is_finite() && v > 0.0),
                 _ => return Err(fail(400, format!("{key} cannot be updated; settings: {}", Self::APP_SETTINGS.join(", ")))),

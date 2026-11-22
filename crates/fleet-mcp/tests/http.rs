@@ -35,10 +35,7 @@ async fn allows_anonymous_discovery_and_authenticates_tool_calls() {
     let args_log = temp.path().join("args.txt");
     std::fs::write(
         &fake_fleetctl,
-        format!(
-            "#!/bin/sh\n test -z \"${{FLEET_ADMIN_TOKEN_FILE}}\" || exit 41\n test \"$(cat \"$FLEET_TOKEN_FILE\")\" = scoped-token || exit 42\n printf '%s\\n' \"$*\" >> '{}'\n printf '{{\"apps\":[{{\"name\":\"demo\"}}]}}\\n'\n",
-            args_log.display()
-        ),
+        include_str!("fixtures/fleetctl.sh"),
     )
     .unwrap();
     std::fs::set_permissions(&fake_fleetctl, std::fs::Permissions::from_mode(0o700)).unwrap();
