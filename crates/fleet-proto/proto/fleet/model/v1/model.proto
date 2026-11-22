@@ -80,6 +80,8 @@ message RouterControl {
   optional RouterAuthorization authorization = 10;
   optional uint64 delivered_authorization_revision = 11;
   optional uint64 applied_authorization_revision = 12;
+  // Advertised by the authenticated relay on its latest successful sync.
+  repeated string capabilities = 13;
 }
 message RouterSyncRequest {
   optional string epoch = 1;

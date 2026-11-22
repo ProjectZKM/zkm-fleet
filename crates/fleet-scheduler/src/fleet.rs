@@ -113,6 +113,8 @@ pub struct Scheduler {
     pub cfg: SchedulerConfig,
     /// Serializes proof submissions' id reservation.
     pub submissions: tokio::sync::Mutex<()>,
+    /// Serializes policy publication with namespace suspension/resumption.
+    pub(crate) router_policy_ops: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
     pub proof_fetch: crate::proof_fetch::ProofFetcher,
     pub log_relay: crate::log_relay::LogRelay,
@@ -172,6 +174,7 @@ impl Scheduler {
     ) -> Arc<Self> {
         Arc::new(Self {
             submissions: tokio::sync::Mutex::new(()),
+            router_policy_ops: tokio::sync::Mutex::new(()),
             cfg,
             store,
             proof_fetch: crate::proof_fetch::ProofFetcher::default(),
@@ -403,6 +406,7 @@ impl Scheduler {
 
     pub async fn suspend_namespace(&self, reference: &str, suspended: bool,
     ) -> anyhow::Result<Namespace> {
+        let _policies = self.router_policy_ops.lock().await;
         let _ops = self.quota_ops.lock().await;
         let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
         n.suspended_ms = suspended.then(now_ms);

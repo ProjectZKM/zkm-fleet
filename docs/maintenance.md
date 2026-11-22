@@ -20,6 +20,20 @@ deploy/fleet-ctl.sh -n scheduler upgrade v0.1.6  # -n prints every step and chan
 
 ### Control host
 
+For the runtime migration release (database schema 19), take a database backup
+and validate the schema 17/18 upgrade against a copy before changing production.
+This migration retains router identities, tombstones and policy acknowledgments;
+it normalizes old JSON records so subsequent syncs can update them. Schema 18
+and older binaries cannot be used as rollback builds after migration. Keep a
+validated schema-19-compatible build available instead of resetting the database
+or restoring stale router authorization over live grants.
+
+Upgrade the independent data-router relay before publishing `workload: "*"`
+policies. Its next authenticated poll must advertise `workload-defaults-v1` in
+`GET /routers/ID`'s `capabilities`; publication otherwise returns 409. The updated
+relay also works with the previous Fleet JSON API. Once a default is stored, keep
+that relay capability through rollback, even if the default is disabled.
+
 The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 

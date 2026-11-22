@@ -213,7 +213,13 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     // New workloads inherit an operator-approved namespace/service default.
     // An exact disabled entry must still win over that default.
     policy["workload"]=json!("*"); policy["service"]=json!("chat");
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().status(),409);
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .header("x-fleet-router-capabilities", "workload-defaults-v1")
+        .json(&ack).send().await.unwrap().status(),200);
     h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    assert_eq!(h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .json(&ack).send().await.unwrap().status(),409, "a downgraded relay cannot renew after defaults are published");
     let mut fresh=operator.clone(); fresh["workload"]=json!("new-agent"); fresh["service"]=json!("chat");
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),200);
     policy["workload"]=fresh["workload"].clone(); policy["enabled"]=json!(false);
@@ -222,6 +228,71 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     fresh["workload"]=json!("another-agent");
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&fresh).send().await.unwrap().status(),200);
     assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&other).json(&fresh).send().await.unwrap().status(),403);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_router_redacts_delegates_and_suspension_withdraws_policies_durably() {
+    use serde_json::{json, Value};
+    let h = start().await;
+    create_namespace(&h, "other", None);
+    let mut namespaces = Vec::new();
+    let mut secrets = Vec::new();
+    for (i, name) in [PROOFS, "other"].iter().enumerate() {
+        let n: Value = h.client.get(format!("{}/namespaces/{name}", h.http)).bearer_auth(&h.admin)
+            .send().await.unwrap().json().await.unwrap();
+        namespaces.push(n["id"].as_str().unwrap().to_owned());
+        let secret = format!("{}", i + 1).repeat(96);
+        let token = json!({"id":format!("{}",i+1).repeat(32),"address":format!("{}",i+1).repeat(40),
+            "namespace":name,"permissions":["read","router_delegate"],"token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))});
+        assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&token).send().await.unwrap().status(),201);
+        secrets.push(secret);
+    }
+    let sync_token = "ac".repeat(48);
+    let token = json!({"id":"ac".repeat(16),"address":"ac".repeat(20),"namespace":PROOFS,
+        "permissions":["router_sync"],"token_hash":hex::encode(sha2::Sha256::digest(sync_token.as_bytes()))});
+    assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&token).send().await.unwrap().status(),201);
+    let base = format!("{}/routers/shared",h.http);
+    assert_eq!(h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)})).send().await.unwrap().status(),201);
+    let policy = |i:usize| json!({"namespace":namespaces[i],"workload":"agent","service":"chat","version":1,"sha256":"ab".repeat(32),"enabled":true});
+    let revoke = |i:usize| json!({"namespace":namespaces[i],"principal":format!("{}",i+3).repeat(64),"session":null});
+    for i in 0..2 {
+        assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy(i)).send().await.unwrap().status(),200);
+        // Check both mutation and idempotent return paths with another tenant's
+        // revocation already present in the shared authorization record.
+        for _ in 0..2 {
+            let response: Value = h.client.post(format!("{base}/revoke-subject")).bearer_auth(&secrets[i]).json(&revoke(i))
+                .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(response["policies"].as_array().unwrap().len(),1);
+            assert_eq!(response["revoked_subjects"].as_array().unwrap().len(),1);
+            assert_eq!(response["policies"][0]["namespace"],namespaces[i]);
+            assert_eq!(response["revoked_subjects"][0]["namespace"],namespaces[i]);
+        }
+    }
+    let pause = format!("{}/namespaces/other/suspended",h.http);
+    assert_eq!(h.client.put(&pause).bearer_auth(&h.admin).send().await.unwrap().status(),200);
+    let snapshot: Value = h.client.post(format!("{base}/sync")).bearer_auth(&sync_token)
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    let policies = snapshot["authorization"]["policies"].as_array().unwrap();
+    assert_eq!(policies.iter().find(|p|p["namespace"]==namespaces[0]).unwrap()["enabled"],true);
+    let withdrawn = policies.iter().find(|p|p["namespace"]==namespaces[1]).unwrap();
+    assert_eq!(withdrawn["enabled"],false);
+    assert_eq!(withdrawn["version"],2);
+    let mut disabled = policy(1); disabled["enabled"]=json!(false); disabled["version"]=json!(3);
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&disabled).send().await.unwrap().status(),200);
+    let mut another = revoke(1); another["principal"]=json!("ff".repeat(32));
+    assert_eq!(h.client.post(format!("{base}/revoke-subject")).bearer_auth(&h.admin).json(&another).send().await.unwrap().status(),200);
+    disabled["enabled"]=json!(true); disabled["version"]=json!(4);
+    assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&disabled).send().await.unwrap().status(),403);
+    assert_eq!(h.client.delete(&pause).bearer_auth(&h.admin).send().await.unwrap().status(),200);
+    let state: Value = h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(state["authorization"]["policies"][1]["enabled"],false, "resume must not revive old grants");
+    // Even a pause/resume before the next router poll persists withdrawal, also
+    // when the suspended namespace owns the router's own sync credential.
+    let own_pause = format!("{}/namespaces/{PROOFS}/suspended",h.http);
+    assert_eq!(h.client.put(&own_pause).bearer_auth(&h.admin).send().await.unwrap().status(),200);
+    assert_eq!(h.client.delete(&own_pause).bearer_auth(&h.admin).send().await.unwrap().status(),200);
+    let state: Value = h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert!(state["authorization"]["policies"].as_array().unwrap().iter().all(|p|p["enabled"]==false));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

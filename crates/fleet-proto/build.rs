@@ -118,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NodeReport.runtime_capabilities",
         "NodeReport.runtime_instances",
         "NodeReport.native_provers",
+        "RouterControl.capabilities",
         "CreateNamespaceRequest.quota",
         "AllocationRequest.restore",
         "CreateTokenRequest.label",

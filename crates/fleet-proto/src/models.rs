@@ -5,6 +5,8 @@ use crate::stage::v1::Status as StageStatus;
 use serde_json::Value;
 
 pub const MAX_ROUTER_REVOCATIONS: usize = 4096;
+pub const ROUTER_CAPABILITIES_HEADER: &str = "x-fleet-router-capabilities";
+pub const ROUTER_WORKLOAD_DEFAULTS: &str = "workload-defaults-v1";
 pub fn valid_router_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
@@ -13,6 +15,10 @@ pub fn valid_route_id(id: &str) -> bool {
 }
 impl RouterControl {
     pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.capabilities.len() <= 16
+            && self.capabilities.iter().all(|c| router_name(c))
+            && self.capabilities.iter().collect::<std::collections::HashSet<_>>().len() == self.capabilities.len(),
+            "invalid router capabilities");
         if let Some(auth) = &self.authorization { auth.validate()?; }
         anyhow::ensure!(self.delivered_authorization_revision.is_none_or(|r| self.authorization.as_ref().is_some_and(|a| r <= a.revision))
             && self.applied_authorization_revision.is_none_or(|r| self.delivered_authorization_revision.is_some_and(|d| r <= d)), "invalid authorization acknowledgment");
@@ -57,6 +63,23 @@ impl RouterAuthorizeRequest {
     }
 }
 impl RouterAuthorization {
+    /// A suspension permanently withdraws the current bindings. Resuming the
+    /// namespace does not enable policies or resurrect previously issued grants.
+    pub fn suspend_namespace(&mut self, namespace: &str) -> anyhow::Result<bool> {
+        if !self.policies.iter().any(|p| p.namespace == namespace && p.enabled) {
+            return Ok(false);
+        }
+        let revision = self.revision.checked_add(1).ok_or_else(|| anyhow::anyhow!("authorization revision exhausted"))?;
+        anyhow::ensure!(self.policies.iter().filter(|p| p.namespace == namespace && p.enabled)
+            .all(|p| p.version < u64::MAX), "policy version exhausted");
+        for policy in self.policies.iter_mut().filter(|p| p.namespace == namespace && p.enabled) {
+            policy.enabled = false;
+            policy.version += 1;
+        }
+        self.revision = revision;
+        Ok(true)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
             "authorization state capacity exceeded");

@@ -155,8 +155,6 @@ def test_upgrade_and_rollback_preserve_runtime_sse_websocket_and_job():
             sync_id,sync_file=credential('sync',['router_sync'])
             _,delegate=credential('delegate',['read','router_delegate'])
             http(api+'/routers/upgrade',admin,{'issuer':'upgrade-test','token_id':sync_id},'PUT')
-            http(api+'/routers/upgrade/access-policy',admin,{'namespace':namespace,'workload':'*','service':'http',
-                'version':1,'sha256':'ab'*32,'enabled':True},'PUT')
             private=root/'gateway.key';public=root/'gateway.pub'
             subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(private)],check=True)
             private.chmod(0o600)
@@ -175,6 +173,9 @@ def test_upgrade_and_rollback_preserve_runtime_sse_websocket_and_job():
                 'TRUSTED_ROUTER_ID':'upgrade','TRUSTED_ROUTER_TOKEN_FILE':str(sync_file)}
             spawn('router',[router_bin,'relay',f'127.0.0.1:{relay_port}',root/'routes.db',public,'upgrade-test'],env)
             spawn('gateway',[router_bin,'gateway',f'127.0.0.1:{gateway_port}'],env)
+            wait(lambda:'workload-defaults-v1' in http(api+'/routers/upgrade',admin).get('capabilities',[]))
+            http(api+'/routers/upgrade/access-policy',admin,{'namespace':namespace,'workload':'*','service':'http',
+                'version':1,'sha256':'ab'*32,'enabled':True},'PUT')
             wait(lambda:http(api+'/routers/upgrade',admin).get('applied_authorization_revision')==1)
             apps=prefix/'etc/apps.yaml';state=str(root/'shim')
             apps.write_text(yaml.safe_dump({'log_dir':str(root/'logs'),'shim_binary':str(shim_bin),'shim_state_dir':state,

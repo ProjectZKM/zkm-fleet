@@ -424,6 +424,12 @@ class NodeExecutor:
                     continue
                 if shim.selected(spec):
                     raise ValueError("shim execution is unhealthy; retained until explicit cleanup")
+                if spec.app.kind in ("ziren-cpu", "ziren-gpu") and not spec.app.worker_command:
+                    # An upgraded bridge cannot infer that an old actor is idle
+                    # from missing/stale executable evidence. Keep its process
+                    # and GPU allocation until an explicit drained stop confirms
+                    # cleanup; ordinary reconciliation must not abort a proof.
+                    raise ValueError("native prover differs from configuration; explicit drain and cleanup required")
                 reconcile.stop(spec.name)
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")

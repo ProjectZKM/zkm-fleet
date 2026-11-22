@@ -417,7 +417,13 @@ upgrade, add `machine` to entries already using `prover_binary`. The actor reads
 the running executable from `/proc/<pid>/exe`; older actors omit this evidence.
 The machine's status includes these records for operator inspection. A selected
 prover is not reported ready if its observed executable differs or is unknown.
-Drain/restart only the affected app before submitting work. The shared process
+Reconciliation retains an existing native prover when its executable evidence or
+configuration differs, including actors from older bridges that report no path.
+It reports that explicit drain and confirmed cleanup are required; it never stops
+that actor to satisfy an automatic `SetApp` retry. Matching actors stay running.
+The bridge's readiness flag does not gate the separate proof dispatch protocol:
+disable admission and drain the affected proof app before changing its executable.
+The shared process
 role marker makes orphan cleanup work for renamed prover executables while still
 checking the exact replica name.
 
@@ -1060,8 +1066,22 @@ sha256, enabled}`. The first policy activates identity enforcement for that rela
 `workload: "*"` supplies a default within one exact namespace and service; an exact
 workload policy always wins, including `enabled: false`. Requests cannot use a
 wildcard target. Upgrade both Fleet and the relay before publishing defaults.
+Relays advertise `x-fleet-router-capabilities: workload-defaults-v1` on every sync;
+Fleet records this on the enrolled router and rejects a new default policy with
+409 until support has been reported. A relay without that capability cannot
+renew a router that already has default policies. The header leaves older Fleet's
+closed JSON request unchanged. Token rotation clears the stored capabilities;
+the replacement relay must sync before publishing new defaults.
 Changing an existing policy requires a higher version. New agents can inherit
-defaults without letting application backends write infrastructure policy.
+defaults without letting application backends write infrastructure policy. Defaults
+also apply to existing workloads without an exact entry; publish explicit disabled
+entries first for workloads that must remain denied.
+
+Schema 19 normalizes existing schema 17/18 router JSON before compare-and-swap
+writes and records relay capabilities. Epochs, revocations, acknowledgments, jobs
+and allocations are retained. Schedulers supporting only schema 18 or earlier
+reject this database at startup, including rollback builds that cannot interpret
+wildcard policies. Keep a schema-19-compatible build for rollback.
 
 A backend's namespace-wide `read,router_delegate` credential may request an
 opaque connection binding at `POST /routers/ID/authorize` after it authenticates
@@ -1071,6 +1091,15 @@ checks namespace/service infrastructure access; it does not validate those keys.
 Administrators cannot obtain ordinary delegated application bindings; the reserved
 `control` service requires an administrator. Backends may revoke opaque subjects
 or sessions only within their namespace via `POST /routers/ID/revoke-subject`.
+The response contains only that delegate's namespace policies and revocations,
+including on an idempotent retry; administrators retain the complete view.
+Suspending a namespace atomically disables its current policies across every
+router, increasing policy and authorization versions without changing runtime
+allocations. Relays withdraw affected streams on their next successful sync;
+an unreachable control plane cannot renew the 30-second lease. Administrators
+can still disable policies and revoke subjects while the namespace is suspended.
+Resuming it does not re-enable policies or revive old grants: publish a higher
+enabled policy version explicitly after recovery.
 
 `authorization.revision`, `delivered_authorization_revision` and
 `applied_authorization_revision` are independent of route generations/revocations.
