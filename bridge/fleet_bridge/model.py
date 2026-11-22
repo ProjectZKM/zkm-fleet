@@ -456,7 +456,43 @@ class ControlPlaneConfig(Record):
     gpu_port_range: tuple[int, int] = (30100, 30199)
     shim_binary: str | None = None
     shim_state_dir: str | None = None
+    shim_daemon: bool = False
     shim_network: ShimNetworkConfig | None = None
+    shim_openshell: ShimOpenShellConfig | None = None
+
+    def __post_init__(self) -> None:
+        if self.shim_openshell is not None and not self.shim_daemon:
+            raise ModelError("OpenShell requires the persistent shim daemon")
+        if self.shim_daemon:
+            if not all(p and os.path.isabs(p) and "\x00" not in p for p in (self.shim_binary, self.shim_state_dir)):
+                raise ModelError("shim daemon requires absolute shim_binary and shim_state_dir")
+            if len(os.fsencode(os.path.join(self.shim_state_dir, "control.sock"))) >= 108:
+                raise ModelError("shim daemon requires a Unix socket path under 108 bytes")
+
+
+@dataclass(kw_only=True)
+class ShimOpenShellConfig(Record):
+    """Operator endpoints only; per-allocation credentials never enter apps.yaml."""
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    socket: str
+    admission_policy: str
+    ledger_endpoint: str
+    ledger_ca_file: str | None = None
+    supervisor_image: str | None = None
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlsplit
+        url = urlsplit(self.ledger_endpoint)
+        if (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1"))
+                or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("", "/")):
+            raise ModelError("OpenShell policy gateway requires TLS without credentials or a path")
+        if (not os.path.isabs(self.socket) or "\x00" in self.socket or len(os.fsencode(self.socket)) >= 108
+                or not self.admission_policy or len(self.admission_policy.encode()) > 65536):
+            raise ModelError("OpenShell needs an absolute private driver socket and admission acknowledgement")
+        if self.ledger_ca_file is not None and (url.scheme != "https" or not os.path.isabs(self.ledger_ca_file) or "\x00" in self.ledger_ca_file):
+            raise ModelError("OpenShell private CA requires HTTPS and an absolute certificate path")
+        if self.supervisor_image is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", self.supervisor_image):
+            raise ModelError("OpenShell supervisor requires an immutable local Docker image ID")
 
 
 @dataclass(kw_only=True)
@@ -479,6 +515,11 @@ class ShimNetworkConfig(Record):
             raise ModelError("shim network needs an issuer and absolute credential/key paths")
 
 
+class ServiceProtocol(str, enum.Enum):
+    HTTP1 = "http1"
+    TCP = "tcp"
+
+
 class ExecutorKind(str, enum.Enum):
     LEGACY = "legacy"
     SHIM = "shim"
@@ -492,8 +533,8 @@ class RuntimeSelection(Record):
 
     def __post_init__(self) -> None:
         if (self.executor is ExecutorKind.LEGACY and self.driver is not None
-                or self.executor is ExecutorKind.SHIM and self.driver != "docker"):
-            raise ModelError("runtime must select legacy or shim with driver docker")
+                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell")):
+            raise ModelError("runtime must select legacy or shim with driver docker or openshell")
 
 
 @dataclass(kw_only=True)
@@ -520,6 +561,7 @@ class AppSpec(Record):
     name: str
     runtime: RuntimeSelection | None = None
     services: list[str] = field(default_factory=list)
+    service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
     ingress: dict[str, HttpIngress] = field(default_factory=dict)
     container_port: int | None = None
     entrypoint: str | None = None
@@ -564,6 +606,21 @@ class AppSpec(Record):
     backend: str = "cpu"
     rust_log: str = "info"
     def __post_init__(self) -> None:
+        if self.runtime and self.runtime.driver == "openshell":
+            if (self.gpus != 0 or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
+                    or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
+                    or self.ingress or self.volumes or self.shm_gb is not None
+                    or any(v is not None for v in (self.port_base, self.entrypoint, self.user, self.workdir))
+                    or self.service_protocol is not ServiceProtocol.HTTP1 or "control" in self.services
+                    or bool(self.services) != (self.container_port is not None)
+                    or not self.health_path.startswith("/") or self.health_path.startswith("//")
+                    or len(self.health_path.encode()) > 2048 or any(ord(c) < 32 or ord(c) == 127 or c in "\\#" for c in self.health_path)
+                    or not self.services and self.health_path != "/"):
+                raise ModelError("native OpenShell requires CPU/memory limits and optional private HTTP app services")
+        if self.service_protocol is ServiceProtocol.TCP:
+            if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
+                    or not any(s != "control" for s in self.services) or self.ingress):
+                raise ModelError("TCP requires a shim application service without HTTP ingress")
         if self.services or self.ingress or self.container_port is not None or self.entrypoint is not None:
             if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
                 raise ModelError("services, container_port and entrypoint require explicit shim execution")
@@ -584,8 +641,9 @@ class AppSpec(Record):
             raise ModelError("priority must be a signed 32-bit integer")
         if self.prover_binary is not None:
             if (self.kind is AppRuntime.APP or self.worker_command
+                    or not self.machine or not self.machine.strip()
                     or not os.path.isabs(self.prover_binary) or "\x00" in self.prover_binary):
-                raise ModelError("prover_binary requires an absolute path on a native prover without worker_command")
+                raise ModelError("prover_binary requires a machine-pinned native prover and an absolute path without worker_command")
         if self.worker_command:
             if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
                     or not self.machine or not self.proof_storage_root):
@@ -630,6 +688,8 @@ class AppsConfig(Record):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
         if any(a.services for a in apps) and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
+        if any(a.runtime and a.runtime.driver == "openshell" for a in apps) and (not cluster.shim_daemon or cluster.shim_openshell is None):
+            raise ModelError("OpenShell requires the configured persistent companion")
         return cls(cluster=cluster, apps=apps, raw=dict(data))
 
 
@@ -653,6 +713,14 @@ class RuntimeInstance(Record):
     execution: RuntimeIdentity
     ready: bool
     services: list[str] = field(default_factory=list)
+    native_observation_base64: str | None = None
+
+
+@dataclass(kw_only=True)
+class NativeProverProcess(Record):
+    entry_name: str
+    replica_name: str
+    executable: str
 
 
 @dataclass(kw_only=True)
@@ -733,6 +801,7 @@ class ReplicaHealth(Record):
     executor: ExecutorKind = ExecutorKind.LEGACY
     execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
+    prover_binary: str | None = None  # observed /proc/<pid>/exe; absent on older actors
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)
     gpu_port: int | None = None
@@ -742,6 +811,9 @@ class ReplicaHealth(Record):
     # Shim's authenticated local management listener can be available while the
     # application is unhealthy (for example during state restore).
     management_ready: bool = False
+    # Durable native ownership may precede compute creation and route readiness.
+    allocation_reserved: bool = False
+    native_observation_base64: str | None = None
     stopping: bool = False
     error: str | None = None
 
