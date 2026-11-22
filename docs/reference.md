@@ -1469,7 +1469,11 @@ shim_tee:
   mode: simulation
   platform: sample
   evidence_endpoint: http://127.0.0.1:8006/aa/evidence
-  trustee_endpoint: http://127.0.0.1:50004
+  trustee_endpoint: https://fleet.example:8905
+  trustee_tls:
+    ca_file: /etc/zkm-fleet/tls/ca.pem
+    cert_file: /etc/zkm-fleet/tls/node.pem
+    key_file: /etc/zkm-fleet/tls/node.key
   trustee_policy_ids: [default]
   expected_measurement: abcde
   init_data_sha256: '<approved 64-character digest>'

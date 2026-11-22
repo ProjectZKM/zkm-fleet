@@ -96,13 +96,55 @@ it. Scheduler-only upgrades do not restart AS. To introduce or update AS on an
 existing control host, apply the installed Compose stack's `trustee-as` service
 separately after reviewing site overrides.
 
-AS listens at `trustee-as:50004` on the private Compose network, with **no host
-port or public gateway route**. Before remote TEE nodes use it, provide an
-authenticated TLS ingress (for example, an operator-managed mTLS proxy) on the
-control plane and set `shim_tee.trustee_endpoint` in the existing node `apps.yaml`.
-This commit packages the private AS service; it does not install that ingress or
-add client-certificate support to shim. A stock AS TLS listener alone does not
-authenticate callers. Keep AS policy/reference-value administration private.
+AS listens at `trustee-as:50004` on the private Compose network with no host
+port. Fleet's existing HTTPS ingress on port 8905 forwards only
+`/attestation.AttestationService/AttestationEvaluate`. This route requires a client
+certificate signed by Fleet's TLS CA with a URI SAN matching
+`spiffe://fleet/trustee/node/<node-id>` (letters, digits, underscores and hyphens).
+Other AS methods, including policy writes, are denied. Existing Fleet routes keep
+their current application authentication; clients without certificates still work.
+Forwarded identity headers cannot substitute for a validated certificate.
+
+Provision a distinct, short-lived client certificate for each node. Generate its
+private key and CSR on the node:
+
+```bash
+umask 077
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout node.key -out node.csr -subj /CN=ant-5090-1
+```
+
+Have the operator sign the CSR with client-auth usage and the approved node URI
+SAN using the existing Fleet PKI. Keep the CA
+private key on the signing host. For example, after reviewing `node.csr`, the
+operator can sign it with OpenSSL (the node ID is an approved enrollment identity):
+
+```bash
+printf '%s\n' 'extendedKeyUsage=clientAuth' \
+  'subjectAltName=URI:spiffe://fleet/trustee/node/ant-5090-1' > node.ext
+openssl x509 -req -in node.csr -CA /etc/zkm-fleet/tls/ca.pem \
+  -CAkey /etc/zkm-fleet/tls/ca.key -CAcreateserial -days 1 \
+  -extfile node.ext -out node.pem
+```
+
+Deliver only `node.pem` and the CA certificate to the node. In its existing
+`apps.yaml`, set `shim_tee.trustee_endpoint: https://<fleet-host>:8905` and
+`shim_tee.trustee_tls: {ca_file: /etc/zkm-fleet/tls/ca.pem, cert_file: /etc/zkm-fleet/tls/node.pem, key_file: /etc/zkm-fleet/tls/node.key}`.
+The endpoint must match the gateway server certificate SAN. The node private key
+must be owned by the shim UID with mode 0600; paths must be absolute and files
+must not be symlinks. Restart shim after renewal to reload credentials; its runtime
+containers survive that restart. This certificate authorizes AS appraisal only,
+not Fleet scheduling, application access or launch admission. Fleet token
+revocation does not revoke certificates; use short lifetimes and PKI rotation.
+Apply the updated `gateway.yaml` and recreate the gateway when upgrading an
+existing deployment; scheduler-only upgrades do not reload the ingress template.
+
+The opt-in `deploy/tests/test_trustee_ingress.py` exercises the packaged Envoy
+configuration and stock AS with temporary certificates. Run it with
+`FLEET_TEST_TRUSTEE_INGRESS=1` and `TRUSTEE_PROTO` pointing to the pinned
+`trusted-shim/proto/attestation.proto`; it requires Docker, OpenSSL, protoc and
+test-only grpcio/protobuf. If Docker cannot access `/tmp`, give pytest a
+`--basetemp` directory on a Docker-visible filesystem. No prover is started.
 
 The packaged configuration supports local sample-evidence acceptance.
 Hardware rollout also requires operator-approved verifier/collateral and reference

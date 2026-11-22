@@ -20,6 +20,7 @@ import types
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Mapping, TypeVar
+from urllib.parse import urlsplit
 
 T = TypeVar("T")
 D = TypeVar("D", bound="Record")
@@ -447,6 +448,18 @@ class AppRuntime(str, enum.Enum):
 
 
 @dataclass(kw_only=True)
+class TrusteeTlsConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    ca_file: str
+    cert_file: str
+    key_file: str
+
+    def __post_init__(self) -> None:
+        if any(not os.path.isabs(p) for p in (self.ca_file, self.cert_file, self.key_file)):
+            raise ModelError("Trustee TLS paths must be absolute")
+
+
+@dataclass(kw_only=True)
 class ShimTeeConfig(Record):
     STRICT_FIELDS: typing.ClassVar[bool] = True
     mode: typing.Literal["hardware", "simulation"]
@@ -454,6 +467,7 @@ class ShimTeeConfig(Record):
     evidence_endpoint: str
     trustee_endpoint: str
     trustee_policy_ids: list[str]
+    trustee_tls: TrusteeTlsConfig | None = None
     init_data_sha256: str
     endpoint_key_sha256: str
     expected_measurement: str
@@ -465,6 +479,12 @@ class ShimTeeConfig(Record):
     proof_signer_file: str | None = None
 
     def __post_init__(self) -> None:
+        endpoint = urlsplit(self.trustee_endpoint)
+        if (endpoint.username is not None or endpoint.password is not None or endpoint.query or endpoint.fragment
+                or endpoint.path not in ("", "/") or not endpoint.hostname
+                or not ((endpoint.scheme == "https" and self.trustee_tls is not None)
+                        or (endpoint.scheme == "http" and endpoint.hostname in ("127.0.0.1", "::1") and self.trustee_tls is None))):
+            raise ModelError("Trustee requires HTTPS with node TLS credentials, or loopback HTTP")
         if ((self.mode == "simulation" and self.platform != "sample")
                 or (self.mode == "hardware" and self.platform not in ("snp", "tdx"))):
             raise ModelError("TEE mode and platform disagree")

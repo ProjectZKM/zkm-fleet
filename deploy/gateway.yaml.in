@@ -20,6 +20,35 @@ static_resources:
               domains:
               - '*'
               routes:
+              # Only node appraisal is public. Policy administration never leaves
+              # the private AS listener, including unknown/future RPC methods.
+              - match:
+                  path: /attestation.AttestationService/AttestationEvaluate
+                route:
+                  cluster: trustee
+                  timeout: 30s
+                typed_per_filter_config:
+                  envoy.filters.http.rbac:
+                    '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                    rbac:
+                      rules:
+                        action: ALLOW
+                        policies:
+                          trustee-node:
+                            permissions: [{ any: true }]
+                            principals:
+                            - custom:
+                                name: envoy.rbac.principals.mtls_authenticated
+                                typed_config:
+                                  '@type': type.googleapis.com/envoy.extensions.rbac.principals.mtls_authenticated.v3.Config
+                                  san_matcher:
+                                    san_type: URI
+                                    matcher:
+                                      safe_regex:
+                                        regex: 'spiffe://fleet/trustee/node/[a-zA-Z0-9_-]+'
+              - match:
+                  prefix: /attestation.
+                direct_response: { status: 403 }
               - match:
                   prefix: /mcp
                 route:
@@ -46,6 +75,9 @@ static_resources:
                   cluster: http
                   timeout: 0s
           http_filters:
+          - name: envoy.filters.http.rbac
+            typed_config:
+              '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
           - name: envoy.filters.http.router
             typed_config:
               '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -54,6 +86,11 @@ static_resources:
         typed_config:
           '@type': type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
           common_tls_context:
+            # Existing Fleet clients may omit a certificate. The Trustee route's
+            # mTLS principal independently requires a validated node certificate.
+            validation_context:
+              trusted_ca:
+                filename: /etc/zkm-fleet/tls/ca.pem
             alpn_protocols:
             - h2
             - http/1.1
@@ -63,6 +100,23 @@ static_resources:
               private_key:
                 filename: /etc/zkm-fleet/tls/server.key
   clusters:
+  - name: trustee
+    type: STRICT_DNS
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: trustee
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: trustee-as
+                port_value: 50004
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
   - name: control
     type: STATIC
     connect_timeout: 2s

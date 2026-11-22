@@ -759,3 +759,17 @@ def test_access_rules_do_not_change_runtime_driver(tmp_path, monkeypatch, driver
     shim.RuntimeBook(tmp_path / "book").cleanup(spec.name)
     assert all(c.get("driver", "docker") == driver for c in calls)
     assert [c["operation"] for c in calls] == ["allocate", "allocate", "delete"]
+
+
+def test_trustee_tls_credentials_are_node_owned_and_reach_daemon(tmp_path):
+    raw = config(tmp_path)
+    tls = dict(ca_file="/private/ca.pem", cert_file="/private/node.pem", key_file="/private/node.key")
+    raw.update(shim_daemon=True, shim_tee={**tee_config(), "trustee_endpoint":"https://fleet.example:8905", "trustee_tls":tls})
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    assert shim.daemon_options(spec.cluster)["machine"]["tee"]["trustee_tls"] == tls
+    for changes in ({"trustee_tls":None}, {"trustee_endpoint":"http://fleet.example:50004"},
+                    {"trustee_endpoint":"http://127.0.0.1:50004"},
+                    {"trustee_tls":{**tls, "key_file":"relative.key"}}):
+        broken = {**raw, "shim_tee":{**raw["shim_tee"], **changes}}
+        with pytest.raises(ValueError):
+            reconcile.load_apps(broken)

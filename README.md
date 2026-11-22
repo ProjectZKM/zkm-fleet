@@ -39,7 +39,8 @@ node-agent upgrades leave that process and existing containers running.
 OpenShell is the default shared access layer for Docker and TEE drivers; without
 user rules it adds no restrictions beyond driver limits. Its gateway is included
 in Fleet’s default Compose stack. Stock Trustee AS runs beside it on the private
-control-plane network. Rail is embedded policy evaluation plus a remote proof guest.
+control-plane network; nodes reach its appraisal RPC through the existing HTTPS
+ingress using client certificates. Rail is embedded policy evaluation plus a remote proof guest.
 The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
 has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
 

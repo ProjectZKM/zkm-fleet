@@ -9029,7 +9029,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=5c20b881072d5c521086097402bc637e28f60f1a#5c20b881072d5c521086097402bc637e28f60f1a"
+source = "git+https://github.com/attestx/trusted-shim?rev=dab6cc68714b16d46864e78d6496efec10a657cc#dab6cc68714b16d46864e78d6496efec10a657cc"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
