@@ -101,7 +101,7 @@ impl WorkloadController {
                     instances.extend(worker.report.runtime_instances.iter().filter(|r| r.entry_name == intent.entry().name()
                         && r.ready && observed.is_some_and(|e| !e.disabled() && (e.ready()
                             || r.services == ["control"]))
-                        && (intent.spec["runtime"]["driver"] != "openshell"
+                        && (!intent.entry().native_access()
                             || self.native_route_ready(&i, r))).cloned());
                 }
             }

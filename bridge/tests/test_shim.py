@@ -105,7 +105,7 @@ def test_automatic_service_ports_require_all_features_on_actor_relaunch(tmp_path
     s = spec(tmp_path)
     s = replace(s, app=replace(s.app, port_base=0, container_port=8080, services=["http"]))
     bound = shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
-    assert shim.required_capabilities(bound) == {"shim-automatic-port-v1", "shim-runtime-v2", "shim-network-v1"}
+    assert shim.required_capabilities(bound) == {"shim-docker-v1", "shim-automatic-port-v1", "shim-runtime-v2", "shim-network-v1"}
     monkeypatch.setattr(shim, "capabilities", lambda _: ["shim-automatic-port-v1", "shim-runtime-v2"])
     invoke = Mock(); monkeypatch.setattr(shim, "invoke", invoke)
     with pytest.raises(RuntimeError, match="no longer supports"):
@@ -460,7 +460,7 @@ def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path,
     from pathlib import Path
     binary = os.environ.get("TRUSTED_SHIM_OPENSHELL_TEST_BINARY")
     if not binary:
-        pytest.skip("requires companion built with --features openshell")
+        pytest.skip("requires TRUSTED_SHIM_OPENSHELL_TEST_BINARY")
     # Keep the Unix socket within the kernel's pathname bound.
     with tempfile.TemporaryDirectory(prefix="fleet-native-") as root:
         path = tmp_path / "native-apps.yaml"
@@ -476,7 +476,7 @@ def test_real_openshell_daemon_bootstrap_matches_running_configuration(tmp_path,
         try:
             shim.check_daemon(parsed,wait_seconds=10)
             value = shim.daemon_call(parsed.shim_state_dir,socket.gethostname(),{"operation":"capabilities"})
-            assert value["drivers"] == ["docker","openshell"]
+            assert value["drivers"] == ["docker"]
             assert ("openshell-local-services-v1" in value["features"]) == (supervisor_image is not None)
             assert value["pid"] == process.pid
             changed = replace(parsed,shim_openshell=replace(parsed.shim_openshell,ledger_endpoint="https://other.example"))
@@ -656,3 +656,106 @@ def test_native_service_report_keeps_compute_observation_when_app_becomes_health
     health.ready=False
     instance=e.report()["runtime_instances"][0]
     assert not instance["ready"] and instance["services"]==[]
+
+
+def tee_config(mode="simulation"):
+    return dict(mode=mode, platform="sample" if mode == "simulation" else "snp",
+        evidence_endpoint="http://127.0.0.1:8006/aa/evidence", trustee_endpoint="http://127.0.0.1:50004",
+        trustee_policy_ids=["default"], init_data_sha256="11"*32, endpoint_key_sha256="22"*32,
+        expected_measurement="abcde", proof_endpoint="https://proof.example", proof_token_file="/private/proof.token",
+        program=dict(kind="remote_attestation", program_sha256="aa"*32, verifying_key_sha256="bb"*32),
+        program_vkey_hash="0x0000", elf_file="/opt/ra.elf")
+
+
+@pytest.mark.parametrize("mode,driver", [("simulation","tee-simulation"),("hardware","tee")])
+def test_tee_configuration_capabilities_and_launch_are_bound(tmp_path, monkeypatch, mode, driver):
+    import hashlib
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config(mode), shim_machine_labels={"runtime.driver":driver})
+    raw["apps"][0]["runtime"]["driver"] = driver
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    machine = shim.daemon_options(spec.cluster)["machine"]
+    digest = hashlib.sha256(shim.json.dumps(machine, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    response = dict(protocol=1, drivers=[driver], machine_config_sha256=digest,
+        features=["runtime-daemon-v1", "tee-startup-v1", "data-plane-v1", "runtime-management-v1"])
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: response)
+    assert shim.required_capability(spec) in shim.capabilities(spec.cluster)
+    assert "shim-docker-v1" not in shim.capabilities(spec.cluster)
+    docker_spec = replace(spec, app=replace(spec.app, runtime=replace(spec.app.runtime, driver="docker")))
+    assert not shim.required_capabilities(docker_spec).issubset(shim.capabilities(spec.cluster))
+    assert "shim-prover-v1" not in shim.capabilities(spec.cluster)
+    other = "shim-tee-v1" if mode == "simulation" else "shim-tee-simulation-v1"
+    assert other not in shim.capabilities(spec.cluster)
+    bound = shim.RuntimeBook(tmp_path / "book").bind(spec, "launch")
+    request = shim.launch_request(bound, [])
+    assert request["driver"] == driver
+    assert request["trust"]["attestation"] == {"mode":"required","profile":raw["shim_tee"]["platform"]}
+    assert request["trust"]["attestation_proof"] == "required"
+    response["machine_config_sha256"] = "changed"
+    assert shim.capabilities(spec.cluster) == []
+    with pytest.raises(RuntimeError, match="machine settings differ"):
+        shim.check_daemon(spec.cluster)
+    for changes in ({"shim_daemon":False}, {"shim_tee":None}, {"shim_tee":tee_config("hardware" if mode == "simulation" else "simulation")}):
+        with pytest.raises(ValueError):
+            reconcile.load_apps({**raw, **changes})
+
+
+def test_tee_lifecycle_preserves_driver_and_extends_launch_timeout(tmp_path, monkeypatch):
+    raw = config(tmp_path); raw.update(shim_daemon=True, shim_tee=tee_config())
+    raw["apps"][0]["runtime"]["driver"] = "tee-simulation"
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    bound = shim.RuntimeBook(tmp_path / "book").bind(spec, "launch")
+    actor = object.__new__(shim._ShimApp); actor.spec = bound
+    call = Mock(return_value={"cleaned":True}); monkeypatch.setattr(shim, "daemon_call", call)
+    actor.call({"operation":"launch", "request":shim.launch_request(bound, [])})
+    assert call.call_args.kwargs["timeout"] == 330
+    for operation in ("inspect", "stop", "delete", "network"):
+        actor.call({"operation":operation,"execution":bound.execution})
+        assert call.call_args.args[2]["driver"] == "tee-simulation"
+    shim.RuntimeBook(tmp_path / "book").cleanup(bound.name)
+    assert call.call_args.args[2]["driver"] == "tee-simulation"
+
+
+@pytest.mark.parametrize("mode", ["simulation", "hardware"])
+def test_native_openshell_composes_with_node_tee_profile(tmp_path, monkeypatch, mode):
+    import hashlib
+    raw = native_config(tmp_path)
+    raw.update(shim_tee=tee_config(mode), shim_machine_labels={"runtime.driver":"auto"})
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    options = shim.daemon_options(spec.cluster)
+    digest = lambda value: hashlib.sha256(shim.json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    active = dict(protocol=1, drivers=["openshell"],
+        features=["runtime-daemon-v1", "tee-startup-v1", "openshell-provisioning-v1", "openshell-allocation-v1"],
+        machine_config_sha256=digest(options["machine"]), openshell_config_sha256=digest(options["openshell"]))
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **kw: active)
+    assert "shim-openshell-provisioning-v1" in shim.capabilities(spec.cluster)
+    assert "shim-docker-v1" not in shim.capabilities(spec.cluster)
+    active["machine_config_sha256"] = "mismatched-profile"
+    assert shim.capabilities(spec.cluster) == []
+
+
+@pytest.mark.parametrize("driver", ["docker", "tee", "tee-simulation"])
+def test_access_rules_do_not_change_runtime_driver(tmp_path, monkeypatch, driver):
+    raw = native_config(tmp_path)
+    raw["apps"][0]["runtime"]["driver"] = driver
+    raw["apps"][0]["access_policy_sha256"] = "ab" * 32
+    if driver != "docker":
+        raw["shim_tee"] = tee_config("hardware" if driver == "tee" else "simulation")
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    assert spec.app.native_access
+    spec = shim.RuntimeBook(tmp_path / "book").bind(spec, "launch")
+    required = shim.required_capabilities(spec)
+    assert "shim-openshell-access-v1" in required
+    assert "shim-openshell-provisioning-v1" in required
+    assert "shim-" + driver + "-v1" in required
+    allocation = shim.RuntimeBook(tmp_path / "book").read(spec.name)
+    assert allocation.driver == driver
+    assert allocation.access_policy_sha256 == "ab" * 32
+    calls = []
+    def invoke(*args, **kwargs):
+        calls.append(args[3]); return {"phase":"reserved", "cleaned":True}
+    monkeypatch.setattr(shim, "invoke", invoke)
+    shim._ProvisionedApp(spec)
+    shim.RuntimeBook(tmp_path / "book").cleanup(spec.name)
+    assert all(c.get("driver", "docker") == driver for c in calls)
+    assert [c["operation"] for c in calls] == ["allocate", "allocate", "delete"]

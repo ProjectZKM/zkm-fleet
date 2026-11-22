@@ -35,9 +35,11 @@ Two integrated app workers prove on their node's own GPU server:
 ## Runtime deployment (0.2)
 
 Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
-node-agent upgrades leave that process and existing containers running. The native
-OpenShell gateway is an optional profile in Fleet’s Compose, required for the
-OpenShell driver. Rail is embedded policy evaluation plus a remote proof guest.
+node-agent upgrades leave that process and existing containers running.
+OpenShell is the default shared access layer for Docker and TEE drivers; without
+user rules it adds no restrictions beyond driver limits. Its gateway is included
+in Fleet’s default Compose stack. Stock Trustee AS runs beside it on the private
+control-plane network. Rail is embedded policy evaluation plus a remote proof guest.
 The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
 has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
 
@@ -71,3 +73,8 @@ and policy revisions; see [policy upgrades](docs/maintenance.md#policy-evaluator
 | [Reference](docs/reference.md) | Architecture, workloads, proofs, access, quotas, APIs, storage and ports |
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
 | [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
+
+Node-configured TEE profiles use CoCo evidence, stock Trustee prechecks and a
+synchronous remote RA receipt gate in shim. Hardware and simulation are separate
+capabilities; existing Docker workloads remain unattested. See the [configuration
+and remaining hardware guest requirements](docs/reference.md#node-configured-tee-runtimes).

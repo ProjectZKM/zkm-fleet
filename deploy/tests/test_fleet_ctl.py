@@ -4,6 +4,8 @@ from pathlib import Path
 import shlex
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -71,7 +73,7 @@ def test_a_failed_upgrade_leaves_no_stage_directory(tmp_path):
     assert list(tmpdir.iterdir()) == [], "the release stage directory leaked"
 
 
-def rollback(tmp_path, healthy_after, later_state="running 0", wait=None):
+def rollback(tmp_path, healthy_after, later_state="running 0", wait=None, trustee=False):
     """`fleet-ctl.sh scheduler rollback` with stand-ins: healthz answers on curl's
     `healthy_after`th call, and the scheduler's container reports "running 0" first and
     `later_state` after that. Sleeps take no time."""
@@ -80,6 +82,10 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None):
     for name in ["fleetctl", "docker-compose.yml", "gateway.yaml.in", "compose.env"]:
         executable(backup / name, "")
     (prefix / "deploy").mkdir(parents=True)
+    if trustee:
+        for parent, text in [(backup, "original AS config"), (prefix / "deploy", "new AS config")]:
+            (parent / "trustee").mkdir()
+            (parent / "trustee/as.json").write_text(text)
     (prefix / "bin").mkdir()
     curls, inspects = tmp_path / "curls", tmp_path / "inspects"
     executable(commands / "curl", f'n=$(($(cat {curls} 2>/dev/null || echo 0) + 1)); echo $n > {curls}\n'
@@ -99,13 +105,16 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None):
     return result, int(curls.read_text())
 
 
-def test_a_scheduler_that_starts_slowly_is_waited_for(tmp_path):
+@pytest.mark.parametrize("trustee", [False, True])
+def test_a_scheduler_that_starts_slowly_is_waited_for(tmp_path, trustee):
     # Forty checks two seconds apart is longer than the minute the script used to wait.
-    result, curls = rollback(tmp_path, healthy_after=40)
+    result, curls = rollback(tmp_path, healthy_after=40, trustee=trustee)
     assert result.returncode == 0, result.stderr
     assert curls == 40
     assert result.stdout.count("waiting up to 300s for the scheduler") == 1
     assert "restored" in result.stdout
+    if trustee:
+        assert (tmp_path / "fleet/deploy/trustee/as.json").read_text() == "original AS config"
 
 
 def test_a_scheduler_that_restarts_fails_at_once(tmp_path):

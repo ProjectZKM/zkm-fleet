@@ -82,15 +82,47 @@ mode. Introduce daemon mode on a new node, or explicitly drain and clean up thos
 shim allocations first. Existing Ray processes are left running; moving Ray itself
 under a different service supervisor is a separate maintenance operation.
 
+### Trustee Attestation Service
+
+The default control-plane Compose stack includes the unmodified, digest-pinned
+`trustee-as` image. It verifies TEE evidence; Attestation Agent remains inside the
+node's confidential VM. The AS does not need TEE devices or a Docker socket.
+Compose explicitly selects upstream `LocalFs` storage for policies and reference
+values via the upstream service config `deploy/trustee/as.json`, using the
+`trustee-data` volume; upstream defaults to memory storage.
+Preserve this volume in backups; do not remove it during upgrades. Release packages
+include the AS configuration; scheduler upgrades back it up and rollbacks restore
+it. Scheduler-only upgrades do not restart AS. To introduce or update AS on an
+existing control host, apply the installed Compose stack's `trustee-as` service
+separately after reviewing site overrides.
+
+AS listens at `trustee-as:50004` on the private Compose network, with **no host
+port or public gateway route**. Before remote TEE nodes use it, provide an
+authenticated TLS ingress (for example, an operator-managed mTLS proxy) on the
+control plane and set `shim_tee.trustee_endpoint` in the existing node `apps.yaml`.
+This commit packages the private AS service; it does not install that ingress or
+add client-certificate support to shim. A stock AS TLS listener alone does not
+authenticate callers. Keep AS policy/reference-value administration private.
+
+The packaged configuration supports local sample-evidence acceptance.
+Hardware rollout also requires operator-approved verifier/collateral and reference
+value settings. Mount the upstream AS configuration read-only and pass
+`grpc-as --socket 0.0.0.0:50004 --config-file /etc/trustee/as.json` through the site's
+Compose override; keep its storage paths under the persistent volume. Supply
+persistent signing-key settings if AS tokens have external consumers.
+A Trustee response is a precheck; shim still needs a verified remote RA receipt
+before creation. No KBS, separate RVPS, local prover or TEE is launched here.
+
 ### OpenShell gateway
 
-Fleet 0.2.0 includes an optional `openshell` profile in its existing Docker Compose
-file. This runs the unmodified upstream gateway beside the scheduler. Both use the
-same UID and a private shared compute socket; only the node's shim/driver creates
-workloads. The gateway has no Docker socket or Fleet administrator credentials.
-The profile is off by default, so existing applications keep their executors.
-It is mandatory for a deployment using `driver: openshell`: an unavailable gateway
-blocks native creation/publication, with no automatic fallback to Docker.
+Fleet 0.2.0 includes the unmodified OpenShell gateway in the default Docker
+Compose stack beside the scheduler. OpenShell is the shared access layer for all
+runtime drivers. Without user rules it adds no restrictions beyond driver limits;
+configured rules require native enforcement and never fall back to that default.
+The gateway and scheduler use the same UID and a private compute socket; only
+the node's shim/driver creates workloads. The gateway has no Docker socket or
+Fleet administrator credentials. Prepare the PKI and configuration below before
+starting the stack. This does not change existing workload executors.
 
 The release workflow publishes `ghcr.io/projectzkm/zkm-fleet-openshell` at the
 OpenShell revision pinned in `Cargo.lock`. Record its registry digest in
@@ -136,16 +168,15 @@ compute socket. Set `FLEET_UID` and `FLEET_GID` to the exact values in `compose.
 COMPOSE=(docker compose --env-file "$FLEET_PREFIX/compose.env" -p zkm-fleet
   -f "$FLEET_PREFIX/deploy/docker-compose.yml")
 # Include the site's docker-compose.override.yml as a second -f when present.
-"${COMPOSE[@]}" --profile openshell run --rm --no-deps --user 0:0 \
+"${COMPOSE[@]}" run --rm --no-deps --user 0:0 \
   --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE \
   --entrypoint install openshell-gateway -d -m 700 \
   -o "$FLEET_UID" -g "$FLEET_GID" /run/zkm-fleet/openshell /var/lib/openshell
 "${COMPOSE[@]}" up -d --no-deps scheduler
-"${COMPOSE[@]}" --profile openshell up -d --no-deps --wait openshell-gateway
+"${COMPOSE[@]}" up -d --no-deps --wait openshell-gateway
 ```
 
-Add `openshell` to `COMPOSE_PROFILES` in `compose.env` (for example
-`mcp,openshell`) to include it in subsequent whole-stack operations. Regular
+No `openshell` profile or application enable switch is needed. Regular
 `fleet-ctl scheduler upgrade` still updates only scheduler/MCP; gateway image
 upgrades and rollback are explicit, with its database and keys preserved.
 Do not use `docker compose down -v`.

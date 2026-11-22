@@ -238,7 +238,7 @@ impl WorkloadController {
             .get(&format!("{worker_id}-{}", instance.entry_name))
             .ok_or(Error::Rejected)?;
         let spec = &deployment.spec;
-        if spec["runtime"] != serde_json::json!({"executor":"shim", "driver":"openshell"}) {
+        if !fleet_proto::workload::Entry(spec).native_access() {
             return Err(Error::Rejected);
         }
         if let Some(r) = launch {
@@ -253,7 +253,8 @@ impl WorkloadController {
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!([]));
             if r.execution != *e
-                || r.driver != "openshell"
+                || spec["runtime"]["driver"] != r.driver
+                || spec.get("access_policy_sha256").and_then(serde_json::Value::as_str) != r.access_policy_sha256.as_deref()
                 || spec["image"] != r.image
                 || command != serde_json::json!(r.command)
                 || env != serde_json::json!(r.environment)
@@ -263,9 +264,12 @@ impl WorkloadController {
                     != spec["memory_gb"]
                         .as_f64()
                         .map(|n| (n * (1u64 << 30) as f64).round() as u64)
-                || r.trust.attestation
-                    != trusted_shim::attestation::AttestationRequirement::SkipNonTee
-                || r.trust.attestation_proof != trusted_shim::proof::ProofRequirement::NotRequired
+                || !match (&r.trust.attestation, &r.trust.attestation_proof, r.driver.as_str()) {
+                    (trusted_shim::attestation::AttestationRequirement::SkipNonTee, trusted_shim::proof::ProofRequirement::NotRequired, "docker" | "openshell") => true,
+                    (trusted_shim::attestation::AttestationRequirement::Required { profile }, trusted_shim::proof::ProofRequirement::Required, "tee") => matches!(profile.as_str(), "snp" | "tdx"),
+                    (trusted_shim::attestation::AttestationRequirement::Required { profile }, trusted_shim::proof::ProofRequirement::Required, "tee-simulation") => profile == "sample",
+                    _ => false,
+                }
                 || r.trust.policy_proof != trusted_shim::proof::ProofRequirement::NotRequired
             {
                 return Err(Error::Rejected);

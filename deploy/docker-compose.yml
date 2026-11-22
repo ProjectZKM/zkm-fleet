@@ -1,4 +1,5 @@
-# Scheduler + Postgres + gateway. Started by deploy/install.sh control; config and secrets in ${FLEET_ETC:-/etc/zkm-fleet}.
+# Fleet control plane, OpenShell gateway and Trustee AS. Started by deploy/install.sh control.
+# Site config and secrets live in ${FLEET_ETC:-/etc/zkm-fleet}.
 services:
   postgres:
     image: postgres:16
@@ -39,11 +40,10 @@ services:
     ports:
       - "127.0.0.1:9191:9191" # local fleetctl; remote clients enter through HTTPS
 
-  # Optional stock gateway. Fleet implements its remote compute driver; this
+  # Stock access-policy gateway, enabled in the default stack. Fleet implements its remote compute driver; this
   # container has no Docker socket and cannot create workloads on the control host.
-  # Prepare PKI, signing keys and volume ownership before enabling this profile.
+  # Prepare PKI, signing keys and volume ownership before starting the stack.
   openshell-gateway:
-    profiles: [openshell]
     image: ${FLEET_OPENSHELL_IMAGE:-ghcr.io/projectzkm/zkm-fleet-openshell:ce58cf8e9b953281352d98a637e41616295b1318}
     restart: unless-stopped
     init: true
@@ -109,6 +109,31 @@ services:
       retries: 4
     stop_grace_period: 60s
 
+  # Stock Trustee verifies TEE evidence on the control plane. No node runtime,
+  # Docker socket or raw public gRPC listener is exposed by this service.
+  trustee-as:
+    image: ${FLEET_TRUSTEE_IMAGE:-ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:f65a0a74972781d5a3a9595f6e1308b86343f940738a0b6a23c270a7e8bd065a}
+    restart: unless-stopped
+    init: true
+    networks: [fleet]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+      - /run/dcap:rw,nosuid,nodev,mode=700
+    environment:
+      QCNL_CONF_PATH: /run/dcap/qcnl.conf
+    command: [grpc-as, --socket, '0.0.0.0:50004', --config-file, /etc/trustee/as.json]
+    volumes:
+      - trustee-data:/opt/confidential-containers/attestation-service
+      - type: bind
+        source: ./trustee/as.json
+        target: /etc/trustee/as.json
+        read_only: true
+        bind: { create_host_path: false }
+    stop_grace_period: 30s
+
   mcp:
     profiles: [mcp]
     image: ${FLEET_SCHEDULER_IMAGE:?set FLEET_SCHEDULER_IMAGE in compose.env}
@@ -152,3 +177,4 @@ volumes:
   fleet-data: {}
   openshell-run: {}
   openshell-data: {}
+  trustee-data: {}

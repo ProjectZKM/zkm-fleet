@@ -132,7 +132,7 @@ impl NodeReport {
             anyhow::ensure!(instance.native_observation_base64.as_ref().is_none_or(|v| !v.is_empty() && v.len() <= 21848), "invalid native observation size");
             let e = &instance.execution;
             let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
-            anyhow::ensure!(instance.native_observation_base64.is_none() || entry.0["runtime"]["driver"] == "openshell", "native observation requires OpenShell runtime");
+            anyhow::ensure!(instance.native_observation_base64.is_none() || entry.native_access(), "native observation requires an access-policy allocation");
             anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && (entry.is_container() || entry.is_prover())
                 && e.node_id == self.machine && e.generation > 0
                 && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
@@ -143,7 +143,7 @@ impl NodeReport {
             let expected: Vec<String> = entry.0["services"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
             // An unhealthy workload may retain only its declared management
             // endpoint so an administrator can repair this exact allocation.
-            anyhow::ensure!((entry.0["runtime"]["driver"] == "openshell" && !instance.ready && instance.services.is_empty())
+            anyhow::ensure!((entry.native_access() && !instance.ready && instance.services.is_empty())
                 || instance.services == expected || (instance.services == ["control"]
                 && expected.iter().any(|s| s == "control")), "runtime services differ from app manifest");
         }
@@ -410,7 +410,12 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
+    pub const CONTAINER_SETTINGS: [&'static str; 12] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256"];
+
+    pub fn local_container_runtime(runtime: Option<&Value>) -> bool {
+        runtime.is_some_and(|v| ["docker", "tee", "tee-simulation"].iter().any(|driver|
+            v == &serde_json::json!({"executor":"shim", "driver": driver})))
+    }
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
         if spec.get("kind").and_then(Value::as_str).is_some_and(|k| k.starts_with("ziren-")) && spec.contains_key("runtime") {
@@ -423,7 +428,11 @@ impl RegisterAppRequest {
                 && spec.get("worker_command").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
                 "packaged provers require shim Docker, a private HTTP health port and an image-owned worker");
         }
-        let native = spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"}));
+        if let Some(hash) = spec.get("access_policy_sha256") {
+            anyhow::ensure!(hash.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+                && Self::local_container_runtime(spec.get("runtime")), "access policy requires SHA256 and a runtime driver");
+        }
+        let native = crate::workload::Entry(&Value::Object(spec.clone())).native_access();
         if native {
             let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
             let health = spec.get("health_path").map_or(Some("/"), Value::as_str);
@@ -441,7 +450,7 @@ impl RegisterAppRequest {
                 "native OpenShell requires CPU/memory limits and optional private HTTP app services");
         }
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
-            anyhow::ensure!(native || spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
+            anyhow::ensure!(native || Self::local_container_runtime(spec.get("runtime")),
                 "transport settings require explicit shim execution");
         }
         if let Some(protocol) = spec.get("service_protocol") {
@@ -474,7 +483,7 @@ impl RegisterAppRequest {
             }
         }
         if spec.get("port_base").and_then(Value::as_u64) == Some(0) {
-            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})) && spec.get("container_port").is_some(), "automatic host ports require shim and container_port");
+            anyhow::ensure!(Self::local_container_runtime(spec.get("runtime")) && spec.get("container_port").is_some(), "automatic host ports require shim and container_port");
         }
         if let Some(port) = spec.get("container_port") {
             anyhow::ensure!(port.as_u64().is_some_and(|p| (1..=65535).contains(&p)), "invalid container_port");
@@ -489,9 +498,9 @@ impl RegisterAppRequest {
 
     pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
         anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
-            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"})
+            || Self::local_container_runtime(Some(runtime))
             || runtime == &serde_json::json!({"executor":"shim", "driver":"openshell"}),
-            "runtime must select legacy or shim with driver docker or openshell; trust options are not supported here");
+            "runtime must select legacy or shim with driver docker, openshell, tee or tee-simulation; trust parameters are node-owned");
         Ok(())
     }
 
@@ -536,7 +545,7 @@ impl RegisterAppRequest {
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        if (kind == "app" || packaged) && spec.get("runtime").is_none_or(|v| v["driver"] != "openshell") {
+        if (kind == "app" || packaged) && !crate::workload::Entry(&self.spec).native_access() {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
         if let Some(runtime) = spec.get("runtime") {
@@ -581,7 +590,7 @@ mod tests {
         assert!(!entry.holds_allocation(), "SDK proof jobs retain their existing per-job quota accounting");
         assert_eq!(entry.runtime_capability(), Some("shim-prover-v1"));
         let mut report = NodeReport::default();
-        report.runtime_capabilities = vec!["shim-runtime-v2".into(),"shim-automatic-port-v1".into()];
+        report.runtime_capabilities = vec!["shim-docker-v1".into(),"shim-runtime-v2".into(),"shim-automatic-port-v1".into()];
         assert!(!report.supports_runtime(entry));
         report.runtime_capabilities.push("shim-prover-v1".into());
         assert!(report.supports_runtime(entry));
@@ -627,7 +636,7 @@ mod tests {
             "container_port":8080,"services":["http"]});
         let entry = crate::workload::Entry(&raw);
         let mut report = NodeReport::default();
-        report.runtime_capabilities = vec!["shim-automatic-port-v1".into(),"shim-runtime-v2".into()];
+        report.runtime_capabilities = vec!["shim-docker-v1".into(),"shim-automatic-port-v1".into(),"shim-runtime-v2".into()];
         assert!(!report.supports_runtime(entry));
         report.runtime_capabilities.push("shim-network-v1".into());
         assert!(report.supports_runtime(entry));
@@ -698,6 +707,43 @@ mod tests {
             ("service_protocol",json!("tcp")),("health_path",json!("//other/health")),("health_path",json!("/a#b")),
             ("health_path",json!("/a\\b")),("health_path",json!("/a\n")),("health_path",Value::Null)] {
             let mut bad=http.clone();bad[field]=value;assert!(request(bad).validate().is_err(),"{field}");
+        }
+    }
+
+    #[test]
+    fn access_rules_compose_with_each_driver_and_require_native_capabilities() {
+        for driver in ["docker", "tee", "tee-simulation"] {
+            let spec = json!({"runtime":{"executor":"shim","driver":driver}, "access_policy_sha256":"ab".repeat(32),
+                "image":"test", "cpus":1,"gpus":0,"memory_gb":0.125});
+            RegisterAppRequest { name:"rules".into(),spec:spec.clone().into(),..Default::default() }.validate().unwrap();
+            let entry = crate::workload::Entry(&spec);
+            let mut report = NodeReport::default();
+            report.runtime_capabilities = vec![format!("shim-{driver}-v1"), "shim-openshell-provisioning-v1".into()];
+            assert!(!report.supports_runtime(entry));
+            report.runtime_capabilities.push("shim-openshell-access-v1".into());
+            assert!(report.supports_runtime(entry));
+            report.runtime_capabilities.remove(0);
+            assert!(!report.supports_runtime(entry));
+        }
+    }
+
+    #[test]
+    fn tee_modes_and_transport_capabilities_are_not_interchangeable() {
+        for (driver, capability) in [("tee", "shim-tee-v1"), ("tee-simulation", "shim-tee-simulation-v1")] {
+            let spec = json!({"runtime":{"executor":"shim","driver":driver},"image":"test", "cpus":1,"gpus":0,
+                "port_base":0,"container_port":8080,"services":["http"],"memory_gb":0.125});
+            RegisterAppRequest { name:"tee".into(),spec:spec.clone().into(),..Default::default() }.validate().unwrap();
+            let mut report = NodeReport::default();
+            report.runtime_capabilities = vec!["shim-network-v1".into(),"shim-runtime-v2".into(),"shim-automatic-port-v1".into(),
+                (if driver == "tee" {"shim-tee-simulation-v1"} else {"shim-tee-v1"}).into()];
+            let entry = crate::workload::Entry(&spec);
+            assert!(!report.supports_runtime(entry));
+            report.runtime_capabilities.push(capability.into());
+            assert!(report.supports_runtime(entry));
+            let mut docker = spec.clone(); docker["runtime"]["driver"] = json!("docker");
+            assert!(!report.supports_runtime(crate::workload::Entry(&docker)));
+            report.runtime_capabilities.retain(|c| c != "shim-network-v1");
+            assert!(!report.supports_runtime(entry));
         }
     }
 

@@ -38,8 +38,10 @@ def selected(spec: AppReplicaSpec) -> bool:
 def required_capability(spec: AppReplicaSpec) -> str:
     if spec.kind is not AppRuntime.APP:
         return "shim-prover-v1"
-    if spec.app.runtime and spec.app.runtime.driver == "openshell":
+    if spec.app.native_access:
         return "shim-openshell-services-v1" if spec.app.services else "shim-openshell-provisioning-v1"
+    if spec.app.runtime and spec.app.runtime.driver in ("tee", "tee-simulation"):
+        return "shim-" + spec.app.runtime.driver + "-v1"
     if spec.app.service_protocol is ServiceProtocol.TCP:
         return "shim-tcp-v1"
     if any(rule.single_use for rule in spec.app.ingress.values()):
@@ -60,11 +62,21 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
     app = spec.app
     required = {required_capability(spec)}
     if app.runtime and app.runtime.driver == "docker":
+        required.add(CAPABILITY)
+    if app.access_policy_sha256 is not None:
+        required.add("shim-openshell-access-v1")
+        if app.runtime.driver in ("tee", "tee-simulation"):
+            required.add("shim-" + app.runtime.driver + "-v1")
+        return required
+    if app.runtime and app.runtime.driver in ("docker", "tee", "tee-simulation"):
         required.update(name for name, needed in (
             ("shim-network-v1", bool(app.services)),
             ("shim-runtime-v2", app.container_port is not None or app.entrypoint is not None),
             ("shim-automatic-port-v1", app.port_base == 0),
             ("shim-private-env-v1", any(r.bearer_env for r in app.ingress.values())),
+            ("shim-tcp-v1", app.runtime.driver != "docker" and app.service_protocol is ServiceProtocol.TCP),
+            ("shim-management-v1", app.runtime.driver != "docker" and (bool(app.ingress) or "control" in app.services)),
+            ("shim-single-use-ingress-v1", app.runtime.driver != "docker" and any(r.single_use for r in app.ingress.values())),
         ) if needed)
     return required
 
@@ -81,32 +93,38 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             value = json.loads(result.stdout)
         if (not isinstance(value, dict) or type(value.get("protocol")) is not int or value["protocol"] != 1
                 or any(not isinstance(value.get(k, []), list) or not all(isinstance(v, str) for v in value.get(k, []))
-                       for k in ("drivers", "features")) or "docker" not in value.get("drivers", [])):
+                       for k in ("drivers", "features"))):
             return []
+        if config.shim_daemon:
+            check_machine(config, value)
         features = value.get("features", [])
         modern = "data-plane-v1" in features
         management = "runtime-management-v1" in features
         network = bool(config.shim_network) and modern
         managed_network = network and management
-        native = []
+        native = ["shim-openshell-access-v1"] if "openshell-access-v1" in features else []
         if config.shim_daemon and config.shim_openshell is not None:
             check_openshell(config, value)
-            if "openshell" in value.get("drivers", []) and "openshell-allocation-v1" in features:
-                native = ["shim-openshell-provisioning-v1"]
+            if "openshell-allocation-v1" in features:
+                native.append("shim-openshell-provisioning-v1")
                 if config.shim_network and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
+        local = "docker" in value.get("drivers", [])
+        if config.shim_tee and config.shim_tee.driver in value.get("drivers", []) and "tee-startup-v1" in features:
+            native.append("shim-" + config.shim_tee.driver + "-v1")
+            local = True
         return native + [name for name, supported in (
             ("shim-cleanup-v1", True),
             ("shim-private-env-v1", managed_network),
-            ("shim-prover-v1", modern and management),
+            ("shim-prover-v1", modern and management and "docker" in value.get("drivers", [])),
             ("shim-tcp-v1", managed_network),
             ("shim-single-use-ingress-v1", managed_network and "single-use-ingress-v1" in features),
-            (CAPABILITY, True),
+            (CAPABILITY, "docker" in value.get("drivers", [])),
             ("shim-automatic-port-v1", modern and management),
             ("shim-runtime-v2", modern),
             ("shim-network-v1", network),
             ("shim-management-v1", managed_network),
-        ) if supported]
+        ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
 
@@ -144,7 +162,7 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
 
 def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False) -> dict[str, Any]:
     if daemon:
-        return daemon_call(state_dir, node_id, command)
+        return daemon_call(state_dir, node_id, command, timeout=330 if command.get("operation") == "launch" and command.get("request", {}).get("driver") in ("tee", "tee-simulation") else 150)
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
         result = subprocess.run([binary, "--state-dir", state_dir, "--node-id", node_id],
@@ -162,6 +180,7 @@ class Allocation(Record):
     binary: str
     state_dir: str
     driver: str = "docker"
+    access_policy_sha256: str | None = None
     daemon: bool = False
     cleaned: bool = False
 
@@ -220,14 +239,14 @@ class RuntimeBook:
             raise ValueError("shim is not configured")
         self.write(spec.name, Allocation(executor=ExecutorKind.SHIM, execution=execution,
             spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir,
-            daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver))
+            daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver, access_policy_sha256=spec.app.access_policy_sha256))
         return replace(spec, execution=execution)
 
     def cleanup(self, name: str) -> None:
         record = self.read(name)
         if not record or record.cleaned:
             return
-        if record.driver == "openshell":
+        if record.driver == "openshell" or record.access_policy_sha256 is not None:
             # Bind-before-actor failures still need a durable cancellation fence.
             invoke(record.binary, record.state_dir, socket.gethostname(),
                 {"operation": "allocate", "execution": record.execution, "driver": record.driver}, daemon=record.daemon)
@@ -257,15 +276,22 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     for volume in app.volumes:
         path, _, options = volume.format(**fill).partition(":")
         volumes.append(f"{path}:{path}" + (f":{options}" if options else ""))
-    return {"execution": spec.execution, "driver": "docker", "image": app.image,
+    driver = app.runtime.driver
+    trust = {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"}
+    if driver in ("tee", "tee-simulation"):
+        tee = spec.cluster.shim_tee
+        if not spec.cluster.shim_daemon or not tee or tee.driver != driver:
+            raise ValueError("TEE launch requires matching node configuration")
+        trust.update(attestation={"mode": "required", "profile": tee.platform}, attestation_proof="required")
+    return {"execution": spec.execution, "driver": driver, "image": app.image,
+        **({"access_policy_sha256": app.access_policy_sha256} if app.access_policy_sha256 is not None else {}),
         "command": [v.format(**fill) for v in app.command],
         "environment": {k: v.format(**fill) for k, v in app.env.items()},
         "limits": {"cpu_millicores": round(app.cpus * 1000),
             "memory_bytes": round(app.memory_gb * 2**30) if app.memory_gb is not None else None},
-        # This lifecycle path makes no policy/attestation claim. Proof-required
-        # execution is a separate admission path; never silently turn it off.
+        # Application policy admission is separate from the synchronous TEE RA gate.
         "policy": {"issuer": "fleet", "policy_id": "unproved-container-lifecycle", "version": 0, "sha256": ""},
-        "trust": {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"},
+        "trust": trust,
         "services": [{"id": {"namespace": spec.execution.namespace, "workload": spec.execution.workload, "service": name},
             "protocol": "http1" if name == "control" else app.service_protocol.value,
             "endpoint_ref": "control" if name == "control" else f"ingress:{name}" if name in app.ingress else "app"} for name in app.services],
@@ -315,6 +341,8 @@ class _ShimApp:
             self.network.stdin.close()
 
     def call(self, command: dict[str, Any]) -> dict[str, Any]:
+        if command["operation"] != "launch" and self.spec.app.runtime.driver != "docker":
+            command = {**command, "driver": self.spec.app.runtime.driver}
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command,
             daemon=self.spec.cluster.shim_daemon)
 
@@ -358,7 +386,7 @@ class _ProvisionedApp:
 
     def call(self, operation: str, **fields: Any) -> dict[str, Any]:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(),
-            {"operation": operation, "execution": self.spec.execution, "driver": "openshell", **fields}, daemon=True)
+            {"operation": operation, "execution": self.spec.execution, "driver": self.spec.app.runtime.driver, **fields}, daemon=True)
 
     def health(self) -> dict[str, Any]:
         status = self.call("inspect")
@@ -388,17 +416,33 @@ def daemon_config(path: Path) -> ControlPlaneConfig:
     if not isinstance(data, dict):
         raise ValueError("apps.yaml must contain a mapping")
     return from_dict(ControlPlaneConfig, {key:data[key] for key in
-        ("shim_binary", "shim_state_dir", "shim_daemon", "shim_openshell") if key in data})
+        ("shim_binary", "shim_state_dir", "shim_daemon", "shim_openshell", "shim_machine_labels", "shim_tee") if key in data})
 
 
 def daemon_options(config: ControlPlaneConfig) -> dict[str, Any]:
+    options = {"machine": machine_options(config)} if config.shim_machine_labels or config.shim_tee else {}
     if config.shim_openshell is None:
-        return {}
+        return options
     native = to_dict(config.shim_openshell)
     # Preserve the running provisioning-only companion's configuration digest.
     if native["supervisor_image"] is None:
         del native["supervisor_image"]
-    return {"openshell": native}
+    return {**options, "openshell": native}
+
+
+def machine_options(config: ControlPlaneConfig) -> dict[str, Any]:
+    return {"labels": config.shim_machine_labels, **({"tee": to_dict(config.shim_tee)} if config.shim_tee else {})}
+
+
+def check_machine(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
+    actual = value.get("machine_config_sha256")
+    # Old companions remain compatible only when no machine selection was requested.
+    if actual is None and not config.shim_machine_labels and not config.shim_tee:
+        return
+    encoded = json.dumps(machine_options(config), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False).encode()
+    if actual != hashlib.sha256(encoded).hexdigest():
+        raise RuntimeError("running shim machine settings differ; reconcile the companion explicitly before starting the node")
 
 
 def check_openshell(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
@@ -427,6 +471,7 @@ def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
     if value.get("protocol") != 1 or "runtime-daemon-v1" not in value.get("features", []):
         raise RuntimeError("running shim has an incompatible protocol; node was not changed")
     check_openshell(config, value)
+    check_machine(config, value)
 
 
 def main() -> None:

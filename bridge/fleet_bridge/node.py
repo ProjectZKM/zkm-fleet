@@ -466,7 +466,7 @@ class NodeExecutor:
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
             spec = self.runtimes.bind(spec, command_id)
             reconcile.start(spec)
-        return {"disabled": False, "ready": not (configured.runtime and configured.runtime.driver == "openshell")}
+        return {"disabled": False, "ready": not configured.native_access}
 
     def _remove_replicas(self, names: list[str]) -> None:
         for name in names:
@@ -699,7 +699,7 @@ class NodeExecutor:
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
                             services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
-                            if record.driver == "openshell" and health.allocation_reserved:
+                            if (record.driver == "openshell" or record.access_policy_sha256 is not None) and health.allocation_reserved:
                                 runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
                                     ready=healthy, services=services if healthy else [], native_observation_base64=health.native_observation_base64).dump())
                             elif services:

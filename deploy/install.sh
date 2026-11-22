@@ -34,6 +34,11 @@ mkdir -p "$PREFIX/bin" "$ETC" "$WORKDIR/logs"
 chmod 750 "$ETC"
 if [ "$ROLE" = control ]; then
   docker compose version >/dev/null || die "Docker compose v2 is required"
+  # Access enforcement is in the default stack. Validate prepared operator
+  # identity before replacing deployment files or starting any services.
+  for file in gateway.toml server.pem server.key ca.pem jwt.key jwt.pub jwt.kid; do
+    [ -f "$ETC/openshell/$file" ] || die "prepare $ETC/openshell/$file per docs/installation.md before control installation"
+  done
   [ -x "$BIN/fleetctl" ] || die "build fleetctl first, or pass --bin"
   install -m 755 "$BIN/fleetctl" "$PREFIX/bin/"
 else
@@ -69,6 +74,8 @@ fi
 mkdir -p "$PREFIX/deploy"
 if [ "$ROLE" = control ]; then
   cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in} "$PREFIX/deploy/"
+  mkdir -p "$PREFIX/deploy/trustee"
+  cp "$SRC/deploy/trustee/as.json" "$PREFIX/deploy/trustee/as.json"
   FLEETCTL="$PREFIX/bin/fleetctl"
   [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" >/dev/null
   [ -f "$ETC/pg_password" ] || (umask 077; openssl rand -hex 24 > "$ETC/pg_password")

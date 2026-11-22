@@ -1,4 +1,4 @@
-"""Validate the rendered optional gateway deployment without starting services."""
+"""Validate isolation and persistence in the rendered control-plane deployment."""
 import json
 import os
 from pathlib import Path
@@ -11,8 +11,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_openshell_profile_keeps_control_host_and_health_port_private(tmp_path, enabled):
+@pytest.fixture
+def control_compose(tmp_path):
     if not shutil.which("docker") or subprocess.run(
         ["docker", "compose", "version"], capture_output=True
     ).returncode:
@@ -24,14 +24,14 @@ def test_openshell_profile_keeps_control_host_and_health_port_private(tmp_path, 
                FLEET_UID="12345", FLEET_GID="12346")
     args = ["docker", "compose", "--env-file", "/dev/null", "-p", "fleet-config-test",
             "-f", str(ROOT / "deploy/docker-compose.yml")]
-    if enabled:
-        args += ["--profile", "openshell"]
     result = subprocess.run(args + ["config", "--format", "json"], env=env,
                             capture_output=True, text=True, check=True)
-    services = json.loads(result.stdout)["services"]
-    assert ("openshell-gateway" in services) == enabled
-    if not enabled:
-        return
+    return json.loads(result.stdout)
+
+
+def test_default_openshell_gateway_keeps_control_host_and_health_port_private(control_compose):
+    services = control_compose["services"]
+    assert "openshell-gateway" in services
     gateway = services["openshell-gateway"]
     upstream = re.search(r'\[\[package\]\]\nname = "openshell-core"\n.*?source = "[^"]+#([0-9a-f]+)"',
                          (ROOT / "Cargo.lock").read_text(), re.S)
@@ -54,3 +54,28 @@ def test_openshell_profile_keeps_control_host_and_health_port_private(tmp_path, 
     assert "--disable-tls" not in command
     for flag in ("--enable-mtls-auth", "--enable-operator-auth"):
         assert command[command.index(flag) + 1] == "true"
+
+
+def test_trustee_has_persistent_state_and_no_public_or_privileged_access(control_compose):
+    service = control_compose["services"]["trustee-as"]
+    assert "@sha256:" in service["image"]
+    assert not service.get("ports")
+    assert service["read_only"] and service["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in service["security_opt"]
+    assert not service.get("privileged") and not service.get("devices")
+    assert service["command"] == ["grpc-as", "--socket", "0.0.0.0:50004", "--config-file", "/etc/trustee/as.json"]
+    config_mount = next(v for v in service["volumes"] if v["target"] == "/etc/trustee/as.json")
+    assert config_mount["type"] == "bind" and config_mount["read_only"]
+    assert not config_mount["bind"].get("create_host_path", False)
+    config = json.loads(Path(config_mount["source"]).read_text())
+    assert config["rvps_config"]["type"] == "BuiltIn"
+    assert config["storage_backend"]["storage_type"] == "LocalFs"
+    assert config["storage_backend"]["backends"]["local_fs"]["dir_path"] == "/opt/confidential-containers/attestation-service"
+    assert service["environment"]["QCNL_CONF_PATH"] == "/run/dcap/qcnl.conf"
+    assert len(service["volumes"]) == 2
+    mounts = [v for v in service["volumes"] if v["type"] == "volume"]
+    assert len(mounts) == 1
+    assert mounts[0]["type"] == "volume"
+    assert mounts[0]["source"] == "trustee-data"
+    assert mounts[0]["target"] == "/opt/confidential-containers/attestation-service"
+    assert "trustee-data" in control_compose["volumes"]

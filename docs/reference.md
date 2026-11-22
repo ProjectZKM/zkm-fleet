@@ -467,13 +467,15 @@ Keep the allocation and shim journals across upgrades and restarts.
 Shim delegates lifecycle to upstream Docker, applies CPU/memory hard limits and
 checks effective limits before start. Its service port is published only on local
 loopback; declared services use the independent router through outbound node
-connectors. GPU ids are Ray's assigned ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
-it makes no shell-policy enforcement claim. OpenShell/TEE and proof-required
-lifecycle requests are unsupported and rejected. The existing separate proof-required
-action admission path in trusted-shim is unchanged.
+connectors. GPU ids are Ray's assigned ids. The Docker profile is explicitly non-TEE
+and makes no shell-policy enforcement claim; it rejects attestation requirements.
+OpenShell access is always enabled across drivers; absent user rules add no
+restrictions. A configured `access_policy_sha256` binds user rules to the native
+provisioning gate. TEE profiles below require synchronous
+remote-attestation receipts. Application action admission remains a separate gate.
 
-The bundled companion is built with OpenShell support. Operators can enable its
-native provisioning endpoint in the **same** `apps.yaml`, alongside `shim_daemon`:
+The bundled companion includes OpenShell and Ziren receipt verification support. Operators configure its
+native enforcement endpoint in the **same** `apps.yaml`, alongside `shim_daemon`:
 
 ```yaml
 shim_daemon: true
@@ -497,8 +499,13 @@ Docker apps and their persisted execution selection remain unchanged.
 The daemon's private `provision` operation accepts exact native gateway bytes and
 a proof-backed grant, consumes the grant centrally before Create, and keeps only
 ownership/digests and admitted public service metadata on disk. Native inspection/cleanup survives gateway outages and
-expired credentials. An explicit `runtime: {executor: shim, driver: openshell}`
-App now reserves Ray resources and a durable shim allocation before provisioning.
+expired credentials. An app with a user access-policy commitment reserves Ray resources and a durable
+shim allocation before native provisioning, while retaining its `docker`, `tee`
+or `tee-simulation` driver. The control plane supplies `access_policy_sha256`
+from the selected OpenShell rules; there is no enable toggle. Omit it when the
+user has no rules: effective permissions then remain exactly the driver boundary.
+Legacy `driver: openshell` records remain readable for recovery. A rule change
+requires confirmed cleanup and a new generation; an upgrade never migrates one.
 This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
 6 MiB); command/environment are literal. Optional HTTP app services declare
 `services`, one `container_port` and `health_path` (default `/`). These ports are
@@ -511,7 +518,7 @@ services, placement instead requires `shim-openshell-services-v1`, advertised on
 by a companion with local health reporting and configured `shim_network`.
 
 The private shim adapter additionally supports proof-bound HTTP service declarations
-and `network` commands with `driver: openshell`. Fleet checks their service IDs,
+and `network` commands with the actual runtime driver. Fleet checks their service IDs,
 container port and health path against the admitted manifest; the daemon stores
 those targets and the native bundle's public SSH fingerprint. Later network
 commands cannot change them. The operator's immutable `supervisor_image` enables
@@ -550,7 +557,7 @@ policy_gateway:
 The socket directory must already exist, owned by the scheduler/gateway UID with
 mode 0700. Fleet creates a 0600 socket and accepts only that UID. Configure the
 unmodified gateway with `--compute-driver docker --compute-driver-socket` pointing
-to this socket. Fleet's optional [Compose profile](installation.md#openshell-gateway)
+to this socket. Fleet's default [Compose service](installation.md#openshell-gateway)
 deploys the unchanged gateway beside the scheduler. Operators deploy the node's
 native compute driver separately; the scheduler does not launch either process.
 The admission acknowledgement must match
@@ -1443,3 +1450,62 @@ The initial authorization snapshot caps policies plus permanent revocations at
 automatic app-lifecycle revocation remain follow-up work; do not discard records
 to recover capacity. See trusted-data-router `crates/transport/CONTROL.md` for the
 complete rollout and credential boundaries.
+
+### Node-configured TEE runtimes
+
+Use the existing `apps.yaml` for node-owned trust configuration. Fleet accepts
+`runtime: {executor: shim, driver: tee}` or `driver: tee-simulation` on ordinary
+apps; packaged proof workers retain their Docker profile. Hardware and simulation
+have separate scheduler capabilities and cannot satisfy each other's placements.
+Transport capabilities must also match the app's services. Existing allocations
+retain their original runtime and cleanup path.
+
+```yaml
+shim_daemon: true
+shim_machine_labels:
+  runtime.driver: tee-simulation
+  tee.platform: sample
+shim_tee:
+  mode: simulation
+  platform: sample
+  evidence_endpoint: http://127.0.0.1:8006/aa/evidence
+  trustee_endpoint: http://127.0.0.1:50004
+  trustee_policy_ids: [default]
+  expected_measurement: abcde
+  init_data_sha256: '<approved 64-character digest>'
+  endpoint_key_sha256: '<approved 64-character digest>'
+  proof_endpoint: https://proof.example
+  proof_token_file: /etc/zkm-fleet/ra-network.token
+  proof_signer_file: null  # optional explicit Fleet signer key file
+  program:
+    kind: remote_attestation
+    program_sha256: '<approved RA ELF SHA256>'
+    verifying_key_sha256: '<approved RA verifying-key SHA256>'
+  program_vkey_hash: '<approved Ziren vkey bytes32>'
+  elf_file: /opt/trusted-shim/ra.elf
+```
+
+This is a configuration template, not a runnable proof guest. A matching approved
+RA guest/ELF must be supplied; hardware RA guests are not shipped yet. Simulation
+also requires a remote receipt in the production daemon. Test doubles exist only
+in the shim test suite; they cannot authorize production launches.
+
+For hardware, select `mode: hardware`, `platform: snp` or `tdx`, driver `tee`,
+matching measurement/key/init-data values and an immutable workload image digest.
+Shim and its local runtime endpoints must be inside the measured confidential
+VM. This adapter does not provision VMs or implement SGX/Nitro isolation. Attestation
+Agent collects evidence; stock Trustee prechecks it; the remote guest must verify
+the actual quote/collateral and binding before shim creates the container. Trustee
+policy results or tokens alone never satisfy the receipt requirement.
+
+With no explicit driver, shim uses its configured TEE profile or detects local
+interfaces. Detected TEE devices without an approved profile require explicit
+configuration; `runtime.driver: docker` deliberately selects an unattested node.
+`--probe-machine` reports devices only. `shim_openshell` is independent of `shim_tee`:
+on TEE nodes, every new native sandbox passes through the same RA gate before its policy grant
+is consumed and CreateSandbox is dispatched. Its compute driver, socket and
+supervisor must be confined to the measured VM; SGX/Nitro need separate adapters.
+The companion validates a canonical configuration
+digest on reconnect; changing node settings cannot silently reconfigure a live
+shim. Preserve its state and credentials through upgrades. Trust-profile changes
+need drained allocations and an explicitly provisioned new state directory.

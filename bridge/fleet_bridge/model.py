@@ -447,6 +447,40 @@ class AppRuntime(str, enum.Enum):
 
 
 @dataclass(kw_only=True)
+class ShimTeeConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    mode: typing.Literal["hardware", "simulation"]
+    platform: str
+    evidence_endpoint: str
+    trustee_endpoint: str
+    trustee_policy_ids: list[str]
+    init_data_sha256: str
+    endpoint_key_sha256: str
+    expected_measurement: str
+    proof_endpoint: str
+    proof_token_file: str
+    program: dict[str, str]
+    program_vkey_hash: str
+    elf_file: str
+    proof_signer_file: str | None = None
+
+    def __post_init__(self) -> None:
+        if ((self.mode == "simulation" and self.platform != "sample")
+                or (self.mode == "hardware" and self.platform not in ("snp", "tdx"))):
+            raise ModelError("TEE mode and platform disagree")
+        if any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in (self.init_data_sha256, self.endpoint_key_sha256)):
+            raise ModelError("TEE bindings require SHA256 digests")
+        if self.program.get("kind") != "remote_attestation" or set(self.program) != {"kind", "program_sha256", "verifying_key_sha256"}:
+            raise ModelError("TEE requires a pinned remote-attestation program")
+        if any(not os.path.isabs(p) for p in (self.proof_token_file, self.elf_file, *([self.proof_signer_file] if self.proof_signer_file else []))):
+            raise ModelError("TEE artifact and credential paths must be absolute")
+
+    @property
+    def driver(self) -> str:
+        return "tee" if self.mode == "hardware" else "tee-simulation"
+
+
+@dataclass(kw_only=True)
 class ControlPlaneConfig(Record):
     """The top of apps.yaml: what every replica shares."""
 
@@ -461,8 +495,12 @@ class ControlPlaneConfig(Record):
     shim_daemon: bool = False
     shim_network: ShimNetworkConfig | None = None
     shim_openshell: ShimOpenShellConfig | None = None
+    shim_machine_labels: dict[str, str] = field(default_factory=dict)
+    shim_tee: ShimTeeConfig | None = None
 
     def __post_init__(self) -> None:
+        if (self.shim_machine_labels or self.shim_tee) and not self.shim_daemon:
+            raise ModelError("machine labels require the persistent shim daemon")
         if self.shim_openshell is not None and not self.shim_daemon:
             raise ModelError("OpenShell requires the persistent shim daemon")
         if self.shim_daemon:
@@ -535,8 +573,8 @@ class RuntimeSelection(Record):
 
     def __post_init__(self) -> None:
         if (self.executor is ExecutorKind.LEGACY and self.driver is not None
-                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell")):
-            raise ModelError("runtime must select legacy or shim with driver docker or openshell")
+                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell", "tee", "tee-simulation")):
+            raise ModelError("runtime must select legacy or shim with driver docker, openshell, tee or tee-simulation")
 
 
 @dataclass(kw_only=True)
@@ -562,6 +600,7 @@ class AppSpec(Record):
 
     name: str
     runtime: RuntimeSelection | None = None
+    access_policy_sha256: str | None = None
     services: list[str] = field(default_factory=list)
     service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
     ingress: dict[str, HttpIngress] = field(default_factory=dict)
@@ -604,8 +643,16 @@ class AppSpec(Record):
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
+    @property
+    def native_access(self) -> bool:
+        return self.access_policy_sha256 is not None or bool(self.runtime and self.runtime.driver == "openshell")
+
     def __post_init__(self) -> None:
-        if self.runtime and self.runtime.driver == "openshell":
+        if self.access_policy_sha256 is not None:
+            if (not re.fullmatch(r"[0-9a-f]{64}", self.access_policy_sha256)
+                    or not self.runtime or self.runtime.executor is not ExecutorKind.SHIM):
+                raise ModelError("access policy requires a SHA256 commitment and shim runtime")
+        if self.native_access:
             if (self.gpus != 0 or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
                     or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
                     or self.ingress or self.volumes or self.shm_gb is not None
@@ -697,7 +744,10 @@ class AppsConfig(Record):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
         if app.services and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
-        if app.runtime and app.runtime.driver == "openshell" and (not cluster.shim_daemon or cluster.shim_openshell is None):
+        if app.runtime and app.runtime.driver in ("tee", "tee-simulation"):
+            if not cluster.shim_daemon or not cluster.shim_tee or cluster.shim_tee.driver != app.runtime.driver:
+                raise ModelError("TEE apps require a matching node TEE mode and persistent shim")
+        if app.native_access and (not cluster.shim_daemon or cluster.shim_openshell is None):
             raise ModelError("OpenShell requires the configured persistent companion")
 
 

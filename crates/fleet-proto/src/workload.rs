@@ -25,17 +25,23 @@ impl<'a> Entry<'a> {
     /// the scheduler keeps from it.
     pub const REPORTED: [&'static str; 4] = ["ready", "logs", "cleaned", "namespace_ref"];
 
+    pub fn native_access(self) -> bool {
+        self.0["access_policy_sha256"].is_string() || self.0["runtime"]["driver"] == "openshell"
+    }
+
     /// Missing selection is permanently the legacy path, including old records.
     pub fn runtime_capability(self) -> Option<&'static str> {
+        if self.native_access() {
+            return Some(if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" } else { "shim-openshell-provisioning-v1" });
+        }
         if self.is_prover() && self.0["runtime"] == json!({"executor":"shim", "driver":"docker"}) {
             return Some("shim-prover-v1");
         }
         match self.0.get("runtime") {
             None => None,
             Some(v) if v == &json!({"executor":"legacy"}) => None,
-            Some(v) if v == &json!({"executor":"shim", "driver":"openshell"}) => Some(
-                if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" }
-                else { "shim-openshell-provisioning-v1" }),
+            Some(v) if v == &json!({"executor":"shim", "driver":"tee"}) => Some("shim-tee-v1"),
+            Some(v) if v == &json!({"executor":"shim", "driver":"tee-simulation"}) => Some("shim-tee-simulation-v1"),
             Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
                 if self.0["service_protocol"] == "tcp" { "shim-tcp-v1" }
                 else if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
@@ -230,9 +236,20 @@ impl NodeReport {
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
         if !entry.runtime_capability().is_none_or(has) { return false; }
-        if entry.0["runtime"]["driver"] != "docker" { return true; }
+        if entry.0["access_policy_sha256"].is_string() {
+            let base = match entry.0["runtime"]["driver"].as_str() {
+                Some("docker") => "shim-docker-v1", Some("tee") => "shim-tee-v1",
+                Some("tee-simulation") => "shim-tee-simulation-v1", _ => return false,
+            };
+            return has("shim-openshell-access-v1") && has(base);
+        }
+        if entry.0["runtime"]["driver"] == "docker" && !has("shim-docker-v1") { return false; }
+        if !crate::model::v1::RegisterAppRequest::local_container_runtime(entry.0.get("runtime")) { return true; }
         [
             ("shim-network-v1", entry.0["services"].as_array().is_some_and(|s| !s.is_empty())),
+            ("shim-tcp-v1", entry.0["runtime"]["driver"] != "docker" && entry.0["service_protocol"] == "tcp"),
+            ("shim-management-v1", entry.0["runtime"]["driver"] != "docker" && (entry.0["ingress"].as_object().is_some_and(|v| !v.is_empty()) || entry.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")))),
+            ("shim-single-use-ingress-v1", entry.0["runtime"]["driver"] != "docker" && entry.0["ingress"].as_object().is_some_and(|v| v.values().any(|r| r["single_use"] == true))),
             ("shim-runtime-v2", entry.0.get("container_port").is_some_and(|v| !v.is_null()) || entry.0.get("entrypoint").is_some_and(|v| !v.is_null())),
             ("shim-automatic-port-v1", entry.0["port_base"].as_u64() == Some(0)),
             ("shim-private-env-v1", entry.0["ingress"].as_object().is_some_and(|i| i.values().any(|r| r["bearer_env"].is_string()))),

@@ -83,9 +83,9 @@ jobs:
         run: |
           TRUSTED_SHIM_REV=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/fleet-scheduler/Cargo.toml", "rb"))["dependencies"]["trusted-shim"]["rev"])')
           echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
-          cargo install --locked --force --git https://github.com/BotMesh/trusted-shim \
+          cargo install --locked --force --git https://github.com/attestx/trusted-shim \
             --rev "$TRUSTED_SHIM_REV" \
-            --features openshell --bin trusted-shim-runtime --root target/shim
+            --features ziren --bin trusted-shim-runtime --root target/shim
 
       - name: Publish component images to GHCR
         env:
@@ -110,6 +110,7 @@ jobs:
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
             deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh \
             deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh "$DIST/deploy/"
+          cp -a deploy/trustee "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"

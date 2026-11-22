@@ -258,22 +258,38 @@ async fn compute_client(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_waits_for_proof_delivers_once_and_returns_only_fresh_owned_observations() {
     for forged in [false, true] {
-        startup(forged, false).await;
+        startup(forged, false, "openshell").await;
+        startup(forged, false, "docker").await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires pinned unmodified OPENSHELL_GATEWAY_BINARY and openssl"]
 async fn stock_gateway_startup_through_fleet_and_persistent_shim() {
-    startup(false, true).await;
+    startup(false, true, "docker").await;
 }
 
 mod docker;
 
 mod gateway;
 
-async fn startup(forged: bool, stock: bool) {
-    let (dir, c, mut report, mut policy, mut request) = policy_setup_with_driver("openshell").await;
+async fn startup(forged: bool, stock: bool, driver: &str) {
+    let native_policy = SandboxPolicy {
+        version: 1,
+        process: Some(protocol::sandbox::v1::ProcessPolicy {
+            run_as_user: "1000".into(),
+            run_as_group: "1000".into(),
+        }),
+        ..Default::default()
+    };
+    let access_hash = trusted_shim::openshell_gateway::deterministic_policy_hash(&native_policy);
+    let (dir, c, mut report, mut policy, mut request) = policy_setup_with_inventory("openshell", |report| {
+        if driver != "openshell" {
+            report.apps[0]["runtime"]["driver"] = json!(driver);
+            report.apps[0]["access_policy_sha256"] = json!(access_hash);
+            report.runtime_capabilities.push("shim-openshell-access-v1".into());
+        }
+    }).await;
     request.operation = "runtime.create".into();
     for module in policy.modules.values_mut() {
         *module = module.replace(
@@ -323,6 +339,7 @@ async fn startup(forged: bool, stock: bool) {
             &state,
             "machine".into(),
             trusted_shim::daemon::DaemonConfig {
+                machine: Default::default(),
                 openshell: Some(trusted_shim::openshell_daemon::OpenShellConfig {
                     socket: native_socket,
                     admission_policy: admission(),
@@ -339,22 +356,16 @@ async fn startup(forged: bool, stock: bool) {
     socket_ready(&shim_socket).await;
     shim_call(
         &shim_socket,
-        json!({"operation":"allocate","execution":request.execution,"driver":"openshell"}),
+        json!({"operation":"allocate","execution":request.execution,"driver":driver}),
     )
     .await;
     let fixture = provisioning(&request);
     let mut launch = fixture.request.clone();
     launch.policy = policy.policy.clone();
+    launch.driver = driver.into();
+    if driver != "openshell" { launch.access_policy_sha256 = Some(access_hash); }
     let native_bytes = STANDARD.decode(&fixture.native_create_base64).unwrap();
     let mut sandbox = DriverSandbox::decode(native_bytes.as_slice()).unwrap();
-    let native_policy = SandboxPolicy {
-        version: 1,
-        process: Some(protocol::sandbox::v1::ProcessPolicy {
-            run_as_user: "1000".into(),
-            run_as_group: "1000".into(),
-        }),
-        ..Default::default()
-    };
     sandbox.spec.as_mut().unwrap().policy = Some(native_policy.clone());
     sandbox.spec.as_mut().unwrap().workload_identity = Some(WorkloadIdentityRequest {
         user: "1000".into(),
@@ -581,7 +592,7 @@ async fn startup(forged: bool, stock: bool) {
         );
         let observed = shim_call(
             &shim_socket,
-            json!({"operation":"inspect","execution":request.execution,"driver":"openshell"}),
+            json!({"operation":"inspect","execution":request.execution,"driver":driver}),
         )
         .await;
         report.runtime_instances[0].native_observation_base64 = Some(

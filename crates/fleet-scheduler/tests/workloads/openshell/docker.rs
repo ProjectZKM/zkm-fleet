@@ -166,6 +166,7 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
                 &state,
                 "machine".into(),
                 trusted_shim::daemon::DaemonConfig {
+                    machine: Default::default(),
                     openshell: Some(trusted_shim::openshell_daemon::OpenShellConfig {
                         socket,
                         admission_policy: admission(),

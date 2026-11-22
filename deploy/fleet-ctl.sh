@@ -135,8 +135,13 @@ scheduler_upgrade() {
   run docker pull "$image"
   run mkdir -p "$b"
   run cp -a "$PREFIX/bin/fleetctl" "$PREFIX/deploy/docker-compose.yml" "$PREFIX/deploy/gateway.yaml.in" "$PREFIX/compose.env" "$b/"
+  [ ! -d "$PREFIX/deploy/trustee" ] || run cp -a "$PREFIX/deploy/trustee" "$b/"
   run install -m 755 "$RELEASE_ROOT/bin/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$RELEASE_ROOT/deploy/docker-compose.yml" "$RELEASE_ROOT/deploy/gateway.yaml.in" "$PREFIX/deploy/"
+  if [ "$DRY" = 1 ] || [ -d "$RELEASE_ROOT/deploy/trustee" ]; then
+    run mkdir -p "$PREFIX/deploy/trustee"
+    run cp -a "$RELEASE_ROOT/deploy/trustee/." "$PREFIX/deploy/trustee/"
+  fi
   set_scheduler_image "$image"
   # The scheduler finishes in-flight calls before it exits, so recreating can take ~90s.
   compose up -d --no-deps --force-recreate $(control_services)
@@ -148,6 +153,10 @@ scheduler_rollback() {
   run install -m 755 "$b/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$b/docker-compose.yml" "$b/gateway.yaml.in" "$PREFIX/deploy/"
   run cp "$b/compose.env" "$PREFIX/compose.env"
+  if [ -d "$b/trustee" ]; then
+    run mkdir -p "$PREFIX/deploy/trustee"
+    run cp -a "$b/trustee/." "$PREFIX/deploy/trustee/"
+  fi
   compose up -d --no-deps --force-recreate $(control_services)
   scheduler_healthy || die "scheduler is not healthy after rollback"
   echo "restored $b"

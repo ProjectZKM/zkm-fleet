@@ -99,7 +99,7 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
 def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
     """Compare the admitted deployment and its observed readiness."""
     from .actors import spec_hash
-    return (health.is_ready or (spec.app.runtime and spec.app.runtime.driver == "openshell" and health.allocation_reserved)) and health.spec == spec_hash(spec)
+    return (health.is_ready or (spec.app.native_access and health.allocation_reserved)) and health.spec == spec_hash(spec)
 
 
 def _pg_name(actor: str) -> str:
@@ -120,10 +120,10 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
         extra = {}
         if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
             from .shim import ShimApp, ProvisionedApp
-            factory = ProvisionedApp if spec.app.runtime.driver == "openshell" else ShimApp
+            factory = ProvisionedApp if spec.app.native_access else ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            adapter = "openshell-allocation-v1" if spec.app.runtime.driver == "openshell" else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            adapter = "openshell-allocation-v1" if spec.app.native_access else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
             extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
         options = factory.options(
             name=spec.name,

@@ -39,7 +39,7 @@ async fn provision(path: &Path, offer: &RuntimeDeliveryOffer, payload: &[u8]) ->
     let payload: Value = serde_json::from_slice(payload)?;
     ensure!(
         payload["request"]["execution"] == serde_json::to_value(&offer.execution)?
-            && payload["request"]["driver"] == "openshell",
+            && matches!(payload["request"]["driver"].as_str(), Some("docker" | "tee" | "tee-simulation" | "openshell")),
         "delivery identity mismatch"
     );
     validate_socket(path)?;
@@ -126,7 +126,8 @@ impl DeliveryClient {
         };
         let accepted = matches!(
             tokio::time::timeout(
-                Duration::from_secs(150),
+                // TEE nodes verify a remote RA receipt before native dispatch.
+                Duration::from_secs(330),
                 provision(&self.socket, &offer, &bytes)
             )
             .await,
