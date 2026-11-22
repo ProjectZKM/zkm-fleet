@@ -12,6 +12,13 @@ pub mod workload;
 
 pub use fleet::model;
 
+/// Preserve Fleet's TLS backend when another library also enables AWS-LC.
+/// Tonic 0.12 uses Rustls's global builder, which cannot choose automatically
+/// with both providers enabled. An embedder's explicit choice takes precedence.
+pub fn initialize_tls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Shared file credential handling for endpoints; tokens never enter command arguments.
 pub fn load_token(path: &std::path::Path) -> anyhow::Result<String> {
     let token = std::fs::read_to_string(path)?.trim().to_owned();

@@ -100,7 +100,7 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
 def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
     """Only explicit overrides require executable evidence from a new actor."""
     from .actors import spec_hash
-    return (health.is_ready and health.spec == spec_hash(spec)
+    return ((health.is_ready or (spec.app.runtime and spec.app.runtime.driver == "openshell" and health.allocation_reserved)) and health.spec == spec_hash(spec)
             and (not spec.app.prover_binary
                  or health.prover_binary == os.path.realpath(spec.cluster.node_binary)))
 
@@ -121,11 +121,12 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
         factory = ACTORS[spec.kind]
         extra = {}
         if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
-            from .shim import ShimApp
-            factory = ShimApp
+            from .shim import ShimApp, ProvisionedApp
+            factory = ProvisionedApp if spec.app.runtime.driver == "openshell" else ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "runtime-recovery-v1"}}
+            adapter = "openshell-allocation-v1" if spec.app.runtime.driver == "openshell" else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
         elif spec.app.prover_binary:
             # Newly selected provers load the updated actor without restarting Ray.
             extra["runtime_env"] = {"env_vars": {"FLEET_PROVER_ADAPTER": "executable-v1"}}
