@@ -117,6 +117,8 @@ def node_fixture(tmp_path):
     (prefix / "bridge" / "fleet_bridge").mkdir(parents=True)
     (prefix / "venv" / "bin").mkdir(parents=True)
     (prefix / "deploy").mkdir()
+    (prefix / "etc").mkdir()
+    (prefix / "etc/apps.yaml").write_text("apps: []\n")
     executable(prefix / "bin/fleet-node", "echo old-node\n")
     executable(prefix / "venv/bin/python", "exit 0\n")
     for name, body in [("node-start.sh", "old node-start"), ("ray-start.sh", "old ray-start"),
@@ -124,8 +126,8 @@ def node_fixture(tmp_path):
         (prefix / "deploy" / name).write_text(body + "\n")
     commands = tmp_path / "bin"
     executable(commands / "sudo", "exec \"$@\"\n")
-    executable(commands / "systemctl", "exit 0\n")
-    executable(commands / "journalctl", "echo 'node connected to control plane'\nexit 0\n")
+    executable(commands / "systemctl", 'case "$*" in *"--property=InvocationID"*) echo 0123456789abcdef0123456789abcdef;; esac\nexit 0\n')
+    executable(commands / "journalctl", 'case "$*" in *"_SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef"*) echo "node connected to control plane";; *) exit 1;; esac\n')
     return prefix, commands
 
 
@@ -178,6 +180,62 @@ def test_watchdog_repairs_a_dead_ray_link(tmp_path):
         pytest.skip("a live fleet watchdog on this machine held the lock; nothing ran")
     assert link.is_symlink() and link.resolve() == (work / "ray").resolve()
     assert (tmp_path / "ray.log").exists(), "the repaired link let the watchdog start Ray"
+
+
+def test_node_upgrade_and_rollback_do_not_restart_proof_endpoints(tmp_path):
+    prefix, commands = node_fixture(tmp_path)
+    calls = tmp_path / "systemctl.calls"
+    executable(commands / "systemctl", f'echo "$*" >> {calls}\ncase "$*" in *"--property=InvocationID"*) echo 0123456789abcdef0123456789abcdef;; esac\n')
+    old_proof = prefix / "bin/fleet-proof-app"
+    executable(old_proof, "echo old-proof\n")
+    new_proof = tmp_path / "new-proof"
+    executable(new_proof, "echo new-proof\n")
+    new_node = tmp_path / "new-node"
+    executable(new_node, "echo new-node\n")
+    new_bridge = tmp_path / "bridge"
+    (new_bridge / "fleet_bridge").mkdir(parents=True)
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_PROOF_APP_UNITS": "active-proof.service"}
+    ctl = ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node"]
+    subprocess.run([*ctl, "upgrade", str(new_node), str(new_bridge), str(new_proof)], env=env, check=True, capture_output=True)
+    assert old_proof.read_text() == new_proof.read_text()
+    subprocess.run([*ctl, "rollback"], env=env, check=True, capture_output=True)
+    assert "old-proof" in old_proof.read_text()
+    assert "active-proof" not in calls.read_text() and "restart" not in calls.read_text()
+
+
+def test_missing_node_configuration_fails_before_stopping_agent(tmp_path):
+    prefix,commands=node_fixture(tmp_path)
+    (prefix/'etc/apps.yaml').unlink()
+    candidate=tmp_path/'candidate';executable(candidate,'exit 0\n')
+    calls=tmp_path/'systemctl.calls'
+    executable(commands/'systemctl',f'echo "$*" >> {calls}\n')
+    env={**os.environ,'PATH':f'{commands}:{os.environ["PATH"]}','FLEET_PREFIX':str(prefix),
+        'FLEET_CTL_ENV':str(tmp_path/'none.env'),'FLEET_NODE_SSH':''}
+    result=subprocess.run(['bash',str(ROOT/'deploy/fleet-ctl.sh'),'node','upgrade',str(candidate),str(prefix/'bridge')],
+        env=env,capture_output=True,text=True,timeout=10)
+    assert result.returncode!=0 and 'cannot locate apps.yaml' in result.stderr
+    assert not calls.exists() or 'stop ' not in calls.read_text()
+
+
+def test_rollback_restores_proof_binary_even_if_agent_cannot_reconnect(tmp_path):
+    prefix,commands=node_fixture(tmp_path)
+    backup=prefix/'backup/node-20260101T000000Z';backup.mkdir(parents=True)
+    executable(backup/'fleet-node','echo restored-node\n')
+    executable(backup/'fleet-proof-app','echo restored-proof\n')
+    (backup/'bridge/fleet_bridge').mkdir(parents=True)
+    executable(prefix/'bin/fleet-proof-app','echo upgraded-proof\n')
+    executable(commands/'journalctl','exit 1\n')
+    executable(commands/'sleep','exit 0\n')
+    env={**os.environ,'PATH':f'{commands}:{os.environ["PATH"]}','FLEET_PREFIX':str(prefix),
+        'FLEET_CTL_ENV':str(tmp_path/'none.env'),'FLEET_NODE_SSH':'','FLEET_ETC':str(prefix/'etc')}
+    # Explicit FLEET_ETC must win even when watchdog.env omits that variable.
+    (prefix/'etc/watchdog.env').write_text('FLEET_HOME=/unused\n')
+    result=subprocess.run(['bash',str(ROOT/'deploy/fleet-ctl.sh'),'node','rollback'],
+        env=env,capture_output=True,text=True,timeout=10)
+    assert result.returncode!=0 and 'restored node did not reconnect' in result.stderr
+    assert 'restored-proof' in (prefix/'bin/fleet-proof-app').read_text()
+    assert 'restored-node' in (prefix/'bin/fleet-node').read_text()
 
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):

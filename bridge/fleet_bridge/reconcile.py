@@ -7,8 +7,8 @@ Namespace validation, quotas, draining and preemption stay in the control plane.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
-from dataclasses import replace
 from typing import Any, Mapping, Callable
 
 import ray
@@ -46,20 +46,20 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
             continue
         if is_job_actor(app.name):
             raise ValueError(f"app {app.name}: the job- prefix is reserved for batch job actors")
+        # Resolve the selection before Ray dispatch using the established field.
+        # Preserve historical hashes unless the administrator selects an override.
+        cluster = file.cluster.merged(node_binary=app.prover_binary) if app.prover_binary else file.cluster
         for i in range(app.replicas):
             name = f"{app.name}-{i}"
             config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
+            if app.prover_binary:
+                config["node_binary"] = cluster.node_binary
             if app.kind is AppRuntime.APP:
                 config["index"] = i
             if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
                 config.update(shim_binary=file.cluster.shim_binary, shim_state_dir=file.cluster.shim_state_dir)
                 if app.services:
                     config["shim_network"] = file.cluster.shim_network.dump() if file.cluster.shim_network else None
-            # Resolve the administrator's executable selection before crossing
-            # the Ray boundary. Existing Ray workers may still have the older
-            # actors module loaded during a rolling bridge upgrade; they read
-            # the established cluster.node_binary field.
-            cluster = replace(file.cluster, node_binary=app.prover_binary) if app.prover_binary else file.cluster
             out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=cluster, config=config)
     return out
 
@@ -97,6 +97,14 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
     return h if isinstance(h, ReplicaHealth) else ReplicaHealth.load(h)
 
 
+def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
+    """Only explicit overrides require executable evidence from a new actor."""
+    from .actors import spec_hash
+    return ((health.is_ready or (spec.app.runtime and spec.app.runtime.driver == "openshell" and health.allocation_reserved)) and health.spec == spec_hash(spec)
+            and (not spec.app.prover_binary
+                 or health.prover_binary == os.path.realpath(spec.cluster.node_binary)))
+
+
 def _pg_name(actor: str) -> str:
     # Ray keeps named placement-group records after removal. Reusing the same
     # name on a later app restart is rejected by the GCS even when the old
@@ -113,11 +121,15 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
         factory = ACTORS[spec.kind]
         extra = {}
         if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
-            from .shim import ShimApp
-            factory = ShimApp
+            from .shim import ShimApp, ProvisionedApp
+            factory = ProvisionedApp if spec.app.runtime.driver == "openshell" else ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": "runtime-management-v1"}}
+            adapter = "openshell-allocation-v1" if spec.app.runtime.driver == "openshell" else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
+        elif spec.app.prover_binary:
+            # Newly selected provers load the updated actor without restarting Ray.
+            extra["runtime_env"] = {"env_vars": {"FLEET_PROVER_ADAPTER": "executable-v1"}}
         actor: ActorHandle[Any] = factory.options(
             name=spec.name,
             namespace=NAMESPACE,

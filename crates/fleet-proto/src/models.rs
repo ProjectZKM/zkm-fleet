@@ -4,13 +4,146 @@ use crate::model::v1::*;
 use crate::stage::v1::Status as StageStatus;
 use serde_json::Value;
 
+pub const MAX_ROUTER_REVOCATIONS: usize = 4096;
+pub const ROUTER_CAPABILITIES_HEADER: &str = "x-fleet-router-capabilities";
+pub const ROUTER_WORKLOAD_DEFAULTS: &str = "workload-defaults-v1";
+pub fn valid_router_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 63 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+pub fn valid_route_id(id: &str) -> bool {
+    id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+impl RouterControl {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.capabilities.len() <= 16
+            && self.capabilities.iter().all(|c| router_name(c))
+            && self.capabilities.iter().collect::<std::collections::HashSet<_>>().len() == self.capabilities.len(),
+            "invalid router capabilities");
+        if let Some(auth) = &self.authorization { auth.validate()?; }
+        anyhow::ensure!(self.delivered_authorization_revision.is_none_or(|r| self.authorization.as_ref().is_some_and(|a| r <= a.revision))
+            && self.applied_authorization_revision.is_none_or(|r| self.delivered_authorization_revision.is_some_and(|d| r <= d)), "invalid authorization acknowledgment");
+        anyhow::ensure!(valid_router_id(&self.router_id) && !self.issuer.is_empty() && self.issuer.len() <= 256
+            && !self.issuer.chars().any(char::is_control) && self.epoch.len() == 32
+            && self.epoch.bytes().all(|b| b.is_ascii_hexdigit()) && !self.token_id.is_empty()
+            && !self.namespace.is_empty(), "invalid router enrollment");
+        anyhow::ensure!(self.revoked_routes.len() <= MAX_ROUTER_REVOCATIONS
+            && self.revoked_routes.iter().all(|r| valid_route_id(r))
+            && self.revoked_routes.iter().collect::<std::collections::HashSet<_>>().len() == self.revoked_routes.len()
+            && self.delivered_revision <= self.revoked_routes.len() as u64
+            && self.applied_revision.is_none_or(|r| r <= self.delivered_revision)
+            && self.applied_revision.is_some() == self.applied_ms.is_some(), "invalid router control state");
+        Ok(())
+    }
+}
+
+pub const MAX_ROUTER_AUTHORIZATION_RECORDS: usize = 1024;
+fn router_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+}
+fn router_namespace(s: &str) -> bool { s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
+impl RouterAccessPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && (self.workload == "*" || router_name(&self.workload)) && router_name(&self.service)
+            && self.version > 0 && valid_route_id(&self.sha256), "invalid router access policy");
+        Ok(())
+    }
+}
+impl RouterSubjectRevocation {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && valid_route_id(&self.principal)
+            && self.session.as_ref().is_none_or(|s| valid_route_id(s)), "invalid subject revocation");
+        Ok(())
+    }
+}
+impl RouterAuthorizeRequest {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(router_namespace(&self.namespace) && router_name(&self.workload) && router_name(&self.service)
+            && valid_route_id(&self.principal) && valid_route_id(&self.session), "invalid access identity");
+        Ok(())
+    }
+}
+impl RouterAuthorization {
+    /// A suspension permanently withdraws the current bindings. Resuming the
+    /// namespace does not enable policies or resurrect previously issued grants.
+    pub fn suspend_namespace(&mut self, namespace: &str) -> anyhow::Result<bool> {
+        if !self.policies.iter().any(|p| p.namespace == namespace && p.enabled) {
+            return Ok(false);
+        }
+        let revision = self.revision.checked_add(1).ok_or_else(|| anyhow::anyhow!("authorization revision exhausted"))?;
+        anyhow::ensure!(self.policies.iter().filter(|p| p.namespace == namespace && p.enabled)
+            .all(|p| p.version < u64::MAX), "policy version exhausted");
+        for policy in self.policies.iter_mut().filter(|p| p.namespace == namespace && p.enabled) {
+            policy.enabled = false;
+            policy.version += 1;
+        }
+        self.revision = revision;
+        Ok(true)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
+            "authorization state capacity exceeded");
+        let mut policies = std::collections::HashSet::new();
+        for p in &self.policies {
+            p.validate()?;
+            anyhow::ensure!(policies.insert((&p.namespace, &p.workload, &p.service)), "duplicate access policy");
+        }
+        let mut subjects = std::collections::HashSet::new();
+        for r in &self.revoked_subjects {
+            r.validate()?;
+            anyhow::ensure!(subjects.insert((&r.namespace, &r.principal, &r.session)), "duplicate subject revocation");
+        }
+        Ok(())
+    }
+    pub fn authorize(&self, request: &RouterAuthorizeRequest) -> anyhow::Result<RouterAccessBinding> {
+        request.validate()?;
+        anyhow::ensure!(!self.revoked_subjects.iter().any(|r| r.namespace == request.namespace && r.principal == request.principal
+            && r.session.as_ref().is_none_or(|s| s == &request.session)), "subject revoked");
+        let scoped = |p: &&RouterAccessPolicy| p.namespace == request.namespace && p.service == request.service;
+        let policy = self.policies.iter().filter(scoped).find(|p| p.workload == request.workload)
+            .or_else(|| self.policies.iter().filter(scoped).find(|p| p.workload == "*"))
+            .filter(|p| p.enabled).ok_or_else(|| anyhow::anyhow!("service not authorized"))?;
+        Ok(RouterAccessBinding {principal: request.principal.clone(), session: request.session.clone(),
+            policy_version: policy.version, policy_sha256: policy.sha256.clone()})
+    }
+}
+
 impl NodeReport {
+    pub fn validate_native_provers(&self) -> anyhow::Result<()> {
+        for entry in self.entries() {
+            if let Some(binary) = entry.0.get("prover_binary").filter(|v| !v.is_null()) {
+                anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu")
+                    && !entry.integrated_worker() && !entry.machine().is_empty()
+                    && entry.machine() == self.machine
+                    && binary.as_str().is_some_and(|p| p.starts_with('/') && p.len() <= 4096
+                        && !p.chars().any(char::is_control)),
+                    "prover_binary requires an absolute path and a native prover pinned to the reporting machine");
+            }
+        }
+        anyhow::ensure!(self.native_provers.len() <= 1024, "too many native prover processes");
+        let mut seen = std::collections::HashSet::new();
+        for process in &self.native_provers {
+            let entry = self.entry(&process.entry_name)
+                .ok_or_else(|| anyhow::anyhow!("native prover process has no app"))?;
+            let prefix = format!("{}-", entry.name());
+            anyhow::ensure!(matches!(entry.kind(), "ziren-gpu" | "ziren-cpu") && !entry.integrated_worker()
+                && process.replica_name.strip_prefix(&prefix).and_then(|s| s.parse::<u64>().ok())
+                    .is_some_and(|index| index < entry.replicas() && process.replica_name == format!("{prefix}{index}"))
+                && process.executable.starts_with('/') && process.executable.len() <= 4096
+                && !process.executable.chars().any(char::is_control)
+                && seen.insert(&process.replica_name), "invalid native prover process");
+        }
+        Ok(())
+    }
+
     pub fn validate_runtime_instances(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.runtime_instances.len() <= 1024, "too many runtime instances");
         let mut seen = std::collections::HashSet::new();
         for instance in &self.runtime_instances {
+            anyhow::ensure!(instance.native_observation_base64.as_ref().is_none_or(|v| !v.is_empty() && v.len() <= 21848), "invalid native observation size");
             let e = &instance.execution;
             let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
+            anyhow::ensure!(instance.native_observation_base64.is_none() || entry.0["runtime"]["driver"] == "openshell", "native observation requires OpenShell runtime");
             anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && entry.is_container()
                 && e.node_id == self.machine && e.generation > 0
                 && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
@@ -19,7 +152,11 @@ impl NodeReport {
             let prefix = format!("{}-",instance.entry_name);
             anyhow::ensure!(e.allocation_id.strip_prefix(&prefix).and_then(|s|s.parse::<u64>().ok()).is_some_and(|index| index < entry.replicas()), "invalid runtime replica");
             let expected: Vec<String> = entry.0["services"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect();
-            anyhow::ensure!(instance.services == expected, "runtime services differ from app manifest");
+            // An unhealthy workload may retain only its declared management
+            // endpoint so an administrator can repair this exact allocation.
+            anyhow::ensure!((entry.0["runtime"]["driver"] == "openshell" && !instance.ready && instance.services.is_empty())
+                || instance.services == expected || (instance.services == ["control"]
+                && expected.iter().any(|s| s == "control")), "runtime services differ from app manifest");
         }
         Ok(())
     }
@@ -284,12 +421,36 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 10] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress"];
+    pub const CONTAINER_SETTINGS: [&'static str; 11] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
 
     pub fn validate_transport(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        if ["services", "container_port", "entrypoint", "ingress"].iter().any(|k| spec.contains_key(*k)) {
-            anyhow::ensure!(spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
+        let native = spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"openshell"}));
+        if native {
+            let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
+            let health = spec.get("health_path").map_or(Some("/"), Value::as_str);
+            anyhow::ensure!(spec.get("gpus").and_then(Value::as_f64) == Some(0.0)
+                && spec.get("cpus").and_then(Value::as_u64).is_some_and(|v| v > 0 && v <= u32::MAX as u64 / 1000)
+                && spec.get("memory_gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v * (1u64 << 30) as f64 >= (6 * 1024 * 1024) as f64 && v * ((1u64 << 30) as f64) < u64::MAX as f64)
+                && ["port_base", "entrypoint", "user", "workdir", "shm_gb"].iter().all(|k| !spec.contains_key(*k))
+                && spec.get("volumes").is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()))
+                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty()))
+                && spec.get("service_protocol").is_none_or(|v| v == "http1")
+                && spec.get("services").and_then(Value::as_array).is_none_or(|s| s.iter().all(|s| s != "control"))
+                && services == spec.contains_key("container_port")
+                && health.is_some_and(|p| p.starts_with('/') && !p.starts_with("//") && p.len() <= 2048
+                    && !p.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'#') && (services || p == "/")),
+                "native OpenShell requires CPU/memory limits and optional private HTTP app services");
+        }
+        if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
+            anyhow::ensure!(native || spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"})),
                 "transport settings require explicit shim execution");
+        }
+        if let Some(protocol) = spec.get("service_protocol") {
+            anyhow::ensure!(matches!(protocol.as_str(), Some("http1" | "tcp")), "invalid service_protocol");
+            if protocol == "tcp" {
+                anyhow::ensure!(spec.get("services").and_then(Value::as_array).is_some_and(|s| s.iter().any(|s| s.as_str().is_some_and(|s| s != "control")))
+                    && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|i| i.is_empty())), "TCP requires an application service without HTTP ingress");
+            }
         }
         if let Some(services) = spec.get("services") {
             let services = services.as_array().ok_or_else(|| anyhow::anyhow!("services must be an array"))?;
@@ -303,7 +464,8 @@ impl RegisterAppRequest {
             for (name, rule) in rules {
                 anyhow::ensure!(name != "control" && spec.get("services").and_then(Value::as_array).is_some_and(|s| s.iter().any(|v| v == name)), "ingress must reference an application service");
                 let rule = rule.as_object().ok_or_else(|| anyhow::anyhow!("ingress rule must be an object"))?;
-                anyhow::ensure!(rule.keys().all(|k| ["paths", "methods", "bearer_env"].contains(&k.as_str())), "unknown ingress field");
+                anyhow::ensure!(rule.keys().all(|k| ["paths", "methods", "bearer_env", "single_use"].contains(&k.as_str())), "unknown ingress field");
+                anyhow::ensure!(rule.get("single_use").is_none_or(Value::is_boolean), "single_use must be boolean");
                 anyhow::ensure!(rule.get("paths").and_then(Value::as_array).is_some_and(|paths| !paths.is_empty() && paths.len() <= 32 && paths.iter().all(|p| p.as_str().is_some_and(|p| p.starts_with('/') && p.len()<=256 && p.is_ascii() && !p.contains(['%', '?', '#', '\\']) && !p.chars().any(char::is_control) && !p.split('/').any(|p| p == "." || p == "..")))), "invalid ingress paths");
                 anyhow::ensure!(rule.get("methods").and_then(Value::as_array).is_some_and(|methods| !methods.is_empty() && methods.len()<=7 && methods.iter().all(|m| m.as_str().is_some_and(|m| ["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"].contains(&m)))), "invalid ingress methods");
                 if let Some(env) = rule.get("bearer_env").filter(|v| !v.is_null()) {
@@ -328,8 +490,9 @@ impl RegisterAppRequest {
 
     pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
         anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
-            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"}),
-            "runtime must select legacy or shim with driver docker; trust options are not supported here");
+            || runtime == &serde_json::json!({"executor":"shim", "driver":"docker"})
+            || runtime == &serde_json::json!({"executor":"shim", "driver":"openshell"}),
+            "runtime must select legacy or shim with driver docker or openshell; trust options are not supported here");
         Ok(())
     }
 
@@ -372,7 +535,7 @@ impl RegisterAppRequest {
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        if kind == "app" {
+        if kind == "app" && spec.get("runtime").is_none_or(|v| v["driver"] != "openshell") {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
         if let Some(runtime) = spec.get("runtime") {
@@ -403,12 +566,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn namespace_service_defaults_never_override_exact_denials_or_cross_namespaces() {
+        let policy = RouterAccessPolicy { namespace:"ab".repeat(16),workload:"*".into(),service:"chat".into(),
+            version:1,sha256:"cd".repeat(32),enabled:true };
+        let mut auth=RouterAuthorization {revision:1,policies:vec![policy.clone()],revoked_subjects:vec![]};
+        auth.validate().unwrap();
+        let mut request=RouterAuthorizeRequest {namespace:policy.namespace.clone(),workload:"new-agent".into(),service:"chat".into(),
+            principal:"12".repeat(32),session:"34".repeat(32)};
+        assert_eq!(auth.authorize(&request).unwrap().policy_version,1);
+        auth.policies.push(RouterAccessPolicy {workload:request.workload.clone(),enabled:false,..policy.clone()});
+        assert!(auth.authorize(&request).is_err());
+        request.workload="another-agent".into(); assert!(auth.authorize(&request).is_ok());
+        request.namespace="ef".repeat(16); assert!(auth.authorize(&request).is_err());
+        request.namespace=policy.namespace; request.service="control".into(); assert!(auth.authorize(&request).is_err());
+        request.service="chat".into();request.workload="*".into();assert!(auth.authorize(&request).is_err());
+    }
+
+    #[test]
+    fn tcp_services_require_shim_and_capable_nodes_without_http_ingress() {
+        let good = json!({"runtime":{"executor":"shim","driver":"docker"},"services":["ssh","control"],"service_protocol":"tcp"});
+        RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
+        assert_eq!(crate::workload::Entry(&good).runtime_capability(), Some("shim-tcp-v1"));
+        for (field,value) in [("service_protocol",json!("udp")),("runtime",json!({"executor":"legacy"})),
+            ("services",json!(["control"])),("ingress",json!({"ssh":{}}))] {
+            let mut bad=good.clone(); bad[field]=value;
+            assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
+        }
+    }
+
+    #[test]
     fn runtime_ingress_and_automatic_ports_are_validated_before_placement() {
         let good = json!({"runtime":{"executor":"shim","driver":"docker"},"port_base":0,"container_port":18789,
             "services":["chat","control"],"env":{"TOKEN":"private"},
             "ingress":{"chat":{"paths":["/v1/chat/completions"],"methods":["POST"],"bearer_env":"TOKEN"}}});
         RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
-        for (field, value) in [("paths",json!(["/../exec"])),("methods",json!(["CONNECT"])),("bearer_env",json!("MISSING"))] {
+        for (field, value) in [("paths",json!(["/../exec"])),("methods",json!(["CONNECT"])),("bearer_env",json!("MISSING")),("single_use",json!("true"))] {
             let mut bad=good.clone(); bad["ingress"]["chat"][field]=value;
             assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
         }
@@ -419,11 +611,31 @@ mod tests {
     }
 
     #[test]
+    fn native_provisioning_profile_rejects_unmapped_workload_settings() {
+        let spec = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"approved", "cpus":1,"gpus":0,"memory_gb":0.125});
+        let request = |spec:Value| RegisterAppRequest {name:"native".into(),spec:spec.into(),..Default::default()};
+        request(spec.clone()).validate().unwrap();
+        for (field,value) in [("port_base",json!(8080)),("services",json!(["http"])),("gpus",json!(1)),
+            ("cpus",json!(0)),("cpus",json!(0.5)),("memory_gb",json!(0.001)),("volumes",json!(["/host"])),("entrypoint",json!("/bin/sh"))] {
+            let mut bad = spec.clone(); bad[field] = value;
+            assert!(request(bad).validate().is_err(),"{field}");
+        }
+        let mut http=spec.clone();http["services"]=json!(["http"]);http["container_port"]=json!(8090);http["health_path"]=json!("/health");
+        request(http.clone()).validate().unwrap();
+        assert_eq!(crate::workload::Entry(&http).runtime_capability(),Some("shim-openshell-services-v1"));
+        for (field,value) in [("services",json!(["control"])),("services",json!([])),("container_port",json!(0)),
+            ("service_protocol",json!("tcp")),("health_path",json!("//other/health")),("health_path",json!("/a#b")),
+            ("health_path",json!("/a\\b")),("health_path",json!("/a\n")),("health_path",Value::Null)] {
+            let mut bad=http.clone();bad[field]=value;assert!(request(bad).validate().is_err(),"{field}");
+        }
+    }
+
+    #[test]
     fn runtime_selection_is_explicit_and_rejects_unsupported_trust_options() {
-        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"})] {
+        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"}),json!({"executor":"shim","driver":"openshell"})] {
             RegisterAppRequest::validate_runtime(&runtime).unwrap();
         }
-        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"openshell"}),
+        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"unknown"}),
             json!({"executor":"shim","driver":"docker","policy_proof":"required"})] {
             assert!(RegisterAppRequest::validate_runtime(&runtime).is_err());
         }

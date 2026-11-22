@@ -22,7 +22,7 @@ import ray
 import yaml
 
 from . import actors, reconcile, jobs, shim
-from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance
+from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance, NativeProverProcess
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -398,9 +398,9 @@ class NodeExecutor:
             raise ValueError("app scope differs from configured scope")
         if app.get("kind") != configured.kind.value or app.get("tag") != configured.tag:
             raise ValueError("app kind or tag differs from configured scope")
-        selected = configured.runtime.executor if configured.runtime else ExecutorKind.LEGACY
-        requested = RuntimeSelection.load(app["runtime"], strict=True).executor if "runtime" in app else ExecutorKind.LEGACY
-        if not p["disabled"] and selected is not requested:
+        selected = configured.runtime or RuntimeSelection(executor=ExecutorKind.LEGACY)
+        requested = RuntimeSelection.load(app["runtime"], strict=True) if "runtime" in app else RuntimeSelection(executor=ExecutorKind.LEGACY)
+        if not p["disabled"] and selected != requested:
             raise ValueError("runtime selection differs from the admitted command")
         running = [n for n in reconcile.running()
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
@@ -420,16 +420,22 @@ class NodeExecutor:
                 wanted = ExecutorKind.SHIM if shim.selected(spec) else ExecutorKind.LEGACY
                 if health.executor is not wanted:
                     raise ValueError("executor change requires explicit drain and confirmed cleanup")
-                if health.is_ready and health.spec == actors.spec_hash(spec):
+                if reconcile.matches(spec, health):
                     continue
                 if shim.selected(spec):
                     raise ValueError("shim execution is unhealthy; retained until explicit cleanup")
+                if spec.app.kind in ("ziren-cpu", "ziren-gpu") and not spec.app.worker_command:
+                    # An upgraded bridge cannot infer that an old actor is idle
+                    # from missing/stale executable evidence. Keep its process
+                    # and GPU allocation until an explicit drained stop confirms
+                    # cleanup; ordinary reconciliation must not abort a proof.
+                    raise ValueError("native prover differs from configuration; explicit drain and cleanup required")
                 reconcile.stop(spec.name)
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
             spec = self.runtimes.bind(spec, command_id)
             reconcile.start(spec)
-        return {"disabled": False, "ready": True}
+        return {"disabled": False, "ready": not (configured.runtime and configured.runtime.driver == "openshell")}
 
     def _remove_replicas(self, names: list[str]) -> None:
         for name in names:
@@ -633,6 +639,7 @@ class NodeExecutor:
         apps = cfg.raw.get("apps", [])
         running = reconcile.running()
         runtime_instances = []
+        native_provers = []
         for app in apps:
             names = [f"{app['name']}-{i}" for i in range(app.get("replicas", 1))]
             app.setdefault("namespace", "0" * 32)
@@ -646,12 +653,23 @@ class NodeExecutor:
             for name in names:
                 try:
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
-                    healthy = health is not None and health.is_ready and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
-                    if healthy and health.execution is not None:
+                    owned_executor = health is not None and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
+                    healthy = owned_executor and health.is_ready
+                    if app.get("prover_binary"):
+                        healthy = healthy and health.prover_binary == os.path.realpath(app["prover_binary"])
+                    if owned_executor and health.prover_binary and app["kind"] in ("ziren-gpu", "ziren-cpu") and not app.get("worker_command"):
+                        native_provers.append(NativeProverProcess(entry_name=app["name"], replica_name=name,
+                            executable=health.prover_binary).dump())
+                    if owned_executor and health.execution is not None and (healthy or health.management_ready or health.allocation_reserved):
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
-                            runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
-                                ready=True, services=list(app.get("services", []))).dump())
+                            services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
+                            if record.driver == "openshell" and health.allocation_reserved:
+                                runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
+                                    ready=healthy, services=services if healthy else [], native_observation_base64=health.native_observation_base64).dump())
+                            elif services:
+                                runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
+                                    ready=True, services=services).dump())
                 except Exception as error:
                     # Starting or restarting one actor must not suppress the
                     # machine heartbeat or another command's cleanup acknowledgment.
@@ -684,6 +702,7 @@ class NodeExecutor:
         runtime_capabilities = shim.capabilities(cfg.cluster)
         return {**({"runtime_capabilities": runtime_capabilities} if runtime_capabilities else {}),
             **({"runtime_instances": runtime_instances} if runtime_instances else {}),
+            **({"native_provers": native_provers} if native_provers else {}),
             "version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
             "free_gpus": free.get("GPU", 0), "free_cpus": free.get("CPU", 0),

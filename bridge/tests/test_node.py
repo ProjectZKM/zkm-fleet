@@ -172,6 +172,47 @@ def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkey
     assert ReplicaHealth(name='cpu',spec='hash').is_ready
 
 
+@pytest.mark.parametrize("old_binary", [None, "/opt/shared", "/opt/selected (deleted)"])
+def test_prover_binary_drift_retains_running_actors_until_explicit_drain(executor, monkeypatch, old_binary):
+    from fleet_bridge.model import ReplicaHealth
+    cfg = yaml.safe_load(executor.apps_file.read_text())
+    cfg["node_binary"] = "/opt/shared"
+    app = cfg["apps"][0]
+    app.update(disabled=False, machine=node.socket.gethostname(), prover_binary="/opt/selected")
+    executor.apps_file.write_text(yaml.safe_dump(cfg))
+    specs = reconcile.replica_specs(reconcile.load_apps(cfg))
+    observed = {"proof-0": old_binary, "proof-1": "/opt/selected"}
+    monkeypatch.setattr(reconcile, "running", lambda: {name: name for name in specs})
+    monkeypatch.setattr(reconcile, "health_of", lambda name, **kw: ReplicaHealth(name=name,
+        spec=actors.spec_hash(specs[name]), gpu_ready=True, prover_binary=observed[name]))
+    monkeypatch.setattr(node.ray, "cluster_resources", lambda: {"CPU": 8, "GPU": 2})
+    monkeypatch.setattr(node.ray, "available_resources", lambda: {"CPU": 4, "GPU": 0})
+    start, stop = Mock(), Mock()
+    monkeypatch.setattr(reconcile, "start", start)
+    monkeypatch.setattr(reconcile, "stop", stop)
+    report = executor.report()
+    assert not report["apps"][0]["ready"]
+    assert report["native_provers"] == [
+        {"entry_name": "proof", "replica_name": name, "executable": binary}
+        for name, binary in observed.items() if binary]
+    for _ in range(2):
+        with pytest.raises(ValueError, match="explicit drain and cleanup"):
+            executor.set_app({"app": app, "disabled": False})
+    stop.assert_not_called()
+    start.assert_not_called()
+    # Explicit cleanup keeps its existing path; a later start can create fresh
+    # actors with the selected executable once absence has been confirmed.
+    clean = Mock()
+    monkeypatch.setattr(actors, "clean_after", clean)
+    monkeypatch.setattr(node.ray, "get", lambda *a, **kw: None)
+    monkeypatch.setattr(node, "container_gone", lambda _: True)
+    assert executor.set_app({"app": app, "disabled": True})["cleaned"]
+    assert [c.args[0] for c in stop.call_args_list] == ["proof-0", "proof-1"]
+    monkeypatch.setattr(reconcile, "running", lambda: {})
+    assert executor.set_app({"app": app, "disabled": False})["ready"]
+    assert [c.args[0].name for c in start.call_args_list] == ["proof-0", "proof-1"]
+
+
 def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(executor, monkeypatch):
     from fleet_bridge.model import ReplicaHealth
     monkeypatch.setattr(node.ray, 'cluster_resources', lambda: {'GPU': 8, 'CPU': 48})

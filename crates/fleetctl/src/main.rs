@@ -274,10 +274,10 @@ enum TokenCmd {
     /// batches, and write the client bundle.
     Issue {
         /// Approved app or batch (repeat), by name. Required unless the token may manage its
-        /// namespace.
+        /// namespace, or holds only router_sync.
         #[arg(long = "app")]
         apps: Vec<String>,
-        /// What the token may do (repeat or comma-separate): read, submit, manage.
+        /// What the token may do: read, submit, manage; or exclusive router_sync.
         #[arg(long = "permission", value_delimiter = ',', default_values_t = ["read".to_string(), "submit".to_string()])]
         permissions: Vec<String>,
         #[arg(long, default_value = "")]

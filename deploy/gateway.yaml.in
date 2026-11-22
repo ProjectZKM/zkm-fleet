@@ -36,6 +36,11 @@ static_resources:
                   cluster: control
                   timeout: 0s
               - match:
+                  prefix: /trusted.ledger.v1.AuthorizationLedger/
+                route:
+                  cluster: policy
+                  timeout: 0s
+              - match:
                   prefix: /
                 route:
                   cluster: http
@@ -102,6 +107,25 @@ static_resources:
               socket_address:
                 address: '@SCHEDULER_IP@'
                 port_value: 9191
+  # The ledger shares the scheduler HTTP listener, but gRPC needs an HTTP/2
+  # upstream. Do not retry single-use grant consumption after an ambiguous RPC.
+  - name: policy
+    type: STATIC
+    connect_timeout: 2s
+    load_assignment:
+      cluster_name: policy
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: '@SCHEDULER_IP@'
+                port_value: 9191
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        '@type': type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
   - name: mcp
     type: STRICT_DNS
     connect_timeout: 2s
