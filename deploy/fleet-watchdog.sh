@@ -22,7 +22,7 @@ if [ "$FOUND" = 0 ]; then
   "$FLEET_HOME/deploy/ray-start.sh" >> "$FLEET_LOG/ray.log" 2>&1
 fi
 # node-start's lock prevents duplicates, including a separately supervised agent.
-if [ "${FLEET_NODE_SUPERVISED:-0}" != 1 ]; then
+if [ "${FLEET_NODE_SUPERVISED:-0}" != 1 ] && [ "${FLEET_WATCH_RAY_ONLY:-0}" != 1 ]; then
 nohup env FLEET_ENV="${FLEET_ENV:-/etc/zkm-fleet/watchdog.env}" "$FLEET_HOME/deploy/node-start.sh" \
   8>&- >> "$FLEET_LOG/node.log" 2>&1 < /dev/null &
 fi

@@ -21,7 +21,7 @@ client, submission CLI, policy editor or HTTP listener.
 
 | Component | Does | Depends on |
 |---|---|---|
-| `fleet-scheduler` | Admission, namespace policy, quotas, placement and durable control records | Postgres; no Ray or prover SDK |
+| `fleet-scheduler` | Admission, namespace policy, quotas, placement, durable control records and optional proof-backed policy ledger | Postgres; policy SQLite and Ziren verifier; no Ray or prover SDK |
 | `fleet-node` | Outbound heartbeats, command delivery and log sync | The local Python adapter; no database, signer recovery or prover SDK |
 | `bridge/fleet_bridge` | Local resource grants, actors, containers and confirmed cleanup | Ray, PyYAML |
 | `fleet-proof-app` | Optional SDK endpoint beside app-owned storage | Fleet HTTPS API; no database or prover SDK |
@@ -387,22 +387,50 @@ storage path: references are `file://`, with owner-managed shared mounts for
 replicas on different machines. Fleet keeps admission, quotas, placement, retries and
 execution leases, and stores no proof inputs or outputs.
 
-The generic `fleet-ziren-node` SDK and CUDA client are pinned together to Ziren
-2.0 revision `c9988a098d92bc55a85ca9307c470d1f97be3337`, matching GPU image
+The generic `fleet-ziren-node` SDK and CUDA client follow Ziren's `main` branch
+in the manifest. `Cargo.lock` fixes both at the validated Ziren 2.0 revision
+`c9988a098d92bc55a85ca9307c470d1f97be3337`, matching GPU image
 `ziren-gpu:c9988a0-8f3c7fb6`. Pin the guest and its receipt verifier to that same
 revision. The circuit label `v2.0.0` alone does not establish CUDA wire compatibility:
 older 2.0 clients can fail decoding the newer server's compressed proof. Upgrade
 the client binary with the image; do not mix their proof representations. CI
 compiles the full SDK/CUDA adapter as well as testing storage without the runtime.
+Use locked builds. Dependency updates must revalidate this tuple; regenerating
+the lockfile is an intentional upgrade, including its Plonky3 dependencies.
 For a staged upgrade, an administrator can set `prover_binary` to an absolute
-path in that prover's existing node-owned `apps.yaml` entry. Other apps retain
+path and `machine` to this host in that prover's existing node-owned `apps.yaml`
+entry. Both fields are node-owned; the scheduler preserves updates and never
+automatically copies that executable selection to another machine. Other apps retain
 the shared `node_binary`. This override is not accepted through user app creation
 or settings APIs. It keeps the native prover's SDK input path; `worker_command`
 instead denotes an integrated app that owns its inputs and rejects SDK submission.
-The bridge resolves this selection before handing the replica to Ray, so an older
-resident Ray worker also receives the selected executable. After upgrading the
-bridge, restart its node adapter and drain/restart the affected app; check the
-running prover's executable, not only the configured path, before submitting work.
+The bridge resolves this selection before handing the replica to Ray. Its deployment
+hash covers the selected executable, so changing an unused shared `node_binary`
+does not restart a pinned prover, and an old adapter that ignored the override no
+longer makes the wrong executable look current. New explicitly selected prover
+actors load the updated adapter in a distinct Ray worker environment. Detached
+legacy actors and their deployment hashes remain unchanged.
+
+Upgrade scheduler and `fleet-node` before the bridge: report v3 adds optional
+`native_provers` records (`entry_name`, `replica_name`, `executable`). Before the
+upgrade, add `machine` to entries already using `prover_binary`. The actor reads
+the running executable from `/proc/<pid>/exe`; older actors omit this evidence.
+The machine's status includes these records for operator inspection. A selected
+prover is not reported ready if its observed executable differs or is unknown.
+Reconciliation retains an existing native prover when its executable evidence or
+configuration differs, including actors from older bridges that report no path.
+It reports that explicit drain and confirmed cleanup are required; it never stops
+that actor to satisfy an automatic `SetApp` retry. Matching actors stay running.
+The bridge's readiness flag does not gate the separate proof dispatch protocol:
+disable admission and drain the affected proof app before changing its executable.
+The shared process
+role marker makes orphan cleanup work for renamed prover executables while still
+checking the exact replica name.
+
+Executable observations are operational metadata, not remote attestation or an
+SDK/CUDA protocol compatibility check. Scheduling still matches the circuit label;
+a validated protocol fingerprint covering the SDK, CUDA server and guest/verifier
+remains follow-up work. Operators must deploy the validated tuple above together.
 Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.
@@ -435,11 +463,275 @@ Keep the allocation and shim journals across upgrades and restarts.
 
 Shim delegates lifecycle to upstream Docker, applies CPU/memory hard limits and
 checks effective limits before start. Its service port is published only on local
-loopback; independent router integration is a later step. GPU ids are Ray's assigned
-ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
+loopback; declared services use the independent router through outbound node
+connectors. GPU ids are Ray's assigned ids. This first adapter supports non-TEE Docker lifecycle without a policy proof;
 it makes no shell-policy enforcement claim. OpenShell/TEE and proof-required
 lifecycle requests are unsupported and rejected. The existing separate proof-required
 action admission path in trusted-shim is unchanged.
+
+The bundled companion is built with OpenShell support. Operators can enable its
+native provisioning endpoint in the **same** `apps.yaml`, alongside `shim_daemon`:
+
+```yaml
+shim_daemon: true
+shim_openshell:
+  socket: /run/openshell/compute.sock
+  admission_policy: '<acknowledgement from the native driver configuration>'
+  ledger_endpoint: https://fleet.example
+  # Optional private CA; absolute, regular, not group/world writable.
+  ledger_ca_file: /etc/zkm-fleet/ca.pem
+  # Optional local service adapter: exact local ID of the composed supervisor.
+  # supervisor_image: sha256:<64 lowercase hex characters>
+```
+
+These are operator settings, not allocation credentials. The native driver remains
+an unmodified OpenShell process with a same-UID private socket. Node bootstrap
+compares the running daemon's configuration digest with these settings; changing
+or removing them requires explicit companion reconciliation. A node upgrade never
+restarts the companion to apply a different policy gateway or driver. Existing
+Docker apps and their persisted execution selection remain unchanged.
+
+The daemon's private `provision` operation accepts exact native gateway bytes and
+a proof-backed grant, consumes the grant centrally before Create, and keeps only
+ownership/digests and admitted public service metadata on disk. Native inspection/cleanup survives gateway outages and
+expired credentials. An explicit `runtime: {executor: shim, driver: openshell}`
+App now reserves Ray resources and a durable shim allocation before provisioning.
+This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
+6 MiB); command/environment are literal. Optional HTTP app services declare
+`services`, one `container_port` and `health_path` (default `/`). These ports are
+private to the workload; `port_base`, `control`, TCP, ingress rewriting, volumes,
+entrypoint, workdir, user overrides and GPU mappings remain unsupported.
+Only a companion advertising `openshell-allocation-v1` exposes its placement
+capability. Native reservations remain `ready: false` with no services; a complete
+reservation set holds quota without repeatedly scheduling another start. With
+services, placement instead requires `shim-openshell-services-v1`, advertised only
+by a companion with local health reporting and configured `shim_network`.
+
+The private shim adapter additionally supports proof-bound HTTP service declarations
+and `network` commands with `driver: openshell`. Fleet checks their service IDs,
+container port and health path against the admitted manifest; the daemon stores
+those targets and the native bundle's public SSH fingerprint. Later network
+commands cannot change them. The operator's immutable `supervisor_image` enables
+`openshell-local-services-v1` and `openshell-service-health-v1`. Existing Docker
+network records remain compatible.
+
+Local health gates registration and unhealthy applications lose active streams.
+The daemon retries health recovery, restores connectors after a companion restart,
+and drains them before acknowledging runtime deletion. Shim `inspect` reports
+`application_ready` from a successful probe within six seconds; this state is
+cleared on failure, cancellation or restart and does not wait for router grants.
+The bridge retains sanitized compute observations alongside local service health.
+Fleet publishes only after joining that health with authenticated gateway
+configuration readiness. The native supervisor health socket reports session
+acceptance before asynchronous policy activation and cannot replace this check.
+A node report claiming `ready: true` alone cannot publish a native service.
+
+The scheduler embeds the stock OpenShell compute extension. Enable it in the
+existing scheduler configuration, under `policy_gateway` alongside its approved
+program and remote `preflight` proof-network settings:
+
+```yaml
+policy_gateway:
+  # Existing program_elf, program_sha256, program_vkey and preflight settings.
+  openshell:
+    compute_socket: /run/zkm-fleet/openshell-compute.sock
+    admission_policy: '<exact native driver resource-admission acknowledgement>'
+    # Optional: required to publish native application services.
+    gateway:
+      endpoint: https://openshell.example:8080
+      ca_file: /etc/zkm-fleet/openshell-ca.pem
+      cert_file: /etc/zkm-fleet/openshell-client.pem
+      key_file: /etc/zkm-fleet/openshell-client.key
+```
+
+The socket directory must already exist, owned by the scheduler/gateway UID with
+mode 0700. Fleet creates a 0600 socket and accepts only that UID. Configure the
+unmodified gateway with `--compute-driver docker --compute-driver-socket` pointing
+to this socket. Operators deploy that gateway and the node's native compute driver;
+Fleet neither launches nor modifies them. The admission acknowledgement must match
+the node's `shim_openshell` settings. This initial profile supports CPU/memory
+limits and private HTTP app routes; it does not advertise gateway-managed lifecycle
+or GPU support.
+
+The scheduler's observer calls the stock API over mTLS; the key must be a
+same-UID 0600 regular file and certificates must not be group/world writable.
+All paths are absolute and symlinks are rejected. The HTTPS origin must match
+the server certificate. These credentials remain in the central scheduler.
+Omitting `gateway` preserves provisioning and leaves native publication closed.
+
+The observer joins the exact public sandbox/workspace with the Fleet Compute
+extension's persisted Create identity and fresh owned native observation. Public
+compute fields may be absent. It requires Ready/configuration acceptance, the approved native policy hash and
+loaded latest policy revision. It compares accepted configuration/provider
+revisions with the current desired configuration. Configuration instance and
+supervisor session IDs are separate upstream identities. Queries have a two-second
+total deadline per sandbox, with at most 16 in flight. Successful observations
+expire five seconds after query start and are never persisted; failure removes
+cached readiness. Publication also rechecks node session freshness, live intent,
+quota, allocation generation, physical instance and active Rail policy.
+
+This gates new route grants and renewals. The updated embedded Router gateway
+issues 30-second node registration leases, counted from the start of each Fleet
+readiness check. Shim renews in place; failed renewal cannot extend the lease.
+Expiry drains existing HTTP/SSE/WebSocket streams even if their application
+Access tokens remain valid (up to 900 seconds). With the five-second observation
+cache, native readiness loss drains in about 35 seconds plus timer/clock skew;
+gateway and relay clocks must be synchronized. Explicit route revocation,
+control-lease expiry, local health loss and deletion can drain sooner. Transient
+readiness loss permits reconnection to the same execution after recovery without
+another proof/Create. Upgrade embedded gateways before depending on this bound:
+previously issued long leases retain their original signed expiry, including
+through a shorter renewal. This does not migrate or restart existing workloads.
+
+Fleet namespace IDs exceeding OpenShell's 19-byte routable-name limit map to
+stable native workspace names. Full canonical identities remain in authorization
+and proof commitments; conflicting mappings are rejected. Explicit nonempty
+commands are required at launch preparation: an omitted command makes the stock
+gateway request an interactive TTY, which this profile excludes.
+
+The startup flow is synchronous through proof verification and native creation:
+
+1. Admit the App, wait for its reserved execution identity, and activate its policy
+   using Fleet's existing policy APIs. The backend resolves its user's identity;
+   these APIs accept Fleet administrators, not application API keys.
+2. `POST /policy/openshell/launches` with `request` (the exact admitted
+   `LaunchRequest`), `native_policy_base64` (stock `SandboxPolicy` protobuf),
+   `principal`, `cost`, and `expires_at` (Unix seconds, at most 15 minutes ahead).
+   The response contains a deterministic `name`, mapped `workspace`, and
+   `create_request_base64` (stock
+   public `CreateSandboxRequest` protobuf). It is private and `no-store`; workload
+   environment may contain secrets. An identical preparation is idempotent.
+3. The control-plane caller submits that decoded request to the authenticated stock
+   gateway, in the returned `workspace` (create it through the stock API first). The gateway calls Fleet's
+   validation extension before minting credentials, then calls Create with its
+   exact private native bytes. Fleet binds those bytes to the allocation and policy.
+4. Fleet stages `runtime.create` at its central ledger, submits the pinned guest to
+   the configured remote proof app, waits for the receipt, and verifies it against
+   the exact decision and active policy epoch. Only then does it issue a single-use
+   grant and stage the existing private delivery. No local prover is started.
+5. Outbound heartbeats carry only a ticket, execution identity and digest. The node
+   claims the private body once, then forwards it directly to the same-UID shim
+   socket. The shim repeats native binding checks, consumes the grant centrally,
+   and calls the native compute driver. Claim/Consume recheck the current node
+   session, generation, deployment intent and quota.
+6. Shim inspection returns a bounded native observation stripped of configuration,
+   credentials, local endpoint addresses and condition messages. Bridge heartbeats
+   carry that control metadata while retaining `ready: false` and no services.
+   Fleet returns only fresh, allocation-owned observations to the stock gateway;
+   an observation cannot bypass proof/delivery, cross workspaces, or replace a
+   pinned native instance. The gateway still owns supervisor/fence readiness.
+
+`GET /policy/openshell/launches/<name>` exposes phase, execution, sandbox ID and
+proof job ID, never credentials or launch inputs. Phases are `prepared`, `bound`,
+`proving`, `dispatching`, `delivered`, and `created`; `created` acknowledges native
+creation, not application readiness. Four creates may run concurrently. A callback
+with different private bytes is rejected. A disconnected RPC does not cancel an
+accepted create; inspect the same operation before retrying.
+
+Persist `data_dir/policy/openshell`, the policy ledger and allocation/delivery
+journals together. A durable proof claim precedes submission; after an ambiguous
+submit, only the same job ID is polled. A crash between claiming and submitting
+requires operator reconciliation. Before minting a grant/delivery, a durable
+`dispatching` fence prevents reminting credentials after a crash. An ambiguous
+`dispatching` operation never reports success from a node observation alone.
+Expired/failed operations need reconciliation; they are not automatically recreated.
+
+The lower-level administrative `PUT /policy/runtime-deliveries/<64-hex-ticket>`
+remains available for exact `ProvisionRequest` delivery. Its 4 MiB private bodies
+stay in memory; `workloads/runtime-deliveries` stores metadata only. Queued records
+become `awaiting_payload` after restart and require the identical body/ticket while
+its grant is valid. Dispatched records are never automatically redelivered. Inspect
+the exact shim allocation for an uncertain result. `DELETE` cancels only a queued
+delivery; stop/delete of a running allocation belongs to Fleet's lifecycle API,
+not the stock gateway's lifecycle RPCs in this profile.
+
+This retains Fleet's trusted cluster-agent/session model; it is not TEE attestation
+or individual cryptographic node enrollment. Production links use HTTPS.
+Application readiness and service routing remain migration gates; native gateway
+readiness alone does not enable application routes.
+Never place native payloads, grants or ledger credentials in App specs, heartbeats,
+logs or Ray actors. GOAT registration execution remains TODO.
+
+Remote runtime nodes need no public inbound listener. Fleet node initiates HTTPS
+to the scheduler, the native supervisor initiates its authenticated connection to
+the central OpenShell gateway, and the shim data-plane connector initiates the
+router tunnel. Bidirectional application traffic uses that established tunnel;
+it is not carried by heartbeats. Shim and compute-driver APIs remain local Unix
+sockets. Central services must be reachable from the node's outbound network.
+Set the native Docker driver's `grpc_endpoint` and trusted `guest_tls_ca` to the
+central gateway; a remote node must not use the gateway host's loopback address.
+The local acceptance below uses supervisor host networking to reach a loopback
+test gateway. Workloads still use `network=none`. This test does not certify a
+cross-machine deployment or a firewall/NAT configuration.
+
+The pinned router transport keeps idle outbound WSS connections alive with
+15-second Ping/Pong controls and a 15-second reply deadline. Silent network loss
+drains application streams within about 30 seconds plus scheduling delay;
+recovery never replays requests. Dedicated ingress idle timeouts must allow this
+interval; configure at least 60 seconds for operational margin. No node inbound
+listener is needed.
+
+Router's `tools/test_nat.py` covers two isolated stateful NATs, overlapping private
+addresses, TCP/443-only egress, blocked inbound traffic, TLS validation, tenant
+and app-key isolation, idle continuity, network blackholes and recovery.
+`tools/test_remote.py` additionally exercises a real remote connector through
+temporary public TLS ingress, with SSH used only for fixture setup/cleanup.
+These transport tests use synthetic grants and loopback applications; they do
+not replace cross-machine Fleet/OpenShell control or real Film/ClawUp acceptance.
+
+The opt-in control integration test launches the pinned, unmodified gateway with
+mTLS and exercises actual Fleet HTTP/UDS, node delivery and the persistent shim.
+Proof and native compute are explicit test doubles; it does not establish workload
+isolation or application readiness:
+
+```sh
+OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
+  cargo test --locked -p fleet-scheduler --lib stock_gateway_startup -- --ignored
+```
+
+The Docker acceptance additionally launches the stock Docker driver and real
+workload/supervisor containers. Build both binaries from the pinned OpenShell
+source and supply compatible, preloaded images by immutable ID. Compose the
+supervisor with trusted-shim's `docker/openshell-supervisor.Dockerfile` and static
+`trusted-shim-socket` helper; the upstream supervisor and driver remain unchanged.
+The workload image must provide Python 3's standard library and numeric UID/GID
+1000 support (the acceptance uses `python:3.12-slim`):
+
+```sh
+OPENSHELL_GATEWAY_BINARY=/absolute/path/to/pinned/openshell-gateway \
+OPENSHELL_DOCKER_DRIVER_BINARY=/absolute/path/to/pinned/openshell-driver-docker \
+OPENSHELL_TEST_SANDBOX_IMAGE=sha256:... \
+OPENSHELL_TEST_SUPERVISOR_IMAGE=sha256:... \
+OPENSHELL_TEST_WORKLOAD_IMAGE=sha256:... \
+  cargo test --locked -p fleet-scheduler --lib stock_docker_startup -- --ignored --nocapture
+```
+
+The test checks proof-before-create, joined gateway readiness, configuration
+activation, hard CPU/memory limits, network isolation, stale-owner rejection and
+offline shim cleanup. It also runs a real local Data Router and outgoing connector
+against the supervisor's local SSH boundary adapter: HTTP application credentials
+are preserved, SSE streams and WebSocket text/binary frames pass, foreign tenants,
+wrong supervisor images and wrong SSH host keys are rejected. Revocation and
+local cancellation close active streams. Application bytes continue locally with
+the central OpenShell gateway offline, within the test's route lease. Test-issued
+route grants do not replace production Fleet control-snapshot freshness. A second route exercises the
+persistent daemon against the same real workload: unhealthy startup and central
+denial prevent registration, 30-second leases renew without interrupting active
+SSE/WebSocket streams, and central observer expiry drains them while local health
+remains good. Readiness recovery reopens the same route without replacing its
+containers. Health loss drains an active SSE stream, recovery
+needs no Ray/client restart, companion restart restores the exact allocation
+without another proof/Create, and deletion drains streams and removes connector
+records. The durable record retains the public host fingerprint and excludes
+native credentials/environment.
+The workload has no published host ports and retains `network=none`.
+It keeps node observations flowing until both native
+creation and gateway readiness complete: the stock driver can acknowledge Create
+before assigning a physical instance. Proof submission/verification remain test
+doubles; no prover is started and this is not a fresh cryptographic proof test.
+Containers and volumes are scoped by a unique test namespace. Private diagnostics
+and ephemeral certificates remain in the printed temporary directory, outside the
+repository. Cleanup targets only that namespace, including after test failure.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:
@@ -578,7 +870,10 @@ job on a tagged batch takes the batch's tag. A record's tag is `null` when absen
 except a proof record's, which is `""`. There is no group resource.
 
 **Tokens.** A namespace token has an optional tag and some of the permissions `read`,
-`submit` and `manage` (default `read` and `submit`). A token without `manage` also
+`submit` and `manage` (default `read` and `submit`). An infrastructure token may
+instead hold the exclusive `router_sync` permission: an API token with a namespace,
+no tag or app grants, and access only to its explicitly enrolled router stream.
+An ordinary app token without `manage` also
 needs `--app` grants, by app or batch name. Grants are explicit, and one from another
 namespace authorizes nothing. An administrator's token has only `admin`, no namespace,
 and may do everything. A token's namespace and tag never change: refreshing copies
@@ -723,6 +1018,220 @@ caps and use; another namespace or tag selector is refused. Token registration t
 a namespace name or ID, an optional `tag` and its `permissions`; refreshing is a CLI
 operation built on lookup and registration.
 
+### Independent data-router control
+
+The Router initiates outbound HTTPS requests to Fleet; node heartbeats and Fleet
+never carry application streams. Shared JSON records come from `RouterControl`,
+`RouterEnrollment`, `RouterSyncRequest` and `RouterSyncResponse` in `model.proto`.
+
+| Endpoint | Authorization and effect |
+|---|---|
+| `PUT /routers/ID` | Administrator enrolls `{"issuer":"gateway-issuer","token_id":"..."}`. Token must hold only `router_sync`. Re-enrollment rotates credentials within the same issuer/namespace, preserving epoch and revocations. |
+| `GET /routers/ID` | Administrator reads desired revocations, last delivered revision and reported `applied_revision`/`applied_ms`. |
+| `DELETE /routers/ID/routes/ROUTE_ID` | Administrator permanently revokes one exact execution/service route. Idempotent; does not stop or migrate its workload. |
+| `POST /routers/ID/sync` | Only that enrolled token ID, holding `router_sync`, may fetch and acknowledge this stream. Administrator and other router/app credentials are rejected. |
+
+Initial request: `{"epoch":null,"after_revision":0,"applied_revision":null}`.
+Response: `router_id`, `issuer`, stable random `epoch`, `from_revision`, `revision`,
+`revoked_routes`, `lease_seconds:30`. Revisions count the append-only tombstones.
+Reconnects send the persisted epoch and last applied cursor; the response contains
+the contiguous suffix after that cursor. Acknowledgments cannot exceed a delivered
+revision or go backwards. An epoch mismatch or cursor ahead of Fleet returns 409;
+the Router must fail closed instead of silently resetting its state.
+
+The Router polls every five seconds, durably applies the whole response and
+cancels revoked sessions before acknowledging it on its next request. The ACK is
+a local enforcement report, not a ZK proof. Control freshness expires after 30
+seconds: active streams close and new access fails. Revoking its sync token or
+suspending its namespace blocks renewal; explicit denial suspends access sooner.
+The Router requires fresh synchronization after restart. Production requires
+Fleet's durable PostgreSQL store; memory-only Fleet remains for local tests.
+Schema 17 adds only the router table and permission; existing apps, allocations,
+node heartbeats and running tasks retain their behavior.
+
+This initial bounded stream supports 4096 permanent route tombstones per router;
+further new revocations return 507 without dropping old entries. Provision another
+router with a fresh grant issuer/key before this limit, withdraw the old router
+and reissue grants; resetting state under the old issuer would revive old grants.
+Revoking the sync token can suspend the entire router.
+Signing-key updates and automatic app lifecycle revocation remain follow-up work.
+Application ownership checks remain mandatory.
+Configure the existing relay environment with `TRUSTED_ROUTER_FLEET_URL`,
+`TRUSTED_ROUTER_ID`, `TRUSTED_ROUTER_TOKEN_FILE`; see trusted-data-router's
+`crates/transport/CONTROL.md` for deployment and binary acceptance instructions.
+
+Schema 18 adds a separate authorization snapshot and applied revision. An admin
+can `PUT /routers/ID/access-policy` with `{namespace, workload, service, version,
+sha256, enabled}`. The first policy activates identity enforcement for that relay.
+`workload: "*"` supplies a default within one exact namespace and service; an exact
+workload policy always wins, including `enabled: false`. Requests cannot use a
+wildcard target. Upgrade both Fleet and the relay before publishing defaults.
+Relays advertise `x-fleet-router-capabilities: workload-defaults-v1` on every sync;
+Fleet records this on the enrolled router and rejects a new default policy with
+409 until support has been reported. A relay without that capability cannot
+renew a router that already has default policies. The header leaves older Fleet's
+closed JSON request unchanged. Token rotation clears the stored capabilities;
+the replacement relay must sync before publishing new defaults.
+Changing an existing policy requires a higher version. New agents can inherit
+defaults without letting application backends write infrastructure policy. Defaults
+also apply to existing workloads without an exact entry; publish explicit disabled
+entries first for workloads that must remain denied.
+
+Schema 19 normalizes existing schema 17/18 router JSON before compare-and-swap
+writes and records relay capabilities. Epochs, revocations, acknowledgments, jobs
+and allocations are retained. Schedulers supporting only schema 18 or earlier
+reject this database at startup, including rollback builds that cannot interpret
+wildcard policies. Keep a schema-19-compatible build for rollback.
+
+A backend's namespace-wide `read,router_delegate` credential may request an
+opaque connection binding at `POST /routers/ID/authorize` after it authenticates
+the user and checks business ownership. Film's model API keys and permissions,
+and ClawUp's chat credentials and bot ownership, remain application-owned. Fleet
+checks namespace/service infrastructure access; it does not validate those keys.
+Administrators cannot obtain ordinary delegated application bindings; the reserved
+`control` service requires an administrator. Backends may revoke opaque subjects
+or sessions only within their namespace via `POST /routers/ID/revoke-subject`.
+The response contains only that delegate's namespace policies and revocations,
+including on an idempotent retry; administrators retain the complete view.
+Suspending a namespace atomically disables its current policies across every
+router, increasing policy and authorization versions without changing runtime
+allocations. Relays withdraw affected streams on their next successful sync;
+an unreachable control plane cannot renew the 30-second lease. Administrators
+can still disable policies and revoke subjects while the namespace is suspended.
+Resuming it does not re-enable policies or revive old grants: publish a higher
+enabled policy version explicitly after recovery.
+
+`authorization.revision`, `delivered_authorization_revision` and
+`applied_authorization_revision` are independent of route generations/revocations.
+Before switching pilot traffic, require the applied authorization and route
+revisions to match the desired values and `applied_ms` to be less than 30 seconds
+old. Snapshot capacity is 1024 total policies plus permanent subject revocations;
+new entries fail with 507 at capacity without discarding denials. Large rollouts
+require safe collection/pagination. These references and ACKs are not policy or
+TEE execution proofs. No existing application is rescheduled by a policy update.
+
+### Central policy ledger
+
+The optional `policy_gateway` section in the existing `fleet.yaml` pins an
+approved Ziren 2.0 policy guest ELF, its SHA-256 and its `vk.bytes32()` value.
+`fleet-scheduler` embeds the ledger in its existing HTTP listener; the existing
+HTTPS gateway forwards `/trusted.ledger.v1.AuthorizationLedger/` using HTTP/2.
+There is no new public port, standalone Rail server or local prover.
+Retain `data_dir/policy` (mode 0700), including its SQLite WAL and signing secret,
+across upgrades. Back it up consistently with SQLite's backup API. Do not share
+this SQLite file across active schedulers or restore an older ledger over live
+allocations. Disabling the section leaves legacy workloads unchanged.
+
+All `/policy/*` routes require a Fleet administrator token. Namespace owners,
+router delegates and execution credentials cannot call them.
+
+| Method and route | Input / result |
+| --- | --- |
+| `GET /policy/program` | Approved guest hashes and `program_vkey` |
+| `GET /policy/program/elf` | Approved ELF bytes |
+| `PUT /policy/budgets` | `{name, allowance}`; cumulative allowance never resets spending |
+| `POST /policy/allocations/prepare` | Exact execution identity for an admitted, unfinished start command and one configured replica; persist before activation |
+| `POST /policy/allocations/activate` | `{execution, policy, context, previous_state_root, budget}` |
+| `POST /policy/allocations/revoke` | Exact execution identity; durable even after replacement |
+| `POST /policy/requests` | `{job_id, request, cost}`; persist before remote proof submission |
+| `GET /policy/requests/:id` | Exact staged evaluation request for recovery |
+| `POST /policy/preflight` | `{job_id, request, cost}`; native decision, optional single-use grant and background receipt state |
+| `GET /policy/preflight/:id` | Receipt state and `receipt_hex` only after cryptographic verification |
+| `POST /policy/credentials` | `{execution, permission, expires_at}`; returns `{id, token, expires_at}` once, with `Cache-Control: no-store` |
+| `DELETE /policy/credentials/:id` | Revoke by SHA-256 identifier; never put the bearer in a URL |
+
+`permission` is `admission`, `execution` or `admission_and_execution`; credentials
+expire in at most one hour and bind every field of the execution identity.
+The gRPC methods `Reserve` and `Consume` require those scoped credentials, not
+an administrator or namespace token. The ledger verifies the pinned proof and
+current policy/context, accounts for budget atomically and consumes each grant
+once. A transport failure after consumption is ambiguous: do not retry dispatch.
+The shim must reconcile its durable local operation instead.
+
+Runtime action authorization uses preflight: the current approved Rego policy is
+evaluated before dispatch; the exact proof witness and native decision are saved
+in the same transaction as the Allow grant and budget reservation. Deny and
+ApprovalRequired also produce background receipts, without execution grants.
+The action's tool consumes its existing grant rather than producing another proof.
+The preflight endpoint is still administrator-only; an agent cannot choose this
+mode to downgrade a strict request. It rejects `runtime.*` operations and reuse
+of a strict job/action. Startup proof verification remains synchronous; the
+existing proof-required Reserve RPC is unchanged. GOAT registration execution
+is deferred and is not a prerequisite for the current Docker migration path.
+
+Enable the worker in the existing `policy_gateway` section (the existing guest
+manifest fields remain required):
+
+```yaml
+policy_gateway:
+  program_elf: /opt/fleet/policy-guest.elf
+  program_sha256: <approved-ELF-SHA256>
+  program_vkey: <approved-vk.bytes32>
+  preflight:
+    endpoint: https://policy-proof-app.example/
+    token_file: /private/policy-proof.token
+    # signer_file: /private/policy-proof-sdk.key
+```
+
+This is the policy proof app's StageService endpoint, not Fleet's control URL.
+The optional SDK signer is a private hex-encoded secp256k1 key for deployments
+that require signed proof submissions. Files must be absolute, private, bounded
+and regular; no token/key discovery occurs. TLS verifies the OS trust roots;
+plain HTTP is restricted to numeric loopback tests. With no worker configuration,
+preflight admission returns 503. No local prover or extra gateway is started.
+
+The scheduler drives up to four remote operations concurrently. Receipt states
+are `queued`, `proving`, `verified` and `failed`. Only the approved cryptographic
+verifier can produce `verified`; native Allow and a completed network job cannot.
+Workers retain the original policy/request through changes and expiry, and never
+renew grants when receipts complete. Queued jobs survive restart; ambiguous
+submissions are polled by their original ID without automatic resubmission. A
+crash before that RPC can need operator reconciliation. Failed jobs block new
+preflight actions for that instance. At 128 outstanding receipts (including
+failures), admission rejects further requests. This is backpressure, not an
+end-to-end latency guarantee. Existing executed effects cannot be rolled back by
+a late proof failure. Receipt retention/monitoring and application action-hook
+wiring are still deployment responsibilities.
+
+GOAT registration execution remains TODO. The companion shim exposes a pure
+EIP-712 owner-consent interface; this Fleet revision does not invoke it or submit
+chain transactions. The future adapter must obtain the user's signature in
+advance, atomically consume its nonce and preserve ownership when registering.
+Signing alone does not register an agent or attest its runtime. Non-TEE identities
+will be explicitly `unattested`; TEE identities will additionally require a
+verified RA result bound to their instance/key before that trust profile is ready.
+Future GOAT policy synchronization must authenticate owner and chain/contract,
+confirmed policy version/digest and revocation before activating the local
+snapshot. Current preflight uses the administratively activated snapshot and
+does not claim chain synchronization or hardware attestation.
+
+Activation, staging, credential issuance, reservation and consumption are fenced
+by current Fleet state: exact reported or centrally prepared runtime identity, active deployment,
+fresh connected node, active namespace and held resource allocation. The fence
+remains locked through the ledger transaction. Node replacement, scale changes,
+suspension and resource release reject old credentials without waiting for TTL.
+Credential rotation does not reauthorize a revoked execution or reset budgets.
+
+For creation, prepare an identity whose `lease_id` is the admitted `SetApp`
+command ID, `allocation_id` is an actual `entry-N` replica, and namespace,
+workload and machine match the command. A preparation cannot replace a reported
+runtime, change an existing command's identity, reuse an older generation, or
+overlap a preceding unfinished preparation. It does not schedule a new job or
+change the requested driver. Retain `workloads/policy-preparations` with command
+history across upgrades; those generated state records contain no credentials.
+An unfinished command must remain admitted with unchanged deployment intent and
+held quota. After command completion, the exact reported runtime identity takes
+over; absence never authorizes a new creation. A late report of an older prepared
+generation cannot revive its authorization.
+
+The native OpenShell compute extension uses Fleet's existing remote proof and
+private outbound delivery flow as described above; OpenShell introduces no
+additional scheduler.
+Do not put credentials or native launch secrets in App specs, environment,
+node reports or diagnostics. Docker still rejects requested
+proof-required execution modes; mounting this ledger does not change that driver.
+Film model keys and ClawUp user/session authorization remain application-owned.
+
 ## MCP
 
 Give external MCP users these connection details:
@@ -810,6 +1319,17 @@ entrypoint. All three are administrator-owned settings and require explicit
 `runtime: {executor: shim, driver: docker}`. Changes use the existing drain,
 confirmed cleanup and replacement sequence.
 
+For an opaque TCP service such as OpenSSH, declare `services: [ssh]` and
+`service_protocol: tcp` in that same spec. HTTP remains the default; no old app
+configuration or launch hash changes. TCP requires `shim-tcp-v1` and uses a
+loopback TCP readiness probe, never an HTTP request to the SSH port. Its client
+opens the existing authenticated `/v1/tunnel/{route}` WebSocket byte stream.
+Native application authentication still runs inside the tunnel. HTTP ingress
+rules cannot be combined with a TCP app; an optional reserved `control` service
+continues to use HTTP and administrator-only grants. Changing the protocol is an
+administrator operation and uses the existing drain/reconfigure path. This adds
+no host network access, storage replication or automatic task migration.
+
 The existing node apps.yaml accepts `shim_network` with `gateway_url`, `relay_url`,
 `token_file`, `public_key_file`, and `issuer`. These are trusted node settings,
 never passed into the workload environment. The central gateway URL serves only
@@ -824,6 +1344,13 @@ identity, readiness and approved service names. App responses expose these as
 are live, excluding other tags. Consumers must use the complete identity and
 must not guess node addresses or host ports. Replacing an execution changes its
 route; session/ComfyUI affinity must fail rather than switch instances silently.
+
+If an application's health probe fails while its shim runtime still runs, the
+node may report only the declared `control` service as ready. This lets an
+administrator repair or restart the exact allocation without advertising its
+unhealthy application services. Disabled, stale, ended and retiring allocations
+remain hidden. Upgrade the scheduler's report validation before the bridge to
+accept this restricted service subset. No legacy task changes executor.
 
 Upgrade scheduler/fleet-node before the bridge (older JSON readers reject unknown
 fields). The bridge advertises `shim-network-v1` only when the binary and node
@@ -849,3 +1376,42 @@ feature and outbound network configuration are present. Older ingress rules omit
 the new field on the shim wire, preserving existing launch hashes and runtimes.
 The shim persists request consumption and rejects replay after reconnect/restart.
 This application admission setting does not enable PolicyEngine or TEE proofs.
+
+
+### Data-router access authorization
+
+Schema 18 adds the `router_delegate` permission; existing jobs and allocations are
+not migrated or restarted. An administrator may issue a namespace-wide backend
+token with `read,router_delegate`, no tag/app restrictions or other permissions.
+Only this explicit delegation permission can call `POST /routers/:id/authorize`
+and revoke subjects in its own namespace. Administrators may revoke subjects but
+cannot use `/authorize` to assert business identities. Only the reserved `control`
+service accepts administrator authorization, under its own enabled exact service
+policy; namespace delegates cannot obtain control-service bindings. Application backends still
+must check user ownership before requesting an access binding.
+
+An administrator's `PUT /routers/:id/access-policy` accepts an exact namespace ID,
+workload, service, monotonic version, SHA-256 digest and enabled flag. This
+activates identity enforcement for all access through that router. The policy is
+an approved reference, not a proof or an executable rule evaluation. Backends
+sign the returned principal/session/policy binding; runtime connector identity
+and execution policy remain separate. `POST /routers/:id/revoke-subject` takes
+`{namespace, principal, session}`; null session permanently revokes the principal.
+Principal and session are opaque 64-character lowercase hex IDs, never raw tokens.
+
+Sync includes a bounded full `authorization` snapshot with its own revision,
+independent of the route tombstone cursor. Router status exposes delivered and
+applied authorization revisions. Persistence precedes delivery; relay SQLite
+commit and affected-stream cancellation precede applied ACK. Healthy propagation
+is one five-second poll plus latency; an unavailable control plane expires the
+relay's lease within 30 seconds. A mutation response acknowledges durable intent,
+not completed enforcement or a cryptographic proof.
+
+Upgrade Fleet, relay and shim before issuing identity-bound grants; old shim
+parsers reject them. Enable all needed service policies before switching a shared
+router's clients. Unconfigured routers and legacy tasks retain their behavior.
+The initial authorization snapshot caps policies plus permanent revocations at
+1024 records and returns 507 at capacity. Collection/pagination, key rotation and
+automatic app-lifecycle revocation remain follow-up work; do not discard records
+to recover capacity. See trusted-data-router `crates/transport/CONTROL.md` for the
+complete rollout and credential boundaries.

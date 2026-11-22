@@ -99,7 +99,10 @@ impl WorkloadController {
                 && tag.is_none_or(|tag| intent.entry().tag().unwrap_or("") == tag) {
                 if let Some(worker) = worker.filter(|w| !w.ended && w.report.ready) {
                     instances.extend(worker.report.runtime_instances.iter().filter(|r| r.entry_name == intent.entry().name()
-                        && r.ready && observed.is_some_and(|e| e.ready() && !e.disabled())).cloned());
+                        && r.ready && observed.is_some_and(|e| !e.disabled() && (e.ready()
+                            || r.services == ["control"]))
+                        && (intent.spec["runtime"]["driver"] != "openshell"
+                            || self.native_route_ready(&i, r))).cloned());
                 }
             }
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
