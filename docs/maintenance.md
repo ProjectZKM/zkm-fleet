@@ -20,6 +20,20 @@ deploy/fleet-ctl.sh -n scheduler upgrade v0.1.6  # -n prints every step and chan
 
 ### Control host
 
+For the runtime migration release (database schema 19), take a database backup
+and validate the schema 17/18 upgrade against a copy before changing production.
+This migration retains router identities, tombstones and policy acknowledgments;
+it normalizes old JSON records so subsequent syncs can update them. Schema 18
+and older binaries cannot be used as rollback builds after migration. Keep a
+validated schema-19-compatible build available instead of resetting the database
+or restoring stale router authorization over live grants.
+
+Upgrade the independent data-router relay before publishing `workload: "*"`
+policies. Its next authenticated poll must advertise `workload-defaults-v1` in
+`GET /routers/ID`'s `capabilities`; publication otherwise returns 409. The updated
+relay also works with the previous Fleet JSON API. Once a default is stored, keep
+that relay capability through rollback, even if the default is disabled.
+
 The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 
@@ -58,12 +72,60 @@ It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scr
 of the agent's unit, after checking that the new bridge imports in the node's venv,
 and waits for the node to reconnect. `node rollback` restores everything the last
 upgrade replaced. In the local form, the last two arguments are optional: the proof
-app, whose endpoint units in `FLEET_PROOF_APP_UNITS` restart too, and the launch
-scripts' directory.
+app binary staged for its next explicit endpoint restart, and the launch scripts'
+directory. Running proof endpoints keep their current processes; node upgrades
+and rollbacks no longer restart `FLEET_PROOF_APP_UNITS`.
 
 Ray keeps running, and so do apps and batches, through the agent restart. The upgrade
 touches neither `etc/` (watchdog.env, apps.yaml, batches.yaml, tokens) nor `work/`;
 leave app endpoints running when their programs are unchanged.
+
+On a node installed with `--with-shim`, shim and its connectors are supervised by
+`zkm-fleet-shim.service`, independently of the node and Ray units. Before stopping
+the agent, upgrade and rollback use the candidate Python adapter to negotiate
+protocol version 1 with the running daemon. An unavailable or incompatible daemon,
+or a rollback adapter without daemon support, rejects the operation while the old
+node continues running. Set `FLEET_ETC` (or `FLEET_ENV`) when configuration lives
+outside the default `$FLEET_PREFIX/etc`.
+
+These commands do not change the configured shim executable, restart its service,
+release existing Ray reservations, or change allocation/lease/generation identities.
+Do not add `PartOf=zkm-fleet-node.service` or `BindsTo` from shim/Ray to the node;
+keep separate cgroups with normal `KillMode=control-group` cleanup. Detached Ray
+actors alone cannot protect processes that share a service's stopping cgroup.
+
+During the brief agent restart, scheduling/control operations can be unavailable.
+Existing runtime streams continue through shim and the relay. Registration leases
+renew on the same transport with a compatible relay; application Access credentials
+still expire/revoke normally. A prolonged node outage can prevent new registration
+grants because Fleet no longer has a live observation, and is not covered by the
+node-upgrade continuity guarantee. Shim/Ray/Docker/host upgrades are separate
+operations and must not be bundled into this restart.
+
+ClawUp's Fleet adapter requires shim's authenticated `GET /logs?tail=N`
+management endpoint. The release bundle includes that implementation. Installing
+an updated node package only stages its shim binary; it does not switch an
+already running shim. For an older shim, schedule a separate maintenance window:
+drain the node, finish/stop affected workloads and confirm their cleanup; stop
+`zkm-fleet-shim.service`, update `shim_binary` in the existing `apps.yaml` to the
+staged executable, then start the service and run `fleet_bridge.shim check` before
+resuming workloads. Preserve `shim_state_dir` and its allocation/replay journals.
+Do not turn a routine node upgrade into an implicit runtime migration.
+
+Run the real systemd acceptance against local, isolated services (no local prover):
+
+```sh
+RUN_FLEET_NODE_UPGRADE=1 \
+TRUSTED_FLEET_TEST_BIN=/absolute/fleet/bin \
+TRUSTED_SHIM_TEST_BINARY=/absolute/trusted-shim-runtime \
+TRUSTED_ROUTER_TEST_BINARY=/absolute/trusted-data-router \
+PYTHONPATH=bridge python -m pytest -q -s deploy/tests/test_node_upgrade_cluster.py
+```
+
+It requires Docker with `python:3.12-slim`, the bridge/Ray environment, and
+passwordless sudo for uniquely named test units. It checks upgrade, rollback,
+incompatible-candidate rejection, unchanged container/PID/allocation, continuous
+SSE/WebSocket traffic, business authorization, and an unreplayed application job.
 
 One agent session at a time drives a node. A stopping agent ends its session, so the
 scheduler admits the restarted agent at once. An agent that crashed, or one stopped

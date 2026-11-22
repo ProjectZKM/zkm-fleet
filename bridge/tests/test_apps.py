@@ -8,7 +8,7 @@ def test_native_prover_version_can_be_pinned_without_changing_other_apps():
     cfg = reconcile.load_apps({"node_binary": "/opt/fleet/prover-old", "apps": [
         {"name": "old", "kind": "ziren-gpu", "elf_id": "a" * 64},
         {"name": "new", "kind": "ziren-gpu", "elf_id": "b" * 64,
-         "prover_binary": "/opt/fleet/prover-v2"},
+         "prover_binary": "/opt/fleet/prover-v2", "machine": "local"},
     ]})
     specs = reconcile.replica_specs(cfg)
     assert actors._node_binary(specs["old-0"]) == "/opt/fleet/prover-old"
@@ -25,6 +25,78 @@ def test_native_prover_version_can_be_pinned_without_changing_other_apps():
     with pytest.raises(ValueError, match="prover_binary"):
         reconcile.load_apps({"apps": [{"name": "bad", "kind": "app",
             "image": "serve", "port_base": 8000, "prover_binary": "/opt/prover"}]})
+
+def test_prover_override_hash_ignores_unused_shared_binary_and_rejects_old_actor():
+    from fleet_bridge import actors
+    from fleet_bridge.model import ReplicaHealth
+    raw = {"node_binary": "/opt/old", "apps": [
+        {"name": "pinned", "kind": "ziren-cpu", "machine": "local", "prover_binary": "/opt/v2"},
+        {"name": "legacy", "kind": "ziren-cpu"}]}
+    specs = reconcile.replica_specs(reconcile.load_apps(raw))
+    pinned = specs["pinned-0"]
+    # An older adapter ignored prover_binary, but retained it in the raw hash.
+    old = pinned.merged(config={**pinned.config, "node_binary": "/opt/old"})
+    assert actors.spec_hash(old) != actors.spec_hash(pinned)
+    raw["node_binary"] = "/opt/next"
+    updated = reconcile.replica_specs(reconcile.load_apps(raw))
+    assert actors.spec_hash(updated["pinned-0"]) == actors.spec_hash(pinned)
+    assert actors.spec_hash(updated["legacy-0"]) != actors.spec_hash(specs["legacy-0"])
+    for observed in (None, "/opt/old", "/opt/v2 (deleted)"):
+        assert not reconcile.matches(pinned, ReplicaHealth(name=pinned.name,
+            spec=actors.spec_hash(pinned), prover_binary=observed))
+    assert reconcile.matches(pinned, ReplicaHealth(name=pinned.name,
+        spec=actors.spec_hash(pinned), prover_binary="/opt/v2"))
+    assert reconcile.matches(specs["legacy-0"], ReplicaHealth(name="legacy-0",
+        spec=actors.spec_hash(specs["legacy-0"])))
+
+
+@pytest.mark.parametrize("machine", [None, "", "  "])
+def test_prover_override_cannot_move_to_an_unconfigured_machine(machine):
+    with pytest.raises(ValueError, match="machine-pinned"):
+        reconcile.load_apps({"apps": [{"name": "p", "kind": "ziren-cpu",
+            "machine": machine, "prover_binary": "/opt/prover"}]})
+
+
+def test_renamed_native_provers_are_marked_and_cleanup_is_replica_scoped(monkeypatch):
+    import io
+    from fleet_bridge import actors
+    spec = reconcile.replica_specs(reconcile.load_apps({"scheduler": "https://scheduler",
+        "cluster_token_file": "/private/service-token", "apps": [{"name": "selected",
+        "kind": "ziren-cpu", "env": {"FLEET_WORKER_ROLE": "override", "FLEET_NODE_NAME": "other-0"}}]}))["selected-0"]
+    env = actors._node_env(spec, "cpu", app_env=True)
+    assert env["FLEET_WORKER_ROLE"] == "prover" and env["FLEET_NODE_NAME"] == "selected-0"
+    processes = {
+        "101": ("prover-v2", b"FLEET_NODE_NAME=selected-0\0FLEET_WORKER_ROLE=prover\0"),
+        "102": ("worker", b"FLEET_NODE_NAME=selected-0\0FLEET_WORKER_ROLE=app\0"),
+        "103": ("fleet-ziren-nod", b"FLEET_NODE_NAME=selected-0\0"),
+        "104": ("prover-v2", b"FLEET_NODE_NAME=other-0\0FLEET_WORKER_ROLE=prover\0"),
+        "105": ("fleet-node", b"FLEET_NODE_NAME=selected-0\0"),
+    }
+    # Linux truncates the legacy executable name to 15 bytes.
+    processes["103"] = ("fleet-ziren-node"[:15], processes["103"][1])
+    def read(path, mode="r"):
+        _, _, pid, field = path.split("/")
+        comm, env = processes[pid]
+        return io.BytesIO(env) if field == "environ" else io.StringIO(comm)
+    monkeypatch.setattr(actors.os, "listdir", lambda _: list(processes))
+    monkeypatch.setattr(actors, "open", read, raising=False)
+    monkeypatch.setattr(actors.os.path, "exists", lambda _: False)
+    kill = Mock()
+    monkeypatch.setattr(actors.os, "kill", kill)
+    actors._kill_orphans("selected-0")
+    assert [c.args for c in kill.call_args_list] == [(101, 15), (102, 15), (103, 15)]
+
+
+def test_native_health_reports_actual_executable_without_launching_a_prover(monkeypatch):
+    from fleet_bridge import actors
+    process = object.__new__(actors._NodeProcess)
+    process.proc = Mock(pid=321)
+    observed = Mock(return_value="/opt/actual-v2")
+    monkeypatch.setattr(actors.os, "readlink", observed)
+    assert process.executable() == "/opt/actual-v2"
+    observed.assert_called_once_with("/proc/321/exe")
+    observed.side_effect = FileNotFoundError()
+    assert process.executable() is None
 
 @pytest.mark.parametrize("gpus", [[], ["2", "3"]])
 def test_apps_use_nvidia_only_when_ray_grants_gpus(gpus):
@@ -68,6 +140,7 @@ def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrat
     actor.name, actor.container = "eth-0", "fleet-gpu-eth-0"
     actor.gpus, actor.gpu_port = ["0"], 30100
     actor.node = Mock()
+    actor.node.executable.return_value = "/opt/fleet/prover-v2"
     actor.node.alive.return_value = True
     monkeypatch.setattr(actors, "_stopping", lambda: False)
     monkeypatch.setattr(actors, "_container_running", lambda _: True)

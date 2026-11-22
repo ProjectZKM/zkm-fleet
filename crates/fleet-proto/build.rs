@@ -4,6 +4,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".fleet.model.v1.Json", "crate::json::Json");
     for name in [
         "StringList",
+        "RouterAccessPolicy",
+        "RouterSubjectRevocation",
+        "RouterAuthorization",
+        "RouterAuthorizeRequest",
+        "RouterAccessBinding",
+        "RouterEnrollment",
+        "RouterControl",
+        "RouterSyncRequest",
+        "RouterSyncResponse",
         "Quota",
         "Allocation",
         "Usage",
@@ -14,6 +23,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Job",
         "CommandRecord",
         "NodeReport",
+        "RuntimeExecutionIdentity",
+        "PolicyActivationRequest",
+        "PolicyStageRequest",
+        "PolicyBudgetRequest",
+        "PolicyCredentialRequest",
+        "OpenShellLaunchPreparation",
+        "RuntimeInstance",
+        "RuntimeDeliveryOffer",
+        "RuntimeDeliveryRecord",
+        "RuntimeDeliveryAck",
+        "NativeProverProcess",
         "JobReport",
         "CommandResult",
         "ScaleStatus",
@@ -44,8 +64,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     for name in [
+        "PolicyActivationRequest",
+        "PolicyStageRequest",
+        "PolicyBudgetRequest",
+        "PolicyCredentialRequest",
+        "OpenShellLaunchPreparation",
+        "RouterAccessPolicy",
+        "RouterSubjectRevocation",
+        "RouterAuthorization",
+        "RouterAuthorizeRequest",
+        "RouterAccessBinding",
+        "RouterEnrollment",
+        "RouterControl",
+        "RouterSyncRequest",
+        "RouterSyncResponse",
         "Quota",
         "NodeReport",
+        "RuntimeExecutionIdentity",
+        "RuntimeInstance",
+        "RuntimeDeliveryOffer",
+        "RuntimeDeliveryRecord",
+        "RuntimeDeliveryAck",
+        "NativeProverProcess",
         "JobReport",
         "CommandResult",
         "ScaleRequest",
@@ -76,6 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NodeReport.jobs",
         "NodeReport.results",
         "NodeReport.runtime_capabilities",
+        "NodeReport.runtime_instances",
+        "NodeReport.native_provers",
+        "RouterControl.capabilities",
         "CreateNamespaceRequest.quota",
         "AllocationRequest.restore",
         "CreateTokenRequest.label",
@@ -89,6 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "PreemptionRequest.candidates",
     ] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default)]");
+    }
+    for path in ["RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64"] {
+        build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
     build = build
         .type_attribute(".fleet.model.v1.NodePin", "#[serde(transparent)]")
