@@ -64,16 +64,27 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             value = json.loads(result.stdout)
         if value.get("protocol") != 1 or "docker" not in value.get("drivers", []):
             return []
-        modern = "data-plane-v1" in value.get("features", [])
-        management = "runtime-management-v1" in value.get("features", [])
+        features = value.get("features", [])
+        modern = "data-plane-v1" in features
+        management = "runtime-management-v1" in features
+        network = bool(config.shim_network) and modern
+        managed_network = network and management
         native = []
         if config.shim_daemon and config.shim_openshell is not None:
             check_openshell(config, value)
-            if "openshell" in value.get("drivers", []) and "openshell-allocation-v1" in value.get("features", []):
+            if "openshell" in value.get("drivers", []) and "openshell-allocation-v1" in features:
                 native = ["shim-openshell-provisioning-v1"]
-                if config.shim_network and "openshell-service-health-v1" in value.get("features", []):
+                if config.shim_network and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
-        return native + (["shim-tcp-v1"] if config.shim_network and modern and management else []) + (["shim-single-use-ingress-v1"] if config.shim_network and modern and management and "single-use-ingress-v1" in value.get("features", []) else []) + [CAPABILITY] + (["shim-automatic-port-v1"] if management else []) + (["shim-runtime-v2"] if modern else []) + (["shim-network-v1"] if config.shim_network and modern else []) + (["shim-management-v1"] if config.shim_network and modern and management else [])
+        return native + [name for name, supported in (
+            ("shim-tcp-v1", managed_network),
+            ("shim-single-use-ingress-v1", managed_network and "single-use-ingress-v1" in features),
+            (CAPABILITY, True),
+            ("shim-automatic-port-v1", management),
+            ("shim-runtime-v2", modern),
+            ("shim-network-v1", network),
+            ("shim-management-v1", managed_network),
+        ) if supported]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
 

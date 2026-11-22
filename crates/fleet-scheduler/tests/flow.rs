@@ -182,7 +182,11 @@ async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_s
     policy["sha256"]=json!("ef".repeat(32));
     assert_eq!(h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().status(),409);
     policy["version"]=json!(2);
-    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy).send().await.unwrap().error_for_status().unwrap();
+    for _ in 0..2 {
+        let published:Value=h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&policy)
+            .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(published["revision"],2, "repeating a policy must not advance its authorization revision");
+    }
     let revocation=json!({"namespace":namespace,"principal":access["principal"],"session":access["session"]});
     assert_eq!(h.client.post(format!("{base}/revoke-subject")).bearer_auth(&other).json(&revocation).send().await.unwrap().status(),403);
     for _ in 0..2 {

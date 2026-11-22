@@ -38,14 +38,41 @@ fn unavailable(_: anyhow::Error) -> StatusCode {
 }
 
 async fn status(State(s): State<HttpState>, Path(id): Path<String>) -> Result<Json<RouterControl>> {
-    Ok(Json(
-        s.fleet
-            .store
-            .router_control(&id)
-            .await
-            .map_err(unavailable)?
-            .ok_or(StatusCode::NOT_FOUND)?,
-    ))
+    Ok(Json(load_router(&s, &id).await?))
+}
+
+async fn load_router(s: &HttpState, id: &str) -> Result<RouterControl> {
+    s.fleet
+        .store
+        .router_control(id)
+        .await
+        .map_err(unavailable)?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Retry edits against the latest durable record without losing concurrent
+/// revocations or acknowledgments. The edit must have no external side effects.
+/// Idempotent edits return without a write; sync renewals use an explicit CAS.
+async fn update_router(
+    s: &HttpState,
+    id: &str,
+    edit: impl Fn(&mut RouterControl) -> Result<()>,
+) -> Result<RouterControl> {
+    for _ in 0..16 {
+        let previous = load_router(s, id).await?;
+        let mut next = previous.clone();
+        edit(&mut next)?;
+        if next == previous
+            || s.fleet
+                .store
+                .save_router_control(Some(&previous), &next)
+                .await
+                .map_err(unavailable)?
+        {
+            return Ok(next);
+        }
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 async fn enroll(
@@ -120,32 +147,18 @@ async fn revoke(
     if !valid_route_id(&route) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    for _ in 0..16 {
-        let previous = s
-            .fleet
-            .store
-            .router_control(&id)
-            .await
-            .map_err(unavailable)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        if previous.revoked_routes.contains(&route) {
-            return Ok(Json(previous));
+    let next = update_router(&s, &id, |next| {
+        if next.revoked_routes.contains(&route) {
+            return Ok(());
         }
-        if previous.revoked_routes.len() >= MAX_ROUTER_REVOCATIONS {
+        if next.revoked_routes.len() >= MAX_ROUTER_REVOCATIONS {
             return Err(StatusCode::INSUFFICIENT_STORAGE);
         }
-        let mut next = previous.clone();
         next.revoked_routes.push(route.clone());
-        if s.fleet
-            .store
-            .save_router_control(Some(&previous), &next)
-            .await
-            .map_err(unavailable)?
-        {
-            return Ok(Json(next));
-        }
-    }
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+        Ok(())
+    })
+    .await?;
+    Ok(Json(next))
 }
 
 async fn sync(
@@ -167,13 +180,7 @@ async fn sync(
     capabilities.sort();
     capabilities.dedup();
     for _ in 0..16 {
-        let previous = s
-            .fleet
-            .store
-            .router_control(&id)
-            .await
-            .map_err(unavailable)?
-            .ok_or(StatusCode::NOT_FOUND)?;
+        let previous = load_router(&s, &id).await?;
         if caller.id != previous.token_id
             || caller.namespace.as_deref() != Some(&previous.namespace)
             || caller.permissions != ["router_sync"]
@@ -303,13 +310,7 @@ async fn authorize_access(
         return Err(StatusCode::FORBIDDEN);
     }
     namespace_scope(&s, caller.as_ref(), &request.namespace, false)?;
-    let state = s
-        .fleet
-        .store
-        .router_control(&id)
-        .await
-        .map_err(unavailable)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let state = load_router(&s, &id).await?;
     let auth = state.authorization.ok_or(StatusCode::FORBIDDEN)?;
     Ok(Json(
         auth.authorize(&request)
@@ -325,23 +326,16 @@ async fn set_policy(
     policy.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     let _policies = s.fleet.router_policy_ops.lock().await;
     namespace_scope(&s, None, &policy.namespace, !policy.enabled)?;
-    for _ in 0..16 {
-        let previous = s
-            .fleet
-            .store
-            .router_control(&id)
-            .await
-            .map_err(unavailable)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let mut next = previous.clone();
-        let disabling_existing = !policy.enabled
-            && next.authorization.as_ref().is_some_and(|a| {
-                a.policies.iter().any(|p| {
-                    p.namespace == policy.namespace
-                        && p.workload == policy.workload
-                        && p.service == policy.service
-                })
-            });
+    let next = update_router(&s, &id, |next| {
+        let auth = next
+            .authorization
+            .get_or_insert_with(RouterAuthorization::default);
+        let old = auth.policies.iter_mut().find(|p| {
+            p.namespace == policy.namespace
+                && p.workload == policy.workload
+                && p.service == policy.service
+        });
+        let disabling_existing = !policy.enabled && old.is_some();
         if policy.workload == "*"
             && !disabling_existing
             && !next
@@ -351,16 +345,9 @@ async fn set_policy(
         {
             return Err(StatusCode::CONFLICT);
         }
-        let auth = next
-            .authorization
-            .get_or_insert_with(RouterAuthorization::default);
-        if let Some(old) = auth.policies.iter_mut().find(|p| {
-            p.namespace == policy.namespace
-                && p.workload == policy.workload
-                && p.service == policy.service
-        }) {
+        if let Some(old) = old {
             if *old == policy {
-                return Ok(Json(auth.clone()));
+                return Ok(());
             }
             if policy.version <= old.version {
                 return Err(StatusCode::CONFLICT);
@@ -374,17 +361,10 @@ async fn set_policy(
             .checked_add(1)
             .ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
         auth.validate()
-            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        if s.fleet
-            .store
-            .save_router_control(Some(&previous), &next)
-            .await
-            .map_err(unavailable)?
-        {
-            return Ok(Json(next.authorization.unwrap()));
-        }
-    }
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)
+    })
+    .await?;
+    Ok(Json(next.authorization.unwrap()))
 }
 
 async fn revoke_subject(
@@ -395,15 +375,7 @@ async fn revoke_subject(
 ) -> Result<Json<RouterAuthorization>> {
     revocation.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     namespace_scope(&s, caller.as_ref(), &revocation.namespace, caller.is_none())?;
-    for _ in 0..16 {
-        let previous = s
-            .fleet
-            .store
-            .router_control(&id)
-            .await
-            .map_err(unavailable)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        let mut next = previous.clone();
+    let next = update_router(&s, &id, |next| {
         let auth = next.authorization.as_mut().ok_or(StatusCode::FORBIDDEN)?;
         if !auth
             .policies
@@ -413,7 +385,7 @@ async fn revoke_subject(
             return Err(StatusCode::FORBIDDEN);
         }
         if auth.revoked_subjects.contains(&revocation) {
-            return Ok(Json(scoped_authorization(auth.clone(), caller.as_ref())));
+            return Ok(());
         }
         auth.revoked_subjects.push(revocation.clone());
         auth.revision = auth
@@ -421,20 +393,13 @@ async fn revoke_subject(
             .checked_add(1)
             .ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
         auth.validate()
-            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        if s.fleet
-            .store
-            .save_router_control(Some(&previous), &next)
-            .await
-            .map_err(unavailable)?
-        {
-            return Ok(Json(scoped_authorization(
-                next.authorization.unwrap(),
-                caller.as_ref(),
-            )));
-        }
-    }
-    Err(StatusCode::SERVICE_UNAVAILABLE)
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)
+    })
+    .await?;
+    Ok(Json(scoped_authorization(
+        next.authorization.unwrap(),
+        caller.as_ref(),
+    )))
 }
 
 fn scoped_authorization(
