@@ -90,9 +90,12 @@ latest_backup() { # the newest backup this script made: KIND-YYYYmmddTHHMMSSZ
   find "$PREFIX/backup" -maxdepth 1 -type d -name "$1-[0-9]*T[0-9]*Z" 2>/dev/null | sort | tail -1
 }
 remote() { [ -n "$NODE_SSH" ] && [ "${FLEET_CTL_ON_NODE:-0}" != 1 ]; }
-on_node() { # this script, run on the node over ssh
-  local flag=; [ "$DRY" != 1 ] || flag=-n
-  ssh "$NODE_SSH" "FLEET_CTL_ON_NODE=1 FLEET_PREFIX=$NODE_PREFIX bash -s -- $flag $(printf '%q ' "$@")" < "$SELF"
+on_node() { # this script, run on the node over ssh, with the node settings given here
+  local flag= vars="FLEET_CTL_ON_NODE=1 FLEET_PREFIX=$NODE_PREFIX" v; [ "$DRY" != 1 ] || flag=-n
+  for v in FLEET_ETC FLEET_ENV FLEET_NODE_UNIT; do
+    [ -z "${!v:-}" ] || vars+=" $v=$(printf '%q' "${!v}")"
+  done
+  ssh "$NODE_SSH" "$vars bash -s -- $flag $(printf '%q ' "$@")" < "$SELF"
 }
 
 # The release's compose file, then this site's changes to it, if any: upgrades replace only the release's.

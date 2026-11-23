@@ -402,6 +402,39 @@ def test_remote_upgrade_ships_the_runtime_binaries_for_staging(tmp_path):
     for name in ("trusted-shim-runtime", "trusted-router-tunnel"):
         assert f"{newbin.parent / name} gpu-host:{stage}/{name}" in shipped.read_text()
 
+def remote_control(tmp_path, **settings):
+    """A control prefix whose node commands go over a stand-in ssh: the node answers `node name`
+    with gpu-a, and every other script run is logged."""
+    prefix = tmp_path / "control"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "etc").mkdir()
+    commands, log = tmp_path / "bin", tmp_path / "ssh.log"
+    executable(commands / "ssh", f'case "$2" in *" node name "*) echo gpu-a;; *"bash -s"*) printf "%s\\n" "$2" >> {log};; esac\n')
+    executable(commands / "scp", "exit 0\n")
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "gpu-host", **settings}
+    return prefix, env, log
+
+
+def test_remote_commands_forward_the_node_settings_given_here(tmp_path):
+    prefix, env, log = remote_control(tmp_path, FLEET_ETC="/srv/fleet etc", FLEET_ENV="/srv/fleet etc/watchdog.env",
+                                      FLEET_NODE_UNIT="fleet-agent.service")
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0, result.stderr
+    words = shlex.split(log.read_text())
+    assert words[0] == "FLEET_CTL_ON_NODE=1" and words[1] == "FLEET_PREFIX=$HOME/app/fleet"
+    assert words[2:5] == ["FLEET_ETC=/srv/fleet etc", "FLEET_ENV=/srv/fleet etc/watchdog.env",
+                          "FLEET_NODE_UNIT=fleet-agent.service"]
+    assert words[words.index("--") + 1:] == ["node", "rollback"]
+
+
+def test_remote_commands_forward_only_the_settings_that_are_set(tmp_path):
+    prefix, env, log = remote_control(tmp_path)
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0, result.stderr
+    for name in ("FLEET_ETC", "FLEET_ENV", "FLEET_NODE_UNIT"):
+        assert name not in log.read_text()
+
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
     """A remote dry run ships nothing, so the node sees paths to no files: it prints the local
