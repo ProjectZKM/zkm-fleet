@@ -828,10 +828,6 @@ class AppsConfig(Record):
 
     def validate_launch(self, app: AppSpec) -> None:
         cluster = self.cluster
-        # A removed override still loads, so the node keeps reporting and the scheduler
-        # quarantines only that entry; it can be disabled and drained, never launched.
-        if any(a.get("name") == app.name and a.get("prover_binary") is not None for a in self.raw.get("apps") or []):
-            raise ModelError("prover_binary was removed; drain and migrate this entry with deploy/migrate-proof-runtime.py")
         if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
             if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
                 raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")

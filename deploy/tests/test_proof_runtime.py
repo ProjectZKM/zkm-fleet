@@ -23,7 +23,7 @@ def configuration(tmp_path):
         shim_binary='/opt/shim', shim_state_dir='/var/lib/shim', shim_daemon=True,
         apps=[dict(name='policy-node', app='policy', namespace='alice', kind='ziren-gpu',
             disabled=True, machine='gpu-1', elf_id='b' * 64, replicas=2, cpus=8, gpus=2,
-            prover_binary='/old/sdk', proof_storage_root=str(tmp_path / 'proofs'),
+            proof_storage_root=str(tmp_path / 'proofs'),
             image='old-gpu:1', env={'SHARD_SIZE':'16777216'}, volumes=['/data/models:ro'])])
 
 
@@ -48,7 +48,6 @@ def test_cutover_preserves_configuration_identity_and_all_storage(tmp_path):
     updated = yaml.safe_load((output / 'apps.yaml').read_text())['apps'][0]
     for key in ('name','app','namespace','machine','elf_id','replicas','cpus','gpus','proof_storage_root','disabled'):
         assert updated[key] == cfg['apps'][0][key]
-    assert 'prover_binary' not in updated
     assert updated['env']['SHARD_SIZE'] == '16777216'
     assert updated['shm_gb'] == 64
     assert updated['env']['FLEET_NODE_NAME'] == '{name}'
@@ -73,11 +72,6 @@ def test_cutover_requires_immutable_image_and_accounts_for_all_binary_overrides(
     cfg = configuration(tmp_path)
     with pytest.raises(ValueError, match='digest'):
         migration.convert(cfg, ['policy-node'], 'proof:latest')
-    cfg['apps'].append({**cfg['apps'][0], 'name':'another'})
-    with pytest.raises(ValueError, match='every remaining'):
-        migration.convert(cfg, ['policy-node'], IMAGE)
-    converted, _ = migration.convert(cfg, ['policy-node','another'], IMAGE)
-    assert all('prover_binary' not in app for app in converted['apps'])
 
 
 def test_cutover_reuses_safe_mounts_and_refuses_readonly_storage(tmp_path):

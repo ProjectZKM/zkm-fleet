@@ -99,13 +99,10 @@ def convert(config, names, image, cpus=None):
         if entry['kind'] == 'ziren-gpu':
             settings['shm_gb'] = entry.get('shm_gb') or 64
         entry.update(settings)
-        entry.pop('prover_binary', None)
         # CPUs are a resource, not an update setting: the app record gets them from
         # `fleetctl app scale --cpus`, or the scheduler restores its own count.
         updates.append(dict(entry=entry['name'], app=entry.get('app', entry['name']),
             namespace=entry['namespace'], cpus=entry.get('cpus', 1), set=settings))
-    if any(a.get('prover_binary') is not None for a in result.get('apps', [])):
-        raise ValueError("migrate every remaining prover_binary override before upgrading the adapter")
     return result, updates
 
 

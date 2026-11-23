@@ -89,7 +89,7 @@ def test_busy_gpu_probe_does_not_restart_integrated_worker(monkeypatch, integrat
     else:
         probe.assert_called_once_with(30100)
 
-def test_integrated_worker_needs_no_native_prover_binary_or_control_credentials(tmp_path, monkeypatch):
+def test_integrated_worker_needs_no_native_prover_or_control_credentials(tmp_path, monkeypatch):
     from fleet_bridge import actors
     cfg = reconcile.load_apps({"log_dir": str(tmp_path), "apps": [{
         "name": "worker", "kind": "ziren-gpu", "image": "prover:latest",

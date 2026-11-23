@@ -223,38 +223,6 @@ def test_start_takes_resources_from_apps_yaml_and_stops_extra_replicas(executor,
     assert (start.call_count,replica.name,replica.app.gpus,replica.app.cpus)==(1,"proof-0",2,8)
 
 
-def test_a_removed_prover_binary_entry_is_reported_for_quarantine_but_never_launched(executor,monkeypatch):
-    """One leftover override must not stop the heartbeat: the scheduler quarantines that entry."""
-    from fleet_bridge.model import ModelError
-    cfg=yaml.safe_load(executor.apps_file.read_text())
-    cfg["apps"][0].update(disabled=False,prover_binary="/old/sdk")
-    cfg["apps"].append({"name":"web","kind":"app","namespace":"a"*32,"image":"web:1","port_base":50100})
-    executor.apps_file.write_text(yaml.safe_dump(cfg))
-    loaded=reconcile.load_apps(cfg,validate_launch=False)
-    assert [a.name for a in loaded.apps]==["proof","web"]
-    for launch in (lambda:reconcile.load_apps(cfg),lambda:loaded.validate_launch(loaded.apps[0])):
-        with pytest.raises(ModelError,match="prover_binary was removed"):
-            launch()
-    loaded.validate_launch(loaded.apps[1])
-    monkeypatch.setattr(node.ray,"cluster_resources",lambda:{"GPU":8,"CPU":48})
-    monkeypatch.setattr(node.ray,"available_resources",lambda:{"GPU":8,"CPU":48})
-    removable(monkeypatch)
-    monkeypatch.setattr(reconcile,"running",lambda:{})
-    reported={a["name"]:a for a in executor.report()["apps"]}
-    assert reported["proof"]["prover_binary"]=="/old/sdk" and "prover_binary" not in reported["web"]
-    start=Mock();monkeypatch.setattr(reconcile,"start",start)
-    with pytest.raises(ModelError,match="prover_binary was removed"):
-        executor.set_app({"app":cfg["apps"][0],"disabled":False})
-    start.assert_not_called()
-    before=executor.apps_file.read_text()
-    result,error=app_message(executor,"set-1",{"set":{"image":"ziren-gpu:2"}},app="eth")
-    assert "prover_binary was removed" in error and executor.apps_file.read_text()==before
-    # Draining it stays possible: disable, then confirmed cleanup.
-    assert app_message(executor,"set-2",{"set":{"disabled":True}},app="eth")==({"updated":["proof"]},None)
-    assert executor.set_app({"app":cfg["apps"][0],"disabled":True})=={"cleaned":True,"disabled":True}
-    start.assert_not_called()
-
-
 @pytest.mark.parametrize("field,value",[("namespace","another"),("app","other-app"),("elf_id","c"*64),("tag","other"),("kind","app")])
 def test_scale_cannot_change_machine_app_scope(executor,field,value):
     before=executor.apps_file.read_bytes()

@@ -31,7 +31,7 @@ def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs
     assert request['driver_options']['gpus'] == ['4', '6']
     assert request['driver_options']['volumes'] == ['/srv/proofs:/srv/proofs', '/private/node.token:/private/node.token:ro']
     assert request['limits']['cpu_millicores'] == 4000
-    for update in ({'prover_binary':'/old/override'}, {'worker_command':['/old/worker']},
+    for update in ({'worker_command':['/old/worker']},
                    {'runtime':{'executor':'shim','driver':'openshell'}}, {'container_port':None},
                    {'services':['http']}, {'service_protocol':'tcp'}):
         invalid = copy.deepcopy(raw)
@@ -339,9 +339,6 @@ def checked_node(tmp_path, features):
     helper.chmod(0o755)
     raw = config(tmp_path)
     raw.update(shim_binary=str(runtime), shim_network={**NETWORK, "tunnel_binary":str(helper)})
-    # A leftover override loads as the report reads it; the scheduler quarantines it.
-    raw["apps"].append({"name":"old", "kind":"ziren-gpu", "app":"eth", "elf_id":"b"*64,
-        "disabled":True, "prover_binary":"/old/sdk"})
     path = tmp_path / "apps.yaml"
     path.write_text(yaml.safe_dump(raw))
     return path, raw, helper

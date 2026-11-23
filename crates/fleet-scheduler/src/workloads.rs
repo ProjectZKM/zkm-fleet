@@ -960,8 +960,7 @@ impl WorkloadController {
         for raw in &mut report.apps {
             EntryMut(raw).redact_private_environment();
             let e = Entry(raw);
-            let invalid = e.0.get("prover_binary").is_some_and(|v| !v.is_null())
-                || e.is_prover() && e.0.get("runtime").is_some() && e.0.as_object().is_none_or(|o|
+            let invalid = e.is_prover() && e.0.get("runtime").is_some() && e.0.as_object().is_none_or(|o|
                     fleet_proto::model::v1::RegisterAppRequest::validate_transport(o).is_err());
             if invalid && raw.is_object() {
                 raw["runtime_error"] = json!("invalid runtime manifest; repair or drain this entry");
@@ -1096,8 +1095,6 @@ impl WorkloadController {
                 continue;
             }
             let intent = if let Some(mut intent) = existing {
-                // The removed override is never a launch input after migration.
-                if let Some(fields) = intent.spec.as_object_mut() { fields.remove("prover_binary"); }
                 // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
                 for field in Entry::NODE_OWNED {

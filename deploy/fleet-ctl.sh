@@ -559,18 +559,10 @@ try:
     data = yaml.safe_load(path.read_text()) or {}
 except (OSError, yaml.YAMLError) as error:
     sys.exit(f"fleet-ctl: cannot read {path}: {error}")
-# Parsed entries drop prover_binary, so find it in the file's own mapping.
-entries = data.get("apps") if isinstance(data, dict) else None
-legacy = [str(a.get("name", "?")) for a in entries if isinstance(a, dict) and a.get("prover_binary") is not None] \
-    if isinstance(entries, list) else []
 try:
     load_apps(data, validate_launch=False)
 except Exception as error:
-    also = f" (entries with prover_binary: {', '.join(legacy)})" if legacy else ""
-    sys.exit(f"fleet-ctl: the new bridge cannot load {path}: {error}{also}")
-if legacy:
-    print(f"fleet-ctl: warning: {', '.join(legacy)} in {path} still set prover_binary; the scheduler "
-          "quarantines them until they are converted with deploy/migrate-proof-runtime.py", file=sys.stderr)
+    sys.exit(f"fleet-ctl: the new bridge cannot load {path}: {error}")
 PY
   ) || die "the new bridge cannot load apps.yaml; node was not stopped"
 }
