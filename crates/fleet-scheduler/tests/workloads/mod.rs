@@ -3148,6 +3148,24 @@ async fn an_unreserved_tee_app_needs_the_nodes_opt_in_and_a_limit_within_its_vcp
 }
 
 #[tokio::test]
+async fn a_hard_limit_added_on_the_node_alone_is_cleared_like_other_drift() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
+    let mut edited = scale_inventory(&ns, false, false);
+    edited.apps[0]["cpu_limit"] = json!(3);
+    c.report("gpu", "session", edited.clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    let stop = command_where(&c, |cmd| cmd.parameters["scale_phase"] == "stop").expect("the drift is repaired");
+    let mut stopped = edited.apps[0].0.clone();
+    (stopped["disabled"], stopped["ready"], stopped["cleaned"]) = (json!(true), json!(false), json!(true));
+    finish_app_command(&c, &ns, false, &stop, true, Some(stopped)).await;
+    c.dispatch().await.unwrap();
+    let update = command_where(&c, |cmd| cmd.operation == NodeOperation::App as i32).unwrap();
+    assert_eq!(update.parameters["set"], json!({"gpus":1,"cpus":2,"replicas":2,"cpu_limit":null,"disabled":false}),
+        "only the limit the node has goes");
+}
+
+#[tokio::test]
 async fn a_node_shows_what_its_apps_reserve_beside_their_hard_limits() {
     let (_dir, c, ns) = setup().await;
     let mut report = shim_node(&ns, &["shim-limits-v1", "shim-cpu-shares-v1"]);
