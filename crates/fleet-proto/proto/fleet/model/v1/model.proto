@@ -433,7 +433,7 @@ message AppDeployment {
   optional ScaleStatus scale = 4;
 }
 
-// A scale's request, sent as JSON: a whole `cpus` still reads as before.
+// A scale's request, sent as JSON.
 message ScaleRequest {
   optional double gpus = 1;
   // Whole CPUs; 0 or a fraction only for a shim app with hard limits.
