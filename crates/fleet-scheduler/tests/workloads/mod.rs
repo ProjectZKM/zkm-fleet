@@ -721,10 +721,26 @@ async fn heartbeat_fences_duplicate_sessions_and_registers_local_node_capacity()
     report.free_gpus = 0.5;
     report.free_cpus = 0.0;
     report.agent_version = Some("v0.1.6".into());
+    report.hardware = Some(fleet_proto::fleet::model::v1::NodeHardware {
+        cpu_arch: "x86_64".into(),
+        cpu_model: Some("AMD EPYC 9654".into()),
+        gpus: vec![fleet_proto::fleet::model::v1::GpuDevice {
+            index: 0,
+            name: "NVIDIA GeForce RTX 5090".into(),
+            compute_capability: Some("12.0".into()),
+            architecture: Some("Blackwell".into()),
+            memory_mib: Some(32607),
+            driver_version: None,
+        }],
+    });
     c.report("gpu", "first", report).await.unwrap();
     assert!(c.report("gpu", "second", inventory(&ns)).await.is_err());
     assert_eq!(c.worker_status()[0]["backend"], "ray-local");
     assert_eq!(c.worker_status()[0]["agent_version"], "v0.1.6");
+    let hardware = &c.worker_status()[0]["hardware"];
+    assert_eq!((hardware["cpu_arch"].as_str(), hardware["cpu_model"].as_str()), (Some("x86_64"), Some("AMD EPYC 9654")));
+    assert_eq!(hardware["gpus"][0]["architecture"], "Blackwell");
+    assert_eq!(hardware["gpus"][0]["compute_capability"], "12.0");
     assert_eq!(c.worker_status()[0]["gpus"].as_f64(), Some(2.0));
     assert_eq!(c.worker_status()[0]["cpus"].as_f64(), Some(8.0));
     assert_eq!(c.worker_status()[0]["free_gpus"].as_f64(), Some(0.5));

@@ -286,6 +286,28 @@ message NodeReport {
   // Removed host-binary observations; runtime identity belongs to shim.
   reserved 15;
   reserved "native_provers";
+  // The machine's processor and GPUs, detected once when the agent starts; absent on older agents.
+  optional NodeHardware hardware = 16;
+}
+
+// What a node runs on, for operators choosing where work can go.
+message NodeHardware {
+  // The instruction set as the OS names it (x86_64, aarch64).
+  required string cpu_arch = 1;
+  optional string cpu_model = 2;
+  repeated GpuDevice gpus = 3;
+}
+
+// One card as nvidia-smi reports it.
+message GpuDevice {
+  required uint32 index = 1;
+  required string name = 2;
+  // CUDA compute capability, e.g. "12.0"; absent when the driver cannot report it.
+  optional string compute_capability = 3;
+  // The NVIDIA architecture that capability belongs to, e.g. "Blackwell".
+  optional string architecture = 4;
+  optional uint64 memory_mib = 5;
+  optional string driver_version = 6;
 }
 
 // Metadata only: native credentials are claimed once over the private HTTPS API.

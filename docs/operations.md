@@ -13,7 +13,7 @@ user token works within its namespace and tag, with what its permissions allow
 
 ```bash
 fleetctl node                   # machines: capacity, READY, heartbeats, the agent's VERSION
-fleetctl node NAME              # one machine's record
+fleetctl node NAME              # one machine's record, with its CPU and GPU architecture
 fleetctl app                    # every app with its state, allocation and node
 fleetctl app logs APP -n 200    # an app's last log lines, read from where it runs
 fleetctl job -a                 # queued and running batch jobs and submitted proofs
@@ -65,6 +65,11 @@ CPU units are logical CPUs, and Ray's pool can be smaller than the hardware.
 `fleetctl node` shows total and free GPUs and CPUs; app listings show configured
 allocations, disabled apps included, not live use. Namespace and tag quotas cap
 allocations further.
+
+`fleetctl node NAME` also shows what the machine runs on, detected once when its
+agent starts: the CPU architecture and model, and each GPU's name, CUDA compute
+capability, architecture (for example Blackwell), memory and driver. Agents
+older than this report leave it out.
 
 ```bash
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 \
