@@ -57,6 +57,10 @@ def convert(config, names, image):
         root = entry.get('proof_storage_root', '')
         if not Path(root).is_absolute() or not re.fullmatch('[0-9a-fA-F]{64}', entry.get('elf_id', '')):
             raise ValueError("retain an absolute proof_storage_root and the existing full ELF identity")
+        cpus = entry.get('cpus', 1)
+        if type(cpus) is not int or cpus < 1:
+            raise ValueError(f"{entry['name']}: cpus must be a whole number of CPUs, at least 1, as the "
+                f"scheduler requires; it is {cpus!r}")
         env = dict(entry.get('env') or {})
         env.update(FLEET_NODE_NAME='{name}', FLEET_MACHINE='{machine}',
             FLEET_SCHEDULER='{scheduler}', FLEET_CLUSTER_TOKEN_FILE='{cluster_token_file}',
@@ -95,7 +99,7 @@ def convert(config, names, image):
         # CPUs are a resource, not an update setting: the app record gets them from
         # `fleetctl app scale --cpus`, or the scheduler restores its own count.
         updates.append(dict(entry=entry['name'], app=entry.get('app', entry['name']),
-            namespace=entry['namespace'], cpus=entry.get('cpus', 1), set=settings))
+            namespace=entry['namespace'], cpus=cpus, set=settings))
     return result, updates
 
 

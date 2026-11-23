@@ -109,11 +109,9 @@ def test_cutover_refuses_a_volume_the_shim_would_mount_at_another_path(tmp_path,
     assert json.dumps(cfg) == original
 
 
-@pytest.mark.parametrize('kind', ['ziren-gpu', 'ziren-cpu'])
-@pytest.mark.parametrize('cpus,carried', [(8, 8), (2.5, 2.5), (None, 1)])
-def test_cutover_carries_each_entrys_cpus_as_its_reservation(tmp_path, kind, cpus, carried):
+@pytest.mark.parametrize('cpus,carried', [(8, 8), (None, 1)])
+def test_cutover_carries_each_entrys_cpus_as_its_reservation(tmp_path, cpus, carried):
     cfg = configuration(tmp_path)
-    cfg['apps'][0]['kind'] = kind
     if cpus is None:
         del cfg['apps'][0]['cpus']
     else:
@@ -123,6 +121,16 @@ def test_cutover_carries_each_entrys_cpus_as_its_reservation(tmp_path, kind, cpu
     assert updated['apps'][0].get('cpus') == cpus and updates[0]['cpus'] == carried
     # The scheduler takes CPUs only through a scale, never as an update setting.
     assert 'cpus' not in updates[0]['set'] and updated['apps'][0]['env']['FLEET_CPUS'] == '{cpu_count}'
+
+
+@pytest.mark.parametrize('cpus', [0, -1, 0.5, 2.5, 8.0, '8', True])
+def test_cutover_requires_whole_cpus(tmp_path, cpus):
+    cfg = configuration(tmp_path)
+    cfg['apps'][0]['cpus'] = cpus
+    # As the scheduler requires; `{cpu_count}` sets RAYON_NUM_THREADS from it.
+    with pytest.raises(ValueError, match=f"policy-node: cpus must be a whole number of CPUs, at least 1, as the "
+                       f"scheduler requires; it is {re.escape(repr(cpus))}"):
+        migration.convert(cfg, ['policy-node'], IMAGE)
 
 
 def test_cli_migrates_a_gpu_entry_without_cpus(tmp_path):
