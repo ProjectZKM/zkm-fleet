@@ -72,6 +72,12 @@ without switching the running shim or restarting its service. Keep the state pat
 short enough that `state/control.sock` is under Linux's 108-byte Unix socket limit.
 Configure `shim_network` in that same file for service forwarding; runtime drivers
 and network credentials retain their existing validation and authorization.
+A release package also carries the pinned Chisel tunnel helper
+(`trusted-router-tunnel`, built from the Router revision the bundled shim locks and
+recorded in `VERSION`). The installer stages it under
+`libexec/trusted-router-tunnel/<sha256>/` and prints that path, but never selects
+it: without `shim_network.tunnel_binary` the existing transport is kept. Selecting
+it is a maintenance step described in docs/maintenance.md.
 The installer preserves existing YAML text and mode, validates the pinned binary's
 hash and publishes it atomically. The Ray service runs its watchdog every 30 seconds,
 including temp-link repair, while the node waits for shim readiness before connecting.

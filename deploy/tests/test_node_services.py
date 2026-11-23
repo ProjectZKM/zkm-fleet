@@ -136,3 +136,33 @@ def test_symlink_workdir_keeps_the_inherited_lock(services):
         'bash',str(ROOT/'deploy/install-node-services.sh'),str(prefix),str(etc),str(root/'work'),str(binary)]
     result=subprocess.run(args,env={**os.environ,'PATH':str(root/'commands')+':'+os.environ['PATH']},capture_output=True,text=True,timeout=20)
     assert result.returncode == 0,result.stderr
+
+
+def test_bundled_tunnel_helper_is_staged_immutably_without_switching_transport(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    helper=root/'trusted-router-tunnel';helper.write_bytes(b'first-helper');helper.chmod(0o755)
+    first=run();assert first.returncode==0,first.stderr
+    staged=lambda content: prefix/'libexec/trusted-router-tunnel'/hashlib.sha256(content).hexdigest()/'trusted-router-tunnel'
+    assert staged(b'first-helper').read_bytes()==b'first-helper'
+    assert staged(b'first-helper').stat().st_mode & 0o777 == 0o755
+    assert str(staged(b'first-helper')) in first.stderr
+    # Staging never selects Chisel: transport choice stays an operator edit.
+    assert 'tunnel_binary' not in config.read_text() and 'shim_network' not in yaml.safe_load(config.read_text())
+    before=config.read_bytes()
+    helper.write_bytes(b'second-helper')
+    second=run();assert second.returncode==0,second.stderr
+    # A live shim may still execute the old helper; both stay addressable.
+    assert staged(b'first-helper').read_bytes()==b'first-helper'
+    assert staged(b'second-helper').read_bytes()==b'second-helper'
+    assert config.read_bytes()==before
+    assert ' restart ' not in log.read_text() and ' stop ' not in log.read_text()
+
+
+def test_non_executable_bundled_tunnel_helper_is_rejected_before_changes(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    helper=root/'trusted-router-tunnel';helper.write_bytes(b'helper');helper.chmod(0o644)
+    before=config.read_bytes()
+    result=run()
+    assert result.returncode!=0 and 'trusted-router-tunnel is not an executable' in result.stderr
+    assert config.read_bytes()==before and not log.exists()
+    assert not (prefix/'libexec').exists()

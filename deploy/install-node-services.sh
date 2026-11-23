@@ -3,6 +3,12 @@
 set -euo pipefail
 PREFIX=$1; ETC=$2; WORKDIR=$3; SHIM=$4
 die(){ echo "[node-services] $*" >&2; exit 1; }
+# A release bundle carries the pinned Chisel helper next to the shim binary.
+TUNNEL=
+if [ -e "$(dirname "$SHIM")/trusted-router-tunnel" ]; then
+  TUNNEL="$(dirname "$SHIM")/trusted-router-tunnel"
+  [ -f "$TUNNEL" ] && [ -x "$TUNNEL" ] || die "bundled trusted-router-tunnel is not an executable file"
+fi
 for path in "$PREFIX" "$ETC" "$WORKDIR"; do
   [[ "$path" = /* && "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *'%'* && "$path" != *'$'* ]] || die "unsupported service path"
 done
@@ -64,15 +70,19 @@ restore() {
 }
 trap restore EXIT
 USER_NAME=$(id -un)
-HASH=$(sha256sum "$SHIM" | cut -d ' ' -f 1)
-DEST="$PREFIX/libexec/trusted-shim/$HASH/trusted-shim-runtime"
-mkdir -p "$(dirname "$DEST")"
-# An interrupted copy cannot poison a content-addressed path permanently.
-if [ ! -f "$DEST" ] || [ "$(sha256sum "$DEST" | cut -d ' ' -f 1)" != "$HASH" ]; then
-  TEMP=$(mktemp "$DEST.XXXXXX")
-  install -m 755 "$SHIM" "$TEMP"
-  [ "$(sha256sum "$TEMP" | cut -d ' ' -f 1)" = "$HASH" ] || die "shim copy checksum mismatch"
-  "$PYTHON" - "$TEMP" "$DEST" <<'PY'
+# Publish SRC at $PREFIX/libexec/DIR/<sha256>/FILE and set PINNED to that path.
+# Existing hashes are never replaced, so live processes keep their executable.
+pin() {
+  local src=$1 dir=$2 name=$3 hash dest
+  hash=$(sha256sum "$src" | cut -d ' ' -f 1)
+  dest="$PREFIX/libexec/$dir/$hash/$name"
+  mkdir -p "$(dirname "$dest")"
+  # An interrupted copy cannot poison a content-addressed path permanently.
+  if [ ! -f "$dest" ] || [ "$(sha256sum "$dest" | cut -d ' ' -f 1)" != "$hash" ]; then
+    TEMP=$(mktemp "$dest.XXXXXX")
+    install -m 755 "$src" "$TEMP"
+    [ "$(sha256sum "$TEMP" | cut -d ' ' -f 1)" = "$hash" ] || die "$name copy checksum mismatch"
+    "$PYTHON" - "$TEMP" "$dest" <<'PY'
 import os, sys
 from pathlib import Path
 with open(sys.argv[1], 'rb') as f: os.fsync(f.fileno())
@@ -81,6 +91,17 @@ fd=os.open(Path(sys.argv[2]).parent, os.O_RDONLY | os.O_DIRECTORY)
 try: os.fsync(fd)
 finally: os.close(fd)
 PY
+    TEMP=
+  fi
+  PINNED=$dest
+}
+pin "$SHIM" trusted-shim trusted-shim-runtime
+DEST=$PINNED
+# Stage the bundled Chisel helper only. Selecting it is an explicit operator
+# change to shim_network.tunnel_binary; omitting it keeps the existing transport.
+if [ -n "$TUNNEL" ]; then
+  pin "$TUNNEL" trusted-router-tunnel trusted-router-tunnel
+  echo "[node-services] staged Chisel helper at $PINNED (select via shim_network.tunnel_binary)" >&2
 fi
 (cd "$PREFIX/bridge" && "$PYTHON" - "$ETC/apps.yaml" "$DEST" "$WORKDIR/shim" <<'PY'
 import json, os, sys, yaml

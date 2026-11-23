@@ -145,6 +145,16 @@ staged executable, then start the service and run `fleet_bridge.shim check` befo
 resuming workloads. Preserve `shim_state_dir` and its allocation/replay journals.
 Do not turn a routine node upgrade into an implicit runtime migration.
 
+To move a shim node's service forwarding onto the pinned Chisel transport, use the
+same maintenance window: drain the node and confirm cleanup as above, then set
+`shim_network.tunnel_binary` in the existing `apps.yaml` to the staged
+`libexec/trusted-router-tunnel/<sha256>/trusted-router-tunnel` path the installer
+printed, and run `fleet_bridge.shim check`. The node then advertises
+`shim-chisel-network-v1`; a configured helper that fails does not fall back to the
+old transport. Rollback is the reverse edit: restore the previous path, or remove
+the key to return to the existing transport. Staged hashes are never replaced or
+removed by reinstalling, so the previous helper stays available.
+
 Run the real systemd acceptance against local, isolated services (no local prover):
 
 ```sh

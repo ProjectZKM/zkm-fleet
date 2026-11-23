@@ -8965,7 +8965,7 @@ dependencies = [
 [[package]]
 name = "trusted-attestation-types"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=87cf55fe4675e619647d73deb995601c02153ddc#87cf55fe4675e619647d73deb995601c02153ddc"
+source = "git+https://github.com/attestx/trusted-shim?rev=f7e64eecce1ac36954b42bd703481dd3b091f31c#f7e64eecce1ac36954b42bd703481dd3b091f31c"
 dependencies = [
  "anyhow",
  "hex",
@@ -9012,7 +9012,7 @@ dependencies = [
 [[package]]
 name = "trusted-router-transport"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-data-router?rev=ee5f97cf8eb4eeb4e0051f83d7d1a8ca207178b0#ee5f97cf8eb4eeb4e0051f83d7d1a8ca207178b0"
+source = "git+https://github.com/attestx/trusted-data-router?rev=d489e4156255075d1c7863040507398055fea270#d489e4156255075d1c7863040507398055fea270"
 dependencies = [
  "async-trait",
  "axum 0.8.9",
@@ -9043,7 +9043,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=87cf55fe4675e619647d73deb995601c02153ddc#87cf55fe4675e619647d73deb995601c02153ddc"
+source = "git+https://github.com/attestx/trusted-shim?rev=f7e64eecce1ac36954b42bd703481dd3b091f31c#f7e64eecce1ac36954b42bd703481dd3b091f31c"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
