@@ -464,10 +464,24 @@ configuration changes. Healthy unchanged legacy replicas are preserved. Directly
 editing a live app's executor cannot replace its actor. An uncertain shim launch or
 cleanup retains its reservation and never falls back to Docker directly. A stopped
 or lost shim execution needs explicit cleanup and a new generation to run again.
+With the persistent shim (`runtime-resume-v1`), a Docker runtime whose container
+exited is started again in place: by a health probe, and when its actor starts
+again after a Ray restart or a reboot.
 Keep the allocation and shim journals across upgrades and restarts.
 
-Shim delegates lifecycle to upstream Docker, applies CPU/memory hard limits and
-checks effective limits before start. Its service port is published only on local
+Shim delegates lifecycle to upstream Docker and checks a container's effective
+CPU/memory limits against the launch request before start. A Docker runtime runs
+the way a legacy app does: Ray reserves its `cpus` and `memory_gb`, and the
+request sets no container limit; TEE runtimes set both as hard limits. Each
+allocation records its launch request revision, and one recorded without a
+revision keeps the hard limits and environment it was launched with until it is
+cleaned up and launched as a new generation. Before a Docker launch the bridge
+pulls a missing image (the shim creates containers with `--pull=never`) within
+the app's `ready_timeout_s`, and a failed pull fails the launch naming the image.
+A Docker `kind: app` entry with GPUs gets `NVIDIA_DRIVER_CAPABILITIES=all` unless
+its `env` sets it, as a legacy app does. The container's stdout and stderr go
+to `<log_dir>/<replica>.node.log`, which `fleetctl app logs` reads. Its service
+port is published only on local
 loopback; declared services use the independent router through outbound node
 connectors. GPU ids are Ray's assigned ids. The Docker profile is explicitly non-TEE
 and makes no shell-policy enforcement claim; it rejects attestation requirements.
@@ -838,8 +852,9 @@ PYTHONPATH=bridge TRUSTED_SHIM_TEST_BINARY=/absolute/path/trusted-shim-runtime \
 ```
 
 The test starts an isolated local Ray cluster, runs legacy and shim apps together,
-checks container ids/start times across adapter recovery, verifies Docker hard
-limits and loopback-only publication, and confirms cleanup. No live Fleet node or
+checks container ids/start times across adapter recovery, verifies that the
+container has no Docker CPU/memory limit and only loopback publication, and
+confirms cleanup. No live Fleet node or
 proof network is contacted. Without the explicit binary path this test is skipped.
 
 Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
