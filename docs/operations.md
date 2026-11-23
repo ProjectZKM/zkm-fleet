@@ -58,7 +58,7 @@ tags and quotas in full are in the [reference](reference.md#namespaces-tags-and-
 
 | Setting | Controls | Change it with |
 |---|---|---|
-| Node capacity | The total pool Fleet may allocate on a machine | Installer `--cuda` / `--cpus`, kept in `etc/watchdog.env` |
+| Node capacity | The total pool Fleet may allocate on a machine | `etc/watchdog.env`, first set by the installer's `--cuda` / `--cpus` |
 | App allocation | GPUs and CPUs per replica, and the replica count | `fleetctl app scale` |
 
 CPU units are logical CPUs, and Ray's pool can be smaller than the hardware.
@@ -190,12 +190,14 @@ When `fleetctl app` shows an app `starting`, DETAIL says why:
 On the node itself:
 
 ```bash
-tail -f ~/app/fleet/work/logs/node.log
+tail -f ~/app/fleet/work/logs/node.log               # with the cron watchdog
 journalctl -u zkm-fleet-node.service -f              # with a systemd supervisor
 tail -f ~/app/fleet/work/logs/ethproofs-v5-gpu-0.node.log   # the EthProofs worker
 ```
 
-For an offline node, check its supervisor, `ray.log`, `watchdog.log`, the gateway
-URL, the cluster token and CA trust. For a stalled app, read its worker or container
-logs and reporting errors. EthProofs retries failed blocks: diagnose the error rather
-than move the cursor ahead. [Maintenance](maintenance.md#troubleshooting) has more.
+For an offline node, check its supervisor and its logs (`watchdog.log` and `node.log`
+with cron, `journalctl -u zkm-fleet-node -u zkm-fleet-ray -u zkm-fleet-shim` with
+systemd), `ray.log`, the gateway URL, the cluster token and CA trust. For a stalled
+app, read its worker or container logs and reporting errors. EthProofs retries failed
+blocks: diagnose the error rather than move the cursor ahead.
+[Maintenance](maintenance.md#troubleshooting) has more.
