@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::process::Command;
 
 #[test]
-fn node_views_show_total_and_free_cpu_gpu_resources() {
+fn node_views_show_total_and_free_cpu_gpu_resources_and_the_hard_limits_apart() {
     for detail in [false, true] {
         for json in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -17,6 +17,7 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
             let node = serde_json::json!({
                 "id": "gpu-box", "name": "gpu-box", "backend": "ray-local",
                 "gpus": 8, "cpus": 48, "free_gpus": 2, "free_cpus": 0,
+                "reserved_cpus": 40, "cpu_limits": 6.5, "memory_limits_gb": 12,
                 "machine": "gpu-machine", "ready": true, "draining": false,
                 "busy": null, "agent_version": "v0.1.6", "heartbeat_age_ms": 1000
             });
@@ -94,6 +95,9 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                         "cpus 48",
                         "free_gpus 2",
                         "free_cpus 0",
+                        "reserved_cpus 40",
+                        "cpu_limits 6.5",
+                        "memory_limits_gb 12",
                         "agent_version v0.1.6",
                     ] {
                         assert!(
@@ -111,7 +115,9 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                         header.contains("VERSION")
                             && header.contains("CPUS")
                             && header.contains("FREE GPUS")
-                            && header.contains("FREE CPUS"),
+                            && header.contains("FREE CPUS")
+                            && header.contains("RESERVED CPUS")
+                            && header.contains("CPU LIMITS"),
                         "{text}"
                     );
                     let cells: Vec<_> = text
@@ -119,11 +125,11 @@ fn node_views_show_total_and_free_cpu_gpu_resources() {
                         .nth(1)
                         .unwrap()
                         .split_whitespace()
-                        .take(7)
+                        .take(10)
                         .collect();
                     assert_eq!(
                         cells,
-                        ["gpu-box", "ray-local", "v0.1.6", "8", "48", "2", "0"],
+                        ["gpu-box", "ray-local", "v0.1.6", "8", "48", "2", "0", "40", "6.5", "12"],
                         "{text}"
                     );
                 }

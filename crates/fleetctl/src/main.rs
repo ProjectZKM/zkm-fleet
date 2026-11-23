@@ -103,8 +103,13 @@ enum AppCmd {
         name: String,
         /// GPU units per replica (proof servers require whole cards).
         #[arg(long)] gpus: Option<f64>,
-        /// CPU units per replica.
-        #[arg(long)] cpus: Option<u32>,
+        /// CPUs Ray reserves per replica: a whole number, or 0 or a fraction for a shim app
+        /// without GPUs that also has --cpu-limit, memory_gb and --memory-limit-gb.
+        #[arg(long)] cpus: Option<f64>,
+        /// Hard CPU limit of each replica's container (fractions allowed; shim apps only).
+        #[arg(long)] cpu_limit: Option<f64>,
+        /// Hard memory limit of each replica's container, in GiB (shim apps only).
+        #[arg(long)] memory_limit_gb: Option<f64>,
         /// The app's replicas, wherever the scheduler places them (positive; use app disable to
         /// stop all). Fewer than it runs: the scheduler stops the extra ones, and a node left with
         /// none removes the app.
@@ -474,7 +479,8 @@ struct AddApp {
     name: String,
     /// A JSON file with the app's container settings, the keys of its apps.yaml entry: kind
     /// (app, the default, or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus,
-    /// shm_gb, memory_gb, env, volumes, ready_timeout_s, stop_timeout_s; for an app also command,
+    /// shm_gb, memory_gb, env, volumes, ready_timeout_s, stop_timeout_s, and for a shim app the
+    /// hard limits cpu_limit and memory_limit_gb; for an app also command,
     /// port_base, health_path, workdir, user; for a prover proof_storage_root, backend, rust_log.
     /// image is required, and port_base for an app; user, volumes and proof_storage_root need
     /// administrator credentials.
@@ -833,6 +839,10 @@ const NODE_COLS: &[out::TableColumn] = &[
     col("CPUS", "cpus"),
     col("FREE GPUS", "free_gpus"),
     col("FREE CPUS", "free_cpus"),
+    // What its enabled apps reserve, and the hard limits of those that set them.
+    col("RESERVED CPUS", "reserved_cpus"),
+    col("CPU LIMITS", "cpu_limits"),
+    col("MEMORY LIMITS GB", "memory_limits_gb"),
     col("MACHINE", "machine"),
     col("READY", "state"),
     col("BUSY WITH", "busy"),
@@ -1009,6 +1019,10 @@ const APP_COLS: &[out::TableColumn] = &[
     col("STATE", "state"),
     col("GPUS", "/resources/gpus"),
     col("CPUS", "/resources/cpus"),
+    // Ray's memory reservation and the containers' hard limits, where the app sets them.
+    col("MEMORY GB", "/resources/memory_gb"),
+    col("CPU LIMIT", "/resources/cpu_limit"),
+    col("MEMORY LIMIT GB", "/resources/memory_limit_gb"),
     col("NODE", "/resources/nodes"),
     col("LAST JOB", "last_at"),
     col("DETAIL", "detail"),
@@ -1064,17 +1078,27 @@ fn app_logs(name: &str, lines: u32, node: Option<&str>, conn: &ConnectionOptions
     Ok(())
 }
 
-fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<u32>, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+/// What `fleetctl app scale` changes, each `None` where its flag is not given.
+struct Scale {
+    gpus: Option<f64>,
+    cpus: Option<f64>,
+    replicas: Option<u32>,
+    cpu_limit: Option<f64>,
+    memory_limit_gb: Option<f64>,
+}
+
+fn scale_app(name: &str, scale: Scale, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     let mut body = json!({});
-    if let Some(v) = gpus {
-        if !v.is_finite() || v < 0.0 { bail!("--gpus must be finite and nonnegative"); }
-        body["gpus"] = json!(v);
+    for (key, value) in [("gpus", scale.gpus), ("cpus", scale.cpus), ("cpu_limit", scale.cpu_limit), ("memory_limit_gb", scale.memory_limit_gb)] {
+        let Some(v) = value else { continue };
+        if !v.is_finite() || v < 0.0 { bail!("--{} must be finite and nonnegative", key.replace('_', "-")); }
+        // A whole number goes as an integer, which a scheduler that counts whole CPUs reads.
+        body[key] = if v.fract() == 0.0 && v < 1e15 { json!(v as u64) } else { json!(v) };
     }
-    if let Some(v) = cpus { body["cpus"] = json!(v); }
-    if let Some(v) = replicas { body["replicas"] = json!(v); }
+    if let Some(v) = scale.replicas { body["replicas"] = json!(v); }
     let write = !body.as_object().unwrap().is_empty();
     if write && node.is_some() {
-        bail!("replicas, GPUs and CPUs are the app's settings: scale it without --node, and the scheduler places its replicas");
+        bail!("replicas, GPUs, CPUs and limits are the app's settings: scale it without --node, and the scheduler places its replicas");
     }
     let method = if write { reqwest::Method::PUT } else { reqwest::Method::GET };
     let a = FleetClient::new(conn)?;
@@ -1084,7 +1108,11 @@ fn scale_app(name: &str, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<
     // One node's part names its node; the app's names all of them.
     let nodes = v["nodes"].as_array().map(|n| n.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
         .or_else(|| v["node"].as_str().map(str::to_owned)).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into());
-    out.done(&format!("{name}: {} — {} replicas, {} GPUs and {} CPUs per replica on {nodes}",
+    // Hard limits, beside the reservation, where the app sets them.
+    let limits = [("CPUs", &v["cpu_limit"]), ("GiB", &v["memory_limit_gb"])].iter()
+        .filter(|(_, l)| !l.is_null()).map(|(unit, l)| format!("{l} {unit}")).collect::<Vec<_>>();
+    let limits = if limits.is_empty() { String::new() } else { format!(", limited to {}", limits.join(" and ")) };
+    out.done(&format!("{name}: {} — {} replicas, {} GPUs and {} CPUs per replica{limits} on {nodes}",
         v["state"].as_str().unwrap_or("requested"), v["replicas"], v["gpus"], v["cpus"]),v);
     Ok(())
 }
@@ -1266,7 +1294,9 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
-        Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
+        Some(AppCmd::Scale { name, gpus, cpus, replicas, node, cpu_limit, memory_limit_gb }) => return scale_app(name,
+            Scale { gpus: *gpus, cpus: *cpus, replicas: *replicas, cpu_limit: *cpu_limit, memory_limit_gb: *memory_limit_gb },
+            node.as_deref(), &p.conn, out),
         Some(AppCmd::Update { name, settings, image, env, shm_gb, node }) => {
             let mut set = match settings {
                 Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,

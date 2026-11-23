@@ -91,7 +91,7 @@ fn app_list() -> String {
         {"type":"app", "name":"comfyui", "namespace":"alice",
          "tags":["scope=default"], "state":"starting", "priority":0, "disabled":false,
          "detail":"waiting for capacity: needs 1 GPU and 2 CPU, gpu-machine has 0 GPU and 8 CPU free",
-         "resources":{"gpus":1,"cpus":2,"replicas":1,"nodes":["gpu-machine"]},
+         "resources":{"gpus":1,"cpus":2,"memory_gb":3,"cpu_limit":2.5,"memory_limit_gb":4,"replicas":1,"nodes":["gpu-machine"]},
          "jobs":{"total":0,"active":0,"succeeded":0,"failed":0,"last_at":3.0},
          "spec":{"image":"comfyui:latest"}},
         {"type":"app", "name":"ethproofs", "namespace":"alice",
@@ -145,8 +145,12 @@ fn app_list_shows_why_a_starting_app_is_not_running() {
     let row = table.lines().find(|l| l.contains("comfyui")).unwrap();
     assert!(row.contains("starting") && row.contains("waiting for capacity: needs 1 GPU and 2 CPU"), "{row}");
     assert!(row.ends_with("comfyui:latest") && !row.contains("image comfyui"), "the image is a column, not a detail: {row}");
+    assert!(head.contains("CPUS") && head.contains("MEMORY GB") && head.contains("CPU LIMIT") && head.contains("MEMORY LIMIT GB"), "{table}");
+    let words = |row: &str| row.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words(row).contains(" 1 2 3 2.5 4 gpu-machine "), "the reservation, then the hard limits: {row}");
     let row = table.lines().find(|l| l.contains("ethproofs")).unwrap();
     assert!(row.starts_with("ethproofs") && row.contains("mean prove 1.2 s"), "{row}");
+    assert!(words(row).contains(" 6 48 - - - gpu-machine "), "an app without them shows none: {row}");
     assert!(row.ends_with("ghcr.io/projectzkm/ziren-gpu@sha256:d4b8"), "a proof app shows its prover image: {row}");
 }
 
@@ -217,6 +221,10 @@ fn app_commands_address_every_app_by_its_name() {
         (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"name":"comfyui","disabled":false,"spec":{"image":"comfyui:1"}}"#),
         (vec!["scale", "ethproofs", "--replicas", "2"], "PUT", "/scale", serde_json::json!({"replicas":2}),
             r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"nodes":["gpu-box"]}"#),
+        (vec!["scale", "agent", "--cpus", "0", "--cpu-limit", "1.5", "--memory-limit-gb", "4"], "PUT", "/scale",
+            serde_json::json!({"cpus":0,"cpu_limit":1.5,"memory_limit_gb":4}),
+            r#"{"state":"draining","replicas":1,"gpus":0,"cpus":0,"cpu_limit":1.5,"memory_limit_gb":4,"nodes":["gpu-box"]}"#),
+        (vec!["scale", "agent", "--cpus", "0.5"], "PUT", "/scale", serde_json::json!({"cpus":0.5}), r#"{"state":"draining"}"#),
         (vec!["update", "comfyui", "--image", "comfyui:2"], "PUT", "/settings", serde_json::json!({"image":"comfyui:2"}),
             r#"{"state":"draining","node":"gpu-box"}"#),
     ] {
@@ -254,6 +262,32 @@ fn app_scale_takes_no_node_and_inspects_one_nodes_part() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(seen[0].line.starts_with("GET /apps/comfyui/scale?namespace=alice&node=gpu-box"), "{}", seen[0].line);
     assert!(String::from_utf8_lossy(&output.stdout).contains("on gpu-box"), "{}", String::from_utf8_lossy(&output.stdout));
+}
+
+/// A scale prints what Ray reserves and, apart, the hard limits an app sets.
+#[test]
+fn app_scale_shows_the_reservation_and_the_hard_limits_apart() {
+    for (reply, expected) in [
+        (r#"{"state":"complete","replicas":2,"gpus":0,"cpus":0,"cpu_limit":1.5,"memory_limit_gb":4,"nodes":["gpu-box"]}"#,
+            "agent: complete — 2 replicas, 0 GPUs and 0 CPUs per replica, limited to 1.5 CPUs and 4 GiB on gpu-box"),
+        (r#"{"state":"complete","replicas":1,"gpus":1,"cpus":4,"nodes":["gpu-box"]}"#,
+            "agent: complete — 1 replicas, 1 GPUs and 4 CPUs per replica on gpu-box"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let token = token_file("app-scale-limits");
+        let server = stub(listener, 1, move |_, _| (200, reply.into()));
+        let output = cli().args(["--namespace", "alice", "--url", &url, "--token-file"]).arg(&token)
+            .args(["app", "scale", "agent"]).output().unwrap();
+        server.join().unwrap();
+        std::fs::remove_file(token).unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected), "{}", String::from_utf8_lossy(&output.stdout));
+    }
+    let output = cli().args(["--namespace", "alice", "--url", "http://127.0.0.1:9", "--token-file", "/dev/null"])
+        .args(["app", "scale", "agent", "--cpu-limit=-1"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--cpu-limit must be finite and nonnegative"));
 }
 
 #[test]
