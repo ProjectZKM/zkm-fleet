@@ -1392,6 +1392,12 @@ current user token, and the scheduler applies its namespace, tag and grants. A c
 must support remote Streamable HTTP and a configurable Bearer header; one that runs
 only local `stdio` servers can't connect.
 
+The repository's `.mcp.json` configures this server for Claude Code from two
+environment variables: `FLEET_MCP_URL` (your gateway's `/mcp` URL) and
+`FLEET_MCP_AUTH` (the user token). The server accepts only the `Host` values in
+`FLEET_MCP_ALLOWED_HOSTS`, which the control host install sets from `--public-url`;
+without it, only loopback.
+
 | Tool | Does |
 |---|---|
 | `fleet_apps_list`, `fleet_app_get` | `fleetctl app`, `fleetctl app NAME` |

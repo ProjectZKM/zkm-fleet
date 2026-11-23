@@ -534,7 +534,7 @@ async fn main() -> Result<()> {
     let fleet = FleetctlClient::from_env();
     let bind = env::var("FLEET_MCP_BIND").unwrap_or_else(|_| "127.0.0.1:8906".into());
     let allowed_hosts = env::var("FLEET_MCP_ALLOWED_HOSTS")
-        .unwrap_or_else(|_| "127.0.0.1:8906,localhost:8906,34.215.238.232".into());
+        .unwrap_or_else(|_| "127.0.0.1:8906,localhost:8906".into());
     let allowed_hosts = allowed_hosts
         .split(',')
         .map(str::trim)
