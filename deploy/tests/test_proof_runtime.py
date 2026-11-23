@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
@@ -89,6 +90,29 @@ def test_cutover_reuses_safe_mounts_and_refuses_readonly_storage(tmp_path):
         cfg['apps'][0]['volumes'] = volumes
         with pytest.raises(ValueError, match='mounts'):
             migration.convert(cfg, ['policy-node'], IMAGE)
+
+
+@pytest.mark.parametrize('legacy,converted', [('/data/models:/data/models:ro', '/data/models:ro'),
+    ('/data/models:/data/models', '/data/models'), ('/data/models:ro', '/data/models:ro'),
+    ('/data/models', '/data/models'), ('/data/models:rslave,ro', '/data/models:rslave,ro')])
+def test_cutover_writes_volumes_the_way_the_shim_mounts_them(tmp_path, legacy, converted):
+    cfg = configuration(tmp_path)
+    root = cfg['apps'][0]['proof_storage_root']
+    cfg['apps'][0]['volumes'] = [legacy, f'{root}:{root}:rslave']
+    updated, updates = migration.convert(cfg, ['policy-node'], IMAGE)
+    volumes = [converted, root + ':rslave', '{cluster_token_file}:ro']
+    assert updated['apps'][0]['volumes'] == volumes and updates[0]['set']['volumes'] == volumes
+
+
+@pytest.mark.parametrize('volume', ['/data/models:/models:ro', '/data/models:/models', 'models:/models',
+    '/data/models:{proof_storage_root}', '/data/models:/data/models:ro:extra'])
+def test_cutover_refuses_a_volume_the_shim_would_mount_at_another_path(tmp_path, volume):
+    cfg = configuration(tmp_path)
+    cfg['apps'][0]['volumes'] = ['/data/cache:ro', volume]
+    original = json.dumps(cfg)
+    with pytest.raises(ValueError, match=re.escape(f'policy-node: volume {volume!r}')):
+        migration.convert(cfg, ['policy-node'], IMAGE)
+    assert json.dumps(cfg) == original
 
 
 @pytest.mark.parametrize('failed,code', [('zkm-gpu-server',7), ('fleet-ziren-node',0), (None,None)])

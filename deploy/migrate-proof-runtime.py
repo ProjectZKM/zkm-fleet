@@ -14,6 +14,23 @@ import re
 import yaml
 
 
+def shim_volume(name, volume):
+    """A volume in the shim's `path[:options]` form. The shim mounts each volume at its host
+    path, so a legacy `host:container[:options]` volume converts only when both are the same."""
+    if not isinstance(volume, str):
+        raise ValueError(f"{name}: volume {volume!r} must be a string")
+    parts = volume.split(':')
+    if len(parts) == 1 or len(parts) == 2 and not parts[1].startswith(('/', '{')):
+        return volume
+    if len(parts) > 3:
+        raise ValueError(f"{name}: volume {volume!r} is not path[:options] or host:container[:options]")
+    host, container, *options = parts
+    if host != container:
+        raise ValueError(f"{name}: volume {volume!r} mounts {host} at {container}, but the shim mounts each "
+            "volume at its own host path; make the app use the host path, or provide the data at the container path")
+    return host + (':' + options[0] if options and options[0] else '')
+
+
 def convert(config, names, image):
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("use the complete proof-worker image by registry digest")
@@ -51,7 +68,7 @@ def convert(config, names, image):
             FLEET_GPU_ENDPOINT='http://127.0.0.1:3000/twirp/', ZIREN_SERVER_PORT='3000',
             CUDA_VISIBLE_DEVICES='{gpus}', ZKM_GPU_DEVICES='{gpus}',
             RAYON_NUM_THREADS='{cpu_count}', RUST_LOG=entry.get('rust_log', 'info'))
-        volumes = list(entry.get('volumes') or [])
+        volumes = [shim_volume(entry['name'], v) for v in entry.get('volumes') or []]
         # Storage paths stay identical: persisted file:// references and completed
         # lease markers remain valid. Only the credential FILE is mounted read-only.
         def mount(path, template, readonly):
