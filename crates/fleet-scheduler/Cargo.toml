@@ -22,6 +22,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+libc = "0.2"
 sqlx.workspace = true
 tokio.workspace = true
 tonic.workspace = true
@@ -30,13 +31,25 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 rand = "0.8"
 reqwest.workspace = true
+base64 = "0.22"
+fs2 = "0.4"
+prost-native = { package = "prost", version = "0.14" }
+tonic-native = { package = "tonic", version = "0.14", features = ["transport", "tls-ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "23414952b888ea2328ae1fcbbcfdcdafb498655d", features = ["ziren"] }
 
 [dev-dependencies]
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 bincode.workspace = true
 prost.workspace = true
+prost-types-native = { package = "prost-types", version = "0.14" }
+rcgen = "0.14"
 fleet-proof-app = { path = "../fleet-proof-app" }
 fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
-tokio-stream = { version = "0.1", features = ["net"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
+trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "d489e4156255075d1c7863040507398055fea270" }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"

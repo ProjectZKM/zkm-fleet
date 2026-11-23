@@ -72,6 +72,9 @@ pub struct ProverArgs {
     /// would keep its name registered and point it at a GPU server port another node reuses.
     #[arg(long, env = "FLEET_EXIT_WITH_PARENT", default_value_t = false)]
     exit_with_parent: bool,
+    /// Optional container health listener. The node publishes it only on loopback.
+    #[arg(long, env = "FLEET_HEALTH_ADDR")]
+    health_addr: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -89,10 +92,27 @@ async fn main() -> anyhow::Result<()> {
     let token = fleet_proto::load_token(&args.cluster_token_file)?;
 
     let node = Arc::new(prover::ZirenProver::start(&args).await?);
+    let health_node = node.clone();
+    let health = async move {
+        let Some(address) = args.health_addr else {
+            return std::future::pending::<anyhow::Result<()>>().await;
+        };
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let app = axum::Router::new().route("/healthz", axum::routing::get(move || {
+            let node = health_node.clone();
+            async move {
+                if node.ready().await { axum::http::StatusCode::OK }
+                else { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+            }
+        }));
+        axum::serve(listener, app).await?;
+        Ok(())
+    };
     tracing::info!(backend = %args.backend, "worker ready; contacting scheduler through heartbeats");
     let control = tokio::spawn(control_loop(args.clone(), token, node.clone()));
     tokio::select! {
         r = control => r??,
+        r = health => r?,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutting down"),
         _ = parent_gone(args.exit_with_parent) => tracing::warn!("the process that started this node is gone; exiting"),
     }
@@ -125,6 +145,7 @@ async fn control_loop(args: ProverArgs, token: String, node: Arc<prover::ZirenPr
     let mut endpoint =
         Endpoint::from_shared(args.scheduler.clone())?.connect_timeout(Duration::from_secs(5));
     if endpoint.uri().scheme_str() == Some("https") {
+        fleet_proto::initialize_tls();
         let host = endpoint
             .uri()
             .host()

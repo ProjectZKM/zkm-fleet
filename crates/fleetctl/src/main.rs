@@ -117,6 +117,12 @@ enum AppCmd {
     /// takes the new settings on its node and starts again, like a scale.
     Update {
         name: String,
+        /// Settings object, sent unchanged. Accepts image, env, command, user, workdir,
+        /// volumes, port_base, shm_gb, memory_gb, health_path, stop_timeout_s,
+        /// ready_timeout_s, runtime, services, container_port, entrypoint, ingress and
+        /// service_protocol. Durable mounts and access policies need a new deployment.
+        #[arg(long, conflicts_with_all = ["image", "env", "shm_gb"])]
+        settings: Option<PathBuf>,
         /// Container image.
         #[arg(long)] image: Option<String>,
         /// K=V; repeat. Replaces the app's whole environment.
@@ -274,10 +280,10 @@ enum TokenCmd {
     /// batches, and write the client bundle.
     Issue {
         /// Approved app or batch (repeat), by name. Required unless the token may manage its
-        /// namespace.
+        /// namespace, or holds only router_sync.
         #[arg(long = "app")]
         apps: Vec<String>,
-        /// What the token may do (repeat or comma-separate): read, submit, manage.
+        /// What the token may do: read, submit, manage; or exclusive router_sync.
         #[arg(long = "permission", value_delimiter = ',', default_values_t = ["read".to_string(), "submit".to_string()])]
         permissions: Vec<String>,
         #[arg(long, default_value = "")]
@@ -1261,8 +1267,11 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node }) => return scale_app(name, *gpus, *cpus, *replicas, node.as_deref(), &p.conn, out),
-        Some(AppCmd::Update { name, image, env, shm_gb, node }) => {
-            let mut set = json!({});
+        Some(AppCmd::Update { name, settings, image, env, shm_gb, node }) => {
+            let mut set = match settings {
+                Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+                None => json!({}),
+            };
             if let Some(v) = image { set["image"] = json!(v); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
             if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }

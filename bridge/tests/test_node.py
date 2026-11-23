@@ -172,6 +172,26 @@ def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkey
     assert ReplicaHealth(name='cpu',spec='hash').is_ready
 
 
+def test_prover_executor_switch_retains_old_actor_until_explicit_cleanup(executor, monkeypatch):
+    from fleet_bridge.model import ReplicaHealth
+    cfg = yaml.safe_load(executor.apps_file.read_text())
+    app = cfg['apps'][0]
+    app.update(disabled=False, runtime={'executor':'shim','driver':'docker'},
+        image='packaged:2', port_base=0, container_port=8080)
+    cfg.update(shim_binary='/shim', shim_state_dir='/state')
+    executor.apps_file.write_text(yaml.safe_dump(cfg))
+    monkeypatch.setattr(reconcile, 'running', lambda: {'proof-0':'old-actor'})
+    monkeypatch.setattr(reconcile, 'health_of', lambda _: ReplicaHealth(name='proof-0', gpu_ready=True))
+    monkeypatch.setattr(node.shim, 'capabilities', lambda _: ['shim-prover-v1'])
+    start, stop = Mock(), Mock()
+    monkeypatch.setattr(reconcile, 'start', start)
+    monkeypatch.setattr(reconcile, 'stop', stop)
+    with pytest.raises(ValueError, match='explicit drain and confirmed cleanup'):
+        executor.set_app({'app':app, 'disabled':False}, 'upgrade')
+    start.assert_not_called()
+    stop.assert_not_called()
+
+
 def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(executor, monkeypatch):
     from fleet_bridge.model import ReplicaHealth
     monkeypatch.setattr(node.ray, 'cluster_resources', lambda: {'GPU': 8, 'CPU': 48})

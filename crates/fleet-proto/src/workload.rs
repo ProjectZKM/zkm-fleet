@@ -25,6 +25,38 @@ impl<'a> Entry<'a> {
     /// the scheduler keeps from it.
     pub const REPORTED: [&'static str; 4] = ["ready", "logs", "cleaned", "namespace_ref"];
 
+    pub fn native_access(self) -> bool {
+        self.0["access_policy_sha256"].is_string() || self.0["runtime"]["driver"] == "openshell"
+    }
+
+    /// Missing selection is permanently the legacy path, including old records.
+    pub fn runtime_capability(self) -> Option<&'static str> {
+        if self.native_access() {
+            if self.0["service_protocol"] == "tcp" {
+                return Some("shim-openshell-tcp-services-v1");
+            }
+            return Some(if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" } else { "shim-openshell-provisioning-v1" });
+        }
+        if self.is_prover() && self.0["runtime"] == json!({"executor":"shim", "driver":"docker"}) {
+            return Some("shim-prover-v1");
+        }
+        match self.0.get("runtime") {
+            None => None,
+            Some(v) if v == &json!({"executor":"legacy"}) => None,
+            Some(v) if v == &json!({"executor":"shim", "driver":"tee"}) => Some("shim-tee-v1"),
+            Some(v) if v == &json!({"executor":"shim", "driver":"tee-simulation"}) => Some("shim-tee-simulation-v1"),
+            Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
+                if self.0["service_protocol"] == "tcp" { "shim-tcp-v1" }
+                else if self.0["ingress"].as_object().is_some_and(|i| i.values().any(|v|v["single_use"]==true)) { "shim-single-use-ingress-v1" }
+                else if self.0["ingress"].as_object().is_some_and(|i| !i.is_empty()) || self.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")) { "shim-management-v1" }
+                else if self.0["port_base"].as_u64() == Some(0) { "shim-automatic-port-v1" }
+                else if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-network-v1" }
+                else if self.0.get("container_port").is_some_and(|v| !v.is_null()) || self.0.get("entrypoint").is_some_and(|v| !v.is_null()) { "shim-runtime-v2" }
+                else { "shim-docker-v1" }),
+            Some(_) => Some("unsupported-runtime"),
+        }
+    }
+
     /// The entry's own name, unique on its node.
     pub fn name(self) -> &'a str {
         text(self.0, "name")
@@ -68,6 +100,10 @@ impl<'a> Entry<'a> {
     /// In a report: nothing of the app is left running on the node.
     pub fn cleaned(self) -> bool {
         self.0["cleaned"].as_bool() == Some(true)
+    }
+    /// A native replica's durable named volumes, each `{name, target, read_only?}`.
+    pub fn durable_mounts(self) -> &'a [Value] {
+        self.0["mounts"].as_array().map(Vec::as_slice).unwrap_or_default()
     }
     /// The GPUs of each replica, when the entry gives them.
     pub fn gpus(self) -> Option<f64> {
@@ -127,6 +163,14 @@ impl<'a> Entry<'a> {
 pub struct EntryMut<'a>(pub &'a mut Value);
 
 impl EntryMut<'_> {
+    /// Heartbeats carry node-local references, never the ingress bearer itself.
+    pub fn redact_private_environment(&mut self) {
+        let names: Vec<_> = self.0["ingress"].as_object().into_iter().flat_map(|r| r.values())
+            .filter_map(|r| r["bearer_env"].as_str().map(str::to_owned)).collect();
+        if let Some(env) = self.0.get_mut("env").and_then(Value::as_object_mut) {
+            for name in names { env.insert(name.clone(), json!(format!("@fleet-local-env:{name}"))); }
+        }
+    }
     pub fn set_disabled(&mut self, disabled: bool) {
         self.0["disabled"] = json!(disabled);
     }
@@ -183,6 +227,54 @@ impl ScaleStatus {
 }
 
 impl NodeReport {
+    /// Native provisioning holds resources before there is an application route.
+    /// Only a complete set of exact, durable replica reservations counts here.
+    pub fn native_allocated(&self, entry: Entry<'_>) -> bool {
+        if !entry.native_access() || entry.disabled() {
+            return false;
+        }
+        let instances: Vec<_> = self.runtime_instances.iter().filter(|r| r.entry_name == entry.name()).collect();
+        instances.len() as u64 == entry.replicas() && (0..entry.replicas()).all(|index|
+            instances.iter().any(|r| r.execution.allocation_id == format!("{}-{index}", entry.name())
+                && r.execution.node_id == self.machine && r.execution.workload == entry.app()
+                && (r.execution.namespace == entry.namespace() || Some(r.execution.namespace.as_str()) == entry.namespace_reference())
+                && r.execution.generation > 0 && (r.ready || r.services.is_empty())))
+    }
+    pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
+        let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
+        if !entry.runtime_capability().is_none_or(has) { return false; }
+        if entry.native_access() && (entry.gpus().is_some_and(|g| g > 0.0) || !entry.durable_mounts().is_empty())
+            && !has("shim-openshell-attachments-v1") {
+            return false;
+        }
+        if entry.native_access() && (entry.0["ingress"].as_object().is_some_and(|i| !i.is_empty())
+            || entry.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")))
+            && !has("shim-openshell-ingress-v1") {
+            return false;
+        }
+        if entry.0["access_policy_sha256"].is_string() {
+            let base = match entry.0["runtime"]["driver"].as_str() {
+                Some("docker") => "shim-docker-v1", Some("tee") => "shim-tee-v1",
+                Some("tee-simulation") => "shim-tee-simulation-v1", _ => return false,
+            };
+            return has("shim-openshell-access-v1") && has(base);
+        }
+        if entry.0["runtime"]["driver"] == "docker" && !has("shim-docker-v1") { return false; }
+        if !crate::model::v1::RegisterAppRequest::local_container_runtime(entry.0.get("runtime")) { return true; }
+        [
+            ("shim-network-v1", entry.0["services"].as_array().is_some_and(|s| !s.is_empty())),
+            ("shim-tcp-v1", entry.0["runtime"]["driver"] != "docker" && entry.0["service_protocol"] == "tcp"),
+            ("shim-management-v1", entry.0["runtime"]["driver"] != "docker" && (entry.0["ingress"].as_object().is_some_and(|v| !v.is_empty()) || entry.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")))),
+            ("shim-single-use-ingress-v1", entry.0["runtime"]["driver"] != "docker" && entry.0["ingress"].as_object().is_some_and(|v| v.values().any(|r| r["single_use"] == true))),
+            ("shim-runtime-v2", entry.0.get("container_port").is_some_and(|v| !v.is_null()) || entry.0.get("entrypoint").is_some_and(|v| !v.is_null())),
+            ("shim-automatic-port-v1", entry.0["port_base"].as_u64() == Some(0)),
+            ("shim-private-env-v1", entry.0["ingress"].as_object().is_some_and(|i| i.values().any(|r| r["bearer_env"].is_string()))),
+        ].into_iter().all(|(cap, needed)| !needed || has(cap))
+    }
+    pub fn supports_cleanup(&self, entry: Entry<'_>) -> bool {
+        entry.runtime_capability().is_none() || self.supports_runtime(entry)
+            || self.runtime_capabilities.iter().any(|c| c == "shim-cleanup-v1")
+    }
     /// The entries the node configures, with how each runs there.
     pub fn entries(&self) -> impl Iterator<Item = Entry<'_>> {
         self.apps.iter().map(|v| Entry(v))

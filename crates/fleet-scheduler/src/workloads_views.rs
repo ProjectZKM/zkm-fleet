@@ -15,7 +15,7 @@ impl WorkloadController {
         let machine = machine
             .filter(|m| !m.is_empty())
             .or(proof_machine.as_deref());
-        let i = self.inner.lock();
+        let i = self.inner.read();
         if let Some(machine) = machine {
             return Some(
                 i.workers
@@ -61,7 +61,7 @@ impl WorkloadController {
     /// apps keep their settings. Quotas are shared namespace limits, not independent limits for
     /// each app.
     pub(crate) fn app_resources(&self, namespace: &str, app: &str, tag: Option<&str>) -> Value {
-        let i = self.inner.lock();
+        let i = self.inner.read();
         let deployments: Vec<_> = i
             .deployments
             .values()
@@ -76,6 +76,7 @@ impl WorkloadController {
         let mut images = std::collections::BTreeSet::new();
         let mut states = std::collections::BTreeSet::new();
         let mut reasons = Vec::new();
+        let mut instances = Vec::new();
         for intent in &deployments {
             let s = intent
                 .scale
@@ -94,6 +95,16 @@ impl WorkloadController {
             }
             let worker = i.workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0);
             let observed = worker.and_then(|w| w.report.entry(intent.entry().name()));
+            if !intent.disabled && intent.scale.as_ref().is_none_or(|s| !s.pending())
+                && tag.is_none_or(|tag| intent.entry().tag().unwrap_or("") == tag) {
+                if let Some(worker) = worker.filter(|w| !w.ended && w.report.ready) {
+                    instances.extend(worker.report.runtime_instances.iter().filter(|r| r.entry_name == intent.entry().name()
+                        && r.ready && observed.is_some_and(|e| !e.disabled() && (e.ready()
+                            || r.services == ["control"]))
+                        && (!intent.entry().native_access()
+                            || self.native_route_ready(&i, r))).cloned());
+                }
+            }
             let state = if intent.scale.as_ref().is_some_and(|s| s.failed()) {
                 "failed"
             } else if worker.is_none() {
@@ -119,7 +130,7 @@ impl WorkloadController {
         let n = self.fleet.namespace(namespace);
         json!({
             "resources":(!deployments.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
-            "tags":tags, "images":images, "state":state,
+            "tags":tags, "images":images, "state":state, "runtime_instances": instances,
             "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
             "tag_quota":tag.and_then(|tag|n.as_ref()?.tag_quotas.get(tag)),
@@ -164,6 +175,7 @@ impl WorkloadController {
             "priority": priority, "disabled": disabled, "resources": r["resources"],
             "namespace_quota": r["namespace_quota"], "tag_quota": r["tag_quota"],
             "jobs": jobs,
+            "runtime_instances":r["runtime_instances"],
         });
         for (key, value) in sections {
             v[key] = value;
@@ -183,7 +195,7 @@ impl WorkloadController {
     /// A template's job records (not purged; the selected tag's when one is), counted the way
     /// every app's `jobs` are.
     fn template_jobs(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
-        let i = self.inner.lock();
+        let i = self.inner.read();
         let jobs: Vec<&Job> = i.jobs.values()
             .filter(|r| !r.purged && r.batch == app.name && r.namespace == app.namespace
                 && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag))
@@ -225,6 +237,7 @@ impl WorkloadController {
     /// An app's container settings as its record shows them, with the nodes it runs on.
     fn spec_value(app: &WorkloadTemplate) -> Value {
         let mut settings = app.spec.0.clone();
+        EntryMut(&mut settings).redact_private_environment();
         if let Some(o) = settings.as_object_mut() {
             for key in ["name", "namespace", "namespace_ref", "priority", "disabled", "tag", "app", "elf_id"] {
                 o.remove(key);
@@ -268,7 +281,7 @@ impl WorkloadController {
             "diagnostics": {"anchor_replica": anchored},
         });
         let mut sections = vec![("proof", proof)];
-        let template = self.inner.lock().apps.get(&app.name).filter(|t| t.persistent && !t.removed && t.namespace == app.namespace).cloned();
+        let template = self.inner.read().apps.get(&app.name).filter(|t| t.persistent && !t.removed && t.namespace == app.namespace).cloned();
         if let Some(template) = template {
             sections.push(("spec", Self::spec_value(&template)));
         }

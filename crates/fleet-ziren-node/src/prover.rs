@@ -66,7 +66,9 @@ impl ZirenProver {
                 let endpoint = args.gpu_endpoint.clone();
                 tokio::task::spawn_blocking(move || ProverClient {
                     prover: Box::new(CudaProver::new(
-                        ZKMProver::new(),
+                        // Match the upstream CUDA client: proof generation is
+                        // remote, so do not prewarm every CPU compose circuit.
+                        ZKMProver::uninitialized(),
                         ZKMGpuServer::External { endpoint },
                     )),
                 })

@@ -4,6 +4,9 @@ use axum::body::Body;
 use fleet_proto::model::v1::{JobReport, CommandResult, ScaleRequest};
 use sha2::Digest;
 
+mod policy;
+mod proof_runtime;
+
 /// The administrator's token the tests' scheduler has.
 const ADMIN: &str = "adminadminadminadminadminadminadminadminadminadminadminadminadmin1";
 
@@ -54,6 +57,41 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
 }
 fn inventory(namespace: &str) -> NodeReport {
     serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+}
+
+#[tokio::test]
+async fn runtime_instances_are_exact_scoped_live_allocations() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
+    report.apps[0]["services"]=json!(["http", "control"]);
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-network-v1".into()];
+    report.runtime_instances=serde_json::from_value(json!([{"entry_name":"model","ready":true,"services":["http", "control"],
+        "execution":{"namespace":ns,"workload":"model","allocation_id":"model-0","lease_id":"lease","generation":1,"node_id":"machine"}}])).unwrap();
+    let mut bad=report.clone();bad.runtime_instances[0].execution.node_id="other-machine".into();
+    c.report("gpu","session",bad).await.unwrap();
+    assert!(c.inner.lock().workers["gpu"].report.runtime_instances.is_empty());
+    let mut bad=report.clone();bad.runtime_instances[0].services=vec!["unapproved".into()];
+    c.report("gpu","session",bad).await.unwrap();
+    assert!(c.inner.lock().workers["gpu"].report.runtime_instances.is_empty());
+    c.report("gpu","session",report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=default"))["runtime_instances"][0]["execution"]["lease_id"],"lease");
+    assert_eq!(c.app_resources(&ns,"model",Some("scope=other"))["runtime_instances"],json!([]));
+    // Repair remains reachable when the application fails its health check;
+    // application traffic must never use this exception.
+    report.apps[0]["ready"] = json!(false);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.runtime_instances[0].services = vec!["control".into()];
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"][0]["services"],json!(["control"]));
+    report.apps[0]["disabled"] = json!(true);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
+    report.apps[0]["disabled"] = json!(false);
+    c.report("gpu", "session", report).await.unwrap();
+    c.end_session("gpu","session");
+    assert_eq!(c.app_resources(&ns,"model",None)["runtime_instances"],json!([]));
 }
 fn incoming(job: &Job, state: &str, cleaned: bool) -> JobReport {
     JobReport {
@@ -2213,6 +2251,98 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
     assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
     assert_eq!(c.inner.lock().apps["model"].spec["image"],"web:2");
     assert_eq!(c.inner.lock().apps["model"].spec["env"],json!({"A":"1"}));
+}
+
+#[tokio::test]
+async fn shim_capability_does_not_migrate_existing_apps() {
+    let (_dir,c,ns)=setup().await;
+    let report=scale_inventory(&ns,false,false);
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let before=c.inner.lock().deployments["gpu-model"].clone();
+    let commands=c.inner.lock().commands.len();
+    let set=json!({"runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.request_update(&ns,"model",None,set.clone()).await.is_err(), "old nodes cannot select shim");
+    let mut upgraded=report;
+    upgraded.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("gpu","session",upgraded.clone()).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(c.inner.lock().commands.len(),commands,"installation alone sends no replacement command");
+    assert_eq!(c.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let restarted=WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap();
+    assert_eq!(restarted.inner.lock().deployments["gpu-model"].spec,before.spec);
+    let owner=user_token(&c,&ns,0x79,"scope=default",Some(vec!["model".into()]),true).await;
+    assert_eq!(scale_call(c.clone(),&owner,"PUT",&format!("/apps/model/settings?namespace={ns}"),set.clone()).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(c.request_update(&ns,"model",None,set).await.unwrap()["state"],"draining");
+    c.dispatch().await.unwrap();
+    let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
+    assert!(stop.parameters["app"].get("runtime").is_none(), "drain uses the old executor");
+    assert!(command_where(&c,|cmd|cmd.parameters["scale_phase"]=="apply").is_none());
+}
+
+#[tokio::test]
+async fn shim_placement_and_pending_commands_require_explicit_node_capability() {
+    let (_dir,c,ns)=setup().await;
+    c.report("old","old-session",inventory(&ns)).await.unwrap();
+    let entry=json!({"name":"web","app":"web","namespace":ns,"kind":"app","gpus":0,"cpus":1,"replicas":1,
+        "runtime":{"executor":"shim","driver":"docker"}});
+    assert!(c.place_app(Entry(&entry),&[]).is_err());
+    assert!(c.command("old",NodeOperation::SetApp,message::set_app(&entry,false)).is_err());
+    let mut capable=inventory(&ns);capable.runtime_capabilities=vec!["shim-docker-v1".into()];
+    c.report("new","new-session",capable).await.unwrap();
+    assert_eq!(c.place_app(Entry(&entry),&[]).unwrap().0,"new");
+    let id=c.command("new",NodeOperation::SetApp,message::set_app(&entry,false)).unwrap();
+    {
+        let mut i=c.inner.lock();let mut command=i.commands[&id].clone();command.admitted=true;i.commands.insert(id.clone(),command);
+        assert_eq!(heartbeat_commands(&i,"new").len(),1);
+        i.workers.get_mut("new").unwrap().report.runtime_capabilities.clear();
+        assert!(heartbeat_commands(&i,"new").is_empty(), "downgrade cannot execute a queued shim command as legacy");
+        assert!(!i.commands[&id].done, "retain the original command and allocation");
+        let mut command=i.commands[&id].clone(); command.done=true; i.commands.insert(id.clone(),command);
+    }
+    let stop=c.command("new",NodeOperation::SetApp,message::set_app(&entry,true)).unwrap();
+    let mut i=c.inner.lock();
+    let mut command=i.commands[&stop].clone(); command.admitted=true; i.commands.insert(stop.clone(),command);
+    i.workers.get_mut("new").unwrap().report.runtime_capabilities=vec!["shim-cleanup-v1".into()];
+    let commands=heartbeat_commands(&i,"new");
+    assert_eq!(commands.len(),1);
+    assert_eq!(commands[0].id,stop,"cleanup survives loss of launch capabilities");
+}
+
+#[tokio::test]
+async fn running_shim_resources_stay_accounted_while_node_capabilities_are_incomplete() {
+    let (_dir,c,ns)=setup().await;
+    // A slow companion answer leaves only cleanup support in the report.
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
+    report.runtime_capabilities=vec!["shim-cleanup-v1".into()];
+    // The scheduler restarts during that window: nothing else may take the GPUs.
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap());
+    c.report("gpu","session",report.clone()).await.unwrap();
+    assert_eq!(c.fleet.usage(&ns).gpus,2.0);
+    assert!(heartbeat_commands(&c.inner.lock(),"gpu").is_empty(), "no command for an unsupported runtime");
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-cleanup-v1".into()];
+    c.report("gpu","session",report).await.unwrap();
+    assert_eq!(c.fleet.usage(&ns).gpus,2.0, "restored once, not twice");
+}
+
+#[tokio::test]
+async fn invalid_prover_entry_does_not_suppress_other_workloads_and_ingress_secrets_stay_local() {
+    let (_dir,c,ns)=setup().await;
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["env"]=json!({"TOKEN":"private-ingress-bearer","PUBLIC":"visible"});
+    report.apps[0]["ingress"]=json!({"http":{"bearer_env":"TOKEN"}});
+    report.apps.push(json!({"name":"broken","app":"broken","namespace":ns,"kind":"ziren-gpu",
+        "runtime":{"executor":"shim","driver":"docker"},"image":"prover:2","ready":true}).into());
+    c.report("gpu","session",report).await.unwrap();
+    let i=c.inner.lock();
+    assert!(!i.workers["gpu"].report.apps[1]["runtime_error"].is_null());
+    assert!(i.deployments.contains_key("gpu-model"));
+    assert!(!i.deployments.contains_key("gpu-broken"));
+    let app=i.apps["model"].clone(); drop(i);
+    let view=c.app_value(&app,None)["spec"].clone();
+    assert!(!view.to_string().contains("private-ingress-bearer"));
+    assert_eq!(view["env"]["PUBLIC"],"visible");
+    assert_eq!(view["env"]["TOKEN"],"@fleet-local-env:TOKEN");
 }
 
 #[tokio::test]

@@ -79,3 +79,17 @@ def test_proof_storage_handler_is_required_only_when_requested(installation):
     assert result.returncode == 0, result.stderr
     assert (prefix / "bin/fleet-ziren-node").is_file()
     assert (prefix / "etc/proof-storage-roots").read_text() == roots.read_text()
+
+
+def test_reinstall_refreshes_node_settings_and_keeps_operator_values(installation):
+    prefix, _, _, run = installation
+    assert run().returncode == 0
+    watchdog = prefix / "etc/watchdog.env"
+    watchdog.write_text(watchdog.read_text() + "FLEET_OPERATOR_SETTING=yes\nFLEET_NODE_SUPERVISED=1\n")
+    result = run("--cpus", "32", "--scheduler", "https://new.example:8905", "--name", "new-name")
+    assert result.returncode == 0, result.stderr
+    text = watchdog.read_text()
+    for expected in ["RAY_NUM_CPUS=32", "FLEET_SCHEDULER=https://new.example:8905", "FLEET_NODE_NAME=new-name",
+                     "FLEET_OPERATOR_SETTING=yes", "FLEET_NODE_SUPERVISED=1"]:
+        assert expected in text
+    assert text.count("RAY_NUM_CPUS=") == 1

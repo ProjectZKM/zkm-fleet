@@ -20,6 +20,7 @@ import types
 import typing
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Mapping, TypeVar
+from urllib.parse import urlsplit
 
 T = TypeVar("T")
 D = TypeVar("D", bound="Record")
@@ -89,7 +90,7 @@ def _coerce(tp: Any, value: Any, where: str) -> Any:
                 return value
             if not isinstance(value, Mapping):
                 raise ModelError(f"{where}: expected a {tp.__name__} mapping, got {type(value).__name__}")
-            return from_dict(tp, value, where=where)
+            return from_dict(tp, value, strict=getattr(tp, "STRICT_FIELDS", False), where=where)
         if issubclass(tp, enum.Enum):
             if isinstance(value, tp):
                 return value
@@ -115,6 +116,8 @@ def from_dict(cls: type[T], data: Mapping[str, Any], *, strict: bool = False, wh
     """A `cls` from a mapping; missing fields take their defaults, extra keys are
     ignored (strict=False) or refused."""
     where = where or cls.__name__
+    if not isinstance(data, Mapping):
+        raise ModelError(f"{where}: expected a mapping")
     hints = _hints(cls)
     names = {f.name for f in fields(cls)}  # type: ignore[arg-type]
     extra = set(data) - names
@@ -132,7 +135,8 @@ def from_dict(cls: type[T], data: Mapping[str, Any], *, strict: bool = False, wh
 def to_dict(obj: Any) -> Any:
     """JSON-ready: records become mappings, enums their values, tuples lists."""
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: to_dict(getattr(obj, f.name)) for f in fields(obj)}
+        return {f.name: to_dict(getattr(obj, f.name)) for f in fields(obj)
+                if not (f.metadata.get("omit_none") and getattr(obj, f.name) is None)}
     if isinstance(obj, enum.Enum):
         return obj.value
     if isinstance(obj, (list, tuple, set, frozenset)):
@@ -445,6 +449,78 @@ class AppRuntime(str, enum.Enum):
 
 
 @dataclass(kw_only=True)
+class TrusteeTlsConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    ca_file: str
+    cert_file: str
+    key_file: str
+
+    def __post_init__(self) -> None:
+        if any(not os.path.isabs(p) for p in (self.ca_file, self.cert_file, self.key_file)):
+            raise ModelError("Trustee TLS paths must be absolute")
+
+
+@dataclass(kw_only=True)
+class ShimDcapConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    collateral_file: str
+    min_tcb_evaluation_data_number: int
+
+    def __post_init__(self) -> None:
+        if not os.path.isabs(self.collateral_file) or not 0 < self.min_tcb_evaluation_data_number <= 0xffffffff:
+            raise ModelError("DCAP requires an absolute collateral path and positive TCB floor")
+
+
+@dataclass(kw_only=True)
+class ShimTeeConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    mode: typing.Literal["hardware", "simulation"]
+    platform: str
+    evidence_endpoint: str
+    trustee_endpoint: str = ""
+    trustee_policy_ids: list[str] = field(default_factory=list)
+    trustee_tls: TrusteeTlsConfig | None = None
+    dcap: ShimDcapConfig | None = None
+    init_data_sha256: str
+    endpoint_key_sha256: str
+    expected_measurement: str
+    proof_endpoint: str
+    proof_token_file: str
+    program: dict[str, str]
+    program_vkey_hash: str
+    elf_file: str
+    proof_signer_file: str | None = None
+
+    def __post_init__(self) -> None:
+        endpoint = urlsplit(self.trustee_endpoint)
+        if not self.trustee_endpoint:
+            if self.trustee_tls is not None or self.trustee_policy_ids or self.dcap is None:
+                raise ModelError("AS-free attestation requires DCAP; orphan Trustee settings are invalid")
+        elif (endpoint.username is not None or endpoint.password is not None or endpoint.query or endpoint.fragment
+                or endpoint.path not in ("", "/") or not endpoint.hostname
+                or not ((endpoint.scheme == "https" and self.trustee_tls is not None)
+                        or (endpoint.scheme == "http" and endpoint.hostname in ("127.0.0.1", "::1") and self.trustee_tls is None))):
+            raise ModelError("Trustee requires HTTPS with node TLS credentials, or loopback HTTP")
+        if self.dcap is not None and (self.mode != "hardware" or self.platform != "tdx"):
+            raise ModelError("DCAP startup requires hardware TDX")
+        if self.dcap is not None and not re.fullmatch(r"[0-9a-f]{64}", self.expected_measurement):
+            raise ModelError("DCAP requires the complete measured-profile SHA256")
+        if ((self.mode == "simulation" and self.platform != "sample")
+                or (self.mode == "hardware" and self.platform not in ("snp", "tdx"))):
+            raise ModelError("TEE mode and platform disagree")
+        if any(not re.fullmatch(r"[0-9a-f]{64}", h) for h in (self.init_data_sha256, self.endpoint_key_sha256)):
+            raise ModelError("TEE bindings require SHA256 digests")
+        if self.program.get("kind") != "remote_attestation" or set(self.program) != {"kind", "program_sha256", "verifying_key_sha256"}:
+            raise ModelError("TEE requires a pinned remote-attestation program")
+        if any(not os.path.isabs(p) for p in (self.proof_token_file, self.elf_file, *([self.proof_signer_file] if self.proof_signer_file else []))):
+            raise ModelError("TEE artifact and credential paths must be absolute")
+
+    @property
+    def driver(self) -> str:
+        return "tee" if self.mode == "hardware" else "tee-simulation"
+
+
+@dataclass(kw_only=True)
 class ControlPlaneConfig(Record):
     """The top of apps.yaml: what every replica shares."""
 
@@ -454,6 +530,134 @@ class ControlPlaneConfig(Record):
     node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
     gpu_port_range: tuple[int, int] = (30100, 30199)
+    shim_binary: str | None = None
+    shim_state_dir: str | None = None
+    shim_daemon: bool = False
+    shim_network: ShimNetworkConfig | None = None
+    shim_openshell: ShimOpenShellConfig | None = None
+    shim_machine_labels: dict[str, str] = field(default_factory=dict)
+    shim_tee: ShimTeeConfig | None = None
+
+    def __post_init__(self) -> None:
+        if (self.shim_machine_labels or self.shim_tee) and not self.shim_daemon:
+            raise ModelError("machine labels require the persistent shim daemon")
+        if self.shim_openshell is not None and not self.shim_daemon:
+            raise ModelError("OpenShell requires the persistent shim daemon")
+        if self.shim_daemon:
+            if not all(p and os.path.isabs(p) and "\x00" not in p for p in (self.shim_binary, self.shim_state_dir)):
+                raise ModelError("shim daemon requires absolute shim_binary and shim_state_dir")
+            if len(os.fsencode(os.path.join(self.shim_state_dir, "control.sock"))) >= 108:
+                raise ModelError("shim daemon requires a Unix socket path under 108 bytes")
+
+
+@dataclass(kw_only=True)
+class ShimOpenShellConfig(Record):
+    """Operator endpoints only; per-allocation credentials never enter apps.yaml."""
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    socket: str
+    admission_policy: str
+    ledger_endpoint: str
+    ledger_ca_file: str | None = None
+    supervisor_image: str | None = None
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlsplit
+        url = urlsplit(self.ledger_endpoint)
+        if (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1"))
+                or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("", "/")):
+            raise ModelError("OpenShell policy gateway requires TLS without credentials or a path")
+        if (not os.path.isabs(self.socket) or "\x00" in self.socket or len(os.fsencode(self.socket)) >= 108
+                or not self.admission_policy or len(self.admission_policy.encode()) > 65536):
+            raise ModelError("OpenShell needs an absolute private driver socket and admission acknowledgement")
+        if self.ledger_ca_file is not None and (url.scheme != "https" or not os.path.isabs(self.ledger_ca_file) or "\x00" in self.ledger_ca_file):
+            raise ModelError("OpenShell private CA requires HTTPS and an absolute certificate path")
+        if self.supervisor_image is not None and not re.fullmatch(r"sha256:[0-9a-f]{64}", self.supervisor_image):
+            raise ModelError("OpenShell supervisor requires an immutable local Docker image ID")
+
+
+@dataclass(kw_only=True)
+class ShimNetworkConfig(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    gateway_url: str
+    relay_url: str
+    token_file: str
+    public_key_file: str
+    issuer: str
+    tunnel_binary: str | None = field(default=None, metadata={"omit_none": True})
+
+    def __post_init__(self) -> None:
+        from urllib.parse import urlsplit
+        for value, secure, local in [(self.gateway_url,"https","http"),(self.relay_url,"wss","ws")]:
+            url=urlsplit(value)
+            if (url.scheme != secure and not (url.scheme == local and url.hostname in ("127.0.0.1","::1"))
+                    or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("","/")):
+                raise ModelError("shim network requires TLS URLs without credentials or paths")
+        if not self.issuer or not all(os.path.isabs(p) and "\x00" not in p for p in (self.token_file,self.public_key_file)):
+            raise ModelError("shim network needs an issuer and absolute credential/key paths")
+        if self.tunnel_binary is not None and (not os.path.isabs(self.tunnel_binary) or "\x00" in self.tunnel_binary):
+            raise ModelError("upstream tunnel helper requires an absolute node-owned path")
+
+
+class ServiceProtocol(str, enum.Enum):
+    HTTP1 = "http1"
+    TCP = "tcp"
+
+
+class ExecutorKind(str, enum.Enum):
+    LEGACY = "legacy"
+    SHIM = "shim"
+
+
+@dataclass(kw_only=True)
+class RuntimeSelection(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    executor: ExecutorKind
+    driver: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.executor is ExecutorKind.LEGACY and self.driver is not None
+                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell", "tee", "tee-simulation")):
+            raise ModelError("runtime must select legacy or shim with driver docker, openshell, tee or tee-simulation")
+
+
+@dataclass(kw_only=True)
+class HttpIngress(Record):
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    paths: list[str]
+    methods: list[str]
+    bearer_env: str | None = None
+    single_use: bool = False
+
+    def __post_init__(self) -> None:
+        if (not 1 <= len(self.paths) <= 32 or any(not p.startswith("/") or len(p)>256 or not p.isascii()
+                or any(c in p for c in "%?#\\") or any(c in p.split("/") for c in (".",".."))
+                or any(ord(c)<32 or ord(c)==127 for c in p) for p in self.paths)
+                or not 1 <= len(self.methods) <= 7 or any(m not in ("GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS") for m in self.methods)
+                or self.bearer_env is not None and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", self.bearer_env)):
+            raise ModelError("invalid HTTP ingress")
+
+
+@dataclass(kw_only=True)
+class DurableMount(Record):
+    """A native replica's workload-scoped named volume; never a host path.
+    The node's shim derives the volume from the execution and `name`."""
+
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    name: str
+    target: str
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        parts = self.target[1:].split("/")
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name)
+                or len(self.target) > 1024 or not self.target.startswith("/")
+                or any(not 33 <= ord(c) <= 126 or c in "\\,:" for c in self.target)
+                or any(p in ("", ".", "..") for p in parts)):
+            raise ModelError("invalid durable mount")
+
+
+# At most this many GPUs or durable mounts per native replica, as in shim.
+MAX_NATIVE_ATTACHMENTS = 16
 
 
 @dataclass(kw_only=True)
@@ -461,6 +665,13 @@ class AppSpec(Record):
     """One entry of `apps:`."""
 
     name: str
+    runtime: RuntimeSelection | None = None
+    access_policy_sha256: str | None = None
+    services: list[str] = field(default_factory=list)
+    service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
+    ingress: dict[str, HttpIngress] = field(default_factory=dict)
+    container_port: int | None = None
+    entrypoint: str | None = None
     namespace: str = "00000000000000000000000000000000"
     tag: str | None = None
     priority: int = 0
@@ -481,6 +692,8 @@ class AppSpec(Record):
     image: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     volumes: list[str] = field(default_factory=list)
+    # Native OpenShell only: durable named volumes that outlive generations.
+    mounts: list[DurableMount] = field(default_factory=list)
     shm_gb: int | None = None
     ready_timeout_s: float = 600
     # Integrated app worker sharing the replica's dedicated GPU server.
@@ -494,11 +707,78 @@ class AppSpec(Record):
     user: str | None = None
     workdir: str | None = None
     health_path: str = "/"
+    health_tcp_banner: str | None = None
     stop_timeout_s: int = 30
     # CPU provers
     backend: str = "cpu"
     rust_log: str = "info"
+    @property
+    def native_access(self) -> bool:
+        return self.access_policy_sha256 is not None or bool(self.runtime and self.runtime.driver == "openshell")
+
     def __post_init__(self) -> None:
+        if self.access_policy_sha256 is not None:
+            if (not re.fullmatch(r"[0-9a-f]{64}", self.access_policy_sha256)
+                    or not self.runtime or self.runtime.executor is not ExecutorKind.SHIM):
+                raise ModelError("access policy requires a SHA256 commitment and shim runtime")
+            # The scheduler admits user rules only on these drivers; legacy
+            # `openshell` records are never placed with one.
+            if self.runtime.driver not in ("docker", "tee", "tee-simulation"):
+                raise ModelError("access policy requires the docker, tee or tee-simulation driver")
+        if self.health_tcp_banner is not None and not (self.native_access and self.service_protocol is ServiceProtocol.TCP):
+            raise ModelError("TCP banner health requires native OpenShell TCP services")
+        if self.mounts and not self.native_access:
+            raise ModelError("durable mounts require native OpenShell")
+        if self.native_access:
+            if (len(self.mounts) > MAX_NATIVE_ATTACHMENTS
+                    or len({m.name for m in self.mounts}) != len(self.mounts)
+                    or len({m.target for m in self.mounts}) != len(self.mounts)):
+                raise ModelError("invalid durable mounts")
+            # Whole GPUs only: shim attaches exactly the device ids Ray granted.
+            if (self.gpus or self.mounts) and self.runtime.driver not in ("docker", "openshell"):
+                raise ModelError("native GPUs and durable mounts require a non-TEE driver")
+            if (not 0 <= self.gpus <= MAX_NATIVE_ATTACHMENTS or self.gpus != int(self.gpus) or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
+                    or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
+                    # A native node holds no application credential: callers send their own.
+                    or any(rule.bearer_env for rule in self.ingress.values())
+                    or self.volumes or self.shm_gb is not None
+                    or any(v is not None for v in (self.port_base, self.entrypoint, self.user, self.workdir))
+                    # `control` is the logs-only service beside an application service.
+                    or self.services and all(s == "control" for s in self.services)
+                    or self.service_protocol is ServiceProtocol.TCP and (
+                        self.health_path != "/" or not self.health_tcp_banner
+                        or len(self.health_tcp_banner) > 128
+                        or not all(32 <= ord(c) <= 126 for c in self.health_tcp_banner))
+                    or bool(self.services) != (self.container_port is not None)
+                    or not self.health_path.startswith("/") or self.health_path.startswith("//")
+                    or len(self.health_path.encode()) > 2048 or any(ord(c) < 32 or ord(c) == 127 or c in "\\#" for c in self.health_path)
+                    or not self.services and self.health_path != "/"):
+                raise ModelError("native OpenShell requires CPU/memory limits, private HTTP services (ingress without bearer_env, control beside an application service) or TCP services with banner health")
+        if self.service_protocol is ServiceProtocol.TCP:
+            if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
+                    or not any(s != "control" for s in self.services) or self.ingress):
+                raise ModelError("TCP requires a shim application service without HTTP ingress")
+        if self.services or self.ingress or self.container_port is not None or self.entrypoint is not None:
+            if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
+                raise ModelError("services, container_port and entrypoint require explicit shim execution")
+        if (len(self.services) != len(set(self.services)) or len(self.services) > 8
+                or any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", s) for s in self.services)):
+            raise ModelError("invalid runtime services")
+        if any(name not in self.services or name == "control" for name in self.ingress):
+            raise ModelError("ingress must reference declared application services")
+        if any(rule.bearer_env and not self.env.get(rule.bearer_env) for rule in self.ingress.values()):
+            raise ModelError("ingress bearer environment is missing")
+        if self.container_port is not None and not 1 <= self.container_port <= 65535:
+            raise ModelError("invalid container_port")
+        if self.port_base == 0 and self.runtime and self.runtime.executor is ExecutorKind.SHIM and self.container_port is None:
+            raise ModelError("automatic host ports require shim and container_port")
+        if self.runtime is not None and self.kind is not AppRuntime.APP:
+            if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker") or self.worker_command:
+                raise ModelError("packaged provers require shim Docker and an image-owned worker")
+            if self.port_base is None or not self.container_port or not self.image:
+                raise ModelError("packaged provers require an image and health port")
+            if self.services or self.ingress or self.service_protocol is not ServiceProtocol.HTTP1:
+                raise ModelError("packaged SDK workers expose only a private HTTP health port")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
         if self.worker_command:
@@ -534,10 +814,57 @@ class AppsConfig(Record):
     raw: dict[str, Any] = field(default_factory=dict)  # the file's own mapping, for the spec hash
 
     @classmethod
-    def parse(cls, data: Mapping[str, Any]) -> AppsConfig:
+    def parse(cls, data: Mapping[str, Any], *, validate_launch: bool = True) -> AppsConfig:
         cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
         apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
-        return cls(cluster=cluster, apps=apps, raw=dict(data))
+        for a in data.get("apps", []):
+            if a.get("prover_binary") is not None:
+                raise ModelError("prover_binary was removed; drain and migrate this entry with deploy/migrate-proof-runtime.py")
+            if "runtime" in a:
+                from_dict(RuntimeSelection, a["runtime"], strict=True)
+        result = cls(cluster=cluster, apps=apps, raw=dict(data))
+        if validate_launch:
+            for app in apps:
+                result.validate_launch(app)
+        return result
+
+    def validate_launch(self, app: AppSpec) -> None:
+        cluster = self.cluster
+        if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+            if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
+                raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
+        if app.services and cluster.shim_network is None:
+            raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
+        if app.runtime and app.runtime.driver in ("tee", "tee-simulation"):
+            if not cluster.shim_daemon or not cluster.shim_tee or cluster.shim_tee.driver != app.runtime.driver:
+                raise ModelError("TEE apps require a matching node TEE mode and persistent shim")
+        if app.native_access and (not cluster.shim_daemon or cluster.shim_openshell is None):
+            raise ModelError("OpenShell requires the configured persistent companion")
+
+
+@dataclass(kw_only=True)
+class RuntimeIdentity(Record):
+    namespace: str
+    workload: str
+    allocation_id: str
+    lease_id: str
+    generation: int
+    node_id: str
+
+    def __post_init__(self) -> None:
+        if self.generation < 1 or not all((self.namespace,self.workload,self.allocation_id,self.lease_id,self.node_id)):
+            raise ModelError("runtime identity requires a positive generation and complete allocation")
+
+
+@dataclass(kw_only=True)
+class RuntimeInstance(Record):
+    entry_name: str
+    execution: RuntimeIdentity
+    ready: bool
+    services: list[str] = field(default_factory=list)
+    native_observation_base64: str | None = None
+    # Ray's device grant to a native reservation; the launch must attach exactly these.
+    gpu_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)
@@ -552,6 +879,8 @@ class AppReplicaSpec(Record):
     app: AppSpec
     cluster: ControlPlaneConfig
     config: dict[str, Any] = field(default_factory=dict)
+    # Pinned machine allocation, supplied before entering Ray; absent for legacy.
+    execution: RuntimeIdentity | None = None
 
     @property
     def kind(self) -> AppRuntime:
@@ -613,6 +942,8 @@ class ReplicaHealth(Record):
     """What an actor answers to `health()`."""
 
     name: str
+    executor: ExecutorKind = ExecutorKind.LEGACY
+    execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)
@@ -620,6 +951,12 @@ class ReplicaHealth(Record):
     gpu_ready: bool | None = None
     port: int | None = None
     ready: bool | None = None
+    # Shim's authenticated local management listener can be available while the
+    # application is unhealthy (for example during state restore).
+    management_ready: bool = False
+    # Durable native ownership may precede compute creation and route readiness.
+    allocation_reserved: bool = False
+    native_observation_base64: str | None = None
     stopping: bool = False
     error: str | None = None
 

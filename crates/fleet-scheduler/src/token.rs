@@ -13,6 +13,10 @@ pub const HEADER: &str = "authorization";
 pub enum Permission {
     /// List and inspect apps, batches, their jobs and the namespace.
     Read,
+    /// Consume the control stream of an explicitly enrolled data router.
+    RouterSync,
+    /// Trusted backend: assert end-user identities and revoke sessions in its namespace.
+    RouterDelegate,
     /// Submit proof and batch jobs; cancel a batch job.
     Submit,
     /// Register, delete, update, scale, enable and disable apps and batches.
@@ -23,11 +27,13 @@ pub enum Permission {
 
 impl Permission {
     /// The permissions a namespace's token may hold.
-    pub const ISSUABLE: [Permission; 3] = [Permission::Read, Permission::Submit, Permission::Manage];
+    pub const ISSUABLE: [Permission; 5] = [Permission::Read, Permission::Submit, Permission::Manage, Permission::RouterSync, Permission::RouterDelegate];
 
     pub fn name(self) -> &'static str {
         match self {
             Permission::Read => "read",
+            Permission::RouterSync => "router_sync",
+            Permission::RouterDelegate => "router_delegate",
             Permission::Submit => "submit",
             Permission::Manage => "manage",
             Permission::Admin => "admin",

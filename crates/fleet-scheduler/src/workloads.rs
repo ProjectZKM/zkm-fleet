@@ -141,16 +141,66 @@ struct WorkloadState {
     commands: Records<CommandRecord>,
     workers: BTreeMap<String, NodeSession>,
     deployments: BTreeMap<String, AppDeployment>,
+    policy_preparations: BTreeMap<String, trusted_shim::contracts::ExecutionIdentity>,
 }
 
 pub struct WorkloadController {
     fleet: Arc<Scheduler>,
     cluster: String,
     dir: PathBuf,
-    inner: Mutex<WorkloadState>,
+    inner: WorkloadLock,
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
+    pub(crate) policy: Option<Arc<crate::policy_gateway::PolicyGateway>>,
+    pub(crate) deliveries: crate::runtime_delivery::DeliveryQueue,
 }
+/// Workload state behind the scheduler's execution fence. `lock` is for any
+/// change: it takes the fence exclusively, so it waits for in-flight execution
+/// guards. `read` cannot change anything and does not wait for them, so views
+/// and guard validation never stall behind a policy ledger write.
+struct WorkloadLock {
+    fleet: Arc<Scheduler>,
+    state: Mutex<WorkloadState>,
+}
+
+struct WorkloadWrite<'a> {
+    // Declared first, so the state is released before the fence.
+    state: parking_lot::MutexGuard<'a, WorkloadState>,
+    _fence: parking_lot::RwLockWriteGuard<'a, ()>,
+}
+
+struct WorkloadRead<'a>(parking_lot::MutexGuard<'a, WorkloadState>);
+
+impl WorkloadLock {
+    fn lock(&self) -> WorkloadWrite<'_> {
+        let fence = self.fleet.execution_fence.write();
+        WorkloadWrite { state: self.state.lock(), _fence: fence }
+    }
+    fn read(&self) -> WorkloadRead<'_> {
+        WorkloadRead(self.state.lock())
+    }
+}
+
+impl std::ops::Deref for WorkloadWrite<'_> {
+    type Target = WorkloadState;
+    fn deref(&self) -> &WorkloadState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for WorkloadWrite<'_> {
+    fn deref_mut(&mut self) -> &mut WorkloadState {
+        &mut self.state
+    }
+}
+
+impl std::ops::Deref for WorkloadRead<'_> {
+    type Target = WorkloadState;
+    fn deref(&self) -> &WorkloadState {
+        &self.0
+    }
+}
+
 /// The proof apps an enabled integrated worker feeds: (namespace, app).
 fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
     inner.deployments.values()
@@ -162,7 +212,7 @@ fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
 impl WorkloadController {
     pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
-        for name in ["apps", "jobs", "commands", "artifacts", "deployments"] {
+        for name in ["apps", "jobs", "commands", "artifacts", "deployments", "policy-preparations"] {
             fs::create_dir_all(dir.join(name))?;
         }
         let mut inner = WorkloadState::default();
@@ -180,14 +230,22 @@ impl WorkloadController {
                 .deployments
                 .insert(format!("{}-{}", v.worker, v.entry().name()), v);
         }
+        for v in load::<fleet_proto::model::v1::RuntimeExecutionIdentity>(&dir.join("policy-preparations"))? {
+            let v = crate::policy_gateway::identity(v);
+            anyhow::ensure!(inner.policy_preparations.insert(policy::preparation_key(&v)?, v).is_none(),
+                "duplicate durable policy preparation");
+        }
         fleet.set_worker_owned_apps(worker_owned(&inner));
+        let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;
         let controller = Self {
+            deliveries: crate::runtime_delivery::DeliveryQueue::open(&dir.join("runtime-deliveries"))?,
+            inner: WorkloadLock { fleet: fleet.clone(), state: Mutex::new(inner) },
             fleet,
             cluster,
             dir,
-            inner: Mutex::new(inner),
             ops: tokio::sync::Mutex::new(()),
             notify: tokio::sync::Notify::new(),
+            policy,
         };
         controller.forget_deleted()?;
         Ok(controller)
@@ -196,7 +254,7 @@ impl WorkloadController {
         &self.fleet
     }
     fn refresh_worker_owned_apps(&self) {
-        self.update_worker_owned_apps(&self.inner.lock());
+        self.update_worker_owned_apps(&self.inner.read());
     }
     fn update_worker_owned_apps(&self, inner: &WorkloadState) {
         self.fleet.set_worker_owned_apps(worker_owned(inner));
@@ -469,6 +527,12 @@ impl WorkloadController {
         parameters: Value,
     ) -> anyhow::Result<String> {
         let mut inner = self.inner.lock();
+        if operation == NodeOperation::SetApp && parameters["disabled"] != true {
+            let entry = Entry(&parameters["app"]);
+            if entry.runtime_capability().is_some() && !inner.workers.get(worker).is_some_and(|w| w.report.supports_runtime(entry)) {
+                return Err(fail(409, "node does not support the selected runtime"));
+            }
+        }
         let c = CommandRecord {
             id: uuid::Uuid::new_v4().to_string(),
             worker: worker.into(),
@@ -867,7 +931,7 @@ impl WorkloadController {
         &self,
         worker_id: &str,
         session: &str,
-        report: NodeReport,
+        mut report: NodeReport,
     ) -> anyhow::Result<Vec<String>> {
         if !is_safe_id(worker_id)
             || worker_id.len() > 63
@@ -890,7 +954,38 @@ impl WorkloadController {
         {
             return Err(fail(400, "invalid capacity"));
         }
-        let mut report = report;
+        // Bad local runtime data withdraws that app's authority, but must not
+        // suppress command acknowledgments or the other workloads' heartbeat.
+        if report.runtime_instances.len() > 1024 { return Err(fail(400, "too many runtime instances")); }
+        for raw in &mut report.apps {
+            EntryMut(raw).redact_private_environment();
+            let e = Entry(raw);
+            let invalid = e.0.get("prover_binary").is_some_and(|v| !v.is_null())
+                || e.is_prover() && e.0.get("runtime").is_some() && e.0.as_object().is_none_or(|o|
+                    fleet_proto::model::v1::RegisterAppRequest::validate_transport(o).is_err());
+            if invalid && raw.is_object() {
+                raw["runtime_error"] = json!("invalid runtime manifest; repair or drain this entry");
+                raw["ready"] = json!(false);
+                raw["cleaned"] = json!(false);
+            }
+        }
+        let instances = std::mem::take(&mut report.runtime_instances);
+        let mut probe = report.clone();
+        for instance in &instances {
+            probe.runtime_instances = vec![instance.clone()];
+            let duplicate = instances.iter().filter(|other| other.execution.namespace == instance.execution.namespace
+                && other.execution.allocation_id == instance.execution.allocation_id
+                && other.execution.node_id == instance.execution.node_id).count() != 1;
+            if !duplicate && probe.validate_runtime_instances().is_ok()
+                && report.entry(&instance.entry_name).is_some_and(|e| e.0.get("runtime_error").is_none()) {
+                report.runtime_instances.push(instance.clone());
+            } else {
+                if let Some(entry) = report.apps.iter_mut().find(|e| Entry(e).name() == instance.entry_name) {
+                    entry["ready"] = json!(false);
+                }
+                tracing::warn!(worker = worker_id, entry = %instance.entry_name, "quarantined invalid runtime observation");
+            }
+        }
         for entry in &mut report.apps {
             let reference = Entry(entry).namespace_reference()
                 .unwrap_or(crate::store::SYSTEM_NAMESPACE)
@@ -941,7 +1036,7 @@ impl WorkloadController {
             report
                 .apps
                 .iter()
-                .filter(|s| Entry(s).is_container())
+                .filter(|s| Entry(s).is_container() && s.get("runtime_error").is_none())
                 .map(|s| (Entry(s).name().into(), s.clone())),
         ) {
             if !is_safe_id(&name) || !spec.is_object() {
@@ -984,6 +1079,7 @@ impl WorkloadController {
         for observed in report.entries() {
             let name = observed.name();
             if !is_safe_id(name)
+                || observed.0.get("runtime_error").is_some()
                 || !matches!(observed.kind(), "app" | "ziren-gpu" | "ziren-cpu")
                 || observed.is_container() && self.inner.lock().apps.get(name).is_some_and(|a| !a.removed && !a.persistent)
             {
@@ -1000,6 +1096,8 @@ impl WorkloadController {
                 continue;
             }
             let intent = if let Some(mut intent) = existing {
+                // The removed override is never a launch input after migration.
+                if let Some(fields) = intent.spec.as_object_mut() { fields.remove("prover_binary"); }
                 // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
                 for field in Entry::NODE_OWNED {
@@ -1026,19 +1124,29 @@ impl WorkloadController {
                     .insert(key.clone(), intent.clone());
                 intent
             };
+            // An older/downgraded bridge cannot attest cleanup of a shim allocation.
+            let supported = if intent.disabled { report.supports_cleanup(intent.entry()) } else { report.supports_runtime(intent.entry()) };
             if observed.holds_allocation() {
                 let id = format!("deployment:{key}");
                 if observed.cleaned() && intent.disabled {
-                    self.fleet.release_job(&namespace.id, &id).await?;
-                } else if observed.ready() {
+                    if supported {
+                        self.fleet.release_job(&namespace.id, &id).await?;
+                    }
+                } else if observed.ready() || report.native_allocated(observed) {
+                    // Resources the node reports in use stay accounted even while
+                    // its capabilities are briefly incomplete: nothing else may be
+                    // placed on them.
                     let (gpus, cpus) = observed.total(0.0);
                     self.fleet
                         .reserve_job(&namespace.id, observed.tag(), &id, gpus, cpus, true)
                         .await?;
                 }
             }
+            if !supported {
+                continue;
+            }
             let mismatch = observed.disabled() != intent.disabled
-                || if intent.disabled { !observed.cleaned() } else { !observed.ready() };
+                || if intent.disabled { !observed.cleaned() } else { !observed.ready() && !report.native_allocated(observed) };
             let pending = {
                 self.inner.lock().commands.open().any(|c| {
                     c.changes_entry(worker_id, name)
@@ -1547,7 +1655,7 @@ impl WorkloadController {
                 let already_ready = {
                     let i = self.inner.lock();
                     i.workers.get(&c.worker).is_some_and(|w| {
-                        w.report.entries().any(|v| v.name() == s.name() && v.ready() && !v.disabled() && v.same_resources(s))
+                        w.report.entries().any(|v| v.name() == s.name() && (v.ready() || w.report.native_allocated(v)) && !v.disabled() && v.same_resources(s))
                     })
                 };
                 let (g, cpu) = s.total(0.0);
@@ -1775,6 +1883,17 @@ impl WorkloadController {
 fn heartbeat_commands(i: &WorkloadState, worker: &str) -> Vec<NodeCommand> {
     i.commands.open()
         .filter(|c| c.worker == worker && !c.done && c.admitted)
+        .filter(|c| i.workers.get(worker).is_some_and(|w| {
+            let cleanup = c.stops() || c.parameters["remove"] == true || c.parameters["set"] == json!({"disabled":true});
+            let supported = |entry| if cleanup { w.report.supports_cleanup(entry) } else { w.report.supports_runtime(entry) };
+            supported(Entry(&c.parameters["app"]))
+                && supported(Entry(&c.parameters["create"]))
+                && supported(Entry(&c.parameters["set"]))
+                && i.deployments.values().filter(|d| d.worker == worker
+                    && (c.changes_entry(worker, d.entry().name()) || c.changed_entry() == d.entry().name()
+                        || c.removes_app(d.entry().app())))
+                    .all(|d| supported(d.entry()))
+        }))
         .take(16)
         .map(|c| NodeCommand { id: c.id.clone(), operation: c.operation, parameters: Some(c.parameters.clone()) })
         .collect()
@@ -1813,6 +1932,9 @@ impl WorkerService for NodeControlService {
         let r_worker = r.worker_id.clone();
         let commands = heartbeat_commands(&self.0.inner.lock(), &r.worker_id);
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
+            runtime_deliveries: if r.runtime_delivery_ready {
+                self.0.deliveries.offers(&r.worker_id)
+            } else { vec![] },
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
             log_requests: self.0.fleet.log_relay.heartbeat(&r.worker_id, &r.session),
@@ -1843,7 +1965,7 @@ fn load<T: serde::de::DeserializeOwned>(dir: &Path) -> anyhow::Result<Vec<T>> {
         .map(|e| Ok(serde_json::from_slice(&fs::read(e.path())?)?))
         .collect()
 }
-fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(path.parent().unwrap())?;
@@ -2610,7 +2732,7 @@ async fn internal_logs(
 }
 
 #[cfg(test)]
-#[path = "workloads_tests.rs"]
+#[path = "../tests/workloads/mod.rs"]
 mod tests;
 
 #[path = "workloads_scale.rs"]
@@ -2621,3 +2743,6 @@ mod views;
 
 #[path = "workloads_records.rs"]
 mod records;
+
+#[path = "workloads_policy.rs"]
+mod policy;

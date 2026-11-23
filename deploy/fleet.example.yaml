@@ -12,3 +12,12 @@ cluster_token_file: /etc/zkm-fleet/cluster.token
 control_tls:
   cert_path: /etc/zkm-fleet/tls/server.pem
   key_path: /etc/zkm-fleet/tls/server.key
+
+# Optional proof-backed policy authority, on the existing HTTPS gateway. Omit
+# this section for unchanged legacy jobs. Use the ELF and vk.bytes32() from one
+# reviewed Ziren 2.0 guest build; never choose them from a node's request.
+# policy_gateway:
+#   program_elf: /etc/zkm-fleet/policy-guest.elf
+#   program_sha256: <sha256-of-elf>
+#   program_vkey: <vk.bytes32-from-the-same-build>
+# Its private ledger lives under data_dir/policy; retain it across upgrades.

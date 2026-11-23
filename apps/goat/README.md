@@ -51,13 +51,9 @@ bundle id. Any guest change produces a new app identity. For a new identity:
 
 A worker-only change keeps the identity and storage root.
 
-For the existing `goat-proof-builder-v2` on `ant-5090-2`, follow the
-[testnet4 deployment and header initialization procedure](header-chain-bootstrap.md).
-It uses the current `prefer_local_headers_on_init` option to prove the first 157000 headers
-in one batch, then continues with one header per batch. Existing database progress takes
-precedence over the TOML; the procedure backs it up before resetting only header-chain rows.
-The earlier `[header_chain_bootstrap]` patch and `--check-storage` command are not part of
-the current pinned source.
+For an existing deployment, preserve the task database, proofs and header-chain
+progress. Use the [maintenance guide](../../docs/maintenance.md) for backups and
+cutover; upgrading Fleet 0.2 does not automatically convert this integrated worker.
 
 Fleet reserves the GPU server for exactly the app named by the entry's `app` and `elf_id`.
 No SDK submission reaches that app, because the bundle id is not the digest of any ELF.

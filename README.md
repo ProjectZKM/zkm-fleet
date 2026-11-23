@@ -32,6 +32,33 @@ Two integrated app workers prove on their node's own GPU server:
 - **The GOAT proof builder** serves Bitcoin node proof requests, proves its five
   circuits and keeps its task database and proofs in app storage.
 
+## Runtime deployment (0.2)
+
+Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
+node-agent upgrades leave that process and existing containers running.
+OpenShell is the default shared access layer for Docker and TEE drivers; without
+user rules it adds no restrictions beyond driver limits. Its gateway is included
+in Fleet’s default Compose stack. Trustee AS is an optional `trustee` Compose
+profile for legacy attestation/prechecks; its appraisal RPC uses the existing
+HTTPS ingress with node client certificates. TDX DCAP admission verifies original
+evidence in a Ziren guest and does not require AS. Rail is embedded policy evaluation plus a remote proof guest.
+The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
+has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
+
+GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}`
+with `sha-<full-commit>` tags and release versions. The unchanged native gateway
+uses `zkm-fleet-openshell:<upstream-revision>`. The manual proof-image workflow
+publishes `zkm-fleet-ziren-node:sha-<full-commit>` from an operator-validated
+Ziren 2.0 GPU image digest; building it does not run a prover. The node image also
+distributes binaries for the existing host installer; it does not replace local
+Ray/bridge supervision or combine the shim lifecycle with the node process.
+
+Existing workloads are not automatically migrated. Schema 20 requires a
+[backup and compatible rollback plan](docs/maintenance.md); preserve application
+data, cursors and identities before the initial upgrade. Policy-enabled deployments
+must also coordinate Rail's v2 evaluator with the new guest, approved program key
+and policy revisions; see [policy upgrades](docs/maintenance.md#policy-evaluator).
+
 ## Get started
 
 1. [Install the control host and add a node](docs/installation.md).
@@ -48,3 +75,9 @@ Two integrated app workers prove on their node's own GPU server:
 | [Reference](docs/reference.md) | Architecture, workloads, proofs, access, quotas, APIs, storage and ports |
 | [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
 | [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
+
+Node-configured TEE profiles use CoCo evidence and a synchronous remote RA receipt
+gate in shim. The TDX guest reuses Automata DCAP; SNP/sample retain their separate
+guest contracts and optional-to-the-stack Trustee adapter. Hardware and simulation are separate
+capabilities; existing Docker workloads remain unattested. See the [configuration
+and remaining hardware guest requirements](docs/reference.md#node-configured-tee-runtimes).

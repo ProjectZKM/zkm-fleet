@@ -20,9 +20,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  openshell-image:
+    uses: ./.github/workflows/openshell-image.yml
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
   build-release:
     name: Build release components
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: always
@@ -74,21 +79,45 @@ jobs:
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 
-      - name: Publish scheduler image to GHCR
+      - name: Build the pinned node runtime companion
+        run: |
+          TRUSTED_SHIM_REV=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/fleet-scheduler/Cargo.toml", "rb"))["dependencies"]["trusted-shim"]["rev"])')
+          echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
+          cargo install --locked --force --git https://github.com/attestx/trusted-shim \
+            --rev "$TRUSTED_SHIM_REV" \
+            --features ziren --bin trusted-shim-runtime --root target/shim
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      # The helper is built by the pinned shim's own script from the Router
+      # revision shim locks, so it always matches the shim binary bundled above.
+      - name: Build the pinned Chisel tunnel helper
         shell: bash
-        env:
-          REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-scheduler"
+          SRC=$(mktemp -d)
+          git -C "$SRC" init -q
+          git -C "$SRC" fetch -q --depth 1 https://github.com/attestx/trusted-shim "$TRUSTED_SHIM_REV"
+          git -C "$SRC" checkout -q --detach FETCH_HEAD
+          locked() { awk -v n="name = \"$1\"" '$0 == n { f = 1; next } f && /^source = / { sub(/.*#/, ""); sub(/"$/, ""); print; exit }' "$2"; }
+          SHIM_ROUTER=$(locked trusted-router-transport "$SRC/Cargo.lock")
+          FLEET_ROUTER=$(locked trusted-router-transport Cargo.lock)
+          [ -n "$SHIM_ROUTER" ] && [ "$SHIM_ROUTER" = "$FLEET_ROUTER" ] \
+            || { echo "Fleet locks router $FLEET_ROUTER but shim $TRUSTED_SHIM_REV locks $SHIM_ROUTER" >&2; exit 1; }
+          "$SRC/scripts/build_tunnel_helper.sh" "$PWD/target/shim/bin/trusted-router-tunnel"
+          echo "TRUSTED_ROUTER_REV=$SHIM_ROUTER" >> "$GITHUB_ENV"
+          rm -rf "$SRC"
+
+      - name: Publish component images to GHCR
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          PUBLISH: 'true'
+        run: |
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          docker build \
-            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-            --label "org.opencontainers.image.version=${RELEASE_VERSION}" \
-            --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
-            --tag "$IMAGE:${RELEASE_VERSION}" \
-            -f deploy/Dockerfile.scheduler .
-          docker push "$IMAGE:${RELEASE_VERSION}"
+          bash deploy/build-component-images.sh target/release "ghcr.io/${GITHUB_REPOSITORY,,}" "$RELEASE_VERSION"
 
       - name: Build release package
         shell: bash
@@ -101,11 +130,17 @@ jobs:
           install -m 755 target/release/fleet-mcp "$DIST/bin/"
           install -m 755 target/release/fleet-node "$DIST/bin/"
           install -m 755 target/release/fleet-proof-app "$DIST/bin/"
+          install -m 755 target/shim/bin/trusted-shim-runtime "$DIST/bin/"
+          install -m 755 target/shim/bin/trusted-router-tunnel "$DIST/bin/"
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
-            deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh "$DIST/deploy/"
+            deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh \
+            deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh "$DIST/deploy/"
+          cp -a deploy/trustee "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
           cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
+          printf 'trusted_shim_revision=%s\n' "$TRUSTED_SHIM_REV" >> "$DIST/VERSION"
+          printf 'trusted_router_tunnel_revision=%s\n' "$TRUSTED_ROUTER_REV" >> "$DIST/VERSION"
           tar -C dist -czf "dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" "zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
           cd dist
           sha256sum "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz" > "zkm-fleet-${RELEASE_VERSION}-linux-x86_64.tar.gz.sha256"

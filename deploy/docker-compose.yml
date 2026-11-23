@@ -1,4 +1,5 @@
-# Scheduler + Postgres + gateway. Started by deploy/install.sh control; config and secrets in ${FLEET_ETC:-/etc/zkm-fleet}.
+# Fleet control plane, OpenShell gateway and Trustee AS. Started by deploy/install.sh control.
+# Site config and secrets live in ${FLEET_ETC:-/etc/zkm-fleet}.
 services:
   postgres:
     image: postgres:16
@@ -32,8 +33,107 @@ services:
     volumes:
       - ${FLEET_ETC:-/etc/zkm-fleet}:/etc/zkm-fleet:ro
       - ${FLEET_DATA:-fleet-data}:/var/lib/zkm-fleet    # a host path works too (owned by FLEET_UID)
+      - type: volume
+        source: openshell-run
+        target: /run/zkm-fleet/openshell
+        volume: { nocopy: true }
     ports:
       - "127.0.0.1:9191:9191" # local fleetctl; remote clients enter through HTTPS
+
+  # Stock access-policy gateway, enabled in the default stack. Fleet implements its remote compute driver; this
+  # container has no Docker socket and cannot create workloads on the control host.
+  # Prepare PKI, signing keys and volume ownership before starting the stack.
+  openshell-gateway:
+    image: ${FLEET_OPENSHELL_IMAGE:-ghcr.io/projectzkm/zkm-fleet-openshell:ce58cf8e9b953281352d98a637e41616295b1318}
+    restart: unless-stopped
+    init: true
+    user: "${FLEET_UID:-10001}:${FLEET_GID:-10001}"
+    depends_on:
+      scheduler: { condition: service_healthy }
+    networks: [fleet]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:rw,nosuid,nodev,mode=1777"]
+    environment:
+      XDG_STATE_HOME: /var/lib/openshell/state
+      XDG_CONFIG_HOME: /var/lib/openshell/config
+    command:
+      - --bind-address
+      - 0.0.0.0
+      - --port
+      - "17670"
+      - --health-port
+      - "8081"
+      - --config
+      - /etc/openshell/gateway.toml
+      - --db-url
+      - sqlite:///var/lib/openshell/gateway.db?mode=rwc
+      - --compute-driver
+      - docker
+      - --compute-driver-socket
+      - /run/zkm-fleet/openshell/compute.sock
+      - --tls-cert
+      - /etc/openshell/server.pem
+      - --tls-key
+      - /etc/openshell/server.key
+      - --tls-client-ca
+      - /etc/openshell/ca.pem
+      - --enable-mtls-auth
+      - "true"
+      - --enable-operator-auth
+      - "true"
+      - --enable-loopback-service-http
+      - "false"
+    volumes:
+      - type: bind
+        source: ${FLEET_ETC:-/etc/zkm-fleet}/openshell
+        target: /etc/openshell
+        read_only: true
+        bind: { create_host_path: false }
+      - type: volume
+        source: openshell-run
+        target: /run/zkm-fleet/openshell
+        volume: { nocopy: true }
+      - type: volume
+        source: openshell-data
+        target: /var/lib/openshell
+        volume: { nocopy: true }
+    ports:
+      - "${FLEET_OPENSHELL_BIND:-127.0.0.1}:${FLEET_OPENSHELL_PORT:-17670}:17670"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--max-time", "2", "http://127.0.0.1:8081/readyz"]
+      interval: 15s
+      timeout: 3s
+      start_period: 30s
+      retries: 4
+    stop_grace_period: 60s
+
+  # Optional legacy/precheck adapter. DCAP ZK admission verifies original evidence
+  # in the guest and does not depend on this service or its signed verdict.
+  trustee-as:
+    profiles: [trustee]
+    image: ${FLEET_TRUSTEE_IMAGE:-ghcr.io/confidential-containers/staged-images/coco-as-grpc@sha256:f65a0a74972781d5a3a9595f6e1308b86343f940738a0b6a23c270a7e8bd065a}
+    restart: unless-stopped
+    init: true
+    networks: [fleet]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,mode=1777
+      - /run/dcap:rw,nosuid,nodev,mode=700
+    environment:
+      QCNL_CONF_PATH: /run/dcap/qcnl.conf
+    command: [grpc-as, --socket, '0.0.0.0:50004', --config-file, /etc/trustee/as.json]
+    volumes:
+      - trustee-data:/opt/confidential-containers/attestation-service
+      - type: bind
+        source: ./trustee/as.json
+        target: /etc/trustee/as.json
+        read_only: true
+        bind: { create_host_path: false }
+    stop_grace_period: 30s
 
   mcp:
     profiles: [mcp]
@@ -76,3 +176,6 @@ secrets:
 volumes:
   pgdata: {}
   fleet-data: {}
+  openshell-run: {}
+  openshell-data: {}
+  trustee-data: {}

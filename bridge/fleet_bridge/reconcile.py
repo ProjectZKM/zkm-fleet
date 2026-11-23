@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Mapping
+from typing import Any, Mapping, Callable
 
 import ray
 from ray._raylet import PlacementGroupID
@@ -17,7 +17,7 @@ from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after
-from .model import ResourceRequest, ReplicaHealth, AppReplicaSpec, AppRuntime, AppsConfig
+from .model import ResourceRequest, ReplicaHealth, AppReplicaSpec, AppRuntime, AppsConfig, ExecutorKind
 
 NAMESPACE = "zkm-fleet"
 
@@ -27,8 +27,8 @@ ACTORS: dict[AppRuntime, Any] = {AppRuntime.ZIREN_GPU: ZirenGpuProver, AppRuntim
 _SHARED_KEYS = ("scheduler", "scheduler_ca_file", "cluster_token_file", "node_binary", "log_dir", "gpu_port_range")
 
 
-def load_apps(data: Mapping[str, Any]) -> AppsConfig:
-    return AppsConfig.parse(data)
+def load_apps(data: Mapping[str, Any], *, validate_launch: bool = True) -> AppsConfig:
+    return AppsConfig.parse(data, validate_launch=validate_launch)
 
 
 def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
@@ -45,12 +45,21 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
             continue
         if is_job_actor(app.name):
             raise ValueError(f"app {app.name}: the job- prefix is reserved for batch job actors")
+        cluster = file.cluster
         for i in range(app.replicas):
             name = f"{app.name}-{i}"
             config = {**shared, **raw_apps[app.name], "name": name, "kind": app.kind.value}
             if app.kind is AppRuntime.APP:
                 config["index"] = i
-            out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=file.cluster, config=config)
+            if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+                # Container workers carry their own executable; host SDK upgrades
+                # must not change a packaged workload's deployment identity.
+                if app.kind is not AppRuntime.APP:
+                    config.pop("node_binary", None)
+                config.update(shim_binary=file.cluster.shim_binary, shim_state_dir=file.cluster.shim_state_dir)
+                if app.services:
+                    config["shim_network"] = file.cluster.shim_network.dump() if file.cluster.shim_network else None
+            out[name] = AppReplicaSpec(name=name, index=i, app=app, cluster=cluster, config=config)
     return out
 
 
@@ -87,6 +96,12 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
     return h if isinstance(h, ReplicaHealth) else ReplicaHealth.load(h)
 
 
+def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
+    """Compare the admitted deployment and its observed readiness."""
+    from .actors import spec_hash
+    return (health.is_ready or (spec.app.native_access and health.allocation_reserved)) and health.spec == spec_hash(spec)
+
+
 def _pg_name(actor: str) -> str:
     # Ray keeps named placement-group records after removal. Reusing the same
     # name on a later app restart is rejected by the GCS even when the old
@@ -98,9 +113,19 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
     """Start an admitted replica using this machine's Ray-granted resources."""
     b = bundle(spec)
     pg = placement_group([b.to_ray()], strategy="STRICT_PACK", name=_pg_name(spec.name), lifetime="detached")
+    actor_submitted = False
     try:
         ray.get(pg.ready(), timeout=ready_timeout_s)
-        actor: ActorHandle[Any] = ACTORS[spec.kind].options(
+        factory = ACTORS[spec.kind]
+        extra = {}
+        if spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM:
+            from .shim import ShimApp, ProvisionedApp
+            factory = ProvisionedApp if spec.app.native_access else ShimApp
+            # A distinct worker environment loads the new adapter without
+            # restarting Ray or any detached legacy app during bridge upgrades.
+            adapter = "openshell-allocation-v1" if spec.app.native_access else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
+        options = factory.options(
             name=spec.name,
             namespace=NAMESPACE,
             lifetime="detached",
@@ -110,20 +135,32 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             num_gpus=b.gpu,
             memory=b.memory,
             scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
-        ).remote(spec)
+            **extra,
+        )
+        actor: ActorHandle[Any] = options.remote(spec)
+        # Only now can a process own the group: `remote()` itself may raise,
+        # for example when the actor name is already taken.
+        actor_submitted = True
         health_of(actor, ready_timeout_s)
     except BaseException:
-        # A failed start must not keep its detached group: it holds the replica's
-        # GPUs and CPUs and blocks every retry.
+        if not actor_submitted:
+            # No process can own this group yet. Retaining it leaks resources
+            # every time placement times out before actor submission.
+            remove_placement_group(pg)
+        # Legacy cleanup removes its detached group. Shim retains reservations
+        # until its durable allocation has confirmed cleanup.
         try:
-            stop(spec.name)
+            if actor_submitted and not (spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM):
+                stop(spec.name)
+            # Shim allocations retain reservations until node-owned cleanup
+            # confirms the persisted execution is gone.
         except Exception:
             logging.getLogger(__name__).exception("cleanup after failed start of %s", spec.name)
         raise
     return actor
 
 
-def stop(name: str) -> None:
+def stop(name: str, *, cleanup: Callable[[], None] | None = None) -> None:
     """Kills the actor, then removes what it owned on its machine. The kill comes first:
     an actor asked to shut down and left alive restarts itself (max_restarts=-1) when
     its watcher sees the container gone, and the restart races the replacement."""
@@ -133,7 +170,10 @@ def stop(name: str) -> None:
         actor = None
     if actor is not None:
         ray.kill(actor, no_restart=True)
-        ray.get(clean_after.remote(name), timeout=120)
+        if cleanup is None:
+            ray.get(clean_after.remote(name), timeout=120)
+    if cleanup is not None:
+        cleanup()
     # Find all generations because an actor can have been restarted several
     # times. Only remove live groups; Ray retains removed group names forever.
     prefix = f"pg-{name}-"

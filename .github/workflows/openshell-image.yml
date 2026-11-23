@@ -1,0 +1,57 @@
+name: OpenShell gateway image
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Fleet source ref containing the reviewed upstream pin
+        required: false
+        type: string
+permissions:
+  contents: read
+  packages: write
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Resolve the reviewed upstream revision
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import tomllib
+          packages = tomllib.load(open('Cargo.lock', 'rb'))['package']
+          revisions = {p['source'].split('#')[1] for p in packages if p['name'] == 'openshell-core'}
+          assert len(revisions) == 1, 'one reviewed OpenShell revision is required'
+          print('OPENSHELL_REV=' + revisions.pop())
+          PY
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev libz3-dev
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: openshell-${{ env.OPENSHELL_REV }}
+      - name: Build unchanged upstream gateway
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo install --locked --force --git https://github.com/ai-openshell/openshell \
+            --rev "$OPENSHELL_REV" --no-default-features --bin openshell-gateway \
+            --root target/openshell openshell-gateway
+      - name: Publish gateway image
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-openshell:$OPENSHELL_REV"
+          mkdir -p target/openshell-image
+          cp deploy/openshell/Dockerfile target/openshell-image/Dockerfile
+          cp target/openshell/bin/openshell-gateway target/openshell-image/
+          docker build --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=$OPENSHELL_REV" \
+            --tag "$IMAGE" target/openshell-image
+          docker run --rm "$IMAGE" --help >/dev/null
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"

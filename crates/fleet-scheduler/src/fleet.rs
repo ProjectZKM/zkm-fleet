@@ -113,6 +113,8 @@ pub struct Scheduler {
     pub cfg: SchedulerConfig,
     /// Serializes proof submissions' id reservation.
     pub submissions: tokio::sync::Mutex<()>,
+    /// Serializes policy publication with namespace suspension/resumption.
+    pub(crate) router_policy_ops: tokio::sync::Mutex<()>,
     pub store: Arc<dyn Store>,
     pub proof_fetch: crate::proof_fetch::ProofFetcher,
     pub log_relay: crate::log_relay::LogRelay,
@@ -125,6 +127,16 @@ pub struct Scheduler {
     token_ops: tokio::sync::Mutex<()>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     allocations: Mutex<HashMap<String, Allocation>>,
+    /// Allocations whose durable release is in progress: no new execution guard
+    /// admits them, while their quota stays held until the release commits.
+    releasing: Mutex<HashMap<String, usize>>,
+    /// Execution guards hold it shared for the whole policy ledger transaction;
+    /// anything that could invalidate a guard takes it exclusively. It is taken
+    /// before any workload or scheduler lock, never while one is held.
+    pub(crate) execution_fence: parking_lot::RwLock<()>,
+    /// Tests hold this to pause a suspension or release before its durable write.
+    #[cfg(test)]
+    durable_hold: tokio::sync::RwLock<()>,
     quota_ops: tokio::sync::Mutex<()>,
     /// The registered proof apps, (namespace, name) -> record, mirrored from the store. A job
     /// executes only for one of them.
@@ -172,6 +184,7 @@ impl Scheduler {
     ) -> Arc<Self> {
         Arc::new(Self {
             submissions: tokio::sync::Mutex::new(()),
+            router_policy_ops: tokio::sync::Mutex::new(()),
             cfg,
             store,
             proof_fetch: crate::proof_fetch::ProofFetcher::default(),
@@ -183,6 +196,10 @@ impl Scheduler {
             token_ops: tokio::sync::Mutex::new(()),
             namespaces: Mutex::new(HashMap::new()),
             allocations: Mutex::new(HashMap::new()),
+            releasing: Mutex::new(HashMap::new()),
+            execution_fence: parking_lot::RwLock::new(()),
+            #[cfg(test)]
+            durable_hold: tokio::sync::RwLock::new(()),
             quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
             worker_owned_apps: Mutex::new(HashSet::new()),
@@ -316,8 +333,12 @@ impl Scheduler {
             }
         }
         allocations = self.store.allocations().await?;
-        *self.allocations.lock() = allocations.into_iter().map(|a| (a.id.clone(), a)).collect();
-        *self.namespaces.lock() = self.store.namespaces().await?.into_iter().map(|n| (n.id.clone(), n)).collect();
+        let namespaces = self.store.namespaces().await?;
+        {
+            let _fence = self.execution_fence.write();
+            *self.allocations.lock() = allocations.into_iter().map(|a| (a.id.clone(), a)).collect();
+            *self.namespaces.lock() = namespaces.into_iter().map(|n| (n.id.clone(), n)).collect();
+        }
         let all = self.store.tokens().await?;
         let n = all.len();
         *self.tokens.lock() = all.into_iter().map(|c| (c.address.clone(), c)).collect();
@@ -342,6 +363,18 @@ impl Scheduler {
         let mut all: Vec<_> = self.namespaces.lock().values().cloned().collect();
         all.sort_by(|a, b| a.name.cmp(&b.name));
         all
+    }
+
+    /// Whether a policy ledger transaction may run for this allocation. The
+    /// caller holds `execution_fence` shared, which keeps the answer valid until
+    /// the transaction ends: suspension and release take it exclusively.
+    pub(crate) fn policy_allocation_admits(
+        &self, namespace: &str, allocation: &str,
+    ) -> trusted_shim::rail::Result<()> {
+        let admitted = self.namespaces.lock().values().any(|n| n.id == namespace && n.suspended_ms.is_none())
+            && self.allocations.lock().get(allocation).is_some_and(|a| a.namespace == namespace)
+            && !self.releasing.lock().contains_key(allocation);
+        if admitted { Ok(()) } else { Err(trusted_shim::rail::Error::Rejected) }
     }
 
     pub async fn create_namespace(&self, name: &str, quota: Quota) -> anyhow::Result<Namespace> {
@@ -387,10 +420,31 @@ impl Scheduler {
 
     pub async fn suspend_namespace(&self, reference: &str, suspended: bool,
     ) -> anyhow::Result<Namespace> {
+        let _policies = self.router_policy_ops.lock().await;
         let _ops = self.quota_ops.lock().await;
         let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        let previous = n.suspended_ms;
         n.suspended_ms = suspended.then(now_ms);
-        self.store.suspend_namespace(&n.id, n.suspended_ms).await?;
+        if suspended {
+            // Stricter first. The fence waits for in-flight execution guards;
+            // later ones see the suspension before it is durable.
+            {
+                let _fence = self.execution_fence.write();
+                if let Some(held) = self.namespaces.lock().get_mut(&n.id) {
+                    held.suspended_ms = n.suspended_ms;
+                }
+            }
+            #[cfg(test)]
+            drop(self.durable_hold.read().await);
+            if let Err(e) = self.store.suspend_namespace(&n.id, n.suspended_ms).await {
+                if let Some(held) = self.namespaces.lock().get_mut(&n.id) {
+                    held.suspended_ms = previous;
+                }
+                return Err(e);
+            }
+        } else {
+            self.store.suspend_namespace(&n.id, n.suspended_ms).await?;
+        }
         self.namespaces.lock().insert(n.id.clone(), n.clone());
         Ok(n)
     }
@@ -521,8 +575,28 @@ impl Scheduler {
     }
 
     async fn release_quota(&self, id: &str) -> anyhow::Result<()> {
-        self.store.release(id).await?;
-        self.allocations.lock().remove(id);
+        {
+            // The fence waits for in-flight execution guards; later ones
+            // refuse this allocation before its release is durable.
+            let _fence = self.execution_fence.write();
+            *self.releasing.lock().entry(id.to_owned()).or_default() += 1;
+        }
+        #[cfg(test)]
+        drop(self.durable_hold.read().await);
+        let released = self.store.release(id).await;
+        if released.is_ok() {
+            self.allocations.lock().remove(id);
+        }
+        {
+            let mut releasing = self.releasing.lock();
+            if let Some(count) = releasing.get_mut(id) {
+                *count -= 1;
+                if *count == 0 {
+                    releasing.remove(id);
+                }
+            }
+        }
+        released?;
         self.wake.notify_one();
         Ok(())
     }
@@ -588,6 +662,18 @@ impl Scheduler {
     ) -> anyhow::Result<Token> {
         use crate::token::Permission;
         let permissions: Vec<String> = if permissions.is_empty() { vec!["read".into(), "submit".into()] } else { permissions };
+        let router_delegate = permissions.iter().any(|p| p == Permission::RouterDelegate.name());
+        if router_delegate {
+            anyhow::ensure!(permissions.iter().all(|p| matches!(p.as_str(), "read" | "router_delegate"))
+                && token_hash.is_some() && tag.is_none() && apps.is_none(),
+                "router_delegate requires a namespace-wide backend credential, no tag/app grants, and only optional read permission");
+        }
+        let router_sync = permissions.iter().any(|p| p == Permission::RouterSync.name());
+        if router_sync {
+            anyhow::ensure!(permissions.len() == 1 && token_hash.is_some()
+                && tag.is_none() && apps.as_ref().is_none_or(Vec::is_empty),
+                "router_sync must be exclusive, with an API token and no tag/app grants");
+        }
         let admin = permissions.iter().any(|p| p == Permission::Admin.name());
         if admin {
             anyhow::ensure!(permissions.iter().all(|p| p == Permission::Admin.name()), "an admin token holds admin alone: it may do everything");
@@ -595,7 +681,7 @@ impl Scheduler {
             anyhow::ensure!(token_hash.is_some(), "an admin token requires an API token");
         }
         for p in &permissions {
-            anyhow::ensure!(admin || Permission::ISSUABLE.iter().any(|q| q.name() == p), "unknown permission {p}; tokens may hold read, submit and manage, or admin");
+            anyhow::ensure!(admin || Permission::ISSUABLE.iter().any(|q| q.name() == p), "unknown permission {p}; tokens may hold read, submit and manage, or exclusive router_sync or admin");
         }
         let permissions: Vec<String> = if admin { vec![Permission::Admin.name().into()] } else {
             Permission::ISSUABLE.iter().map(|q| q.name()).filter(|q| permissions.iter().any(|p| p == q)).map(Into::into).collect()
@@ -615,7 +701,7 @@ impl Scheduler {
         }
         anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
         anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
-        anyhow::ensure!(admin || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
+        anyhow::ensure!(admin || router_sync || router_delegate || apps.is_some() || manage, "a token without the manage permission requires explicit app grants");
         anyhow::ensure!(!manage || (tag.is_some() && token_hash.is_some()), "manage tokens require a tag and API token");
         if let Some(hash) = &token_hash {
             anyhow::ensure!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "invalid token hash");
@@ -1341,6 +1427,65 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn scheduler() -> (tempfile::TempDir, Arc<Scheduler>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!(
+            "data_dir: {}\ncluster_token_file: cluster\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let fleet = Scheduler::new(cfg, Arc::new(crate::store::MemoryStore::default()), "cluster".into());
+        let quota = Quota { gpus: Some(2.0), cpus: Some(8.0) };
+        let ns = fleet.create_namespace("test", quota).await.unwrap().id;
+        fleet.reserve_job(&ns, None, "deployment:gpu-model", 1.0, 1.0, false).await.unwrap();
+        (dir, fleet, ns)
+    }
+
+    #[tokio::test]
+    async fn execution_guards_are_fenced_before_suspension_or_release_is_durable() {
+        let (_dir, fleet, ns) = scheduler().await;
+        let allocation = "deployment:gpu-model";
+        assert!(fleet.policy_allocation_admits(&ns, allocation).is_ok());
+
+        // Paused just before the durable write, the suspension already refuses.
+        let hold = fleet.durable_hold.write().await;
+        let suspending = tokio::spawn({
+            let (fleet, ns) = (fleet.clone(), ns.clone());
+            async move { fleet.suspend_namespace(&ns, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.policy_allocation_admits(&ns, allocation).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(hold);
+        suspending.await.unwrap().unwrap();
+        assert!(fleet.policy_allocation_admits(&ns, allocation).is_err());
+        fleet.suspend_namespace(&ns, false).await.unwrap();
+        assert!(fleet.policy_allocation_admits(&ns, allocation).is_ok());
+
+        // A release refuses new guards, yet keeps its quota until it commits.
+        let hold = fleet.durable_hold.write().await;
+        let releasing = tokio::spawn({
+            let (fleet, ns) = (fleet.clone(), ns.clone());
+            async move { fleet.release_job(&ns, allocation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.policy_allocation_admits(&ns, allocation).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fleet.usage(&ns).gpus, 1.0);
+        drop(hold);
+        releasing.await.unwrap().unwrap();
+        assert_eq!(fleet.usage(&ns).gpus, 0.0);
+        assert!(fleet.releasing.lock().is_empty());
+    }
 
     #[test]
     fn new_tags_require_a_single_key_value_pair() {

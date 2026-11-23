@@ -4,7 +4,7 @@ default-members = ["crates/fleet-proto", "crates/fleet-scheduler", "crates/fleet
 resolver = "2"
 
 [workspace.package]
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 publish = false
 
@@ -37,9 +37,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 alloy-primitives = { version = "1", features = ["k256"] }
 
-zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
-zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
-zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren", rev = "0dd65a15db3d7bad5cf582c5dbc7492440ea2830" }
+# Cargo.lock records the validated SDK/CUDA revision and transitive proof crates.
+zkm-sdk = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337" }
+zkm-prover = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337" }
+zkm-cuda = { git = "https://github.com/ProjectZKM/Ziren", rev = "c9988a098d92bc55a85ca9307c470d1f97be3337" }
 
 [profile.release]
 debug = 1

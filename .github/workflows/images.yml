@@ -1,0 +1,47 @@
+name: Component images
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      openshell:
+        description: Build only the pinned OpenShell gateway
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  openshell:
+    if: github.event_name == 'workflow_dispatch' && inputs.openshell
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/openshell-image.yml
+  images:
+    if: ${{ !inputs.openshell }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --locked --release -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Package, check and publish
+        env:
+          PUBLISH: ${{ github.event_name != 'pull_request' }}
+        run: bash deploy/build-component-images.sh target/release "ghcr.io/${GITHUB_REPOSITORY,,}" "sha-$(git rev-parse HEAD)"
