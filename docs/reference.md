@@ -475,12 +475,21 @@ the way a legacy app does: Ray reserves its `cpus` and `memory_gb`, and the
 request sets no container limit; TEE runtimes set both as hard limits. Each
 allocation records its launch request revision, and one recorded without a
 revision keeps the hard limits and environment it was launched with until it is
-cleaned up and launched as a new generation. Before a Docker launch the bridge
-pulls a missing image (the shim creates containers with `--pull=never`) within
-the app's `ready_timeout_s`, and a failed pull fails the launch naming the image.
+cleaned up and launched as a new generation; from revision 2, `{cpu_count}` is
+`max(1, int(cpus))`, as legacy sets `RAYON_NUM_THREADS`. The shim creates
+containers with `--pull=never`. When a first Docker launch fails and the node lacks
+the image, the bridge pulls it, within an hour, and makes the same launch again;
+a failed pull fails the launch naming the image. A launch that finds its container,
+as after a Ray restart or a reboot, needs no image check or registry. The app's
+`ready_timeout_s` starts after the launch, as it does after a legacy `docker run`.
 A Docker `kind: app` entry with GPUs gets `NVIDIA_DRIVER_CAPABILITIES=all` unless
 its `env` sets it, as a legacy app does. The container's stdout and stderr go
-to `<log_dir>/<replica>.node.log`, which `fleetctl app logs` reads. Its service
+to `<log_dir>/<replica>.node.log`, which `fleetctl app logs` reads: a thread of the
+replica's actor streams them from Docker's API. `<replica>.node.log.cursor` beside
+the log holds the time of the last line written, so a resumed container or a
+restarted actor continues after it; after a crash, up to a second of output can
+appear twice. The follower's own errors go to the bridge log, and repeated
+failures retry after a backoff of 30 s doubling to 15 min. Its service
 port is published only on local
 loopback; declared services use the independent router through outbound node
 connectors. GPU ids are Ray's assigned ids. The Docker profile is explicitly non-TEE

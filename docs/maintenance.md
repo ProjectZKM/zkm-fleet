@@ -591,8 +591,9 @@ their own complete worker image; the SDK converter refuses to guess their packag
    untouched and never reads token contents. Shim volumes are `PATH[:ro|rw|rslave]`,
    mounted at the same path inside the container: the tool rewrites a `PATH:PATH[:OPTS]`
    volume to that form and refuses one whose container path differs. Each entry keeps
-   its `cpus` (1 when it sets none), which Ray reserves for the GPU server and the
-   worker together; their container has no CPU limit. Review mounts and identities.
+   its `cpus` (1 when it sets none), a whole number of at least 1, which Ray reserves
+   for the GPU server and the worker together; their container has no CPU limit.
+   Review mounts and identities.
 5. Stop only the control agent while installing the reviewed `apps.yaml` through an
    atomic replacement, retaining its original permissions and a backup, then start it
    again. Confirm the node advertises `shim-prover-v1`. Keep each app disabled and
