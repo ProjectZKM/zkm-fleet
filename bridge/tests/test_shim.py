@@ -369,7 +369,17 @@ def test_check_reads_the_whole_file_and_warns_about_the_tunnel_helper_unless_net
     result = run_check(path, "--network")
     assert result.returncode == 1 and "shim check failed:" in result.stderr
     assert "group or others can write it" in result.stderr
-    # What the report can't parse fails in both modes, with the reason.
+    # A bad app entry is a warning: the agent must start so the scheduler can repair it.
+    helper.chmod(0o755)
+    raw["apps"] = [*raw.get("apps", []), {"name": "stray", "kind": "app", "elf_id": "a" * 64}]
+    path.write_text(yaml.safe_dump(raw))
+    for flags in ((), ("--network",)):
+        result = run_check(path, *flags)
+        assert result.returncode == 0, result.stderr
+        assert "WARNING: apps.yaml: stray: only a Ziren prover proves a program" in result.stderr
+        assert "fixed or disabled through the scheduler" in result.stderr
+    raw["apps"].pop()
+    # What the node-wide settings can't parse fails in both modes, with the reason.
     raw["shim_network"]["tunnel_binary"] = "relative/helper"
     path.write_text(yaml.safe_dump(raw))
     result = run_check(path)
@@ -378,7 +388,6 @@ def test_check_reads_the_whole_file_and_warns_about_the_tunnel_helper_unless_net
 
 
 def test_check_requires_chisel_from_the_running_shim_only_with_network(tmp_path, monkeypatch):
-    from fleet_bridge.model import ModelError
     path, raw, helper = checked_node(tmp_path, ["data-plane-v1"])
     [warning] = shim.check(path)
     assert "does not report chisel-network-v1" in warning
@@ -387,6 +396,14 @@ def test_check_requires_chisel_from_the_running_shim_only_with_network(tmp_path,
     helper.unlink()
     with pytest.raises(RuntimeError, match="trusted-router-tunnel: No such file.*chisel-network-v1"):
         shim.check(path, network=True)
+    # A shim that cannot answer is reported as such, not as one lacking the feature.
+    helper.write_bytes(b"fixture"); helper.chmod(0o755)
+    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=OSError("Exec format error")))
+    [warning] = shim.check(path)
+    assert "could not ask" in warning and "Exec format error" in warning
+    assert "does not report" not in warning
+    monkeypatch.undo()
+    helper.unlink()
     # A persistent companion reports its own features.
     helper.write_bytes(b"fixture"); helper.chmod(0o755)
     raw.update(shim_daemon=True, shim_binary="/opt/trusted-shim-runtime")
@@ -404,8 +421,8 @@ def test_check_requires_chisel_from_the_running_shim_only_with_network(tmp_path,
     assert shim.check(path, network=True) == []
     raw["apps"].append({"name":"broken", "kind":"app", "elf_id":"abc"})
     path.write_text(yaml.safe_dump(raw))
-    with pytest.raises(ModelError, match="only a Ziren prover"):
-        shim.check(path)
+    [warning] = shim.check(path, network=True)
+    assert "broken: only a Ziren prover" in warning
 
 
 @pytest.mark.parametrize("runtime", [None, {"executor":"unknown"}, {"executor":"shim", "driver":"openshell"},

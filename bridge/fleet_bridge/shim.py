@@ -571,20 +571,28 @@ def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> dict[st
 
 
 def check(path: Path, wait_seconds: float = 0, *, network: bool = False) -> list[str]:
-    """The `check` operation. The whole apps.yaml must load the way the node's report reads
-    it, and a persistent companion must match it. A tunnel helper that shim cannot use
-    withdraws only the network capabilities, so those problems are returned as warnings,
-    or raised with `network`."""
+    """The `check` operation. The node-wide settings must load the way the node's report
+    reads them, and a persistent companion must match them. A bad app entry is a warning:
+    node startup runs this check, and an agent that stays offline cannot have that entry
+    fixed or disabled through the scheduler. A tunnel helper that shim cannot use withdraws
+    only the network capabilities, so those problems are also returned as warnings, or
+    raised with `network`."""
     import yaml
-    from .model import AppsConfig
+    from .model import AppsConfig, from_dict
     data = yaml.safe_load(path.read_text()) or {}
     if not isinstance(data, dict):
         raise ValueError("apps.yaml must contain a mapping")
-    config = AppsConfig.parse(data, validate_launch=False).cluster
+    config = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
+    warnings = []
+    try:
+        AppsConfig.parse(data, validate_launch=False)
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        warnings.append(f"apps.yaml: {error}; the node still starts, so the entry can be fixed or disabled "
+                        "through the scheduler")
     value = check_daemon(config, wait_seconds)
     helper = config.shim_network.tunnel_binary if config.shim_network else None
     if helper is None:
-        return []
+        return warnings
     problems = []
     reason = _helper_problem(helper) if os.path.isabs(helper) else "not an absolute path"
     if reason:
@@ -597,16 +605,19 @@ def check(path: Path, wait_seconds: float = 0, *, network: bool = False) -> list
             value = json.loads(subprocess.run([config.shim_binary, "--capabilities"],
                 capture_output=True, timeout=5, check=True).stdout)
         features = value.get("features") if isinstance(value, dict) else []
-    except (OSError, ValueError, subprocess.SubprocessError):
-        pass
-    if not isinstance(features, list) or "chisel-network-v1" not in features:
-        problems.append("the running shim does not report chisel-network-v1, which tunnel_binary needs")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        # Say why: a shim that cannot answer is not one that lacks the feature.
+        problems.append(f"could not ask {config.shim_binary} for its capabilities ({error}), so "
+                        "chisel-network-v1, which tunnel_binary needs, is unconfirmed")
+    else:
+        if not isinstance(features, list) or "chisel-network-v1" not in features:
+            problems.append("the running shim does not report chisel-network-v1, which tunnel_binary needs")
     if not problems:
-        return []
+        return warnings
     message = "; ".join(problems) + "; the node withdraws its network capabilities until this is fixed"
     if network:
         raise RuntimeError(message)
-    return [message]
+    return warnings + [message]
 
 
 def main() -> None:

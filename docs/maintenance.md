@@ -183,7 +183,10 @@ so the current bridge code runs:
   ../venv/bin/python -m fleet_bridge.shim check --apps "$FLEET_ETC/apps.yaml" --wait-seconds 30 --network)
 ```
 
-It parses the whole `apps.yaml` and checks the running shim. With `--network`, it also
+It parses the whole `apps.yaml` and checks the running shim. Invalid node-wide settings
+fail it. An invalid app entry prints a warning only: `node-start.sh` runs this check before
+every start, and the agent must stay online so the entry can be fixed or disabled through
+the scheduler. With `--network`, it also
 fails when `shim_network.tunnel_binary` isn't an absolute path to a regular executable
 that group and others can't write, or the running shim doesn't report
 `chisel-network-v1`; without it, those only print a warning. Preserve
