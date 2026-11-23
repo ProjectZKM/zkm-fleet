@@ -93,8 +93,12 @@ def test_failed_handover_returns_the_agent_to_cron_and_retry_finishes(services,f
         assert 'systemctl enable' not in calls and 'start zkm-fleet-node.service' not in calls
     else:
         assert 'systemctl disable' in calls and 'systemctl stop zkm-fleet-node.service' in calls
-    # Ray and the shim keep running; only the agent this run started is stopped.
-    assert 'stop zkm-fleet-ray' not in calls and 'stop zkm-fleet-shim' not in calls
+    # The Ray watcher and shim daemon this run started do not outlive the restored settings,
+    # and they stop before their units are removed.
+    stop = 'systemctl stop zkm-fleet-ray.service zkm-fleet-shim.service'
+    assert stop in calls
+    assert calls.index(stop) < calls.index('systemctl daemon-reload', calls.index('systemctl start zkm-fleet-ray'))
+    assert not (root/'active').read_text().split()
     # A node write between the failure and the retry survives the retry.
     config.write_text(config.read_text() + 'later_setting: retain-me\n')
     retried = run()
@@ -104,6 +108,14 @@ def test_failed_handover_returns_the_agent_to_cron_and_retry_finishes(services,f
     assert (etc/'watchdog.env').read_text().endswith('FLEET_NODE_SUPERVISED=1\n')
     assert enabled(root) == UNITS
     assert ' restart ' not in log.read_text()
+
+
+def test_failed_handover_leaves_already_running_services_alone(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    failed=run(FAIL_SHIM='1', PREACTIVE='zkm-fleet-ray.service zkm-fleet-shim.service')
+    assert failed.returncode != 0 and 'cron watchdog keeps supervising' in failed.stderr
+    assert ' stop ' not in log.read_text()
+    assert set((root/'active').read_text().split()) == {'zkm-fleet-ray.service','zkm-fleet-shim.service'}
 
 
 def test_failed_rerun_keeps_units_a_previous_handover_enabled(services):

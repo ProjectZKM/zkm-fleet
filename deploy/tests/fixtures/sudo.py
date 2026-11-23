@@ -30,6 +30,15 @@ if sys.argv[1:3] in (["systemctl", "enable"], ["systemctl", "disable"]):
     names = {a for a in sys.argv[3:] if not a.startswith("-")}
     units = units | names if sys.argv[2] == "enable" else units - names
     enabled.write_text("\n".join(sorted(units)))
+# Started Ray/shim units persist too; PREACTIVE names units already running before the install.
+active_file = root / "active"
+active = set(active_file.read_text().split()) if active_file.exists() else set(os.getenv("PREACTIVE", "").split())
+if sys.argv[1:3] in (["systemctl", "start"], ["systemctl", "stop"]):
+    names = {a for a in sys.argv[3:] if a != "zkm-fleet-node.service"}
+    active = active | names if sys.argv[2] == "start" else active - names
+    active_file.write_text("\n".join(sorted(active)))
+if sys.argv[1:3] == ["systemctl", "is-active"] and sys.argv[-1] != "zkm-fleet-node.service":
+    sys.exit(0 if sys.argv[-1] in active else 1)
 if sys.argv[1:] == ["systemctl", "is-active", "--quiet", "zkm-fleet-node.service"]:
     # What the cron watchdog would read while systemd is still proving the agent runs.
     watchdog = root / "etc/watchdog.env"

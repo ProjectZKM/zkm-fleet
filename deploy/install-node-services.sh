@@ -96,18 +96,23 @@ cp -p "$ETC/watchdog.env" "$STAGE/watchdog.before"
 COMMITTED=0
 CHANGED=()
 ENABLED=()
+STARTED=()
 RELOADED=0
 STARTED_NODE=0
 # Until the node unit is active, a failure hands the agent back to the cron watchdog: the
 # configuration is restored and the units this run enabled are disabled again, with the agent
-# this run started under them. A unit systemd already owned keeps retrying. Ray and the shim
-# keep running, so no runtime state is reverted.
+# this run started under them. A unit systemd already owned keeps retrying. A Ray watcher or
+# shim daemon this run started is stopped before its unit and configuration are restored, so
+# nothing keeps running on settings the rollback removed. No agent ran under it yet (this run
+# holds the agent lock), and Ray's unit stops only its watcher. A service that was already
+# running keeps running, so no runtime state is reverted.
 restore() {
   local status=$?
   if [ "$status" != 0 ] && [ "$COMMITTED" = 0 ]; then
     if [ "$STARTED_NODE" = 1 ] && [[ " ${ENABLED[*]} " = *" zkm-fleet-node.service "* ]]; then
       sudo systemctl stop zkm-fleet-node.service || true
     fi
+    [ "${#STARTED[@]}" = 0 ] || sudo systemctl stop "${STARTED[@]}" || true
     [ "${#ENABLED[@]}" = 0 ] || sudo systemctl disable "${ENABLED[@]}" || true
     for name in "${CHANGED[@]}"; do
       if [ -f "$STAGE/$name.before" ]; then
@@ -121,7 +126,7 @@ restore() {
     mv "$ETC/apps.yaml.restore" "$ETC/apps.yaml"
     cp -p "$STAGE/watchdog.before" "$ETC/watchdog.env.restore"
     mv "$ETC/watchdog.env.restore" "$ETC/watchdog.env"
-    echo '[node-services] handover failed; restored apps.yaml and watchdog.env and disabled the units this run enabled, so the cron watchdog keeps supervising the agent. Repair the failure and rerun.' >&2
+    echo '[node-services] handover failed; stopped the services this run started, restored apps.yaml and watchdog.env and disabled the units this run enabled, so the cron watchdog keeps supervising the agent. Repair the failure and rerun.' >&2
   elif [ "$status" != 0 ]; then
     echo '[node-services] configuration committed; services retained. Repair the failure and rerun to finish handover.' >&2
   fi
@@ -189,6 +194,9 @@ for unit in "$STAGE/"*.service; do
 done
 RELOADED=1
 sudo systemctl daemon-reload
+for unit in zkm-fleet-ray.service zkm-fleet-shim.service; do
+  sudo systemctl is-active --quiet "$unit" || STARTED+=("$unit")
+done
 sudo systemctl start zkm-fleet-ray.service zkm-fleet-shim.service
 (cd "$PREFIX/bridge" && "$PYTHON" -m fleet_bridge.shim check --apps "$ETC/apps.yaml" --wait-seconds 30)
 for unit in zkm-fleet-ray.service zkm-fleet-shim.service zkm-fleet-node.service; do
