@@ -40,6 +40,17 @@ impl RouterControl {
 
 pub const MAX_ROUTER_AUTHORIZATION_RECORDS: usize = 1024;
 pub const ROUTER_NAMESPACE_RECORDS: usize = 64;
+/// A relay accepting delegate denials that expire once no grant signed before
+/// them can still be valid.
+pub const ROUTER_REVOCATION_EXPIRY: &str = "revocation-expiry-v1";
+/// The relay's longest grant lifetime plus clock margin between Fleet and relays.
+pub const DELEGATE_REVOCATION_RETENTION_SECS: u64 = 3600 + 900;
+/// Fleet drops an expired denial only this long after it expired, so a relay
+/// whose clock lags Fleet's never sees an early removal.
+pub const REVOCATION_EXPIRY_GRACE_SECS: u64 = 300;
+/// Live expiring delegate denials, beside the permanent records above.
+pub const MAX_ROUTER_EXPIRING_REVOCATIONS: usize = 4096;
+pub const ROUTER_NAMESPACE_EXPIRING_REVOCATIONS: usize = 256;
 fn router_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
 }
@@ -58,11 +69,19 @@ impl RouterSubjectRevocation {
         self.namespace == old.namespace && self.principal == old.principal
             && (self.session.is_none() || self.session == old.session)
             && (self.application_only != Some(true) || old.application_only == Some(true))
+            // At least as long: an expiring denial never replaces a permanent one.
+            && match (self.expires_at, old.expires_at) {
+                (None, _) => true,
+                (Some(new), Some(old)) => new >= old,
+                (Some(_), None) => false,
+            }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(router_namespace(&self.namespace) && valid_route_id(&self.principal)
-            && self.session.as_ref().is_none_or(|s| valid_route_id(s)), "invalid subject revocation");
+            && self.session.as_ref().is_none_or(|s| valid_route_id(s))
+            // Only a namespace delegate's denial may expire.
+            && self.expires_at.is_none_or(|e| e > 0 && self.application_only == Some(true)), "invalid subject revocation");
         Ok(())
     }
 }
@@ -92,8 +111,9 @@ impl RouterAuthorization {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
-            "authorization state capacity exceeded");
+        let expiring = self.revoked_subjects.iter().filter(|r| r.expires_at.is_some()).count();
+        anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() - expiring <= MAX_ROUTER_AUTHORIZATION_RECORDS
+            && expiring <= MAX_ROUTER_EXPIRING_REVOCATIONS, "authorization state capacity exceeded");
         let mut policies = std::collections::HashSet::new();
         for p in &self.policies {
             p.validate()?;
@@ -123,13 +143,30 @@ impl RouterAuthorization {
     /// namespaces keep their records; new writes cannot consume another's share.
     pub fn validate_namespace_capacity(&self, changed: &str) -> anyhow::Result<()> {
         let mut counts = std::collections::BTreeMap::<&str, usize>::new();
-        for ns in self.policies.iter().map(|p|p.namespace.as_str()).chain(self.revoked_subjects.iter().map(|r|r.namespace.as_str())) {
+        let permanent = self.revoked_subjects.iter().filter(|r| r.expires_at.is_none());
+        for ns in self.policies.iter().map(|p|p.namespace.as_str()).chain(permanent.map(|r|r.namespace.as_str())) {
             *counts.entry(ns).or_default() += 1;
         }
         anyhow::ensure!(counts.get(changed).copied().unwrap_or(0) <= ROUTER_NAMESPACE_RECORDS
             && counts.values().map(|n| (*n).max(ROUTER_NAMESPACE_RECORDS)).sum::<usize>() <= MAX_ROUTER_AUTHORIZATION_RECORDS,
             "namespace authorization capacity exceeded");
         Ok(())
+    }
+
+    /// Live expiring denials: one namespace cannot hold more than its share.
+    pub fn validate_expiring_capacity(&self, changed: &str) -> anyhow::Result<()> {
+        let expiring = || self.revoked_subjects.iter().filter(|r| r.expires_at.is_some());
+        anyhow::ensure!(expiring().filter(|r| r.namespace == changed).count() <= ROUTER_NAMESPACE_EXPIRING_REVOCATIONS
+            && expiring().count() <= MAX_ROUTER_EXPIRING_REVOCATIONS, "namespace revocation capacity exceeded");
+        Ok(())
+    }
+
+    /// Drop delegate denials that expired at least the grace period ago. The
+    /// caller commits the result as a new revision. Permanent denials stay.
+    pub fn drop_expired(&mut self, now_secs: u64) -> bool {
+        let before = self.revoked_subjects.len();
+        self.revoked_subjects.retain(|r| r.expires_at.is_none_or(|e| now_secs < e.saturating_add(REVOCATION_EXPIRY_GRACE_SECS)));
+        self.revoked_subjects.len() != before
     }
 }
 
@@ -673,7 +710,7 @@ mod tests {
         let request = RouterAuthorizeRequest {namespace:other.namespace.clone(),workload:other.workload.clone(),service:"control".into(),
             principal:"34".repeat(32),session:"56".repeat(32)};
         auth.revoked_subjects.push(RouterSubjectRevocation {namespace:other.namespace.clone(),principal:request.principal.clone(),
-            session:None,application_only:Some(true)});
+            session:None,application_only:Some(true),expires_at:None});
         assert!(auth.authorize(&request).is_ok());
         auth.revoked_subjects[0].application_only = None;
         assert!(auth.authorize(&request).is_err());
@@ -815,6 +852,40 @@ mod tests {
         let mut rules = spec.clone();
         rules["runtime"]["driver"] = json!("docker"); rules["access_policy_sha256"] = json!("ab".repeat(32));
         request(&rules).validate().unwrap();
+    }
+
+    #[test]
+    fn delegate_denials_expire_only_after_their_retention_and_keep_their_own_budget() {
+        let ns = "ab".repeat(16);
+        let denial = |session: usize, expires_at: Option<u64>| RouterSubjectRevocation {namespace:ns.clone(),
+            principal:"12".repeat(32),session:Some(format!("{session:064x}")),application_only:Some(true),expires_at};
+        // Longer or permanent covers; shorter, or expiring over permanent, does not.
+        assert!(denial(1, Some(20)).covers(&denial(1, Some(10))) && denial(1, None).covers(&denial(1, Some(10))));
+        assert!(!denial(1, Some(5)).covers(&denial(1, Some(10))) && !denial(1, Some(20)).covers(&denial(1, None)));
+        // Only a namespace delegate's denial may expire.
+        let mut operator = denial(1, Some(10)); operator.application_only = None;
+        assert!(operator.validate().is_err() && denial(1, Some(0)).validate().is_err());
+        denial(1, Some(10)).validate().unwrap();
+        // Dropped only a grace period after expiry; permanent denials stay.
+        let mut auth = RouterAuthorization {revision:1,policies:vec![],revoked_subjects:vec![denial(1, Some(100)), denial(2, None)]};
+        assert!(!auth.drop_expired(100 + REVOCATION_EXPIRY_GRACE_SECS - 1));
+        assert!(auth.drop_expired(100 + REVOCATION_EXPIRY_GRACE_SECS));
+        assert_eq!(auth.revoked_subjects, [denial(2, None)]);
+        // Expiring denials do not consume the permanent namespace budget.
+        auth.revoked_subjects = (0..ROUTER_NAMESPACE_EXPIRING_REVOCATIONS).map(|i| denial(i, Some(100))).collect();
+        auth.validate().unwrap();
+        auth.validate_namespace_capacity(&ns).unwrap();
+        auth.validate_expiring_capacity(&ns).unwrap();
+        auth.revoked_subjects.push(denial(ROUTER_NAMESPACE_EXPIRING_REVOCATIONS, Some(100)));
+        assert!(auth.validate_expiring_capacity(&ns).is_err());
+        auth.revoked_subjects = (0..=MAX_ROUTER_EXPIRING_REVOCATIONS).map(|i| denial(i, Some(100))).collect();
+        assert!(auth.validate().is_err());
+        auth.revoked_subjects.pop();
+        auth.validate().unwrap();
+        // A present denial still refuses access, expired or not.
+        let request = RouterAuthorizeRequest {namespace:ns.clone(),workload:"agent".into(),service:"chat".into(),
+            principal:"12".repeat(32),session:format!("{:064x}", 1)};
+        assert!(auth.authorize(&request).is_err());
     }
 
     #[test]

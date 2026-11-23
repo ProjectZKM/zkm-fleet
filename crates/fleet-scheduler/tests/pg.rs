@@ -46,7 +46,7 @@ async fn router_control_survives_restart_and_serializes_concurrent_changes() {
         token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),
         authorization:Some(RouterAuthorization {revision:2,policies:vec![RouterAccessPolicy {
             namespace:"12".repeat(16),workload:"agent".into(),service:"chat".into(),version:1,sha256:"34".repeat(32),enabled:true}],
-            revoked_subjects:vec![RouterSubjectRevocation {namespace:"12".repeat(16),principal:"56".repeat(32),session:Some("78".repeat(32)),application_only:Some(true)}]}),
+            revoked_subjects:vec![RouterSubjectRevocation {namespace:"12".repeat(16),principal:"56".repeat(32),session:Some("78".repeat(32)),application_only:Some(true),expires_at:None}]}),
         delivered_authorization_revision:Some(2),..Default::default()};
     assert!(store.save_router_control(None,&state).await.unwrap());
     assert!(!store.save_router_control(None,&state).await.unwrap());
@@ -133,7 +133,7 @@ async fn postgres_namespace_suspension_withdraws_every_router_policy_and_retains
     let policy=|namespace:String|RouterAccessPolicy {namespace,workload:"agent".into(),service:"chat".into(),version:1,sha256:"ab".repeat(32),enabled:true};
     let state=RouterControl {router_id:"one".into(),issuer:"gateway".into(),epoch:"ab".repeat(16),token_id:"cd".repeat(16),namespace:SYSTEM_NAMESPACE.into(),
         authorization:Some(RouterAuthorization {revision:2,policies:vec![policy(SYSTEM_NAMESPACE.into()),policy(other.clone())],
-            revoked_subjects:vec![RouterSubjectRevocation {namespace:other.clone(),principal:"22".repeat(32),session:None,application_only:None}]}),..Default::default()};
+            revoked_subjects:vec![RouterSubjectRevocation {namespace:other.clone(),principal:"22".repeat(32),session:None,application_only:None,expires_at:None}]}),..Default::default()};
     assert!(store.save_router_control(None,&state).await.unwrap());
     let mut second=state.clone(); second.router_id="two".into();
     // Simulate a pre-upgrade duplicate binding. New enrollment rejects it, but

@@ -18,7 +18,7 @@ use fleet_proto::{
     models::{
         valid_route_id, valid_router_id, MAX_ROUTER_REVOCATIONS, ROUTER_CAPABILITIES_HEADER,
         ROUTER_WORKLOAD_DEFAULTS, ROUTER_SCOPED_REVOCATIONS,
-        ROUTER_REVOCATION_COMPACTION,
+        ROUTER_REVOCATION_COMPACTION, ROUTER_REVOCATION_EXPIRY, DELEGATE_REVOCATION_RETENTION_SECS,
     },
 };
 
@@ -212,6 +212,12 @@ async fn sync(
             && !next.capabilities.iter().any(|c|c == ROUTER_SCOPED_REVOCATIONS) {
             return Err(StatusCode::CONFLICT);
         }
+        // A relay must never be downgraded below the denials it already holds.
+        let expiring_relay = next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_EXPIRY);
+        if next.authorization.as_ref().is_some_and(|a| a.revoked_subjects.iter().any(|r| r.expires_at.is_some()))
+            && !expiring_relay {
+            return Err(StatusCode::CONFLICT);
+        }
         next.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
         if next
             .authorization
@@ -244,6 +250,9 @@ async fn sync(
             for namespace in suspended {
                 auth.suspend_namespace(&namespace)
                     .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+            }
+            if expiring_relay && auth.drop_expired(now_ms() / 1000) {
+                auth.revision = auth.revision.checked_add(1).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
             }
         }
         next.delivered_revision = revision;
@@ -390,12 +399,25 @@ async fn revoke_subject(
     Extension(caller): Extension<Option<Token>>,
     Json(mut revocation): Json<RouterSubjectRevocation>,
 ) -> Result<Json<RouterAuthorization>> {
+    // Fleet alone decides how long a denial lasts.
+    if revocation.expires_at.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     revocation.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     namespace_scope(&s, caller.as_ref(), &revocation.namespace, caller.is_none())?;
     if caller.is_some() { revocation.application_only = Some(true); }
     let next = update_router(&s, &id, |next| {
         if revocation.application_only == Some(true) && !next.capabilities.iter().any(|c|c == ROUTER_SCOPED_REVOCATIONS) {
             return Err(StatusCode::CONFLICT);
+        }
+        // A delegate's denial outlives every grant signed before it, so dropping
+        // it later revives nothing; the delegate decides any later access itself.
+        // Operator bans stay permanent.
+        let expiring_relay = next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_EXPIRY);
+        let now = now_ms() / 1000;
+        let mut revocation = revocation.clone();
+        if expiring_relay && revocation.application_only == Some(true) {
+            revocation.expires_at = Some(now + DELEGATE_REVOCATION_RETENTION_SECS);
         }
         let auth = next.authorization.as_mut().ok_or(StatusCode::FORBIDDEN)?;
         if !auth
@@ -405,15 +427,16 @@ async fn revoke_subject(
         {
             return Err(StatusCode::FORBIDDEN);
         }
+        let dropped = expiring_relay && auth.drop_expired(now);
         let covered = auth.revoked_subjects.iter().any(|old| old.covers(&revocation));
         let previous_len = auth.revoked_subjects.len();
         // Only upgraded relays accept removing a record covered by a broader
-        // denial. Preserve old snapshots for legacy relays. CAS commits the
-        // replacement and revision atomically, never an intermediate deletion.
-        if next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_COMPACTION) {
+        // or longer denial. Preserve old snapshots for legacy relays. CAS commits
+        // the replacement and revision atomically, never an intermediate deletion.
+        if expiring_relay || next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_COMPACTION) {
             auth.revoked_subjects.retain(|old| !revocation.covers(old) || old.covers(&revocation));
         }
-        if covered && previous_len == auth.revoked_subjects.len() {
+        if covered && previous_len == auth.revoked_subjects.len() && !dropped {
             return Ok(());
         }
         if !covered {
@@ -422,7 +445,12 @@ async fn revoke_subject(
         // Shrinking a legacy oversized namespace cannot consume another share.
         // Apply admission quotas only when this mutation allocates a new slot.
         if auth.revoked_subjects.len() > previous_len {
-            auth.validate_namespace_capacity(&revocation.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
+            if revocation.expires_at.is_some() {
+                auth.validate_expiring_capacity(&revocation.namespace)
+            } else {
+                auth.validate_namespace_capacity(&revocation.namespace)
+            }
+            .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
         }
         auth.revision = auth
             .revision

@@ -396,6 +396,78 @@ async fn router_revocation_compaction_recovers_capacity_without_restoring_access
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegate_logouts_expire_beyond_signed_grants_and_never_fill_the_permanent_budget() {
+    use fleet_proto::models::{DELEGATE_REVOCATION_RETENTION_SECS, ROUTER_NAMESPACE_EXPIRING_REVOCATIONS, ROUTER_NAMESPACE_RECORDS};
+    use serde_json::{json, Value};
+    let h = start().await;
+    let ns: Value = h.client.get(format!("{}/namespaces/{PROOFS}", h.http))
+        .bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let ns = ns["id"].as_str().unwrap();
+    let sync_token = "ac".repeat(48);
+    let backend = "bc".repeat(48);
+    for (id, secret, permissions) in [("ac", &sync_token, vec!["router_sync"]),
+        ("bc", &backend, vec!["read", "router_delegate"])] {
+        h.client.post(format!("{}/tokens", h.http)).bearer_auth(&h.admin)
+            .json(&json!({"id":id.repeat(16),"address":id.repeat(20),"namespace":PROOFS,
+                "permissions":permissions,"token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))}))
+            .send().await.unwrap().error_for_status().unwrap();
+    }
+    let base = format!("{}/routers/expiring", h.http);
+    h.client.put(&base).bearer_auth(&h.admin)
+        .json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let all = "scoped-revocations-v1,revocation-compaction-v1,revocation-expiry-v1";
+    let poll = |capabilities: &str| h.client.post(format!("{base}/sync"))
+        .bearer_auth(&sync_token).header("x-fleet-router-capabilities", capabilities)
+        .json(&json!({"epoch":null,"after_revision":0,"applied_revision":null}));
+    poll(all).send().await.unwrap().error_for_status().unwrap();
+    h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin)
+        .json(&json!({"namespace":ns,"workload":"agent","service":"chat","version":1,
+            "sha256":"ab".repeat(32),"enabled":true}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let revoke = |body: &Value| h.client.post(format!("{base}/revoke-subject")).bearer_auth(&backend).json(body);
+    let session = |i: usize| json!({"namespace":ns,"principal":"12".repeat(32),"session":format!("{i:064x}")});
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // Far more logouts than the permanent namespace budget holds.
+    for i in 0..ROUTER_NAMESPACE_RECORDS * 2 {
+        revoke(&session(i)).send().await.unwrap().error_for_status().unwrap();
+    }
+    let state: Value = h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let denials = state["authorization"]["revoked_subjects"].as_array().unwrap();
+    assert_eq!(denials.len(), ROUTER_NAMESPACE_RECORDS * 2);
+    for d in denials {
+        let expires = d["expires_at"].as_u64().unwrap();
+        assert!(d["application_only"] == true && (now + DELEGATE_REVOCATION_RETENTION_SECS..now + DELEGATE_REVOCATION_RETENTION_SECS + 60).contains(&expires));
+    }
+    let request = |i: usize| json!({"namespace":ns,"workload":"agent","service":"chat","principal":"12".repeat(32),"session":format!("{i:064x}")});
+    assert_eq!(h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&request(0)).send().await.unwrap().status(), 403);
+    h.client.post(format!("{base}/authorize")).bearer_auth(&backend).json(&request(100_000)).send().await.unwrap().error_for_status().unwrap();
+    // Repeating a logout refreshes its single record rather than adding one.
+    let again: Value = revoke(&session(0)).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(again["revoked_subjects"].as_array().unwrap().len(), ROUTER_NAMESPACE_RECORDS * 2);
+    // Fleet alone sets the lifetime; the live share is still bounded.
+    let mut chosen = session(1); chosen["expires_at"] = json!(now + 1);
+    assert_eq!(revoke(&chosen).send().await.unwrap().status(), 400);
+    for i in ROUTER_NAMESPACE_RECORDS * 2..ROUTER_NAMESPACE_EXPIRING_REVOCATIONS {
+        revoke(&session(i)).send().await.unwrap().error_for_status().unwrap();
+    }
+    assert_eq!(revoke(&session(ROUTER_NAMESPACE_EXPIRING_REVOCATIONS)).send().await.unwrap().status(), 507);
+    // A principal-wide logout replaces its sessions' denials; operator bans stay permanent.
+    let user = json!({"namespace":ns,"principal":"12".repeat(32),"session":null});
+    let replaced: Value = revoke(&user).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(replaced["revoked_subjects"].as_array().unwrap().len(), 1);
+    let mut operator = user.clone(); operator["principal"] = json!("34".repeat(32));
+    let banned: Value = h.client.post(format!("{base}/revoke-subject")).bearer_auth(&h.admin).json(&operator)
+        .send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+    assert!(banned["revoked_subjects"].as_array().unwrap().iter()
+        .any(|r| r["principal"] == operator["principal"] && r["expires_at"].is_null() && r["application_only"].is_null()));
+    // A relay that cannot honour expiry is never handed expiring denials.
+    // (Relays without the capability keep permanent denials: see the compaction test.)
+    assert_eq!(poll("scoped-revocations-v1,revocation-compaction-v1").send().await.unwrap().status(), 409);
+    poll(all).send().await.unwrap().error_for_status().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
     use serde_json::json;
     let h = start().await;

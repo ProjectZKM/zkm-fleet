@@ -117,6 +117,9 @@ message RouterSubjectRevocation {
   optional string session = 3;
   // Namespace delegates may revoke application sessions, never operator control.
   optional bool application_only = 4;
+  // Unix seconds after which a delegate's denial may be dropped: beyond every
+  // grant signed before it. Operator bans never expire.
+  optional uint64 expires_at = 5;
 }
 message RouterAuthorization {
   required uint64 revision = 1;

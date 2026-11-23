@@ -1167,6 +1167,18 @@ committing and canceling affected streams. Upgrade the relay first: a rollback
 can reject the compacted snapshot and must not reset its durable state. Without
 this capability, Fleet retains the old append-only representation.
 
+With `revocation-expiry-v1` advertised, each delegate revocation carries
+`expires_at`, set by Fleet to one hour of grant lifetime plus 15 minutes of clock
+margin from now. Every grant signed before the denial has expired by then, and
+Fleet refuses access bindings for the subject while the denial exists. Fleet drops
+the denial five minutes after it expires, during sync or the next revocation. The
+relay accepts the drop only once its own clock has passed `expires_at`. Callers
+cannot choose the lifetime (400). Repeating a logout refreshes its one record.
+Operator revocations stay permanent. Expiring denials do not count toward the
+64-record budget; they have their own: 256 live per namespace and 4096 per
+router. Once a relay holds expiring denials, Fleet rejects its sync without the
+capability (409); never downgrade the relay.
+
 Changing an existing policy requires a higher version. New agents can inherit
 defaults without letting application backends write infrastructure policy. Defaults
 also apply to existing workloads without an exact entry; publish explicit disabled
@@ -1505,7 +1517,9 @@ activates identity enforcement for all access through that router. The policy is
 an approved reference, not a proof or an executable rule evaluation. Backends
 sign the returned principal/session/policy binding; runtime connector identity
 and execution policy remain separate. `POST /routers/:id/revoke-subject` takes
-`{namespace, principal, session}`; null session permanently revokes the principal.
+`{namespace, principal, session}`; null session revokes the principal. Operator
+revocations are permanent; a delegate's expire as described above once the relay
+supports it.
 Principal and session are opaque 64-character lowercase hex IDs, never raw tokens.
 
 Sync includes a bounded full `authorization` snapshot with its own revision,
@@ -1519,8 +1533,9 @@ not completed enforcement or a cryptographic proof.
 Upgrade Fleet, relay and shim before issuing identity-bound grants; old shim
 parsers reject them. Enable all needed service policies before switching a shared
 router's clients. Unconfigured routers and legacy tasks retain their behavior.
-The initial authorization snapshot caps policies plus permanent revocations at
-1024 records and returns 507 at capacity. Compaction only removes denials covered
+The authorization snapshot caps policies plus permanent revocations at 1024
+records, and live expiring delegate denials separately at 4096; it returns 507 at
+capacity. Compaction only removes denials covered
 by an explicitly requested broader ban; distinct permanent bans still consume
 capacity. General collection/pagination, key rotation and
 automatic app-lifecycle revocation remain follow-up work; do not discard records
