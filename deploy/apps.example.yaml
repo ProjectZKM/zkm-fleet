@@ -62,6 +62,22 @@ apps:
       ZIREN_FUSE_LEAVES: "1"
       ZIREN_REDUCE_OVERLAP: "1"
       TMPDIR: /dev/shm
+  # An agent that reserves no CPU: Ray reserves its memory_gb only, and its replicas
+  # share the node's CPUs with a low weight (64, against Docker's 1024). cpu_limit and
+  # memory_limit_gb are each container's hard limits, which cpus 0 requires. Its node's
+  # shim needs the runtime-cpu-shares-v1 feature.
+  - name: agent
+    kind: app
+    replicas: 4
+    gpus: 0
+    cpus: 0
+    cpu_limit: 2                       # CPUs, fractions allowed
+    memory_gb: 1
+    memory_limit_gb: 2
+    image: REGISTRY/AGENT@sha256:REPLACE
+    runtime: {executor: shim, driver: docker}
+    port_base: 51000
+    command: [agent, --port, "{port}", --threads, "{cpu_count}"]   # {cpu_count} is 1 here
   # A legacy native CPU prover: it runs node_binary, so that binary must be installed.
   - name: cpu-wrap
     kind: ziren-cpu

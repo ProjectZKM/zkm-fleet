@@ -59,12 +59,15 @@ tags and quotas in full are in the [reference](reference.md#namespaces-tags-and-
 | Setting | Controls | Change it with |
 |---|---|---|
 | Node capacity | The total pool Fleet may allocate on a machine | `etc/watchdog.env`, first set by the installer's `--cuda` / `--cpus` |
-| App allocation | GPUs and CPUs per replica, and the replica count | `fleetctl app scale` |
+| App allocation | GPUs and CPUs each replica reserves, the replica count, and a shim app's hard limits | `fleetctl app scale` |
 
 CPU units are logical CPUs, and Ray's pool can be smaller than the hardware.
-`fleetctl node` shows total and free GPUs and CPUs; app listings show configured
-allocations, disabled apps included, not live use. Namespace and tag quotas cap
-allocations further.
+`fleetctl node` shows total and free GPUs and CPUs, and apart from them the CPUs its
+enabled apps reserve (`RESERVED CPUS`) and the sum of their hard limits
+(`CPU LIMITS`, `MEMORY LIMITS GB`): limits beyond the node's CPUs mean its CPUs are
+overcommitted. App listings show configured allocations, disabled apps included,
+not live use. Namespace and tag quotas cap reservations further; hard limits don't
+count toward them.
 
 `fleetctl node NAME` also shows what the machine runs on, detected once when its
 agent starts: the CPU architecture and model, and each GPU's name, CUDA compute
@@ -76,7 +79,14 @@ fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 \
   --gpus 5 --cpus 96 --replicas 1
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4   # desired, observed, status
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 --node gpu-1   # that node's part
+fleetctl --token-file zkm-owner.token --namespace zkm app scale agent \
+  --cpus 0 --cpu-limit 2 --memory-limit-gb 2   # a shim app that reserves no CPU, capped
 ```
+
+`--cpus`, `--gpus` and `--replicas` set what Ray reserves. `--cpu-limit` (CPUs,
+fractions allowed) and `--memory-limit-gb` (GiB) set a shim app's hard limits per
+replica; `--cpus 0` or a fraction needs both, and `memory_gb` in the app's settings
+([reference](reference.md#apps)).
 
 Scaling needs `manage` on the app and an online, ready node. It runs in the
 background: check it until it's `complete` or `failed`. Omitted flags keep their

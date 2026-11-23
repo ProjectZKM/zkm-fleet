@@ -133,6 +133,35 @@ the app's `apps.yaml` entry; unknown or mistyped settings are refused.
 | `image` (required), `replicas`, `gpus`, `cpus`, `shm_gb`, `memory_gb`, `env`, `volumes`, `ready_timeout_s`, `stop_timeout_s` | Every app |
 | `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user` | A `kind: app` container |
 | `proof_storage_root`, `backend`, `rust_log` | A prover |
+| `cpu_limit`, `memory_limit_gb` | A shim app: `runtime: {executor: shim}` with driver `docker`, `tee` or `tee-simulation` |
+
+**Reservations and hard limits.** `gpus`, `cpus` and `memory_gb` are what Ray
+reserves for each replica: the scheduler places and admits an app by them, and on
+the Docker driver nothing caps a container to them. A shim app may also set hard
+limits for each replica's container: `cpu_limit` in CPUs (fractions allowed, at
+least 0.01 and at least `cpus`) and `memory_limit_gb` in GiB (at least 6 MiB and at
+least `memory_gb`). A limit the app doesn't set isn't applied. Both are refused for a
+legacy-executor app, which doesn't enforce them, and for a native OpenShell app,
+whose `cpus` and `memory_gb` are its limits. Quotas count reservations, not limits.
+
+`cpus` is a positive whole number, except that a shim `kind: app` without GPUs may
+reserve 0 or a fraction of a CPU when it sets `cpu_limit`, `memory_gb` and
+`memory_limit_gb`: a replica that reserves less than a CPU is always capped. A
+replica with `cpus: 0` counts no CPU toward its node's free CPUs, though its memory
+counts, so it fits on a node whose CPUs are all reserved. It runs with a CPU weight
+of 64 (Docker `--cpu-shares`; the default is 1024), so under contention it yields to
+replicas that reserve CPUs, and its `cpu_limit` caps it either way. The scheduler
+places an app with hard limits only on a node that reports `shim-limits-v1`, and one
+with `cpus: 0` only on a node that also reports `shim-cpu-shares-v1`, its shim's
+`runtime-cpu-shares-v1` feature. On a TEE node, `cpus: 0` also needs
+`shim-tee-cpu-overcommit-v1` and `cpu_limit` must fit in the node's CPUs
+([TEE runtimes](#node-configured-tee-runtimes)). A spec for such an app:
+
+```json
+{"image":"REGISTRY/AGENT@sha256:DIGEST","port_base":51000,"command":["agent","--port","{port}"],
+ "gpus":0,"cpus":0,"cpu_limit":2,"memory_gb":1,"memory_limit_gb":2,
+ "runtime":{"executor":"shim","driver":"docker"}}
+```
 
 A prover also takes its program, `--elf-id ID` or `--elf FILE`, and a placement
 policy, sent as `proof`:
@@ -183,8 +212,10 @@ data there, or runs from it, by setting `machine` in its entry in that node's
 
 **States.** An app is `configured`, `starting`, `running`, `draining`, `disabled`,
 `offline` or `failed`; a proof app without provers is `registered`. The table shows
-total configured GPUs and CPUs, and every tag when an app's entries use several; the
-details show replica settings and job counts.
+the total GPUs and CPUs its replicas reserve, and, where the app sets them, its
+memory reservation (`MEMORY GB`) and hard limits (`CPU LIMIT`, `MEMORY LIMIT GB`),
+every tag when an app's entries use several; the details show replica settings and
+job counts.
 
 **Enabling and disabling.** Enabling starts the replicas before the app takes work.
 Disabling drains and stops them, then releases their reservation; durable app data
@@ -192,8 +223,9 @@ stays. Disabling a proof app blocks new submissions, drains its active proofs an
 stops its GPU server; queued proofs wait for the next enable, and its retained proofs
 stay fetchable.
 
-**Changing.** `fleetctl app scale` sets an app's GPUs, CPUs and replicas within its
-quotas ([operations](operations.md#configure-resources)). They are the app's, not a
+**Changing.** `fleetctl app scale` sets an app's GPUs, CPUs and replicas, and a shim
+app's `--cpu-limit` and `--memory-limit-gb`, within its quotas
+([operations](operations.md#configure-resources)). They are the app's, not a
 node's: the replica count covers all its nodes, and a node the count leaves none
 removes the app. An active proof can't be
 resized ([issue #3](https://github.com/ProjectZKM/zkm-fleet/issues/3)).
@@ -476,11 +508,17 @@ Keep the allocation and shim journals across upgrades and restarts.
 Shim delegates lifecycle to upstream Docker and checks a container's effective
 CPU/memory limits against the launch request before start. A Docker runtime runs
 the way a legacy app does: Ray reserves its `cpus` and `memory_gb`, and the
-request sets no container limit; TEE runtimes set both as hard limits. Each
+request sets no container limit; TEE runtimes set both as hard limits. On either
+driver, an entry's `cpu_limit` and `memory_limit_gb` are the container's hard
+limits in place of those, and a replica with `cpus: 0` also gets
+`limits.cpu_shares` 64; an entry without them sends the launch request it always
+has. Each
 allocation records its launch request revision, and one recorded without a
 revision keeps the hard limits and environment it was launched with until it is
 cleaned up and launched as a new generation; from revision 2, `{cpu_count}` is
-`max(1, int(cpus))`, as legacy sets `RAYON_NUM_THREADS`. The shim creates
+`max(1, int(cpus))`, as legacy sets `RAYON_NUM_THREADS`: 1 for a replica that
+reserves 0 or a fraction of a CPU, whatever its `cpu_limit`, since a cap isn't a
+reservation. The shim creates
 containers with `--pull=never`. When a first Docker launch fails and the node lacks
 the image, the bridge pulls it, within an hour, and makes the same launch again;
 a failed pull fails the launch naming the image. A launch that finds its container,
@@ -1612,6 +1650,14 @@ apps; packaged proof workers retain their Docker profile. Hardware and simulatio
 have separate scheduler capabilities and cannot satisfy each other's placements.
 Transport capabilities must also match the app's services. Existing allocations
 retain their original runtime and cleanup path.
+
+A TEE node's CPUs are its confidential VM's vCPUs, fixed when the VM boots: set its
+Ray pool, `RAY_NUM_CPUS` in `etc/watchdog.env`, to the vCPUs minus what the node's
+own services need. An app's `cpu_limit` must fit in that pool; the scheduler and the
+node refuse a larger one. Tenants that reserve no CPU (`cpus: 0`) share the VM only
+where its operator sets `allow_cpu_overcommit: true` inside `shim_tee` (default
+`false`); the node then reports `shim-tee-cpu-overcommit-v1`. The bridge enforces
+this setting, and it isn't part of the shim's machine configuration or its digest.
 
 ```yaml
 shim_daemon: true
