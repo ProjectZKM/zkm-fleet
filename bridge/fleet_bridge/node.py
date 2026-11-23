@@ -436,7 +436,7 @@ class NodeExecutor:
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
         cfg.validate_launch(configured)
-        if configured.cpu_limit is not None and configured.runtime and configured.runtime.driver in ("tee", "tee-simulation"):
+        if configured.cpu_limit is not None and configured.runtime and configured.runtime.driver in shim.TEE_DRIVERS:
             # A TEE node's CPUs are its confidential VM's vCPUs, fixed when it boots.
             total = resources()[0].get("CPU", 0)
             if configured.cpu_limit > total + 1e-9:

@@ -317,7 +317,7 @@ impl NodeReport {
             // The low CPU weight of a replica that reserves no CPU.
             (CPU_SHARES_CAPABILITY, entry.unreserved()),
             // Tenants that reserve no CPU share a confidential VM only where its operator allows it.
-            (TEE_CPU_OVERCOMMIT_CAPABILITY, entry.unreserved() && entry.0["runtime"]["driver"] != "docker"),
+            (TEE_CPU_OVERCOMMIT_CAPABILITY, entry.unreserved() && matches!(entry.0["runtime"]["driver"].as_str(), Some("tee" | "tee-simulation"))),
         ].into_iter().all(|(cap, needed)| !needed || has(cap))
     }
     /// Whether the node has the CPUs an entry's hard limit gives. A TEE node's CPUs are its
