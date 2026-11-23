@@ -107,8 +107,10 @@ It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scr
 `ray-watch.sh`, `install-node-services.sh`) around a short stop and start
 of the agent's unit, after checking that the new bridge imports in the node's venv
 and parses the node's `apps.yaml`, and waits until the scheduler reports the node
-READY with a heartbeat newer than the restart. Without the control host's `fleetctl`
-and admin token, it only checks the agent's log for the connection, and warns. A
+READY with a heartbeat newer than the restart (a drained node never reports READY, so
+for it a newer heartbeat is enough; check READY once it's undrained). Without the
+control host's `fleetctl` and admin token, it only checks the agent's log for the
+connection, and warns. A
 parse error stops the upgrade before the agent is touched. Entries that still have
 `prover_binary` are listed: they load, but the scheduler quarantines them (`invalid
 runtime manifest`) until they're converted with `migrate-proof-runtime.py`
