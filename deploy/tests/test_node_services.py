@@ -214,3 +214,23 @@ def test_non_executable_bundled_tunnel_helper_is_rejected_before_changes(service
     assert config.read_bytes()==before and not log.exists()
     assert not (prefix/'libexec').exists()
 
+
+def test_stage_only_publishes_runtime_binaries_beside_a_live_agent(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    helper=root/'trusted-router-tunnel';helper.write_bytes(b'helper');helper.chmod(0o755)
+    (root/'work').mkdir();before=config.read_bytes();watchdog=(etc/'watchdog.env').read_bytes()
+    command=['bash',str(ROOT/'deploy/install-node-services.sh'),str(prefix),'','',str(binary),'--stage-only']
+    env={**os.environ,'PATH':str(root/'commands')+':'+os.environ['PATH']}
+    # fleet-ctl stages while the agent still holds its lock.
+    with (root/'work/node-agent.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        result=subprocess.run(command,env=env,text=True,capture_output=True,timeout=20)
+    assert result.returncode==0,result.stderr
+    shim=prefix/'libexec/trusted-shim'/hashlib.sha256(b'first-runtime').hexdigest()/'trusted-shim-runtime'
+    tunnel=prefix/'libexec/trusted-router-tunnel'/hashlib.sha256(b'helper').hexdigest()/'trusted-router-tunnel'
+    assert shim.read_bytes()==b'first-runtime' and tunnel.read_bytes()==b'helper'
+    assert str(shim) in result.stderr and str(tunnel) in result.stderr
+    # Never selects, switches or restarts anything.
+    assert config.read_bytes()==before and (etc/'watchdog.env').read_bytes()==watchdog
+    assert not log.exists() and not list(capture.glob('*.service'))
+    assert not (prefix/'libexec/node-services').exists()

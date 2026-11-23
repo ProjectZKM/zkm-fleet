@@ -352,6 +352,10 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
       run ssh "$NODE_SSH" "mkdir -p $stage/scripts"
       local files=(); local s; for s in "${NODE_SCRIPTS[@]}"; do files+=("$scripts/$s"); done
       run scp -q "${files[@]}" "$NODE_SSH:$stage/scripts/"
+      # The runtime binaries travel next to fleet-node, where the node's upgrade stages them.
+      for s in trusted-shim-runtime trusted-router-tunnel; do
+        [ ! -f "$(dirname "$bin")/$s" ] || run scp -q "$(dirname "$bin")/$s" "$NODE_SSH:$stage/$s"
+      done
       # Keep the third argument reserved for the optional proof-app binary.
       [ -n "$proof_app" ] || args+=("")
       args+=("$stage/scripts")
@@ -365,6 +369,7 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   [ "$DRY" = 1 ] || (cd "$bridge" && "$PREFIX/venv/bin/python" -c "import fleet_bridge.node") || die "the new bridge does not import; nothing changed"
   node_config_check "$bridge"
   node_runtime_check "$bridge"
+  node_stage_runtime "$bin" "$scripts"
   run mkdir -p "$b"; run cp -a "$PREFIX/bin/fleet-node" "$PREFIX/bridge" "$b/"
   [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
   if [ -n "$scripts" ]; then
@@ -468,6 +473,22 @@ if legacy:
           "quarantines them until they are converted with deploy/migrate-proof-runtime.py", file=sys.stderr)
 PY
   ) || die "the new bridge cannot load apps.yaml; node was not stopped"
+}
+# A release's shim runtime and Chisel helper sit next to its fleet-node. The release's own
+# install-node-services.sh stages them under libexec by content hash; nothing selects, switches
+# or restarts them here.
+node_stage_runtime() { # FLEET_NODE DEPLOY_DIR
+  local shim; shim=$(dirname "$1")/trusted-shim-runtime
+  [ -n "$2" ] || return 0
+  if [ "$DRY" = 1 ]; then [ -f "$shim" ] || [ -n "${RELEASE_ROOT:-}" ] || return 0
+  else
+    [ -f "$shim" ] || return 0
+    grep -q -- --stage-only "$2/install-node-services.sh" \
+      || { echo "fleet-ctl: $2/install-node-services.sh cannot stage runtime binaries; none staged" >&2; return 0; }
+  fi
+  run bash "$2/install-node-services.sh" "$PREFIX" "" "" "$shim" --stage-only \
+    || die "staging the runtime binaries failed; node was not stopped"
+  [ "$DRY" = 1 ] || echo "staged the runtime binaries above; apps.yaml still selects the running shim"
 }
 node_runtime_check() {
   # Use the candidate adapter against the live daemon before stopping the node.

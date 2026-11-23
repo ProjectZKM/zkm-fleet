@@ -1,5 +1,9 @@
 #!/bin/bash
 # Install companions without converting live allocations or replacing operator units.
+#   install-node-services.sh PREFIX ETC WORKDIR SHIM [--check]
+#   install-node-services.sh PREFIX '' '' SHIM --stage-only
+# --stage-only publishes SHIM and its bundled tunnel helper under PREFIX/libexec and nothing
+# else: fleet-ctl node upgrade runs it beside a live agent and shim.
 set -euo pipefail
 PREFIX=$1; ETC=$2; WORKDIR=$3; SHIM=$4
 die(){ echo "[node-services] $*" >&2; exit 1; }
@@ -8,6 +12,52 @@ TUNNEL=
 if [ -e "$(dirname "$SHIM")/trusted-router-tunnel" ]; then
   TUNNEL="$(dirname "$SHIM")/trusted-router-tunnel"
   [ -f "$TUNNEL" ] && [ -x "$TUNNEL" ] || die "bundled trusted-router-tunnel is not an executable file"
+fi
+PYTHON="$PREFIX/venv/bin/python"
+[ -x "$PYTHON" ] || PYTHON=python3
+# Publish SRC at $PREFIX/libexec/DIR/<sha256>/FILE and set PINNED to that path.
+# Existing hashes are never replaced, so live processes keep their executable.
+pin() {
+  local src=$1 dir=$2 name=$3 hash dest
+  hash=$(sha256sum "$src" | cut -d ' ' -f 1)
+  dest="$PREFIX/libexec/$dir/$hash/$name"
+  mkdir -p "$(dirname "$dest")"
+  # An interrupted copy cannot poison a content-addressed path permanently.
+  if [ ! -f "$dest" ] || [ "$(sha256sum "$dest" | cut -d ' ' -f 1)" != "$hash" ]; then
+    TEMP=$(mktemp "$dest.XXXXXX")
+    install -m 755 "$src" "$TEMP"
+    [ "$(sha256sum "$TEMP" | cut -d ' ' -f 1)" = "$hash" ] || die "$name copy checksum mismatch"
+    "$PYTHON" - "$TEMP" "$dest" <<'PY'
+import os, sys
+from pathlib import Path
+with open(sys.argv[1], 'rb') as f: os.fsync(f.fileno())
+os.replace(sys.argv[1], sys.argv[2])
+fd=os.open(Path(sys.argv[2]).parent, os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY
+    TEMP=
+  fi
+  PINNED=$dest
+}
+# Stage the shim and the bundled Chisel helper only, setting DEST to the shim's copy. Selecting
+# the helper is an explicit operator change to shim_network.tunnel_binary; omitting it keeps the
+# existing transport. Staging never switches or restarts a running shim.
+stage_runtime() {
+  pin "$SHIM" trusted-shim trusted-shim-runtime
+  DEST=$PINNED
+  echo "[node-services] staged trusted-shim-runtime at $DEST" >&2
+  if [ -n "$TUNNEL" ]; then
+    pin "$TUNNEL" trusted-router-tunnel trusted-router-tunnel
+    echo "[node-services] staged Chisel helper at $PINNED (select via shim_network.tunnel_binary)" >&2
+  fi
+}
+if [ "${5:-}" = --stage-only ]; then
+  [[ "$PREFIX" = /* && "$PREFIX" != *$'\n'* && "$PREFIX" != *$'\r'* ]] || die "unsupported service path"
+  [ -f "$SHIM" ] || die "no shim runtime $SHIM"
+  trap '[ -z "${TEMP:-}" ] || rm -f "$TEMP"' EXIT
+  stage_runtime
+  exit 0
 fi
 for path in "$PREFIX" "$ETC" "$WORKDIR"; do
   [[ "$path" = /* && "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *'%'* && "$path" != *'$'* ]] || die "unsupported service path"
@@ -19,8 +69,6 @@ if ! [ "/proc/$$/fd/9" -ef "$WORKDIR/node-agent.lock" ]; then
   exec 9>"$WORKDIR/node-agent.lock"
 fi
 flock -n 9 || die "control agent is running; use fleet-ctl node upgrade, or stop only the control agent before first supervisor conversion"
-PYTHON="$PREFIX/venv/bin/python"
-[ -x "$PYTHON" ] || PYTHON=python3
 # A fresh install creates its venv later. The full pass repeats validation with
 # that interpreter before changing configuration or installing services.
 if [ "${5:-}" = --check ] && ! "$PYTHON" -c 'import yaml' 2>/dev/null; then exit 0; fi
@@ -83,39 +131,7 @@ restore() {
 }
 trap restore EXIT
 USER_NAME=$(id -un)
-# Publish SRC at $PREFIX/libexec/DIR/<sha256>/FILE and set PINNED to that path.
-# Existing hashes are never replaced, so live processes keep their executable.
-pin() {
-  local src=$1 dir=$2 name=$3 hash dest
-  hash=$(sha256sum "$src" | cut -d ' ' -f 1)
-  dest="$PREFIX/libexec/$dir/$hash/$name"
-  mkdir -p "$(dirname "$dest")"
-  # An interrupted copy cannot poison a content-addressed path permanently.
-  if [ ! -f "$dest" ] || [ "$(sha256sum "$dest" | cut -d ' ' -f 1)" != "$hash" ]; then
-    TEMP=$(mktemp "$dest.XXXXXX")
-    install -m 755 "$src" "$TEMP"
-    [ "$(sha256sum "$TEMP" | cut -d ' ' -f 1)" = "$hash" ] || die "$name copy checksum mismatch"
-    "$PYTHON" - "$TEMP" "$dest" <<'PY'
-import os, sys
-from pathlib import Path
-with open(sys.argv[1], 'rb') as f: os.fsync(f.fileno())
-os.replace(sys.argv[1], sys.argv[2])
-fd=os.open(Path(sys.argv[2]).parent, os.O_RDONLY | os.O_DIRECTORY)
-try: os.fsync(fd)
-finally: os.close(fd)
-PY
-    TEMP=
-  fi
-  PINNED=$dest
-}
-pin "$SHIM" trusted-shim trusted-shim-runtime
-DEST=$PINNED
-# Stage the bundled Chisel helper only. Selecting it is an explicit operator
-# change to shim_network.tunnel_binary; omitting it keeps the existing transport.
-if [ -n "$TUNNEL" ]; then
-  pin "$TUNNEL" trusted-router-tunnel trusted-router-tunnel
-  echo "[node-services] staged Chisel helper at $PINNED (select via shim_network.tunnel_binary)" >&2
-fi
+stage_runtime
 (cd "$PREFIX/bridge" && "$PYTHON" - "$ETC/apps.yaml" "$DEST" "$WORKDIR/shim" <<'PY'
 import json, os, sys, yaml
 from pathlib import Path

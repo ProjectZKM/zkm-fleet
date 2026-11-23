@@ -344,6 +344,64 @@ def test_prover_binary_entries_are_named_whichever_way_the_bridge_treats_them(tm
     else:  # one that loads it for the scheduler to quarantine
         assert "warning: old-gpu" in result.stderr, result.stderr
 
+def release_scripts(tmp_path):
+    scripts = tmp_path / "release/deploy"
+    scripts.mkdir(parents=True)
+    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh",
+                 "install-node-services.sh"):
+        (scripts / name).write_text((ROOT / "deploy" / name).read_text())
+    return scripts
+
+
+def test_upgrade_stages_the_release_runtime_without_selecting_or_restarting_it(tmp_path):
+    import hashlib
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    scripts = release_scripts(tmp_path)
+    for name in ("trusted-shim-runtime", "trusted-router-tunnel"):
+        executable(newbin.parent / name, f"echo {name}\n")
+    apps = prefix / "etc/apps.yaml"
+    before = apps.read_bytes()
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate), "", str(scripts))
+    assert result.returncode == 0, result.stderr
+    for directory, name in (("trusted-shim", "trusted-shim-runtime"), ("trusted-router-tunnel", "trusted-router-tunnel")):
+        content = (newbin.parent / name).read_bytes()
+        staged = prefix / "libexec" / directory / hashlib.sha256(content).hexdigest() / name
+        assert staged.read_bytes() == content and str(staged) in result.stderr
+    assert apps.read_bytes() == before
+    # Only the agent's unit restarts; the shim is never switched or touched.
+    actions = [c for c in calls.read_text().splitlines() if not c.startswith("show ") and not c.startswith("is-active")]
+    assert actions == ["stop zkm-fleet-node.service", "start zkm-fleet-node.service"]
+    assert (prefix / "deploy/install-node-services.sh").read_text() == (ROOT / "deploy/install-node-services.sh").read_text()
+
+
+def test_a_runtime_that_cannot_be_staged_stops_the_upgrade_before_the_agent(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    scripts = release_scripts(tmp_path)
+    executable(newbin.parent / "trusted-shim-runtime", "exit 0\n")
+    (newbin.parent / "trusted-router-tunnel").write_text("not executable\n")
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate), "", str(scripts))
+    assert result.returncode != 0 and "node was not stopped" in result.stderr
+    assert not stopped(calls) and "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_remote_upgrade_ships_the_runtime_binaries_for_staging(tmp_path):
+    commands, log, shipped = tmp_path / "bin", tmp_path / "ssh.log", tmp_path / "scp.log"
+    executable(commands / "ssh", f'case "$2" in *" node upgrade "*) printf "%s\\n" "$2" > {log};; esac\n')
+    executable(commands / "scp", f'echo "$*" >> {shipped}\n')
+    newbin = tmp_path / "release/bin/fleet-node"
+    for name in ("fleet-node", "trusted-shim-runtime", "trusted-router-tunnel"):
+        executable(newbin.parent / name, "exit 0\n")
+    bridge = tmp_path / "release/bridge"
+    (bridge / "fleet_bridge").mkdir(parents=True)
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(tmp_path / "control"),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "gpu-host"}
+    result = ctl(env, "node", "upgrade", str(newbin), str(bridge), "", str(release_scripts(tmp_path)))
+    assert result.returncode == 0, result.stderr
+    args = shlex.split(log.read_text())
+    stage = str(Path(args[args.index("--") + 3]).parent)
+    for name in ("trusted-shim-runtime", "trusted-router-tunnel"):
+        assert f"{newbin.parent / name} gpu-host:{stage}/{name}" in shipped.read_text()
+
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
     """A remote dry run ships nothing, so the node sees paths to no files: it prints the local
