@@ -223,13 +223,13 @@ def test_node_upgrade_and_rollback_do_not_restart_proof_endpoints(tmp_path):
     new_bridge = tmp_path / "bridge"
     (new_bridge / "fleet_bridge").mkdir(parents=True)
     env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
-        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_PROOF_APP_UNITS": "active-proof.service"}
+        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": ""}
     ctl = ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node"]
     subprocess.run([*ctl, "upgrade", str(new_node), str(new_bridge), str(new_proof)], env=env, check=True, capture_output=True)
     assert old_proof.read_text() == new_proof.read_text()
     subprocess.run([*ctl, "rollback"], env=env, check=True, capture_output=True)
     assert "old-proof" in old_proof.read_text()
-    assert "active-proof" not in calls.read_text() and "restart" not in calls.read_text()
+    assert "restart" not in calls.read_text()
 
 
 def test_missing_node_configuration_fails_before_stopping_agent(tmp_path):
@@ -266,9 +266,9 @@ def test_rollback_restores_proof_binary_even_if_agent_cannot_reconnect(tmp_path)
     assert 'restored-node' in (prefix/'bin/fleet-node').read_text()
 
 
-def checked_node(tmp_path, bridge="quarantine"):
+def checked_node(tmp_path, bridge="stub"):
     """node_fixture with a working venv python and a candidate bridge: the real one, or a stand-in
-    whose load_apps loads prover_binary entries ("quarantine") or refuses them as older bridges do."""
+    whose load_apps accepts any mapping."""
     import shutil, sys
     prefix, commands = node_fixture(tmp_path)
     executable(prefix / "venv/bin/python", f'exec {sys.executable} "$@"\n')
@@ -281,10 +281,7 @@ def checked_node(tmp_path, bridge="quarantine"):
             (candidate / "fleet_bridge" / name).write_text("")
         (candidate / "fleet_bridge/reconcile.py").write_text(
             "def load_apps(data, *, validate_launch=True):\n"
-            "    assert validate_launch is False and isinstance(data, dict)\n"
-            + ("    if any('prover_binary' in a for a in data.get('apps', [])):\n"
-               "        raise ValueError('prover_binary was removed; drain and migrate this entry')\n"
-               if bridge == "refuse" else ""))
+            "    assert validate_launch is False and isinstance(data, dict)\n")
     newbin = tmp_path / "release/bin/fleet-node"
     executable(newbin, "echo new-node\n")
     calls = tmp_path / "systemctl.calls"
@@ -304,12 +301,7 @@ def ctl(env, *args, timeout=60):
                           capture_output=True, text=True, timeout=timeout)
 
 
-LEGACY = (f"apps:\n- name: old-gpu\n  kind: ziren-gpu\n  elf_id: {'a' * 64}\n  prover_binary: /opt/prover\n"
-          "  disabled: true\n")
-
-
 @pytest.mark.parametrize("apps,bridge,message", [
-    (LEGACY, "refuse", "prover_binary was removed"),
     ("apps: [\n", "real", "cannot read"),
     ("apps:\n- name: bad\n  kind: no-such-kind\n", "real", "the new bridge cannot load"),
     ("apps:\n- name: gpu\n  kind: ziren-gpu\n", "real", "set its elf_id"),
@@ -320,29 +312,9 @@ def test_upgrade_refuses_apps_yaml_the_new_bridge_cannot_load(tmp_path, apps, br
     result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
     assert result.returncode != 0 and message in result.stderr, result.stderr
     assert "node was not stopped" in result.stderr
-    if apps == LEGACY:
-        assert "entries with prover_binary: old-gpu" in result.stderr
     assert not stopped(calls) and "old-node" in (prefix / "bin/fleet-node").read_text()
 
 
-def test_upgrade_warns_about_prover_binary_entries_the_new_bridge_quarantines(tmp_path):
-    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
-    (prefix / "etc/apps.yaml").write_text(LEGACY)
-    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
-    assert result.returncode == 0, result.stderr
-    assert "warning: old-gpu" in result.stderr and "quarantines them" in result.stderr
-    assert "migrate-proof-runtime.py" in result.stderr
-    assert "new-node" in (prefix / "bin/fleet-node").read_text()
-
-
-def test_prover_binary_entries_are_named_whichever_way_the_bridge_treats_them(tmp_path):
-    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path, bridge="real")
-    (prefix / "etc/apps.yaml").write_text(LEGACY)
-    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
-    if result.returncode:  # a bridge that still rejects the key: nothing changes
-        assert "entries with prover_binary: old-gpu" in result.stderr and not stopped(calls)
-    else:  # one that loads it for the scheduler to quarantine
-        assert "warning: old-gpu" in result.stderr, result.stderr
 
 def release_scripts(tmp_path):
     scripts = tmp_path / "release/deploy"

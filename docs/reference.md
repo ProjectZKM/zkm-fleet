@@ -430,13 +430,8 @@ Keep proof storage mounted at the same absolute path so persisted `file://`
 references and completed lease records remain usable. The existing host storage
 fetch handler remains available for fetching historical outputs.
 
-`prover_binary` and native executable-path reports have been removed. Existing
-native entries using the shared `node_binary` remain readable for an explicit
-cutover; a packaged worker does not use that binary. An entry that still has an
-override loads, and the scheduler quarantines it (`invalid runtime manifest; repair or
-drain this entry`) while the node's other entries keep running; it can be disabled,
-but not enabled or changed, until it's drained and converted using
-`deploy/migrate-proof-runtime.py`. See the
+Existing native entries using the shared `node_binary` remain readable for an
+explicit cutover; a packaged worker does not use that binary. See the
 [maintenance procedure](maintenance.md#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)
 for an upgrade that retains queued jobs and all stored data.
 Guest/verifier compatibility still needs validation for the pinned image tuple;

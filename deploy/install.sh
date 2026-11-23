@@ -89,7 +89,7 @@ if [ "$ROLE" = control ]; then
   # The OpenShell gateway is optional: fleet-ctl.sh openshell up checks its files.
   command -v openssl >/dev/null || die "openssl is required on the control host (it generates the database password)"
   command -v python3 >/dev/null || die "python3 is required on the control host (fleet-ctl.sh uses it)"
-  # An install without openssl used to leave an empty password, which Postgres refuses.
+  # Postgres refuses an empty password.
   [ ! -e "$ETC/pg_password" ] || [ -s "$ETC/pg_password" ] || die "$ETC/pg_password is empty. If Postgres was never initialised (its volume is new or empty), remove $ETC/pg_password and $ETC/database_url and run the installer again; otherwise write the database's password into $ETC/pg_password and $ETC/database_url"
   [ -x "$BIN/fleetctl" ] || die "build fleetctl first, or pass --bin"
   install -m 755 "$BIN/fleetctl" "$PREFIX/bin/"

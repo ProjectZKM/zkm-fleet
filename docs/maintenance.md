@@ -115,17 +115,12 @@ READY with a heartbeat newer than the restart (a drained node never reports READ
 for it a newer heartbeat is enough; check READY once it's undrained). Without the
 control host's `fleetctl` and admin token, it only checks the agent's log for the
 connection, and warns. A
-parse error stops the upgrade before the agent is touched. Entries that still have
-`prover_binary` are listed: they load, but the scheduler quarantines them (`invalid
-runtime manifest`) until they're converted with `migrate-proof-runtime.py`
-([cut-over](#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)); the node's other
-apps keep running. The release form also stages the package's `trusted-shim-runtime`
-and `trusted-router-tunnel` under `libexec/<name>/<sha256>/` and prints their paths,
-without switching the running shim. `node rollback` restores everything the last
+parse error stops the upgrade before the agent is touched. The release form also
+stages the package's `trusted-shim-runtime` and `trusted-router-tunnel` under
+`libexec/<name>/<sha256>/` and prints their paths, without switching the running shim. `node rollback` restores everything the last
 upgrade replaced. In the local form, the last two arguments are optional: the proof
 app binary staged for its next explicit endpoint restart, and the launch scripts'
-directory. Running proof endpoints keep their current processes; node upgrades
-and rollbacks no longer restart `FLEET_PROOF_APP_UNITS`.
+directory. Running proof endpoints keep their current processes.
 
 The companion installer refreshes only recognized generated units, preserving
 operator edits and drop-ins. Ray uses `KillMode=process`: losing its watchdog does
@@ -578,10 +573,7 @@ their own complete worker image; the SDK converter refuses to guess their packag
    Upgrade the control host and CLI, then each affected node to the same release with
    the persistent shim service: `install.sh node --with-shim`
    ([installation](installation.md#nodes-with-persistent-shim-services)) on a node
-   without it, `fleet-ctl.sh node upgrade` on one with it. This removes the old
-   executable-path report field; its protobuf number is reserved. The new bridge
-   loads entries that still have `prover_binary`, and the scheduler quarantines them
-   until they're converted; the node's other apps keep running.
+   without it, `fleet-ctl.sh node upgrade` on one with it.
 4. Prepare the existing configuration while every selected entry is disabled. Run the
    release package's migrator (`PACKAGE` as in the [cron procedure](#cron-supervised-nodes))
    with the node's venv Python, which has PyYAML:
@@ -593,8 +585,7 @@ their own complete worker image; the SDK converter refuses to guess their packag
      --output-dir /private/upgrade-review
    ```
 
-   Repeat `--name` for more entries, naming every entry that still has
-   `prover_binary`: the tool refuses to leave one behind. The directory must be new; it
+   Repeat `--name` for more entries. The directory must be new; it
    contains a private `apps.yaml` preview, an update index and one settings JSON per
    entry. The tool leaves the source configuration, database and every storage file
    untouched and never reads token contents. Shim volumes are `PATH[:ro|rw|rslave]`,
