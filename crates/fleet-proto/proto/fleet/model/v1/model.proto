@@ -433,11 +433,17 @@ message AppDeployment {
   optional ScaleStatus scale = 4;
 }
 
+// A scale's request, sent as JSON: a whole `cpus` still reads as before.
 message ScaleRequest {
   optional double gpus = 1;
-  optional uint32 cpus = 2;
+  // Whole CPUs; 0 or a fraction only for a shim app with hard limits.
+  reserved 2;
+  optional double cpus = 5;
   optional uint32 replicas = 3;
   optional string node = 4;
+  // Hard limits of a shim app's container: CPUs (fractions allowed) and GiB.
+  optional double cpu_limit = 6;
+  optional double memory_limit_gb = 7;
 }
 
 message CreateNamespaceRequest {

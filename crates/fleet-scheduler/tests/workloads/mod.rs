@@ -3008,6 +3008,204 @@ async fn a_namespace_owner_creates_its_app_but_not_host_mounts_or_users() {
     assert_eq!(deployed(&c, &ns, "model").await.unwrap().1["tag"], "scope=default");
 }
 
+/// A node that runs shim Docker apps with `capabilities` beyond `shim-docker-v1`, its CPUs all
+/// reserved.
+fn shim_node(ns: &str, capabilities: &[&str]) -> NodeReport {
+    let mut report = inventory(ns);
+    report.free_cpus = 0.0;
+    report.runtime_capabilities = ["shim-docker-v1", "shim-cleanup-v1"].iter().chain(capabilities).map(|c| c.to_string()).collect();
+    report
+}
+
+fn status_of(error: &anyhow::Error) -> u16 {
+    error.downcast_ref::<crate::fleet::RequestRejection>().map_or(0, |r| r.status)
+}
+
+#[tokio::test]
+async fn an_app_without_hard_limits_keeps_its_record_and_entry() {
+    let (dir, c, ns) = setup().await;
+    c.report("gpu", "session", shim_node(&ns, &[])).await.unwrap();
+    let body = json!({"name":"web","namespace":ns,"spec":{"image":"web:1","gpus":0,"cpus":2,"memory_gb":4,"port_base":50100,
+        "runtime":{"executor":"shim","driver":"docker"}}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    // The record and the node's entry are what they were before hard limits existed: the
+    // bridge's spec hash covers the entry, so a running replica is never recreated.
+    let entry = json!({"name":"web","kind":"app","namespace":ns,"disabled":true,"priority":0,"replicas":1,"gpus":0,"cpus":2,
+        "image":"web:1","memory_gb":4,"port_base":50100,"runtime":{"executor":"shim","driver":"docker"}});
+    let stored: Value = serde_json::from_slice(&std::fs::read(dir.path().join("workloads/apps/web.json")).unwrap()).unwrap();
+    assert_eq!(stored["spec"], entry);
+    assert_eq!(deployed(&c, &ns, "web").await.unwrap().1, entry);
+}
+
+#[tokio::test]
+async fn a_scale_of_an_app_without_hard_limits_sends_none_and_records_none() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, false)).await.unwrap();
+    c.request_scale(&ns, "model", request_resources(json!({"cpus":3}))).await.unwrap();
+    node_completes_changes(&c, &ns, false).await;
+    let sets: Vec<Value> = c.inner.lock().commands.values().filter(|v| v.operation == NodeOperation::App as i32 && !v.parameters["set"].is_null())
+        .map(|v| v.parameters["set"].clone()).collect();
+    assert_eq!(sets, [json!({"gpus":1,"cpus":3,"replicas":2,"disabled":false})]);
+    let model = c.inner.lock().apps["model"].spec.0.clone();
+    assert!(Entry::LIMITS.iter().all(|k| model.get(*k).is_none()), "{model}");
+    let status = c.scale_status(&ns, "model", None).unwrap();
+    assert!(Entry::LIMITS.iter().all(|k| status.get(*k).is_none()), "{status}");
+}
+
+#[tokio::test]
+async fn an_unreserved_app_places_by_memory_on_a_node_that_caps_it_and_counts_no_cpu() {
+    let (_dir, c, ns) = setup().await;
+    let capped = json!({"image":"agent:1","port_base":50100,"gpus":0,"cpus":0,"cpu_limit":2,"memory_gb":2,"memory_limit_gb":2,
+        "runtime":{"executor":"shim","driver":"docker"}});
+    let create = |name: &str, spec: &Value| scale_call(c.clone(), "admin", "POST", "/apps", json!({"name":name,"namespace":ns,"spec":spec}));
+    // A node that can't give the low CPU weight, or reads no limits, never gets one.
+    c.report("old", "session", shim_node(&ns, &["shim-limits-v1"])).await.unwrap();
+    assert_eq!(create("agent", &capped).await.status(), StatusCode::CREATED);
+    let refused = deployed(&c, &ns, "agent").await.unwrap_err();
+    assert!(refused.to_string().contains("no ready node"), "{refused}");
+    // One with no CPU free does: the replica reserves none.
+    c.report("full", "session", shim_node(&ns, &["shim-limits-v1", "shim-cpu-shares-v1"])).await.unwrap();
+    let before = c.capacity("full").unwrap();
+    let (node, entry) = deployed(&c, &ns, "agent").await.unwrap();
+    assert_eq!((node.as_str(), &entry["cpus"], &entry["cpu_limit"], &entry["memory_limit_gb"]), ("full", &json!(0), &json!(2), &json!(2)));
+    assert_eq!(Entry(&entry).total(0.0), (0.0, 0.0), "it counts nothing toward free_cpus");
+    c.begin_toggle(&["full-agent".into()], false).unwrap();
+    c.dispatch().await.unwrap();
+    let start = command_where(&c, |v| v.worker == "full" && v.operation == NodeOperation::SetApp as i32).unwrap();
+    assert!(start.admitted, "admitted on a node with 0 free CPUs");
+    assert_eq!(c.capacity("full").unwrap(), before);
+    let listed = c.app_resources(&ns, "agent", None)["resources"].clone();
+    assert_eq!((&listed["cpus"], &listed["cpu_limit"], &listed["memory_gb"], &listed["memory_limit_gb"]),
+        (&json!(0.0), &json!(2.0), &json!(2.0), &json!(2.0)), "{listed}");
+    // A fraction is a reservation too, under the same caps.
+    let mut half = capped.clone(); half["cpus"] = json!(0.5);
+    assert_eq!(create("half", &half).await.status(), StatusCode::CREATED);
+    assert_eq!(c.inner.lock().apps["half"].spec["cpus"], 0.5);
+    // Refused with a clear error, and nothing is recorded.
+    let native = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"x","gpus":0,"cpus":1,"memory_gb":1});
+    for (change, message) in [
+        (json!({"cpu_limit":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+        (json!({"memory_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+        (json!({"memory_limit_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+        (json!({"gpus":1}), "only for a kind: app without GPUs"),
+        (json!({"gpus":null}), "only for a kind: app without GPUs"),
+        (json!({"runtime":null}), "the legacy executor doesn't enforce them"),
+        (json!({"runtime":{"executor":"legacy"}}), "the legacy executor doesn't enforce them"),
+        (json!({"cpus":3}), "cpu_limit (2) must be at least cpus (3)"),
+        (json!({"memory_gb":4}), "memory_limit_gb (2) must be at least memory_gb (4)"),
+        (json!({"memory_limit_gb":0.005}), "at least 6 MiB"),
+        (json!({"cpu_limit":0}), "invalid app setting cpu_limit"),
+        (json!({"cpu_limit":0.001}), "cpu_limit must be at least 0.01 CPUs"),
+        (json!({"cpus":-1}), "invalid app setting cpus"),
+    ] {
+        let mut spec = capped.clone();
+        for (k, v) in change.as_object().unwrap() {
+            if v.is_null() { spec.as_object_mut().unwrap().remove(k); } else { spec[k] = v.clone(); }
+        }
+        let response = create("bad", &spec).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{change}");
+        let text = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(text.contains(message), "{change}: {text}");
+    }
+    // Native OpenShell's cpus and memory_gb are its limits: whole CPUs, and no others.
+    for (change, message) in [(json!({"cpus":0}), "native OpenShell requires CPU/memory limits"), (json!({"cpus":0.5}), "native OpenShell requires CPU/memory limits"),
+        (json!({"cpu_limit":2}), "don't apply to a native OpenShell app"),
+        (json!({"memory_limit_gb":2}), "don't apply to a native OpenShell app")] {
+        let mut spec = native.clone();
+        for (k, v) in change.as_object().unwrap() { spec[k] = v.clone(); }
+        let response = create("bad", &spec).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{change}");
+        let text = String::from_utf8(to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(text.contains(message), "{change}: {text}");
+    }
+    assert!(!c.inner.lock().apps.contains_key("bad"));
+}
+
+#[tokio::test]
+async fn an_unreserved_tee_app_needs_the_nodes_opt_in_and_a_limit_within_its_vcpus() {
+    let (_dir, c, ns) = setup().await;
+    let mut tee = shim_node(&ns, &["shim-limits-v1", "shim-cpu-shares-v1"]);
+    tee.runtime_capabilities = vec!["shim-tee-simulation-v1".into(), "shim-limits-v1".into(), "shim-cpu-shares-v1".into()];
+    c.report("tee", "session", tee.clone()).await.unwrap();
+    let mut entry = json!({"name":"agent","app":"agent","namespace":ns,"kind":"app","replicas":1,"gpus":0,"cpus":0,"cpu_limit":2,
+        "memory_gb":2,"memory_limit_gb":2,"runtime":{"executor":"shim","driver":"tee-simulation"}});
+    assert!(c.place_app(Entry(&entry), &[]).is_err(), "co-residency without a reservation is the operator's opt-in");
+    tee.runtime_capabilities.push("shim-tee-cpu-overcommit-v1".into());
+    c.report("tee", "session", tee).await.unwrap();
+    assert_eq!(c.place_app(Entry(&entry), &[]).unwrap().0, "tee");
+    // The node's CPUs are its confidential VM's vCPUs: a limit beyond them is refused.
+    entry["cpu_limit"] = json!(9);
+    assert!(c.place_app(Entry(&entry), &[]).is_err());
+    entry["cpu_limit"] = json!(8);
+    assert_eq!(c.place_app(Entry(&entry), &[]).unwrap().0, "tee");
+    // A reserved TEE app with a limit needs no opt-in.
+    let reserved = json!({"name":"svc","app":"svc","namespace":ns,"kind":"app","replicas":1,"gpus":0,"cpus":1,"cpu_limit":4,
+        "runtime":{"executor":"shim","driver":"tee"}});
+    let mut hardware = shim_node(&ns, &[]);
+    hardware.runtime_capabilities = vec!["shim-tee-v1".into(), "shim-limits-v1".into()];
+    c.report("vm", "session", hardware).await.unwrap();
+    assert_eq!(c.place_app(Entry(&reserved), &[]).unwrap().0, "vm");
+}
+
+#[tokio::test]
+async fn a_node_shows_what_its_apps_reserve_beside_their_hard_limits() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = shim_node(&ns, &["shim-limits-v1", "shim-cpu-shares-v1"]);
+    let runtime = json!({"executor":"shim","driver":"docker"});
+    report.apps = vec![
+        json!({"name":"agent","app":"agent","namespace":ns,"kind":"app","replicas":2,"gpus":0,"cpus":0,"cpu_limit":1.5,"memory_gb":1,
+            "memory_limit_gb":2,"runtime":runtime,"disabled":false,"ready":true,"cleaned":false}).into(),
+        json!({"name":"web","app":"web","namespace":ns,"kind":"app","replicas":1,"gpus":0,"cpus":2,"runtime":runtime,
+            "disabled":false,"ready":true,"cleaned":false}).into(),
+        json!({"name":"off","app":"off","namespace":ns,"kind":"app","replicas":1,"gpus":0,"cpus":4,"cpu_limit":4,"memory_gb":1,"memory_limit_gb":1,
+            "runtime":runtime,"disabled":true,"ready":false,"cleaned":true}).into(),
+    ];
+    c.report("gpu", "session", report).await.unwrap();
+    let node = &c.worker_status()[0];
+    assert_eq!((&node["cpus"], &node["free_cpus"]), (&json!(8.0), &json!(0.0)));
+    assert_eq!((&node["reserved_cpus"], &node["cpu_limits"], &node["memory_limits_gb"]), (&json!(2.0), &json!(3.0), &json!(4.0)),
+        "a disabled app counts in neither");
+}
+
+#[tokio::test]
+async fn a_scale_sets_hard_limits_only_where_the_node_enforces_them() {
+    let (_dir, c, ns) = setup().await;
+    let mut report = scale_inventory(&ns, false, false);
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let refused = c.request_scale(&ns, "model", request_resources(json!({"cpu_limit":3}))).await.unwrap_err();
+    assert_eq!(status_of(&refused), 400);
+    assert!(refused.to_string().contains("legacy executor doesn't enforce them"), "{refused}");
+    let (_dir, c, ns) = setup().await;
+    report.apps[0]["namespace"] = json!(ns);
+    report.apps[0]["runtime"] = json!({"executor":"shim","driver":"docker"});
+    report.runtime_capabilities = vec!["shim-docker-v1".into()];
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let scale = |body: Value| c.request_scale(&ns, "model", request_resources(body));
+    let refused = scale(json!({"cpu_limit":3})).await.unwrap_err();
+    assert_eq!(status_of(&refused), 409, "an older bridge would launch it without the limit: {refused}");
+    for (body, message) in [(json!({"cpus":0}), "only for a kind: app without GPUs"),
+        (json!({"cpus":0.5}), "only for a kind: app without GPUs"),
+        (json!({"cpus":0,"gpus":0}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+        (json!({"cpu_limit":1}), "cpu_limit (1) must be at least cpus (2)")] {
+        let refused = scale(body.clone()).await.unwrap_err();
+        assert_eq!(status_of(&refused), 400, "{body}");
+        assert!(refused.to_string().contains(message), "{body}: {refused}");
+    }
+    report.runtime_capabilities.push("shim-limits-v1".into());
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    let value = scale(json!({"cpu_limit":2.5})).await.unwrap();
+    assert_eq!((&value["cpus"], &value["cpu_limit"]), (&json!(2.0), &json!(2.5)));
+    c.dispatch().await.unwrap();
+    let stop = command_where(&c, |cmd| cmd.parameters["scale_phase"] == "stop").unwrap();
+    finish_app_command(&c, &ns, false, &stop, true, Some({
+        let mut stopped = report.apps[0].0.clone();
+        stopped["disabled"] = json!(true); stopped["ready"] = json!(false); stopped["cleaned"] = json!(true); stopped
+    })).await;
+    c.dispatch().await.unwrap();
+    let update = command_where(&c, |cmd| cmd.operation == NodeOperation::App as i32).unwrap();
+    assert_eq!(update.parameters["set"], json!({"gpus":1,"cpus":2,"replicas":2,"cpu_limit":2.5,"disabled":false}));
+}
+
 #[test]
 fn a_failed_record_write_leaves_no_temporary_file() {
     let dir = tempfile::tempdir().unwrap();

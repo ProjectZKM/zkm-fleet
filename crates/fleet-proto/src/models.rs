@@ -459,8 +459,8 @@ impl PreemptionPlan {
 impl RegisterAppRequest {
     /// Settings every app's spec may give; the scheduler adds its name, namespace, tag,
     /// priority and program, and creates it disabled.
-    pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
-        "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
+    pub const SPEC_SETTINGS: [&'static str; 13] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
+        "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s", "cpu_limit", "memory_limit_gb"];
     /// Settings only a container app's spec (`kind: app`) may give.
     pub const CONTAINER_SETTINGS: [&'static str; 14] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner", "mounts"];
     /// At most this many GPUs or durable mounts per native replica, as in shim.
@@ -583,6 +583,57 @@ impl RegisterAppRequest {
     }
     /// Settings only a prover's spec (`kind: ziren-gpu` or `ziren-cpu`) may give.
     pub const PROVER_SETTINGS: [&'static str; 3] = ["proof_storage_root", "backend", "rust_log"];
+    /// The most CPUs a reservation or a limit gives: shim counts them in 32-bit millicores.
+    pub const MAX_CPUS: f64 = (u32::MAX / 1000) as f64;
+    /// The smallest hard CPU limit Docker accepts.
+    pub const MIN_CPU_LIMIT: f64 = 0.01;
+    /// The smallest hard memory limit shim accepts, in bytes.
+    pub const MIN_MEMORY_LIMIT_BYTES: f64 = (6 * 1024 * 1024) as f64;
+
+    /// That an app's CPU and memory settings fit its runtime. `cpus` and `memory_gb` are what
+    /// Ray reserves; `cpu_limit` and `memory_limit_gb` are hard limits, which only a shim
+    /// container (driver docker, tee or tee-simulation) gets, and only when it sets them. A
+    /// reservation is a positive whole number of CPUs, except that a shim `kind: app` without
+    /// GPUs may reserve 0 or a fraction when it sets `cpu_limit`, `memory_gb` and
+    /// `memory_limit_gb`: a replica that reserves less than a CPU is always capped. `spec`
+    /// carries its `kind`; a missing `cpus` is 1 and missing `gpus` the kind's default.
+    pub fn validate_resources(spec: &serde_json::Map<String, Value>) -> anyhow::Result<()> {
+        let value = Value::Object(spec.clone());
+        let entry = crate::workload::Entry(&value);
+        let set = |key: &str| spec.get(key).filter(|v| !v.is_null());
+        let limited = set("cpu_limit").is_some() || set("memory_limit_gb").is_some();
+        let shim = Self::local_container_runtime(spec.get("runtime"));
+        if limited {
+            anyhow::ensure!(!entry.native_access(),
+                "cpu_limit and memory_limit_gb don't apply to a native OpenShell app: its cpus and memory_gb are its limits");
+            anyhow::ensure!(shim,
+                "cpu_limit and memory_limit_gb need runtime {{executor: shim}} with driver docker, tee or tee-simulation: the legacy executor doesn't enforce them");
+        }
+        let cpus = entry.cpus();
+        anyhow::ensure!(cpus.is_finite() && (0.0..=Self::MAX_CPUS).contains(&cpus), "cpus must be a number from 0 to {}", Self::MAX_CPUS);
+        if let Some(limit) = set("cpu_limit") {
+            let limit = limit.as_f64().unwrap_or(f64::NAN);
+            anyhow::ensure!(limit.is_finite() && (Self::MIN_CPU_LIMIT..=Self::MAX_CPUS).contains(&limit),
+                "cpu_limit must be at least {} CPUs", Self::MIN_CPU_LIMIT);
+            anyhow::ensure!(limit + 1e-9 >= cpus, "cpu_limit ({limit}) must be at least cpus ({cpus}), which Ray reserves");
+        }
+        if let Some(limit) = set("memory_limit_gb") {
+            let limit = limit.as_f64().unwrap_or(f64::NAN);
+            let bytes = limit * (1u64 << 30) as f64;
+            anyhow::ensure!(bytes.is_finite() && bytes >= Self::MIN_MEMORY_LIMIT_BYTES && bytes < i64::MAX as f64,
+                "memory_limit_gb must be at least 6 MiB (0.005859375 GiB)");
+            if let Some(memory) = entry.memory_gb() {
+                anyhow::ensure!(limit + 1e-12 >= memory, "memory_limit_gb ({limit}) must be at least memory_gb ({memory}), which Ray reserves");
+            }
+        }
+        if cpus.fract() != 0.0 || cpus == 0.0 {
+            anyhow::ensure!(shim && !entry.native_access() && entry.is_container() && entry.gpus_or_default() == 0.0,
+                "cpus must be a positive whole number: 0 or a fraction is only for a kind: app without GPUs on runtime {{executor: shim}} with driver docker, tee or tee-simulation, not native OpenShell");
+            anyhow::ensure!(set("cpu_limit").is_some() && entry.memory_gb().is_some_and(|m| m > 0.0) && set("memory_limit_gb").is_some(),
+                "cpus {cpus} reserves less than a whole CPU: also set cpu_limit, memory_gb and memory_limit_gb, so its container is always capped");
+        }
+        Ok(())
+    }
 
     pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
         anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
@@ -646,8 +697,9 @@ impl RegisterAppRequest {
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
         let invalid = ["user", "health_path", "workdir", "proof_storage_root", "backend", "rust_log"].into_iter()
                 .find(|k| set(k).is_some_and(|v| !v.is_string()))
-            .or_else(|| ["cpus", "shm_gb", "port_base", "stop_timeout_s"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
-            .or_else(|| ["memory_gb", "ready_timeout_s"].into_iter().find(|k| set(k).is_some_and(positive)))
+            .or_else(|| ["shm_gb", "port_base", "stop_timeout_s"].into_iter().find(|k| set(k).is_some_and(|v| v.as_u64().is_none())))
+            .or_else(|| set("cpus").is_some_and(|v| v.as_f64().is_none_or(|v| v < 0.0 || !v.is_finite())).then_some("cpus"))
+            .or_else(|| ["memory_gb", "ready_timeout_s", "cpu_limit", "memory_limit_gb"].into_iter().find(|k| set(k).is_some_and(positive)))
             .or_else(|| ["command", "volumes"].into_iter().find(|k| set(k).is_some_and(strings)))
             .or_else(|| set("replicas").is_some_and(|r| r.as_u64().is_none_or(|r| !(1..=64).contains(&r))).then_some("replicas"))
             .or_else(|| set("gpus").is_some_and(|g| g.as_f64().is_none_or(|g| g < 0.0 || !g.is_finite())).then_some("gpus"))
@@ -655,7 +707,7 @@ impl RegisterAppRequest {
         if let Some(key) = invalid {
             anyhow::bail!("invalid app setting {key}");
         }
-        Ok(())
+        Self::validate_resources(&execution)
     }
 }
 
@@ -1061,5 +1113,82 @@ mod tests {
             assert!(public.get("token_hash").is_none());
             assert_eq!(public["apps"], serde_json::to_value(&token.apps).unwrap());
         }
+    }
+
+    #[test]
+    fn hard_limits_and_partial_reservations_are_only_for_capped_shim_containers() {
+        let validate = |spec: Value| RegisterAppRequest { name:"agent".into(), spec:spec.into(), ..Default::default() }.validate();
+        let capped = json!({"image":"agent:1","port_base":50100,"gpus":0,"cpus":0,"cpu_limit":2,"memory_gb":1,"memory_limit_gb":1.5,
+            "runtime":{"executor":"shim","driver":"docker"}});
+        for driver in ["docker", "tee", "tee-simulation"] {
+            let mut spec = capped.clone(); spec["runtime"]["driver"] = json!(driver);
+            validate(spec.clone()).unwrap();
+            spec["cpus"] = json!(0.25);
+            validate(spec).unwrap();
+        }
+        // Without one, nothing changes: a whole reservation, no limit.
+        validate(json!({"image":"web:1","port_base":50100,"cpus":2})).unwrap();
+        validate(json!({"image":"web:1","port_base":50100,"cpus":2,"cpu_limit":2.5,"runtime":{"executor":"shim","driver":"docker"}})).unwrap();
+        let refused = |change: Value| {
+            let mut spec = capped.clone();
+            for (k, v) in change.as_object().unwrap() {
+                if v.is_null() { spec.as_object_mut().unwrap().remove(k); } else { spec[k] = v.clone(); }
+            }
+            validate(spec).unwrap_err().to_string()
+        };
+        for (change, message) in [
+            (json!({"runtime":null}), "the legacy executor doesn't enforce them"),
+            (json!({"runtime":{"executor":"shim","driver":"openshell"},"cpus":1,"port_base":null}), "don't apply to a native OpenShell app"),
+            (json!({"cpu_limit":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+            (json!({"memory_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+            (json!({"memory_limit_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
+            (json!({"gpus":1}), "only for a kind: app without GPUs"),
+            (json!({"cpus":3}), "must be at least cpus (3)"),
+            (json!({"memory_gb":2}), "must be at least memory_gb (2)"),
+            (json!({"memory_limit_gb":0.005}), "at least 6 MiB"),
+            (json!({"memory_limit_gb":1e12}), "at least 6 MiB"),
+            (json!({"cpu_limit":0.005}), "at least 0.01 CPUs"),
+            (json!({"cpu_limit":5e6}), "at least 0.01 CPUs"),
+            (json!({"cpu_limit":0}), "invalid app setting cpu_limit"),
+            (json!({"memory_limit_gb":-1}), "invalid app setting memory_limit_gb"),
+            (json!({"cpus":-1}), "invalid app setting cpus"),
+            (json!({"cpus":"1"}), "invalid app setting cpus"),
+        ] {
+            let error = refused(change.clone());
+            assert!(error.contains(message), "{change}: {error}");
+        }
+        let mut prover = capped.as_object().unwrap().clone();
+        prover.insert("kind".into(), json!("ziren-cpu"));
+        let error = RegisterAppRequest::validate_resources(&prover).unwrap_err().to_string();
+        assert!(error.contains("only for a kind: app without GPUs"), "{error}");
+        // A legacy or GPU app keeps whole CPUs.
+        assert!(validate(json!({"image":"web:1","port_base":50100,"cpus":0.5})).is_err());
+        assert!(validate(json!({"image":"web:1","port_base":50100,"cpus":0})).is_err());
+        // The smallest hard limits shim accepts are accepted.
+        let mut spec = capped.clone(); (spec["cpu_limit"], spec["memory_gb"], spec["memory_limit_gb"]) = (json!(0.01), json!(0.005859375), json!(0.005859375));
+        validate(spec).unwrap();
+    }
+
+    #[test]
+    fn limits_and_unreserved_cpus_need_node_capabilities_and_a_tee_limit_fits_its_vcpus() {
+        use crate::workload::{Entry, CPU_SHARES_CAPABILITY as SHARES, LIMITS_CAPABILITY as LIMITS, TEE_CPU_OVERCOMMIT_CAPABILITY as OVERCOMMIT};
+        let report = |caps: &[&str]| NodeReport { total_cpus: 8.0, runtime_capabilities: caps.iter().map(|c| c.to_string()).collect(), ..Default::default() };
+        let plain = json!({"kind":"app","cpus":2,"runtime":{"executor":"shim","driver":"docker"}});
+        assert!(report(&["shim-docker-v1"]).supports_runtime(Entry(&plain)), "an app without limits needs nothing new");
+        let mut limited = plain.clone(); limited["memory_limit_gb"] = json!(4);
+        assert!(!report(&["shim-docker-v1"]).supports_runtime(Entry(&limited)));
+        assert!(report(&["shim-docker-v1", LIMITS]).supports_runtime(Entry(&limited)));
+        let mut unreserved = limited.clone(); (unreserved["cpus"], unreserved["cpu_limit"]) = (json!(0), json!(1));
+        assert!(!report(&["shim-docker-v1", LIMITS]).supports_runtime(Entry(&unreserved)));
+        assert!(report(&["shim-docker-v1", LIMITS, SHARES]).supports_runtime(Entry(&unreserved)));
+        let mut half = unreserved.clone(); half["cpus"] = json!(0.5);
+        assert!(report(&["shim-docker-v1", LIMITS]).supports_runtime(Entry(&half)), "a fraction is a reservation: normal weight");
+        let mut tee = unreserved.clone(); tee["runtime"]["driver"] = json!("tee");
+        assert!(!report(&["shim-tee-v1", LIMITS, SHARES]).supports_runtime(Entry(&tee)));
+        assert!(report(&["shim-tee-v1", LIMITS, SHARES, OVERCOMMIT]).supports_runtime(Entry(&tee)));
+        assert!(report(&[]).fits_cpu_limit(Entry(&tee)));
+        tee["cpu_limit"] = json!(8.5);
+        assert!(!report(&[]).fits_cpu_limit(Entry(&tee)));
+        assert!(report(&[]).fits_cpu_limit(Entry(&json!({"cpu_limit":8.5,"runtime":{"executor":"shim","driver":"docker"}}))));
     }
 }

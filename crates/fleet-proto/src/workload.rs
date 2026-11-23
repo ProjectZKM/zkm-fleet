@@ -2,7 +2,7 @@
 //! JSON, as a node configured or reported them, so keys the scheduler does not know pass
 //! through untouched; these views read and write the keys it does know, each in one place.
 use crate::fleet::v1::NodeOperation;
-use crate::model::v1::{AppDeployment, CommandRecord, Job, JobReport, NodeReport, ScaleStatus, WorkloadTemplate};
+use crate::model::v1::{AppDeployment, CommandRecord, Job, JobReport, NodeReport, ScaleRequest, ScaleStatus, WorkloadTemplate};
 use serde_json::{json, Value};
 
 fn text<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -15,8 +15,12 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 pub struct Entry<'a>(pub &'a Value);
 
 impl<'a> Entry<'a> {
-    /// What a scale changes: the GPUs and CPUs of each replica, and how many replicas run.
-    pub const RESOURCES: [&'static str; 3] = ["gpus", "cpus", "replicas"];
+    /// What a scale changes: the GPUs and CPUs of each replica, how many replicas run, and the
+    /// hard limits of a shim replica's container.
+    pub const RESOURCES: [&'static str; 5] = ["gpus", "cpus", "replicas", "cpu_limit", "memory_limit_gb"];
+    /// The hard limits among them: an entry without one has none, so its container has no
+    /// such limit on the Docker driver.
+    pub const LIMITS: [&'static str; 2] = ["cpu_limit", "memory_limit_gb"];
     /// The node's own configuration of an entry: the app it runs, its program and how its
     /// worker launches. No change the scheduler sends replaces them.
     pub const NODE_OWNED: [&'static str; 8] = ["app", "elf_id", "worker_command", "worker_env_file",
@@ -117,6 +121,22 @@ impl<'a> Entry<'a> {
     pub fn cpus(self) -> f64 {
         self.0["cpus"].as_f64().unwrap_or(1.0)
     }
+    /// Whether its replicas reserve no CPU (`cpus: 0`); `cpu_limit` caps each instead.
+    pub fn unreserved(self) -> bool {
+        self.0["cpus"].as_f64() == Some(0.0)
+    }
+    /// The memory Ray reserves for each replica, in GiB, when the entry gives it.
+    pub fn memory_gb(self) -> Option<f64> {
+        self.0["memory_gb"].as_f64()
+    }
+    /// The hard CPU limit of each replica's container, when the entry sets one.
+    pub fn cpu_limit(self) -> Option<f64> {
+        self.0["cpu_limit"].as_f64()
+    }
+    /// The hard memory limit of each replica's container, in GiB, when the entry sets one.
+    pub fn memory_limit_gb(self) -> Option<f64> {
+        self.0["memory_limit_gb"].as_f64()
+    }
     /// How many replicas run, one where the entry gives none.
     pub fn replicas(self) -> u64 {
         self.0["replicas"].as_u64().unwrap_or(1)
@@ -131,12 +151,18 @@ impl<'a> Entry<'a> {
         (self.gpus().unwrap_or(gpus) * n, self.cpus() * n)
     }
     /// Whether `other` gives it the same resources. A missing setting is one, and no GPU when
-    /// `other` is a CPU prover.
+    /// `other` is a CPU prover; a missing hard limit is none.
     pub fn same_resources(self, other: Entry) -> bool {
         let gpus = if other.kind() == "ziren-cpu" { 0.0 } else { 1.0 };
+        let same = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => (a - b).abs() < 1e-9,
+            (a, b) => a.is_none() && b.is_none(),
+        };
         (self.gpus().unwrap_or(gpus) - other.gpus().unwrap_or(gpus)).abs() < 1e-9
             && (self.cpus() - other.cpus()).abs() < 1e-9
             && (self.replica_count() - other.replica_count()).abs() < 1e-9
+            && same(self.cpu_limit(), other.cpu_limit())
+            && same(self.memory_limit_gb(), other.memory_limit_gb())
     }
     /// How long its replicas take to become ready before a start fails.
     pub fn ready_timeout_s(self) -> f64 {
@@ -183,16 +209,24 @@ impl EntryMut<'_> {
             self.set_priority(0);
         }
     }
-    /// Sets the resources a scale gives, keeping the others.
-    pub fn set_resources(&mut self, gpus: Option<f64>, cpus: Option<u32>, replicas: Option<u32>) {
-        if let Some(v) = gpus {
+    /// Sets the resources a scale gives, keeping the others. A whole number of CPUs is
+    /// written as an integer, as an entry has always had it.
+    pub fn set_resources(&mut self, scale: &ScaleRequest, replicas: Option<u32>) {
+        let number = |v: f64| if v.fract() == 0.0 && (0.0..9.0e15).contains(&v) { json!(v as u64) } else { json!(v) };
+        if let Some(v) = scale.gpus {
             self.0["gpus"] = json!(v);
         }
-        if let Some(v) = cpus {
-            self.0["cpus"] = json!(v);
+        if let Some(v) = scale.cpus {
+            self.0["cpus"] = number(v);
         }
         if let Some(v) = replicas {
             self.0["replicas"] = json!(v);
+        }
+        if let Some(v) = scale.cpu_limit {
+            self.0["cpu_limit"] = number(v);
+        }
+        if let Some(v) = scale.memory_limit_gb {
+            self.0["memory_limit_gb"] = number(v);
         }
     }
     /// Keeps how the node names the namespace, and the namespace's id once it is known.
@@ -225,6 +259,15 @@ impl ScaleStatus {
         Entry(&self.target)
     }
 }
+
+/// A node whose bridge sets an entry's `cpu_limit` and `memory_limit_gb` as its container's
+/// hard limits.
+pub const LIMITS_CAPABILITY: &str = "shim-limits-v1";
+/// A node whose shim gives a container a CPU weight (Docker `--cpu-shares`).
+pub const CPU_SHARES_CAPABILITY: &str = "shim-cpu-shares-v1";
+/// A TEE node whose machine configuration allows tenants that reserve no CPU
+/// (`shim_tee.allow_cpu_overcommit`).
+pub const TEE_CPU_OVERCOMMIT_CAPABILITY: &str = "shim-tee-cpu-overcommit-v1";
 
 impl NodeReport {
     /// Native provisioning holds resources before there is an application route.
@@ -269,7 +312,20 @@ impl NodeReport {
             ("shim-runtime-v2", entry.0.get("container_port").is_some_and(|v| !v.is_null()) || entry.0.get("entrypoint").is_some_and(|v| !v.is_null())),
             ("shim-automatic-port-v1", entry.0["port_base"].as_u64() == Some(0)),
             ("shim-private-env-v1", entry.0["ingress"].as_object().is_some_and(|i| i.values().any(|r| r["bearer_env"].is_string()))),
+            // A bridge that reads them; an older one would launch without the limits.
+            (LIMITS_CAPABILITY, Entry::LIMITS.iter().any(|k| entry.0.get(*k).is_some_and(|v| !v.is_null()))),
+            // The low CPU weight of a replica that reserves no CPU.
+            (CPU_SHARES_CAPABILITY, entry.unreserved()),
+            // Tenants that reserve no CPU share a confidential VM only where its operator allows it.
+            (TEE_CPU_OVERCOMMIT_CAPABILITY, entry.unreserved() && entry.0["runtime"]["driver"] != "docker"),
         ].into_iter().all(|(cap, needed)| !needed || has(cap))
+    }
+    /// Whether the node has the CPUs an entry's hard limit gives. A TEE node's CPUs are its
+    /// confidential VM's vCPUs, which are fixed when the VM boots: a TEE replica's
+    /// `cpu_limit` must fit in them. A Docker limit is the shim's and Docker's to check.
+    pub fn fits_cpu_limit(&self, entry: Entry<'_>) -> bool {
+        !matches!(entry.0["runtime"]["driver"].as_str(), Some("tee" | "tee-simulation"))
+            || entry.cpu_limit().is_none_or(|limit| limit <= self.total_cpus + 1e-9)
     }
     pub fn supports_cleanup(&self, entry: Entry<'_>) -> bool {
         entry.runtime_capability().is_none() || self.supports_runtime(entry)
@@ -668,6 +724,24 @@ mod tests {
         assert!(Entry(&missing).same_resources(Entry(&json!({"gpus": 1, "kind": "app"}))));
         assert!(Entry(&missing).same_resources(Entry(&json!({"gpus": 0, "kind": "ziren-cpu"}))));
         assert!(!Entry(&missing).same_resources(Entry(&json!({"gpus": 2}))));
+    }
+
+    #[test]
+    fn a_scale_writes_whole_cpus_as_integers_and_compares_hard_limits() {
+        let mut entry = json!({"gpus": 1, "cpus": 2, "replicas": 1});
+        let scale = |v: Value| serde_json::from_value::<ScaleRequest>(v).unwrap();
+        EntryMut(&mut entry).set_resources(&scale(json!({"cpus": 3})), None);
+        assert_eq!(entry, json!({"gpus": 1, "cpus": 3, "replicas": 1}), "no limit appears");
+        let before = entry.clone();
+        EntryMut(&mut entry).set_resources(&scale(json!({"cpus": 0.5, "cpu_limit": 2, "memory_limit_gb": 1.5})), Some(2));
+        assert_eq!(entry, json!({"gpus": 1, "cpus": 0.5, "replicas": 2, "cpu_limit": 2, "memory_limit_gb": 1.5}));
+        assert!(!Entry(&entry).same_resources(Entry(&before)));
+        let mut unlimited = entry.clone();
+        unlimited.as_object_mut().unwrap().remove("cpu_limit");
+        assert!(!Entry(&entry).same_resources(Entry(&unlimited)), "a limit only one sets differs");
+        assert!(Entry(&entry).same_resources(Entry(&entry.clone())));
+        assert!(Entry(&json!({"cpus": 0})).unreserved() && !Entry(&json!({})).unreserved());
+        assert_eq!(Entry(&json!({"cpus": 0})).total(0.0), (0.0, 0.0));
     }
 
     #[test]
