@@ -672,6 +672,26 @@ creation, not application readiness. Four creates may run concurrently. A callba
 with different private bytes is rejected. A disconnected RPC does not cancel an
 accepted create; inspect the same operation before retrying.
 
+**Administrative exec.** `POST /policy/openshell/launches/<name>/exec` takes the
+same body as shim's Docker `control` service, `{command, user, stdin,
+timeout_seconds}`, and returns `{stdout, stderr, exit_code}` (stdin/stdout/stderr
+base64). It needs the scheduler's `gateway` settings and runs through the stock
+gateway's interactive exec: the sandbox supervisor runs the command under the
+approved native process policy, so `user` may only repeat that policy's
+`run_as_user`. Fleet never executes on the node. Each call is accepted only for a
+`created` launch whose owning node session, generation, deployment intent and
+quota are current; losing any of them closes control at once. Bounds: at most 256
+arguments and 256 KiB assembled command, 1 to 600 seconds, 64 MiB stdin (sent in
+512 KiB frames, under the gateway's 1 MiB message limit) and 64 MiB per output
+stream; four execs per scheduler. Every call gets a fresh upstream `request_id`,
+so a transport retry never relaunches a command. A stream that ends without an
+exit status reports unavailable, not success.
+
+Native lifecycle stays with Fleet allocations: the compute extension refuses
+gateway stop/start, so "restart" is a replacement generation, and durable `mounts`
+carry state across it. Gateway sandbox logs are supervisor events only; the
+application's own stdout/stderr stay on its node and are not exposed here.
+
 Persist `data_dir/policy/openshell`, the policy ledger and allocation/delivery
 journals together. A durable proof claim precedes submission; after an ambiguous
 submit, only the same job ID is polled. A crash between claiming and submitting

@@ -45,7 +45,11 @@ use trusted_shim::{
 };
 type Result<T> = trusted_shim::rail::Result<T>;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
+mod control;
 mod readiness;
+pub(crate) use control::{ExecGateway, StockGateway};
+#[cfg(test)]
+pub(crate) use control::{stdin_frames, ExecOutput};
 pub(crate) use readiness::{services_ready, Observer};
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -112,6 +116,9 @@ pub(crate) struct Launches {
     /// The acknowledged node policy accepts GPU/volume `driver_config`.
     attachments: bool,
     readiness: readiness::Cache,
+    /// Administrative exec through the stock gateway, when it is configured.
+    control: Option<Arc<dyn ExecGateway>>,
+    control_slots: Semaphore,
 }
 impl Launches {
     pub(crate) fn open(dir: &Path, admission_policy: String) -> anyhow::Result<Self> {
@@ -167,7 +174,19 @@ impl Launches {
             admission_policy,
             attachments: admission.allow_driver_config,
             readiness: Default::default(),
+            control: None,
+            control_slots: Semaphore::new(control::CONTROL_SLOTS),
         })
+    }
+    pub(crate) fn with_control(mut self, gateway: Arc<dyn ExecGateway>) -> Self {
+        self.control = Some(gateway);
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn test_phase(&self, name: &str, phase: &str) {
+        let mut record = self.get(name).unwrap();
+        record.phase = phase.into();
+        self.update(record).unwrap();
     }
     fn save(&self, record: &Record) -> Result<()> {
         let bytes = serde_json::to_vec(record).map_err(|_| Error::InvalidInput)?;
@@ -225,6 +244,10 @@ pub(crate) fn admin_router(c: Arc<WorkloadController>) -> Router {
         .route(
             "/policy/openshell/launches/:name",
             axum::routing::get(launch_status),
+        )
+        .route(
+            "/policy/openshell/launches/:name/exec",
+            post(control::exec).layer(axum::extract::DefaultBodyLimit::max(90 * 1024 * 1024)),
         )
         .with_state(c)
 }

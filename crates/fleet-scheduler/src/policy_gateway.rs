@@ -121,8 +121,13 @@ impl PolicyGateway {
             None
         };
         let preflight = network.as_ref().map(|n| Arc::new(PreflightWorker::new(ledger.clone(), n.clone())));
-        let openshell = p.openshell.as_ref().map(|o| crate::openshell::Launches::open(
-            &dir.join("openshell"), o.admission_policy.clone()).map(Arc::new)).transpose()?;
+        let openshell = p.openshell.as_ref().map(|o| {
+            let launches = crate::openshell::Launches::open(&dir.join("openshell"), o.admission_policy.clone())?;
+            Ok::<_, anyhow::Error>(Arc::new(match &o.gateway {
+                Some(gateway) => launches.with_control(Arc::new(crate::openshell::StockGateway::new(gateway)?)),
+                None => launches,
+            }))
+        }).transpose()?;
         Ok(Some(Arc::new(Self {
             ledger,
             program,

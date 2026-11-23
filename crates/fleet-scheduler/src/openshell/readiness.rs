@@ -46,27 +46,34 @@ fn certificate(path: &Path, secret: bool) -> anyhow::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// The operator's mTLS client for the stock gateway. `rpc_timeout` bounds each
+/// call; long-running streams (administrative exec) bound themselves instead.
+pub(super) fn gateway_client(
+    config: &OpenShellGatewayConfig,
+    rpc_timeout: Option<Duration>,
+) -> anyhow::Result<OpenShellClient<tonic_native::transport::Channel>> {
+    config.validate()?;
+    fleet_proto::initialize_tls();
+    use tonic_native::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(certificate(&config.ca_file, false)?))
+        .identity(Identity::from_pem(
+            certificate(&config.cert_file, false)?,
+            certificate(&config.key_file, true)?,
+        ));
+    let mut endpoint = Endpoint::from_shared(config.endpoint.clone())?.connect_timeout(RPC_TIMEOUT);
+    if let Some(timeout) = rpc_timeout {
+        endpoint = endpoint.timeout(timeout);
+    }
+    Ok(OpenShellClient::new(endpoint.tls_config(tls)?.connect_lazy())
+        .max_decoding_message_size(MAX_RECORD))
+}
+
 #[derive(Clone)]
 pub(crate) struct Observer(OpenShellClient<tonic_native::transport::Channel>);
 impl Observer {
     pub(crate) fn new(config: &OpenShellGatewayConfig) -> anyhow::Result<Self> {
-        config.validate()?;
-        fleet_proto::initialize_tls();
-        use tonic_native::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(certificate(&config.ca_file, false)?))
-            .identity(Identity::from_pem(
-                certificate(&config.cert_file, false)?,
-                certificate(&config.key_file, true)?,
-            ));
-        let channel = Endpoint::from_shared(config.endpoint.clone())?
-            .connect_timeout(RPC_TIMEOUT)
-            .timeout(RPC_TIMEOUT)
-            .tls_config(tls)?
-            .connect_lazy();
-        Ok(Self(
-            OpenShellClient::new(channel).max_decoding_message_size(MAX_RECORD),
-        ))
+        Ok(Self(gateway_client(config, Some(RPC_TIMEOUT))?))
     }
 
     async fn check(&self, record: &Record) -> Result<()> {
