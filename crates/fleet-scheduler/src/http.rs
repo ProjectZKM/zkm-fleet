@@ -63,11 +63,15 @@ pub fn router(state: HttpState) -> Router {
 /// namespace needs read; submitting a job (or cancelling a batch job) submit; changing an app
 /// or batch manage; everything else (namespaces and their quotas,
 /// tokens, allocations, preemption, nodes, the fleet's status) admin.
+/// A namespace also reads a router's records for itself and, with manage, adds its own
+/// workloads' access policies; the handlers keep both to the caller's namespace.
 pub fn required(method: &Method, path: &str) -> Permission {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
         (&Method::POST, ["routers", _, "authorize" | "revoke-subject"]) => Permission::RouterDelegate,
         (&Method::POST, ["routers", _, "sync"]) => Permission::RouterSync,
+        (&Method::GET, ["routers", _]) => Permission::Read,
+        (&Method::PUT, ["routers", _, "access-policy"]) => Permission::Manage,
         (&Method::GET, ["namespaces"] | ["namespaces", _]) => Permission::Read,
         (&Method::GET, ["apps" | "batches", ..]) => Permission::Read,
         (&Method::POST, ["apps" | "batches", _, "jobs"]) => Permission::Submit,
@@ -348,6 +352,10 @@ mod tests {
             (Method::GET, "/namespaces", Read),
             (Method::GET, "/namespaces/zkm", Read),
             (Method::GET, "/apps", Read),
+            (Method::GET, "/routers/relay-a", Read),
+            (Method::PUT, "/routers/relay-a/access-policy", Manage),
+            (Method::PUT, "/routers/relay-a", Admin),
+            (Method::DELETE, "/routers/relay-a/routes/r-1", Admin),
             (Method::GET, "/apps/goat/jobs/p-1/output/proof.json", Read),
             (Method::GET, "/batches/training/jobs/j/logs", Read),
             (Method::POST, "/apps/goat/jobs", Submit),

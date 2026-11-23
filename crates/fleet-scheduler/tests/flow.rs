@@ -154,6 +154,62 @@ const TEST_ELFS: &[&[u8]] =
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_namespace_adds_its_own_workload_policies_and_reads_only_its_own() {
+    use serde_json::{json,Value};
+    let h = start().await;
+    let namespace: Value = h.client.get(format!("{}/namespaces/{PROOFS}",h.http)).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let namespace = namespace["id"].as_str().unwrap();
+    create_namespace(&h,"other",None);
+    let foreign: Value = h.client.get(format!("{}/namespaces/other",h.http)).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    let foreign = foreign["id"].as_str().unwrap();
+    let (sync_token, owner, reader) = ("da".repeat(48), "db".repeat(48), "dc".repeat(48));
+    for (id,secret,permissions) in [("da",&sync_token,vec!["router_sync"]),("db",&owner,vec!["read","submit","manage"]),("dc",&reader,vec!["read"])] {
+        let mut body = json!({"id":id.repeat(16),"address":id.repeat(20),"namespace":PROOFS,"permissions":permissions,
+            "token_hash":hex::encode(sha2::Sha256::digest(secret.as_bytes()))});
+        if permissions.contains(&"manage") { body["tag"]=json!("scope=default"); }
+        if permissions==["read"] { body["apps"]=json!(["agent-1"]); }
+        assert_eq!(h.client.post(format!("{}/tokens",h.http)).bearer_auth(&h.admin).json(&body).send().await.unwrap().status(),201);
+    }
+    let base = format!("{}/routers/scoped-relay",h.http);
+    h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"da".repeat(16)}))
+        .send().await.unwrap().error_for_status().unwrap();
+    let policy=|ns:&str,workload:&str,service:&str,enabled:bool,version:u64|json!({"namespace":ns,"workload":workload,"service":service,
+        "version":version,"sha256":"ab".repeat(32),"enabled":enabled});
+    let put=|token:&str,body:Value|{let (client,url,token)=(h.client.clone(),format!("{base}/access-policy"),token.to_owned());
+        async move{client.put(url).bearer_auth(token).json(&body).send().await.unwrap()}};
+    // The administrator's records: another tenant's policy, and a denial in this namespace.
+    for body in [policy(foreign,"theirs","chat",true,1),policy(namespace,"banned","control",true,1),policy(namespace,"banned","control",false,2)] {
+        put(&h.admin,body).await.error_for_status().unwrap();
+    }
+    // Manage adds an exact policy for its own workload, and repeating it changes nothing.
+    let added:Value=put(&owner,policy(namespace,"agent-1","control",true,1)).await.error_for_status().unwrap().json().await.unwrap();
+    assert!(added["policies"].as_array().unwrap().iter().all(|p|p["namespace"]==namespace), "{added}");
+    let again:Value=put(&owner,policy(namespace,"agent-1","control",true,1)).await.error_for_status().unwrap().json().await.unwrap();
+    assert_eq!(again["revision"],added["revision"]);
+    // Everything else stays with the administrator.
+    for denied in [policy(foreign,"agent-1","control",true,1),   // another namespace
+        policy(namespace,"*","chat",true,1),                      // a namespace-wide default
+        policy(namespace,"agent-2","control",false,1),            // a denial
+        policy(namespace,"banned","control",true,3),              // re-enabling the administrator's denial
+        policy(namespace,"agent-1","control",true,2)] {           // replacing an existing policy
+        assert_eq!(put(&owner,denied.clone()).await.status(),403,"{denied}");
+    }
+    assert_eq!(put(&reader,policy(namespace,"agent-3","control",true,1)).await.status(),403);
+    // A namespace reads its own records; the relay's credential and other tenants stay hidden.
+    for token in [&owner,&reader] {
+        let seen:Value=h.client.get(&base).bearer_auth(token).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let policies=seen["authorization"]["policies"].as_array().unwrap();
+        assert_eq!(policies.len(),2,"{seen}");
+        assert!(policies.iter().all(|p|p["namespace"]==namespace));
+        assert_eq!(seen["token_id"],"");
+    }
+    let all:Value=h.client.get(&base).bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+    assert_eq!(all["authorization"]["policies"].as_array().unwrap().len(),3);
+    assert_eq!(all["token_id"],"da".repeat(16));
+    assert_eq!(h.client.get(&base).bearer_auth(USER).send().await.unwrap().status(),200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_policy_versions_and_delegated_subject_revocation_are_namespace_scoped() {
     use serde_json::{json,Value};
     let h = start().await;
