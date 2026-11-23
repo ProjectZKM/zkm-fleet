@@ -207,6 +207,20 @@ def test_a_scheduler_change_that_is_not_safe_is_refused(installation):
     assert apps.read_bytes() == before and watchdog.read_bytes() == settings
 
 
+def test_no_cron_starts_nothing_and_names_what_to_supervise(installation):
+    prefix, _, temporary, run = installation
+    result = run()
+    assert result.returncode == 0, result.stderr
+    assert not (prefix / "work/watchdog.lock").exists(), "the cron watchdog ran"
+    assert f"{prefix}/deploy/node-start.sh" in result.stdout and f"{prefix}/deploy/ray-start.sh" in result.stdout
+    # Without --no-cron, the installer starts the watchdog and installs its cron line.
+    crontab = temporary / "crontab"
+    executable(temporary / "commands/crontab", f'if [ "${{1:-}}" = -l ]; then cat {crontab} 2>/dev/null; else cat > {crontab}; fi\n')
+    cron = install_node(installation, "--name", "cpu-node")
+    assert cron.returncode == 0, cron.stderr
+    assert (prefix / "work/watchdog.lock").exists() and "fleet-watchdog.sh" in crontab.read_text()
+
+
 def test_reinstall_refreshes_node_settings_and_keeps_operator_values(installation):
     prefix, _, _, run = installation
     assert run().returncode == 0

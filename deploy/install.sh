@@ -295,8 +295,10 @@ PY
   mv "$WATCHDOG_STAGE" "$ETC/watchdog.env"
   if [ "$WITH_SHIM" = 1 ]; then
     bash "$PREFIX/deploy/install-node-services.sh" "$PREFIX" "$ETC" "$WORKDIR" "$BIN/trusted-shim-runtime"
-  else
+  elif [ "$CRON" = 1 ]; then
     FLEET_ENV="$ETC/watchdog.env" "$PREFIX/deploy/fleet-watchdog.sh"
+  else # the operator's supervisor starts them; a nohup agent here would hold its lock
+    echo "[install] --no-cron: nothing was started. Supervise both $PREFIX/deploy/node-start.sh and Ray ($PREFIX/deploy/ray-start.sh) yourself, with the settings in $ETC/watchdog.env"
   fi
   if [ "$CRON" = 1 ]; then
     command -v crontab >/dev/null || die "install cron or supervise node-start.sh yourself with --no-cron"
