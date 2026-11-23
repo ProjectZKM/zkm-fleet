@@ -233,3 +233,41 @@ def test_reinstall_refreshes_node_settings_and_keeps_operator_values(installatio
                      "FLEET_OPERATOR_SETTING=yes", "FLEET_NODE_SUPERVISED=1"]:
         assert expected in text
     assert text.count("RAY_NUM_CPUS=") == 1
+
+
+def link_home(tmp_path, target, link):
+    """Run install.sh's own link_home with a private HOME."""
+    script = (ROOT / "deploy/install.sh").read_text()
+    body = script[script.index("link_home(){"):]
+    body = body[:body.index("\n}\n") + 3]
+    return subprocess.run(["bash", "-c", body + 'link_home "$1" "$2"', "-", str(target), str(link)],
+        capture_output=True, text=True, timeout=10, env={**os.environ, "HOME": str(tmp_path)})
+
+
+def test_second_installation_never_redirects_existing_home_links(tmp_path):
+    live, rehearsal = tmp_path / "live/etc/admin.token", tmp_path / "rehearsal/etc/admin.token"
+    for token in (live, rehearsal):
+        token.parent.mkdir(parents=True)
+        token.write_text("x")
+    link = tmp_path / ".config/zkm-fleet/admin.token"
+    link.parent.mkdir(parents=True)
+    # A fresh user gets the link.
+    assert link_home(tmp_path, live, link).returncode == 0
+    assert os.readlink(link) == str(live)
+    # Re-installing the same prefix is silent and unchanged.
+    again = link_home(tmp_path, live, link)
+    assert again.returncode == 0 and again.stderr == "" and os.readlink(link) == str(live)
+    # Another installation keeps the live one and says how to switch.
+    other = link_home(tmp_path, rehearsal, link)
+    assert other.returncode == 0 and os.readlink(link) == str(live)
+    assert f"ln -sfn {rehearsal} {link}" in other.stderr
+    # Once the live installation is gone, a later install repairs the dangling link.
+    live.unlink()
+    assert link_home(tmp_path, rehearsal, link).returncode == 0
+    assert os.readlink(link) == str(rehearsal)
+    # An operator's own file is never replaced by a link.
+    own = tmp_path / ".local/bin/fleetctl"
+    own.parent.mkdir(parents=True)
+    own.write_text("#!/bin/sh\n")
+    assert link_home(tmp_path, rehearsal, own).returncode == 0
+    assert not own.is_symlink() and own.read_text() == "#!/bin/sh\n"

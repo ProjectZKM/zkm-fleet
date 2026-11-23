@@ -25,6 +25,10 @@ certificate. The installer creates the cluster token, a private TLS CA and the f
 administrator token in `etc/admin.token`, installs `deploy/fleet-ctl.sh` under the
 prefix, and puts `fleetctl` on the PATH. That `fleet-ctl.sh` is the version from the
 last install; for upgrades, use the new release's copy ([maintenance](maintenance.md#upgrading)).
+It links `~/.local/bin/fleetctl` and `~/.config/zkm-fleet/admin.token` to this
+installation only when they are missing or dangling. Links to another
+installation are kept, so a second prefix (a rehearsal or a test) never
+redirects your existing `fleetctl`. The installer prints the command to switch.
 Scheduler settings are in `etc/fleet.yaml`
 (see [fleet.example.yaml](../deploy/fleet.example.yaml)). Re-running the installer keeps
 the `compose.env` settings it doesn't own, such as `FLEET_OPENSHELL_*` and the

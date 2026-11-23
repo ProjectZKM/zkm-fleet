@@ -29,6 +29,19 @@ done
 case "$ROLE" in control|node) ;; *) sed -n '2,6p' "$0"; exit 2;; esac
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 die(){ echo "[install] $*" >&2; exit 1; }
+# Point a per-user convenience link at this installation, unless it already
+# leads somewhere real: another live installation's token/CLI, or an operator's
+# own file. Installing a second prefix (a rehearsal, a test) must not redirect
+# the administrator's existing fleetctl. A missing or dangling link is (re)made.
+link_home(){
+  local target=$1 link=$2
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then return; fi
+  if [ -e "$link" ]; then
+    echo "[install] keeping $link -> $(readlink -f "$link"); to use this installation instead: ln -sfn $target $link" >&2
+    return
+  fi
+  ln -sfn "$target" "$link"
+}
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker must be installed and accessible"
 # A re-run keeps the node's settings: an install-owned watchdog.env key changes only when its flag
 # is given or the key is missing, and this run's paths and name follow the kept values.
@@ -142,8 +155,8 @@ EOF
   SCHED_IP="${SUBNET%.*}.10"
   sed "s/@SCHEDULER_IP@/$SCHED_IP/g" "$PREFIX/deploy/gateway.yaml.in" > "$ETC/gateway.yaml"
   mkdir -p "$PREFIX/data" "$HOME/.config/zkm-fleet" "$HOME/.local/bin"
-  ln -sf "$ETC/admin.token" "$HOME/.config/zkm-fleet/admin.token"
-  ln -sf "$FLEETCTL" "$HOME/.local/bin/fleetctl"
+  link_home "$ETC/admin.token" "$HOME/.config/zkm-fleet/admin.token"
+  link_home "$FLEETCTL" "$HOME/.local/bin/fleetctl"
   IMG=${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
   # Rewrite only the keys this installer owns, and keep every other line (FLEET_OPENSHELL_*
   # and other site settings). Of COMPOSE_PROFILES it manages only mcp; profiles enabled
