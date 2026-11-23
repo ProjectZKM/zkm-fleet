@@ -435,6 +435,80 @@ def test_remote_commands_forward_only_the_settings_that_are_set(tmp_path):
     for name in ("FLEET_ETC", "FLEET_ENV", "FLEET_NODE_UNIT"):
         assert name not in log.read_text()
 
+def scheduler_view(tmp_path, prefix, env, record, name="gpu-a"):
+    """A stand-in fleetctl answering `--json node NAME` with RECORD (None: it fails)."""
+    import json
+    token = tmp_path / "admin.token"
+    token.write_text("secret\n")
+    asked = tmp_path / "fleetctl.calls"
+    answer = "exit 1\n" if record is None else f"cat <<'JSON'\n{json.dumps(record)}\nJSON\n"
+    executable(prefix / "bin/fleetctl", f'echo "$FLEET_TOKEN_FILE $*" >> {asked}\n' + answer)
+    (prefix / "etc/watchdog.env").write_text(f"FLEET_HOME={prefix}\nFLEET_NODE_NAME={name}\n")
+    executable(Path(env["PATH"].split(":")[0]) / "sleep", "exit 0\n")
+    return {**env, "FLEET_TOKEN_FILE": str(token)}, asked, token
+
+
+@pytest.mark.parametrize("record,ok", [
+    ({"name": "gpu-a", "ready": True, "draining": False, "heartbeat_age_ms": 0}, True),
+    ({"name": "gpu-a", "ready": False, "draining": True, "heartbeat_age_ms": 0}, True),
+    # The last accepted report predates the restart: the new agent was never heard from.
+    ({"name": "gpu-a", "ready": True, "draining": False, "heartbeat_age_ms": 600000}, False),
+    ({"name": "gpu-a", "ready": False, "draining": False, "heartbeat_age_ms": 0}, False),
+    (None, False),
+])
+def test_upgrade_waits_for_a_ready_report_newer_than_the_restart(tmp_path, record, ok):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    env, asked, token = scheduler_view(tmp_path, prefix, env, record)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert asked.read_text().splitlines()[0] == f"{token} --json node gpu-a"
+    if ok:
+        assert result.returncode == 0, result.stderr
+        assert "draining" in result.stdout if record["draining"] else "reports gpu-a READY" in result.stdout
+    else:
+        assert result.returncode != 0
+        assert "no READY report from gpu-a" in result.stderr
+        assert "node did not reconnect; run: fleet-ctl.sh node rollback" in result.stderr
+
+
+def test_rollback_waits_for_the_scheduler_too(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    assert ctl(env, "node", "upgrade", str(newbin), str(candidate)).returncode == 0
+    env, asked, token = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": 10**6})
+    result = ctl(env, "node", "rollback")
+    assert result.returncode != 0 and "restored node did not reconnect" in result.stderr
+    assert "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_without_fleetctl_the_log_check_stands_with_a_warning(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    (prefix / "etc/watchdog.env").write_text("FLEET_NODE_NAME=gpu-a\n")
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert result.returncode == 0, result.stderr
+    assert "warning: cannot ask the scheduler about gpu-a" in result.stderr
+    assert "confirm it is READY in: fleetctl node" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["upgrade", "rollback"])
+@pytest.mark.parametrize("age,ok", [(0, True), (10**6, False)])
+def test_remote_upgrade_and_rollback_ask_the_scheduler_from_the_control_host(tmp_path, command, age, ok):
+    prefix, env, log = remote_control(tmp_path)
+    env, asked, token = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": age})
+    args = ["node", "rollback"]
+    if command == "upgrade":
+        newbin = tmp_path / "release/bin/fleet-node"
+        executable(newbin, "exit 0\n")
+        (tmp_path / "release/bridge/fleet_bridge").mkdir(parents=True)
+        args = ["node", "upgrade", str(newbin), str(tmp_path / "release/bridge")]
+    result = ctl(env, *args)
+    # The node's own run leaves the scheduler to the control host.
+    assert "FLEET_CTL_ON_NODE=1" in log.read_text()
+    assert asked.read_text().splitlines()[0] == f"{token} --json node gpu-a"
+    if ok:
+        assert result.returncode == 0 and "reports gpu-a READY" in result.stdout, result.stderr
+    else:
+        hint = "run: fleet-ctl.sh node rollback" if command == "upgrade" else "restored node did not reconnect"
+        assert result.returncode != 0 and hint in result.stderr
+
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
     """A remote dry run ships nothing, so the node sees paths to no files: it prints the local

@@ -342,7 +342,8 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   fi
   if remote; then # ship them, then upgrade on the node
     local stage; stage=/tmp/fleet-ctl-$(stamp)
-    local args=()
+    local args=() name=
+    [ "$DRY" = 1 ] || name=$(remote_node_name)
     run ssh "$NODE_SSH" "mkdir -p $stage/bridge"
     run scp -q "$bin" "$NODE_SSH:$stage/fleet-node"
     run scp -q -r "$bridge/fleet_bridge" "$NODE_SSH:$stage/bridge/"
@@ -364,7 +365,9 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
       args+=("$stage/scripts")
     fi
     on_node node upgrade "${args[@]}"
+    local restarted; restarted=$(date +%s.%N)
     run ssh "$NODE_SSH" "rm -rf $stage"
+    [ "$DRY" = 1 ] || node_reported "$name" "$restarted" || die "node did not reconnect; run: fleet-ctl.sh node rollback"
     return
   fi
   local b; b=$PREFIX/backup/node-$(stamp)
@@ -391,8 +394,9 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
       run install -m 755 "$scripts/$s" "$PREFIX/deploy/$s"
     done
   fi
+  local restarted; restarted=$(date +%s.%N)
   run sudo systemctl start "$NODE_UNIT"
-  [ "$DRY" = 1 ] || node_connected || die "node did not reconnect; run: fleet-ctl.sh node rollback"
+  [ "$DRY" = 1 ] || node_reconnected "$restarted" || die "node did not reconnect; run: fleet-ctl.sh node rollback"
   if [ -n "$proof_app" ]; then
     run install -m 755 "$proof_app" "$PREFIX/bin/fleet-proof-app.new"
     run mv "$PREFIX/bin/fleet-proof-app.new" "$PREFIX/bin/fleet-proof-app"
@@ -416,7 +420,70 @@ node_connected() { # this invocation's agent, including operator wrapper process
     sleep 2
   done; return 1
 }
+node_reconnected() { # RESTARTED: the agent logged its connection and the scheduler took its report
+  node_connected || return 1
+  # Over ssh, the control host asks the scheduler itself.
+  [ "${FLEET_CTL_ON_NODE:-0}" = 1 ] || node_reported "$(node_name)" "$1"
+}
+scheduler_access() { # fleetctl and the admin token file it would use; sets ADMIN_TOKEN
+  [ -x "$PREFIX/bin/fleetctl" ] || return 1
+  if [ -n "${FLEET_TOKEN_FILE:-}" ]; then ADMIN_TOKEN=$FLEET_TOKEN_FILE; [ -r "$ADMIN_TOKEN" ]; return; fi
+  local d; for d in ${FLEET_ETC:+"$FLEET_ETC"} "$HOME/.config/zkm-fleet" /etc/zkm-fleet; do
+    ADMIN_TOKEN=$d/admin.token; [ ! -r "$ADMIN_TOKEN" ] || return 0
+  done
+  return 1
+}
+# The agent logs that it connected as soon as its channel opens, before the scheduler accepts a
+# report. Proof that it works is the node READY with a report newer than RESTARTED (date +%s.%N).
+node_reported() { # NAME RESTARTED
+  local name=$1 state
+  if ! [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || ! scheduler_access; then
+    echo "fleet-ctl: warning: cannot ask the scheduler about ${name:-the node} (this needs $PREFIX/bin/fleetctl, an admin token and the node's FLEET_NODE_NAME); only the agent's log was checked, so confirm it is READY in: fleetctl node" >&2
+    return 0
+  fi
+  echo "waiting up to 90s for the scheduler to report $name READY"
+  for _ in $(seq 45); do
+    state=$(python3 - "$PREFIX/bin/fleetctl" "$name" "$ADMIN_TOKEN" "$2" <<'PY'
+import json, os, subprocess, sys, time
+fleetctl, name, token, restarted = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
+asked = time.time()
+try:
+    out = subprocess.run([fleetctl, "--json", "node", name], capture_output=True, text=True, timeout=30,
+                         env={**os.environ, "FLEET_TOKEN_FILE": token})
+    node = json.loads(out.stdout)
+    # The scheduler measures the age when it answers, after `asked`: this never makes a report newer.
+    fresh = asked - float(node["heartbeat_age_ms"]) / 1000 > restarted
+except (subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+    fresh = False
+print("ready" if fresh and node.get("ready") is True else "draining" if fresh and node.get("draining") is True else "waiting")
+PY
+    ) || state=
+    case "$state" in
+      ready) echo "the scheduler reports $name READY"; return 0;;
+      draining) echo "the scheduler took a report from $name after the restart; it is draining, so check READY once it is undrained"; return 0;;
+    esac
+    sleep 2
+  done
+  echo "fleet-ctl: the scheduler has no READY report from $name since the restart" >&2
+  return 1
+}
+remote_node_name() { # the node's FLEET_NODE_NAME, asked over ssh; nothing if unknown
+  local name; name=$(on_node node name 2>/dev/null | tail -n 1) || name=
+  name=${name//$'\r'/}
+  if [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then printf '%s\n' "$name"; fi
+}
+node_name() { # the name this node's agent reports under: FLEET_NODE_NAME in its watchdog.env
+  node_locate
+  [ ! -f "$NODE_ENV" ] || bash -c '. "$1"; printf "%s\n" "${FLEET_NODE_NAME:-}"' _ "$NODE_ENV"
+}
 node_rollback() {
+  if remote; then
+    local name=; [ "$DRY" = 1 ] || name=$(remote_node_name)
+    on_node node rollback
+    local restarted; restarted=$(date +%s.%N)
+    [ "$DRY" = 1 ] || node_reported "$name" "$restarted" || die "restored node did not reconnect; runtime services were left running"
+    return
+  fi
   local b; b=$(latest_backup node); [ -n "$b" ] || die "no backup in $PREFIX/backup"
   node_runtime_check "$b/bridge"
   run sudo systemctl stop "$NODE_UNIT"
@@ -431,8 +498,9 @@ node_rollback() {
   if [ -f "$b/fleet-proof-app" ]; then
     run install -m 755 "$b/fleet-proof-app" "$PREFIX/bin/fleet-proof-app"
   fi
+  local restarted; restarted=$(date +%s.%N)
   run sudo systemctl start "$NODE_UNIT"
-  [ "$DRY" = 1 ] || node_connected || die "restored node did not reconnect; runtime services were left running"
+  [ "$DRY" = 1 ] || node_reconnected "$restarted" || die "restored node did not reconnect; runtime services were left running"
   echo "restored $b"
 }
 
@@ -562,7 +630,8 @@ case "${1:-}/${2:-}" in
   scheduler/upgrade) scheduler_upgrade "${3:-}";;
   scheduler/rollback) scheduler_rollback "${3:-}";;
   node/upgrade) node_upgrade "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
-  node/rollback) if remote; then on_node node rollback; else node_rollback; fi;;
+  node/rollback) node_rollback;;
+  node/name) if remote; then on_node node name; else node_name; fi;;
   app/cleanup) if remote; then on_node app cleanup "${3:-}"; else app_cleanup "${3:-}"; fi;;
   *) sed -n '2,/^set -euo/p' "$SELF" | sed '$d;s/^# \{0,1\}//'; exit 2;;
 esac
