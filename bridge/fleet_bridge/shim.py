@@ -88,13 +88,24 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
     return required
 
 
-def _operator_executable(path: str) -> bool:
-    """Shim's own helper check: a regular executable nobody else can modify."""
+def _helper_problem(path: str) -> str | None:
+    """Why shim would refuse this helper, or None for a regular executable nobody else can modify."""
     try:
         mode = os.stat(path).st_mode
-    except OSError:
-        return False
-    return stat.S_ISREG(mode) and not mode & 0o022 and bool(mode & 0o111)
+    except OSError as error:
+        return error.strerror or "cannot be read"
+    if not stat.S_ISREG(mode):
+        return "not a regular file"
+    if mode & 0o022:
+        return "group or others can write it"
+    if not mode & 0o111:
+        return "not executable"
+    return None
+
+
+def _operator_executable(path: str) -> bool:
+    """Shim's own helper check: a regular executable nobody else can modify."""
+    return _helper_problem(path) is None
 
 
 def capabilities(config: ControlPlaneConfig) -> list[str]:
@@ -539,9 +550,10 @@ def check_openshell(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
         raise RuntimeError("running shim OpenShell settings differ; reconcile the companion explicitly before starting the node")
 
 
-def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
+def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> dict[str, Any] | None:
+    """The running companion's capabilities, once they match `config`; None without one."""
     if not config.shim_daemon:
-        return
+        return None
     deadline = time.monotonic() + wait_seconds
     while True:
         try:
@@ -555,17 +567,69 @@ def check_daemon(config: ControlPlaneConfig, wait_seconds: float = 0) -> None:
         raise RuntimeError("running shim has an incompatible protocol; node was not changed")
     check_openshell(config, value)
     check_machine(config, value)
+    return value
+
+
+def check(path: Path, wait_seconds: float = 0, *, network: bool = False) -> list[str]:
+    """The `check` operation. The whole apps.yaml must load the way the node's report reads
+    it, and a persistent companion must match it. A tunnel helper that shim cannot use
+    withdraws only the network capabilities, so those problems are returned as warnings,
+    or raised with `network`."""
+    import yaml
+    from .model import AppsConfig
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        raise ValueError("apps.yaml must contain a mapping")
+    config = AppsConfig.parse(data, validate_launch=False).cluster
+    value = check_daemon(config, wait_seconds)
+    helper = config.shim_network.tunnel_binary if config.shim_network else None
+    if helper is None:
+        return []
+    problems = []
+    reason = _helper_problem(helper) if os.path.isabs(helper) else "not an absolute path"
+    if reason:
+        problems.append(f"shim_network.tunnel_binary {helper}: {reason}; it must be an absolute path "
+            "to a regular executable that group and others cannot write")
+    features: Any = []
+    try:
+        if value is None and config.shim_binary and os.path.isabs(config.shim_binary):
+            # A per-call shim answers for itself, the way capabilities() asks it.
+            value = json.loads(subprocess.run([config.shim_binary, "--capabilities"],
+                capture_output=True, timeout=5, check=True).stdout)
+        features = value.get("features") if isinstance(value, dict) else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    if not isinstance(features, list) or "chisel-network-v1" not in features:
+        problems.append("the running shim does not report chisel-network-v1, which tunnel_binary needs")
+    if not problems:
+        return []
+    message = "; ".join(problems) + "; the node withdraws its network capabilities until this is fixed"
+    if network:
+        raise RuntimeError(message)
+    return [message]
 
 
 def main() -> None:
     """Installer/service entry points use the existing apps.yaml exclusively."""
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser()
     parser.add_argument("operation", choices=["check", "serve", "socket"])
     parser.add_argument("--apps", required=True)
     parser.add_argument("--wait-seconds", type=float, default=0)
+    parser.add_argument("--network", action="store_true", help="check only: fail instead of warning when "
+        "shim_network.tunnel_binary is not an absolute regular executable that group and others cannot write, "
+        "or the running shim does not report chisel-network-v1")
     args = parser.parse_args()
+    if args.operation == "check":
+        try:
+            warnings = check(Path(args.apps), args.wait_seconds, network=args.network)
+        except Exception as error:
+            raise SystemExit(f"shim check failed: {error}") from None
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+        return
     config = daemon_config(Path(args.apps))
     if not config.shim_daemon:
         if args.operation == "serve":
@@ -585,7 +649,6 @@ def main() -> None:
         if options:
             command += ["--options", json.dumps(options)]
         os.execv(config.shim_binary, command)
-    check_daemon(config, args.wait_seconds)
 
 
 if __name__ == "__main__":

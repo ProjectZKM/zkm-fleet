@@ -324,6 +324,90 @@ def test_service_bootstrap_ignores_invalid_apps_but_validates_daemon_settings(tm
         with pytest.raises(ValueError):shim.daemon_config(path)
 
 
+NETWORK = {"gateway_url":"https://control.example", "relay_url":"wss://data.example",
+    "token_file":"/private/node.jwt", "public_key_file":"/private/gateway.pem", "issuer":"control"}
+
+
+def checked_node(tmp_path, features):
+    """An apps.yaml with a tunnel helper and a per-call shim that reports `features`."""
+    import json
+    runtime = tmp_path / "trusted-shim-runtime"
+    runtime.write_text("#!/bin/sh\necho '" + json.dumps({"protocol":1,"drivers":["docker"],"features":features}) + "'\n")
+    runtime.chmod(0o755)
+    helper = tmp_path / "trusted-router-tunnel"
+    helper.write_bytes(b"fixture")
+    helper.chmod(0o755)
+    raw = config(tmp_path)
+    raw.update(shim_binary=str(runtime), shim_network={**NETWORK, "tunnel_binary":str(helper)})
+    # A leftover override loads as the report reads it; the scheduler quarantines it.
+    raw["apps"].append({"name":"old", "kind":"ziren-gpu", "app":"eth", "elf_id":"b"*64,
+        "disabled":True, "prover_binary":"/old/sdk"})
+    path = tmp_path / "apps.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path, raw, helper
+
+
+def run_check(path, *flags):
+    import subprocess
+    import sys
+    from pathlib import Path
+    # This checkout's bridge, not an installed copy.
+    return subprocess.run([sys.executable, "-m", "fleet_bridge.shim", "check", "--apps", str(path), *flags],
+        cwd=Path(shim.__file__).parents[1], capture_output=True, text=True, timeout=60)
+
+
+def test_check_reads_the_whole_file_and_warns_about_the_tunnel_helper_unless_network(tmp_path):
+    path, raw, helper = checked_node(tmp_path, ["data-plane-v1", "chisel-network-v1"])
+    for flags in ((), ("--network",)):
+        result = run_check(path, *flags)
+        assert (result.returncode, result.stderr) == (0, ""), result.stderr
+    # Node startup runs the check: a helper shim can't use only withdraws network capabilities.
+    helper.chmod(0o775)
+    result = run_check(path)
+    assert result.returncode == 0 and result.stderr.startswith("WARNING: ")
+    assert "group or others can write it" in result.stderr and "network capabilities" in result.stderr
+    result = run_check(path, "--network")
+    assert result.returncode == 1 and "shim check failed:" in result.stderr
+    assert "group or others can write it" in result.stderr
+    # What the report can't parse fails in both modes, with the reason.
+    raw["shim_network"]["tunnel_binary"] = "relative/helper"
+    path.write_text(yaml.safe_dump(raw))
+    result = run_check(path)
+    assert result.returncode == 1 and "shim check failed:" in result.stderr and "absolute" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_check_requires_chisel_from_the_running_shim_only_with_network(tmp_path, monkeypatch):
+    from fleet_bridge.model import ModelError
+    path, raw, helper = checked_node(tmp_path, ["data-plane-v1"])
+    [warning] = shim.check(path)
+    assert "does not report chisel-network-v1" in warning
+    with pytest.raises(RuntimeError, match="chisel-network-v1"):
+        shim.check(path, network=True)
+    helper.unlink()
+    with pytest.raises(RuntimeError, match="trusted-router-tunnel: No such file.*chisel-network-v1"):
+        shim.check(path, network=True)
+    # A persistent companion reports its own features.
+    helper.write_bytes(b"fixture"); helper.chmod(0o755)
+    raw.update(shim_daemon=True, shim_binary="/opt/trusted-shim-runtime")
+    path.write_text(yaml.safe_dump(raw))
+    value = {"protocol":1, "features":["runtime-daemon-v1"]}
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: value)
+    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=AssertionError("ask the running companion")))
+    with pytest.raises(RuntimeError, match="chisel-network-v1"):
+        shim.check(path, network=True)
+    value["features"].append("chisel-network-v1")
+    assert shim.check(path, network=True) == []
+    del raw["shim_network"]["tunnel_binary"]
+    value["features"].remove("chisel-network-v1")
+    path.write_text(yaml.safe_dump(raw))
+    assert shim.check(path, network=True) == []
+    raw["apps"].append({"name":"broken", "kind":"app", "elf_id":"abc"})
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ModelError, match="only a Ziren prover"):
+        shim.check(path)
+
+
 @pytest.mark.parametrize("runtime", [None, {"executor":"unknown"}, {"executor":"shim", "driver":"openshell"},
     {"executor":"shim", "driver":"docker", "policy_proof":"required"}])
 def test_unsupported_or_misspelled_runtime_is_not_ignored(tmp_path, runtime):
