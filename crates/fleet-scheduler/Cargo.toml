@@ -36,7 +36,7 @@ fs2 = "0.4"
 prost-native = { package = "prost", version = "0.14" }
 tonic-native = { package = "tonic", version = "0.14", features = ["transport", "tls-ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "23414952b888ea2328ae1fcbbcfdcdafb498655d", features = ["ziren"] }
+trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "662c1c55b558ce8ca9660c487d32290a5445a763", features = ["ziren"] }
 
 [dev-dependencies]
 hyper-util = { version = "0.1", features = ["tokio"] }
