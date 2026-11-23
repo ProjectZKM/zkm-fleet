@@ -28,11 +28,15 @@ import ray
 from .model import ReplicaHealth, NodeEnvironment, AppReplicaSpec, to_env
 
 
-def spec_hash(spec: AppReplicaSpec) -> str:
+def config_digest(spec: AppReplicaSpec) -> str:
     """Over the replica's own mapping from the apps file: a bridge upgrade never
     replaces a running app by itself. Priority is scheduling metadata and
     does not require restarting a container."""
-    return hashlib.sha256(json.dumps({k: v for k, v in spec.config.items() if k != "priority"}, sort_keys=True).encode()).hexdigest()[:16]
+    return hashlib.sha256(json.dumps({k: v for k, v in spec.config.items() if k != "priority"}, sort_keys=True).encode()).hexdigest()
+
+
+def spec_hash(spec: AppReplicaSpec) -> str:
+    return config_digest(spec)[:16]
 
 
 def _sh(argv: list[str]) -> subprocess.CompletedProcess[str]:

@@ -151,7 +151,10 @@ same maintenance window: drain the node and confirm cleanup as above, then set
 `libexec/trusted-router-tunnel/<sha256>/trusted-router-tunnel` path the installer
 printed, and run `fleet_bridge.shim check`. The node then advertises
 `shim-chisel-network-v1`; a configured helper that fails does not fall back to the
-old transport. Rollback is the reverse edit: restore the previous path, or remove
+old transport. The helper must be a regular executable that neither group nor
+others can modify. A missing or modifiable one withdraws only the network
+capabilities, so apps with services stop being placed there; provers and apps
+without services keep running and stay scheduled. Rollback is the reverse edit: restore the previous path, or remove
 the key to return to the existing transport. Staged hashes are never replaced or
 removed by reinstalling, so the previous helper stays available.
 

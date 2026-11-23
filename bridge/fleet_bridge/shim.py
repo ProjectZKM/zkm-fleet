@@ -28,7 +28,8 @@ CAPABILITY = "shim-docker-v1"
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
-    return hashlib.sha256(json.dumps({k:v for k,v in spec.config.items() if k != "priority"},sort_keys=True).encode()).hexdigest()
+    # The full digest: persisted allocations compare against this exact value.
+    return actors.config_digest(spec)
 
 
 def selected(spec: AppReplicaSpec) -> bool:
@@ -113,11 +114,13 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         if config.shim_daemon:
             check_machine(config, value)
         features = value.get("features", [])
+        # A configured tunnel helper gates only the network capabilities; runtimes
+        # without services never use it.
         upstream = not config.shim_network or config.shim_network.tunnel_binary is None or (
             "chisel-network-v1" in features and _operator_executable(config.shim_network.tunnel_binary))
-        modern = "data-plane-v1" in features and upstream
+        modern = "data-plane-v1" in features
         management = "runtime-management-v1" in features
-        network = bool(config.shim_network) and modern
+        network = bool(config.shim_network) and modern and upstream
         managed_network = network and management
         native = ["shim-openshell-access-v1"] if "openshell-access-v1" in features else []
         if config.shim_daemon and config.shim_openshell is not None:
@@ -184,9 +187,16 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
         raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
 
 
-def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False) -> dict[str, Any]:
+# A health probe's connector recovery must finish within the probe's own budget.
+RECOVERY_TIMEOUT_S = 3
+
+
+def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False,
+           timeout: float | None = None) -> dict[str, Any]:
     if daemon:
-        return daemon_call(state_dir, node_id, command, timeout=330 if command.get("operation") == "launch" and command.get("request", {}).get("driver") in ("tee", "tee-simulation") else 150)
+        if timeout is None:
+            timeout = 330 if command.get("operation") == "launch" and command.get("request", {}).get("driver") in ("tee", "tee-simulation") else 150
+        return daemon_call(state_dir, node_id, command, timeout=timeout)
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
         result = subprocess.run([binary, "--state-dir", state_dir, "--node-id", node_id],
@@ -350,11 +360,13 @@ class _ShimApp:
                 raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
             time.sleep(2)
 
-    def start_network(self) -> None:
+    def start_network(self, timeout: float | None = None) -> None:
         spec = self.spec
         if spec.app.services:
             if spec.cluster.shim_daemon:
-                self.call({"operation": "network", "execution": spec.execution, "config": spec.cluster.shim_network})
+                # Idempotent: a running connector answers at once.
+                self.call({"operation": "network", "execution": spec.execution, "config": spec.cluster.shim_network},
+                          timeout=timeout)
                 return
             # The Rust shim owns endpoints, grant verification, reconnect and
             # stream drain. Ray supervises only this local process.
@@ -364,18 +376,18 @@ class _ShimApp:
                 "config": spec.cluster.shim_network})).encode())
             self.network.stdin.close()
 
-    def call(self, command: dict[str, Any]) -> dict[str, Any]:
+    def call(self, command: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
         if command["operation"] != "launch" and self.spec.app.runtime.driver != "docker":
             command = {**command, "driver": self.spec.app.runtime.driver}
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command,
-            daemon=self.spec.cluster.shim_daemon)
+            daemon=self.spec.cluster.shim_daemon, timeout=timeout)
 
     def health(self) -> dict[str, Any]:
         status = self.call({"operation": "inspect", "execution": self.spec.execution})
         if status.get("state") == "ready" and (self.spec.cluster.shim_daemon or
                 self.network is not None and self.network.poll() is not None):
             try:
-                self.start_network()
+                self.start_network(timeout=RECOVERY_TIMEOUT_S)
             except (RuntimeError, OSError, ValueError):
                 # The observed container and repair endpoint remain valid even
                 # if re-registering its connector temporarily fails. Router
@@ -410,15 +422,16 @@ class _ProvisionedApp:
         if status.get("phase") not in ("reserved", "authorizing", "dispatched", "created"):
             raise RuntimeError("native allocation requires explicit cleanup")
 
-    def call(self, operation: str, **fields: Any) -> dict[str, Any]:
+    def call(self, operation: str, timeout: float | None = None, **fields: Any) -> dict[str, Any]:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(),
-            {"operation": operation, "execution": self.spec.execution, "driver": self.spec.app.runtime.driver, **fields}, daemon=True)
+            {"operation": operation, "execution": self.spec.execution, "driver": self.spec.app.runtime.driver, **fields},
+            daemon=True, timeout=timeout)
 
     def health(self) -> dict[str, Any]:
         status = self.call("inspect")
         if self.spec.app.services and status.get("platform_ready"):
             try:
-                self.call("network", config=self.spec.cluster.shim_network)
+                self.call("network", timeout=RECOVERY_TIMEOUT_S, config=self.spec.cluster.shim_network)
             except (RuntimeError, OSError, ValueError):
                 logging.getLogger(__name__).warning("native shim connector recovery failed for %s", self.spec.name)
         # A local health verdict is independent of connector registration.

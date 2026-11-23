@@ -721,6 +721,10 @@ class AppSpec(Record):
             if (not re.fullmatch(r"[0-9a-f]{64}", self.access_policy_sha256)
                     or not self.runtime or self.runtime.executor is not ExecutorKind.SHIM):
                 raise ModelError("access policy requires a SHA256 commitment and shim runtime")
+            # The scheduler admits user rules only on these drivers; legacy
+            # `openshell` records are never placed with one.
+            if self.runtime.driver not in ("docker", "tee", "tee-simulation"):
+                raise ModelError("access policy requires the docker, tee or tee-simulation driver")
         if self.health_tcp_banner is not None and not (self.native_access and self.service_protocol is ServiceProtocol.TCP):
             raise ModelError("TCP banner health requires native OpenShell TCP services")
         if self.mounts and not self.native_access:

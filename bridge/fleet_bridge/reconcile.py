@@ -137,8 +137,10 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             scheduling_strategy=PlacementGroupSchedulingStrategy(placement_group=pg, placement_group_bundle_index=0),
             **extra,
         )
-        actor_submitted = True
         actor: ActorHandle[Any] = options.remote(spec)
+        # Only now can a process own the group: `remote()` itself may raise,
+        # for example when the actor name is already taken.
+        actor_submitted = True
         health_of(actor, ready_timeout_s)
     except BaseException:
         if not actor_submitted:

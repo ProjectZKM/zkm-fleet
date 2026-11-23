@@ -393,12 +393,20 @@ def test_chisel_selection_preserves_legacy_wire_and_requires_a_ready_companion(t
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1","chisel-network-v1"]}'))
     assert "shim-chisel-network-v1" in shim.capabilities(parsed.cluster)
     # Shim refuses a helper others can modify; never advertise one it would reject.
+    # Runtimes without services never use the helper and stay supported.
+    monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],'
+        '"features":["data-plane-v1","chisel-network-v1","runtime-management-v1"]}'))
+    unrelated = {"shim-runtime-v2", "shim-automatic-port-v1", "shim-prover-v1"}
+    assert unrelated <= set(shim.capabilities(parsed.cluster))
     for mode in (0o775, 0o757, 0o644):
         helper.chmod(mode)
-        assert "shim-network-v1" not in shim.capabilities(parsed.cluster), oct(mode)
+        advertised = set(shim.capabilities(parsed.cluster))
+        assert not advertised & {"shim-network-v1", "shim-chisel-network-v1", "shim-management-v1"}, oct(mode)
+        assert unrelated <= advertised, oct(mode)
     helper.chmod(0o755)
     helper.unlink()
-    assert "shim-network-v1" not in shim.capabilities(parsed.cluster)
+    advertised = set(shim.capabilities(parsed.cluster))
+    assert "shim-network-v1" not in advertised and unrelated <= advertised
     cfg["shim_network"]["tunnel_binary"] = "relative/helper"
     with pytest.raises(ValueError, match="absolute"):
         reconcile.load_apps(cfg)
@@ -536,7 +544,7 @@ def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_pat
     spec = book.bind(spec, "launch")
     calls = []
     def invoke(binary, state, node, command, **kwargs):
-        assert kwargs == {"daemon":True}
+        assert kwargs["daemon"] is True and kwargs.get("timeout") is None
         assert command["driver"] == "openshell"
         assert command["execution"] == spec.execution
         calls.append(command["operation"])
@@ -691,11 +699,13 @@ def test_native_services_report_local_health_without_waiting_for_registration(tm
     status = {"phase":"created", "platform_ready":True, "application_ready":False,
         "native_observation_base64":"c2FuaXRpemVk"}
     def invoke(binary, state, node, command, **kwargs):
-        assert kwargs == {"daemon":True}
         commands.append(command)
         if command["operation"] == "network":
+            # Recovery stays within the health probe's own budget.
+            assert kwargs == {"daemon":True, "timeout":shim.RECOVERY_TIMEOUT_S}
             assert command["driver"] == "openshell" and command["config"] == cfg.cluster.shim_network
             return {"connected_worker":True}
+        assert kwargs == {"daemon":True, "timeout":None}
         return dict(status)
     monkeypatch.setattr(shim,"invoke",invoke)
     actor = shim._ProvisionedApp(spec)
@@ -873,6 +883,15 @@ def test_native_openshell_composes_with_node_tee_profile(tmp_path, monkeypatch, 
     assert shim.capabilities(spec.cluster) == []
 
 
+def test_access_rules_are_refused_on_the_legacy_openshell_driver(tmp_path):
+    # The scheduler never places this pairing; refuse it where it is written.
+    raw = native_config(tmp_path)
+    raw["apps"][0]["access_policy_sha256"] = "ab" * 32
+    assert raw["apps"][0]["runtime"]["driver"] == "openshell"
+    with pytest.raises(ValueError, match="docker, tee or tee-simulation"):
+        reconcile.load_apps(raw)
+
+
 @pytest.mark.parametrize("driver", ["docker", "tee", "tee-simulation"])
 def test_access_rules_do_not_change_runtime_driver(tmp_path, monkeypatch, driver):
     raw = native_config(tmp_path)
@@ -931,3 +950,12 @@ def test_dcap_guest_configuration_reaches_shim_without_as(tmp_path):
                     {"dcap": {**tee["dcap"], "min_tcb_evaluation_data_number": 0}}):
         with pytest.raises(ValueError):
             reconcile.load_apps({**raw, "shim_tee": {**tee, **changes}})
+
+
+def test_persisted_binding_digest_is_unchanged_and_shares_the_spec_hash(tmp_path):
+    # Allocations already on disk compare against this exact full digest.
+    spec = reconcile.replica_specs(reconcile.load_apps(config(tmp_path)))["web-0"]
+    legacy = shim.hashlib.sha256(shim.json.dumps({k: v for k, v in spec.config.items() if k != "priority"},
+        sort_keys=True).encode()).hexdigest()
+    assert shim.binding_hash(spec) == legacy
+    assert actors.spec_hash(spec) == legacy[:16]

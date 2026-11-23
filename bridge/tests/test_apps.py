@@ -236,3 +236,21 @@ def test_worker_workdir_is_created(tmp_path, monkeypatch):
     proc = actors._NodeProcess(["true"], {"FLEET_NODE_NAME": "n"}, str(tmp_path / "log"), str(workdir))
     proc.proc.wait()
     assert workdir.is_dir()
+
+
+def test_a_refused_actor_submission_releases_its_placement_group(monkeypatch):
+    # Ray raises from `remote()` itself, e.g. for a taken actor name: no
+    # process can own the group, so its resources must not stay reserved.
+    spec = reconcile.replica_specs(reconcile.load_apps({"apps": [{"name": "web", "kind": "app"}]}))["web-0"]
+    pg, remove, stop = Mock(), Mock(), Mock()
+    monkeypatch.setattr(reconcile, "placement_group", lambda *a, **k: pg)
+    monkeypatch.setattr(reconcile.ray, "get", lambda *a, **k: None)
+    monkeypatch.setattr(reconcile, "remove_placement_group", remove)
+    monkeypatch.setattr(reconcile, "stop", stop)
+    factory = Mock()
+    factory.options.return_value.remote.side_effect = ValueError("actor name already taken")
+    monkeypatch.setitem(reconcile.ACTORS, spec.kind, factory)
+    with pytest.raises(ValueError, match="already taken"):
+        reconcile.start(spec, ready_timeout_s=1)
+    remove.assert_called_once_with(pg)
+    stop.assert_not_called()
