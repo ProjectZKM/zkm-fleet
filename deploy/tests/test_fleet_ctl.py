@@ -81,6 +81,7 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None, truste
     backup = prefix / "backup/control-20260101T000000Z"
     for name in ["fleetctl", "docker-compose.yml", "gateway.yaml.in", "compose.env"]:
         executable(backup / name, "")
+    (backup / "schema_version").write_text("20\n")  # what the database still reports below
     (prefix / "deploy").mkdir(parents=True)
     if trustee:
         for parent, text in [(backup, "original AS config"), (prefix / "deploy", "new AS config")]:
@@ -91,6 +92,7 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None, truste
     executable(commands / "curl", f'n=$(($(cat {curls} 2>/dev/null || echo 0) + 1)); echo $n > {curls}\n'
                                   f'[ "$n" -ge {healthy_after} ]\n')
     executable(commands / "docker", f'case "$*" in\n'
+                                    f'  *" exec -T postgres psql "*) echo 20 ;;\n'
                                     f'  *" ps -aq scheduler") echo abc123 ;;\n'
                                     f'  inspect*) n=$(($(cat {inspects} 2>/dev/null || echo 0) + 1)); echo $n > {inspects}\n'
                                     f'    if [ "$n" = 1 ]; then echo "running 0"; else echo {shlex.quote(later_state)}; fi ;;\n'
@@ -221,13 +223,13 @@ def test_node_upgrade_and_rollback_do_not_restart_proof_endpoints(tmp_path):
     new_bridge = tmp_path / "bridge"
     (new_bridge / "fleet_bridge").mkdir(parents=True)
     env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
-        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_PROOF_APP_UNITS": "active-proof.service"}
+        "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": ""}
     ctl = ["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node"]
     subprocess.run([*ctl, "upgrade", str(new_node), str(new_bridge), str(new_proof)], env=env, check=True, capture_output=True)
     assert old_proof.read_text() == new_proof.read_text()
     subprocess.run([*ctl, "rollback"], env=env, check=True, capture_output=True)
     assert "old-proof" in old_proof.read_text()
-    assert "active-proof" not in calls.read_text() and "restart" not in calls.read_text()
+    assert "restart" not in calls.read_text()
 
 
 def test_missing_node_configuration_fails_before_stopping_agent(tmp_path):
@@ -262,6 +264,236 @@ def test_rollback_restores_proof_binary_even_if_agent_cannot_reconnect(tmp_path)
     assert result.returncode!=0 and 'restored node did not reconnect' in result.stderr
     assert 'restored-proof' in (prefix/'bin/fleet-proof-app').read_text()
     assert 'restored-node' in (prefix/'bin/fleet-node').read_text()
+
+
+def checked_node(tmp_path, bridge="stub"):
+    """node_fixture with a working venv python and a candidate bridge: the real one, or a stand-in
+    whose load_apps accepts any mapping."""
+    import shutil, sys
+    prefix, commands = node_fixture(tmp_path)
+    executable(prefix / "venv/bin/python", f'exec {sys.executable} "$@"\n')
+    candidate = tmp_path / "candidate"
+    if bridge == "real":
+        shutil.copytree(ROOT / "bridge/fleet_bridge", candidate / "fleet_bridge")
+    else:
+        (candidate / "fleet_bridge").mkdir(parents=True)
+        for name in ("__init__.py", "node.py"):
+            (candidate / "fleet_bridge" / name).write_text("")
+        (candidate / "fleet_bridge/reconcile.py").write_text(
+            "def load_apps(data, *, validate_launch=True):\n"
+            "    assert validate_launch is False and isinstance(data, dict)\n")
+    newbin = tmp_path / "release/bin/fleet-node"
+    executable(newbin, "echo new-node\n")
+    calls = tmp_path / "systemctl.calls"
+    executable(commands / "systemctl", f'echo "$*" >> {calls}\n'
+               'case "$*" in *"--property=InvocationID"*) echo 0123456789abcdef0123456789abcdef;; esac\n')
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_ETC": str(prefix / "etc")}
+    return prefix, commands, candidate, newbin, calls, env
+
+
+def stopped(calls):
+    return calls.exists() and "stop" in calls.read_text()
+
+
+def ctl(env, *args, timeout=60):
+    return subprocess.run(["bash", str(ROOT / "deploy/fleet-ctl.sh"), *args], env=env,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+@pytest.mark.parametrize("apps,bridge,message", [
+    ("apps: [\n", "real", "cannot read"),
+    ("apps:\n- name: bad\n  kind: no-such-kind\n", "real", "the new bridge cannot load"),
+    ("apps:\n- name: gpu\n  kind: ziren-gpu\n", "real", "set its elf_id"),
+])
+def test_upgrade_refuses_apps_yaml_the_new_bridge_cannot_load(tmp_path, apps, bridge, message):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path, bridge=bridge)
+    (prefix / "etc/apps.yaml").write_text(apps)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert "node was not stopped" in result.stderr
+    assert not stopped(calls) and "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+
+def release_scripts(tmp_path):
+    scripts = tmp_path / "release/deploy"
+    scripts.mkdir(parents=True)
+    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh",
+                 "install-node-services.sh"):
+        (scripts / name).write_text((ROOT / "deploy" / name).read_text())
+    return scripts
+
+
+def test_upgrade_stages_the_release_runtime_without_selecting_or_restarting_it(tmp_path):
+    import hashlib
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    scripts = release_scripts(tmp_path)
+    for name in ("trusted-shim-runtime", "trusted-router-tunnel"):
+        executable(newbin.parent / name, f"echo {name}\n")
+    apps = prefix / "etc/apps.yaml"
+    before = apps.read_bytes()
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate), "", str(scripts))
+    assert result.returncode == 0, result.stderr
+    for directory, name in (("trusted-shim", "trusted-shim-runtime"), ("trusted-router-tunnel", "trusted-router-tunnel")):
+        content = (newbin.parent / name).read_bytes()
+        staged = prefix / "libexec" / directory / hashlib.sha256(content).hexdigest() / name
+        assert staged.read_bytes() == content and str(staged) in result.stderr
+    assert apps.read_bytes() == before
+    # Only the agent's unit restarts; the shim is never switched or touched.
+    actions = [c for c in calls.read_text().splitlines() if not c.startswith("show ") and not c.startswith("is-active")]
+    assert actions == ["stop zkm-fleet-node.service", "start zkm-fleet-node.service"]
+    assert (prefix / "deploy/install-node-services.sh").read_text() == (ROOT / "deploy/install-node-services.sh").read_text()
+
+
+def test_a_runtime_that_cannot_be_staged_stops_the_upgrade_before_the_agent(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    scripts = release_scripts(tmp_path)
+    executable(newbin.parent / "trusted-shim-runtime", "exit 0\n")
+    (newbin.parent / "trusted-router-tunnel").write_text("not executable\n")
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate), "", str(scripts))
+    assert result.returncode != 0 and "node was not stopped" in result.stderr
+    assert not stopped(calls) and "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_remote_upgrade_ships_the_runtime_binaries_for_staging(tmp_path):
+    commands, log, shipped = tmp_path / "bin", tmp_path / "ssh.log", tmp_path / "scp.log"
+    executable(commands / "ssh", f'case "$2" in *" node upgrade "*) printf "%s\\n" "$2" > {log};; esac\n')
+    executable(commands / "scp", f'echo "$*" >> {shipped}\n')
+    newbin = tmp_path / "release/bin/fleet-node"
+    for name in ("fleet-node", "trusted-shim-runtime", "trusted-router-tunnel"):
+        executable(newbin.parent / name, "exit 0\n")
+    bridge = tmp_path / "release/bridge"
+    (bridge / "fleet_bridge").mkdir(parents=True)
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(tmp_path / "control"),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "gpu-host"}
+    result = ctl(env, "node", "upgrade", str(newbin), str(bridge), "", str(release_scripts(tmp_path)))
+    assert result.returncode == 0, result.stderr
+    args = shlex.split(log.read_text())
+    stage = str(Path(args[args.index("--") + 3]).parent)
+    for name in ("trusted-shim-runtime", "trusted-router-tunnel"):
+        assert f"{newbin.parent / name} gpu-host:{stage}/{name}" in shipped.read_text()
+
+def remote_control(tmp_path, **settings):
+    """A control prefix whose node commands go over a stand-in ssh: the node answers `node name`
+    with gpu-a, and every other script run is logged."""
+    prefix = tmp_path / "control"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "etc").mkdir()
+    commands, log = tmp_path / "bin", tmp_path / "ssh.log"
+    executable(commands / "ssh", f'case "$2" in *" node name "*) echo gpu-a;; *"bash -s"*) printf "%s\\n" "$2" >> {log};; esac\n')
+    executable(commands / "scp", "exit 0\n")
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "gpu-host", **settings}
+    return prefix, env, log
+
+
+def test_remote_commands_forward_the_node_settings_given_here(tmp_path):
+    prefix, env, log = remote_control(tmp_path, FLEET_ETC="/srv/fleet etc", FLEET_ENV="/srv/fleet etc/watchdog.env",
+                                      FLEET_NODE_UNIT="fleet-agent.service")
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0, result.stderr
+    words = shlex.split(log.read_text())
+    assert words[0] == "FLEET_CTL_ON_NODE=1" and words[1] == "FLEET_PREFIX=$HOME/app/fleet"
+    assert words[2:5] == ["FLEET_ETC=/srv/fleet etc", "FLEET_ENV=/srv/fleet etc/watchdog.env",
+                          "FLEET_NODE_UNIT=fleet-agent.service"]
+    assert words[words.index("--") + 1:] == ["node", "rollback"]
+
+
+def test_remote_commands_forward_only_the_settings_that_are_set(tmp_path):
+    prefix, env, log = remote_control(tmp_path)
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0, result.stderr
+    for name in ("FLEET_ETC", "FLEET_ENV", "FLEET_NODE_UNIT"):
+        assert name not in log.read_text()
+
+def scheduler_view(tmp_path, prefix, env, record, name="gpu-a"):
+    """A stand-in fleetctl answering `--json node NAME` with RECORD (None: it fails)."""
+    import json
+    token = tmp_path / "admin.token"
+    token.write_text("secret\n")
+    asked = tmp_path / "fleetctl.calls"
+    answer = "exit 1\n" if record is None else f"cat <<'JSON'\n{json.dumps(record)}\nJSON\n"
+    executable(prefix / "bin/fleetctl", f'echo "$FLEET_TOKEN_FILE $*" >> {asked}\n' + answer)
+    (prefix / "etc/watchdog.env").write_text(f"FLEET_HOME={prefix}\nFLEET_NODE_NAME={name}\n")
+    executable(Path(env["PATH"].split(":")[0]) / "sleep", "exit 0\n")
+    return {**env, "FLEET_TOKEN_FILE": str(token)}, asked, token
+
+
+@pytest.mark.parametrize("record,ok", [
+    ({"name": "gpu-a", "ready": True, "draining": False, "heartbeat_age_ms": 0}, True),
+    ({"name": "gpu-a", "ready": False, "draining": True, "heartbeat_age_ms": 0}, True),
+    # The last accepted report predates the restart: the new agent was never heard from.
+    ({"name": "gpu-a", "ready": True, "draining": False, "heartbeat_age_ms": 600000}, False),
+    ({"name": "gpu-a", "ready": False, "draining": False, "heartbeat_age_ms": 0}, False),
+    (None, False),
+])
+def test_upgrade_waits_for_a_ready_report_newer_than_the_restart(tmp_path, record, ok):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    env, asked, token = scheduler_view(tmp_path, prefix, env, record)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert asked.read_text().splitlines()[0] == f"{token} --json node gpu-a"
+    if ok:
+        assert result.returncode == 0, result.stderr
+        assert "draining" in result.stdout if record["draining"] else "reports gpu-a READY" in result.stdout
+    else:
+        assert result.returncode != 0
+        assert "no READY report from gpu-a" in result.stderr
+        assert "node did not reconnect; run: fleet-ctl.sh node rollback" in result.stderr
+
+
+def test_rollback_waits_for_the_scheduler_too(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    assert ctl(env, "node", "upgrade", str(newbin), str(candidate)).returncode == 0
+    env, asked, token = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": 10**6})
+    result = ctl(env, "node", "rollback")
+    assert result.returncode != 0 and "restored node did not reconnect" in result.stderr
+    assert "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_without_fleetctl_the_log_check_stands_with_a_warning(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    (prefix / "etc/watchdog.env").write_text("FLEET_NODE_NAME=gpu-a\n")
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert result.returncode == 0, result.stderr
+    assert "warning: cannot ask the scheduler about gpu-a" in result.stderr
+    assert "confirm it is READY in: fleetctl node" in result.stderr
+
+
+@pytest.mark.parametrize("command", ["upgrade", "rollback"])
+@pytest.mark.parametrize("age,ok", [(0, True), (10**6, False)])
+def test_remote_upgrade_and_rollback_ask_the_scheduler_from_the_control_host(tmp_path, command, age, ok):
+    prefix, env, log = remote_control(tmp_path)
+    env, asked, token = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": age})
+    args = ["node", "rollback"]
+    if command == "upgrade":
+        newbin = tmp_path / "release/bin/fleet-node"
+        executable(newbin, "exit 0\n")
+        (tmp_path / "release/bridge/fleet_bridge").mkdir(parents=True)
+        args = ["node", "upgrade", str(newbin), str(tmp_path / "release/bridge")]
+    result = ctl(env, *args)
+    # The node's own run leaves the scheduler to the control host.
+    assert "FLEET_CTL_ON_NODE=1" in log.read_text()
+    assert asked.read_text().splitlines()[0] == f"{token} --json node gpu-a"
+    if ok:
+        assert result.returncode == 0 and "reports gpu-a READY" in result.stdout, result.stderr
+    else:
+        hint = "run: fleet-ctl.sh node rollback" if command == "upgrade" else "restored node did not reconnect"
+        assert result.returncode != 0 and hint in result.stderr
+
+
+def test_the_control_host_finds_its_admin_token_where_compose_env_puts_its_config(tmp_path):
+    """FLEET_ETC set for the node names a directory on the node; the control host's own is in compose.env."""
+    prefix, env, log = remote_control(tmp_path, FLEET_ETC="/srv/node etc", HOME=str(tmp_path / "home"))
+    env, asked, _ = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": 0})
+    del env["FLEET_TOKEN_FILE"]
+    control_etc = tmp_path / "control etc"
+    control_etc.mkdir()
+    (control_etc / "admin.token").write_text("secret\n")
+    (prefix / "compose.env").write_text(f"FLEET_ETC={control_etc}\n")
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0 and "reports gpu-a READY" in result.stdout, result.stderr
+    assert asked.read_text().splitlines()[0] == f"{control_etc / 'admin.token'} --json node gpu-a"
 
 
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):

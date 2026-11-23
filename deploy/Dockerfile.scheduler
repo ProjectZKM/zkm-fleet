@@ -14,6 +14,6 @@ USER fleet
 EXPOSE 51001 9191
 # Exec form, and curl gives up before Docker does: a shell-form check that times out leaves its curl to PID 1,
 # which never reaps it (one zombie per slow check).
-HEALTHCHECK --interval=15s --timeout=3s CMD ["curl", "-sf", "--max-time", "2", "http://127.0.0.1:9191/healthz"]
+HEALTHCHECK --interval=15s --timeout=3s --start-period=300s CMD ["curl", "-sf", "--max-time", "2", "http://127.0.0.1:9191/healthz"]
 ENTRYPOINT ["fleet-scheduler"]
 CMD ["-c", "/etc/zkm-fleet/fleet.yaml"]

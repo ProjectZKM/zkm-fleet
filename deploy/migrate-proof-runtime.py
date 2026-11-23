@@ -14,7 +14,24 @@ import re
 import yaml
 
 
-def convert(config, names, image):
+def shim_volume(name, volume):
+    """A volume in the shim's `path[:options]` form. The shim mounts each volume at its host
+    path, so a legacy `host:container[:options]` volume converts only when both are the same."""
+    if not isinstance(volume, str):
+        raise ValueError(f"{name}: volume {volume!r} must be a string")
+    parts = volume.split(':')
+    if len(parts) == 1 or len(parts) == 2 and not parts[1].startswith(('/', '{')):
+        return volume
+    if len(parts) > 3:
+        raise ValueError(f"{name}: volume {volume!r} is not path[:options] or host:container[:options]")
+    host, container, *options = parts
+    if host != container:
+        raise ValueError(f"{name}: volume {volume!r} mounts {host} at {container}, but the shim mounts each "
+            "volume at its own host path; make the app use the host path, or provide the data at the container path")
+    return host + (':' + options[0] if options and options[0] else '')
+
+
+def convert(config, names, image, cpus=None):
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("use the complete proof-worker image by registry digest")
     result = copy.deepcopy(config)
@@ -40,6 +57,13 @@ def convert(config, names, image):
         root = entry.get('proof_storage_root', '')
         if not Path(root).is_absolute() or not re.fullmatch('[0-9a-fA-F]{64}', entry.get('elf_id', '')):
             raise ValueError("retain an absolute proof_storage_root and the existing full ELF identity")
+        if cpus is not None:
+            entry['cpus'] = cpus
+        explicit = entry.get('cpus')
+        if entry['kind'] == 'ziren-gpu' and not (type(explicit) in (int, float) and explicit >= 1):
+            raise ValueError(f"{entry['name']}: set an explicit cpus (at least 1) on the entry or pass --cpus N. "
+                "The migrated entry runs the GPU server and the worker in one container, hard-capped at cpus "
+                "cores for both (the legacy GPU server had no CPU cap)")
         env = dict(entry.get('env') or {})
         env.update(FLEET_NODE_NAME='{name}', FLEET_MACHINE='{machine}',
             FLEET_SCHEDULER='{scheduler}', FLEET_CLUSTER_TOKEN_FILE='{cluster_token_file}',
@@ -51,7 +75,7 @@ def convert(config, names, image):
             FLEET_GPU_ENDPOINT='http://127.0.0.1:3000/twirp/', ZIREN_SERVER_PORT='3000',
             CUDA_VISIBLE_DEVICES='{gpus}', ZKM_GPU_DEVICES='{gpus}',
             RAYON_NUM_THREADS='{cpu_count}', RUST_LOG=entry.get('rust_log', 'info'))
-        volumes = list(entry.get('volumes') or [])
+        volumes = [shim_volume(entry['name'], v) for v in entry.get('volumes') or []]
         # Storage paths stay identical: persisted file:// references and completed
         # lease markers remain valid. Only the credential FILE is mounted read-only.
         def mount(path, template, readonly):
@@ -75,12 +99,17 @@ def convert(config, names, image):
         if entry['kind'] == 'ziren-gpu':
             settings['shm_gb'] = entry.get('shm_gb') or 64
         entry.update(settings)
-        entry.pop('prover_binary', None)
+        # CPUs are a resource, not an update setting: the app record gets them from
+        # `fleetctl app scale --cpus`, or the scheduler restores its own count.
         updates.append(dict(entry=entry['name'], app=entry.get('app', entry['name']),
-            namespace=entry['namespace'], set=settings))
-    if any(a.get('prover_binary') is not None for a in result.get('apps', [])):
-        raise ValueError("migrate every remaining prover_binary override before upgrading the adapter")
+            namespace=entry['namespace'], cpus=entry.get('cpus', 1), set=settings))
     return result, updates
+
+
+def cores(value):
+    if not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError('a whole number of CPU cores, at least 1')
+    return int(value)
 
 
 def main():
@@ -88,11 +117,14 @@ def main():
     parser.add_argument('--apps', type=Path, required=True)
     parser.add_argument('--name', action='append', required=True)
     parser.add_argument('--image', required=True)
+    parser.add_argument('--cpus', type=cores, metavar='N',
+        help='CPU cores for every selected entry, replacing its cpus; a ziren-gpu entry without an '
+             'explicit cpus needs it, because one container now runs and caps both GPU server and worker')
     parser.add_argument('--output-dir', type=Path, required=True,
         help='new private review directory, outside the repository; never applied automatically')
     args = parser.parse_args()
     with args.apps.open() as source:
-        config, updates = convert(yaml.safe_load(source), args.name, args.image)
+        config, updates = convert(yaml.safe_load(source), args.name, args.image, args.cpus)
     args.output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     files = [('apps.yaml', yaml.safe_dump(config, sort_keys=False)),
              ('updates.json', json.dumps(updates, indent=2) + '\n')]

@@ -31,11 +31,28 @@ def control_compose(tmp_path, request):
     return json.loads(result.stdout)
 
 
-def test_default_openshell_gateway_keeps_control_host_and_health_port_private(control_compose):
+def test_default_stack_leaves_the_optional_gateways_off(control_compose):
+    # The OpenShell gateway exits without the scheduler's compute socket, which only
+    # policy_gateway.openshell creates; fleet-ctl.sh openshell up turns it on.
+    services = control_compose["services"]
+    assert set(services) == {"postgres", "scheduler", "gateway"}
+
+
+def test_scheduler_health_check_allows_a_slow_start(control_compose):
+    # A busy scheduler loads its records before it listens; FLEET_CTL_HEALTH_WAIT is 300 s.
+    check = control_compose["services"]["scheduler"]["healthcheck"]
+    assert check["start_period"] in ("5m0s", "300s")
+    healthcheck = next(line for line in (ROOT / "deploy/Dockerfile.scheduler").read_text().splitlines()
+                       if line.startswith("HEALTHCHECK"))
+    assert "--start-period=300s" in healthcheck.split(" CMD ")[0]
+
+
+@pytest.mark.parametrize("control_compose", ["openshell"], indirect=True)
+def test_openshell_gateway_keeps_control_host_and_health_port_private(control_compose):
     services = control_compose["services"]
     assert "trustee-as" not in services
-    assert "openshell-gateway" in services
     gateway = services["openshell-gateway"]
+    assert gateway["profiles"] == ["openshell"]
     upstream = re.search(r'\[\[package\]\]\nname = "openshell-core"\n.*?source = "[^"]+#([0-9a-f]+)"',
                          (ROOT / "Cargo.lock").read_text(), re.S)
     assert upstream and gateway["image"].endswith(":" + upstream[1])

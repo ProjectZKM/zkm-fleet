@@ -8,20 +8,25 @@ upgrades need none of them.
 
 `deploy/fleet-ctl.sh`, from the release package or a checkout of that revision,
 upgrades the control host and systemd-supervised nodes; cron-supervised nodes use the
-[manual procedure](#cron-supervised-nodes). Each scripted upgrade first copies what it
-replaces to `backup/`, then waits for the scheduler's health check or the node's
-reconnection, and the matching `rollback` restores that copy.
+[manual procedure](#cron-supervised-nodes). `install.sh control` also installs a copy as
+`$FLEET_PREFIX/deploy/fleet-ctl.sh`, but that is the version from the last install: for
+an upgrade, run the new release's copy. Each scripted upgrade first copies what it
+replaces to `backup/`, then waits for the scheduler's health check, or for the scheduler
+to report the node READY with a heartbeat newer than the restart, and the matching
+`rollback` restores that copy.
 
 ```bash
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-1   # or ~/.config/zkm-fleet/ctl.env
+export FLEET_NODE_PREFIX=/path/to/node/install                      # default ~/app/fleet
 deploy/fleet-ctl.sh status                       # control services, health, nodes and apps
-deploy/fleet-ctl.sh -n scheduler upgrade v0.2.0  # -n prints every step and changes nothing
+deploy/fleet-ctl.sh -n scheduler upgrade v0.2.4  # -n prints every step and changes nothing
 ```
 
 ### Control host
 
 For the runtime migration release (database schema 20), take a database backup
-and validate the schema 17/18/19 upgrade against a copy before changing production.
+and validate the upgrade from schema 16 (the 0.1 releases) against a copy before
+changing production.
 This migration retains router identities, tombstones and policy acknowledgments;
 it normalizes old JSON records so subsequent syncs can update them. Schema 19
 and older binaries cannot be used as rollback builds after migration. Keep a
@@ -44,20 +49,34 @@ The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 
 ```bash
-deploy/fleet-ctl.sh scheduler upgrade v0.2.0
+deploy/fleet-ctl.sh scheduler upgrade v0.2.4
 ```
 
 It downloads the release package and checks its SHA-256, pulls the image (a missing
-image changes nothing), backs up `fleetctl`, the Compose files and `compose.env`,
-records the new image, recreates `scheduler` (and `mcp` when enabled) and waits for
-`/healthz`. The old scheduler can take about 90 seconds to finish in-flight calls, and
-the new one reads every job and command record it keeps before it listens, a minute or
-more on a busy host. The script waits up to five minutes (`FLEET_CTL_HEALTH_WAIT`
+image changes nothing), backs up `fleetctl`, the Compose files, `compose.env`,
+`$FLEET_ETC/gateway.yaml` and the database schema version, records the new image,
+recreates `scheduler` (and `mcp` when enabled) and waits for `/healthz`. It re-renders
+`gateway.yaml` from the new `gateway.yaml.in` and recreates the HTTPS gateway when that
+changes it. It replaces `gateway.yaml` only while it still matches what the previous
+template rendered: an edited one is left alone and the gateway is not restarted, with the
+new render beside it as `gateway.yaml.release` to merge by hand. A site without that file (it runs
+its own gateway) gets a note instead. It leaves the OpenShell gateway alone. The old
+scheduler can take about 90 seconds to finish in-flight calls, and the new one reads
+every job and command record it keeps before it listens, a minute or more on a busy
+host. The script waits up to five minutes (`FLEET_CTL_HEALTH_WAIT`
 seconds), and gives up at once if the scheduler's container exits or restarts.
-`scheduler rollback` restores the backup. Keep site changes to the Compose
-file, such as another gateway or an existing Postgres volume, in
+`scheduler rollback` restores the backup, except that in `compose.env` it restores only
+the scheduler image, so settings added since (such as the OpenShell image pin and
+profile) stay. It recreates the HTTPS gateway if its configuration changes back. It refuses when
+the database schema changed since the upgrade (as from 0.1 to schema 20), because the
+older scheduler can't start on the migrated database: restore the Postgres and
+`data_dir` backups taken before the upgrade instead. The version is read from the bundled
+Postgres or, when `database_url` points elsewhere, with `psql` from the Compose Postgres
+image on the host network. A backup without a recorded version, such as one taken by an
+older `fleet-ctl.sh`, needs `--force`. `scheduler rollback --force` skips that check. Keep site changes to the Compose file, such as another gateway or an
+existing Postgres volume, in
 `deploy/docker-compose.override.yml`: an upgrade replaces only `docker-compose.yml`,
-and every Compose call applies the override after it.
+and every Compose call, the installer's included, applies the override after it.
 
 Then check the gateway's `/healthz`, `fleetctl node` and `fleetctl app`, and with MCP
 enabled, its initialization and one authenticated tool call. After a permissions
@@ -81,7 +100,7 @@ stop existing workloads automatically.
 ### Execution node
 
 ```bash
-deploy/fleet-ctl.sh node upgrade v0.2.0
+deploy/fleet-ctl.sh node upgrade v0.2.4
 # or from a local build of the same revision:
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
   target/release/fleet-proof-app deploy
@@ -90,23 +109,33 @@ deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
 It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scripts
 (`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`, `shim-start.sh`,
 `ray-watch.sh`, `install-node-services.sh`) around a short stop and start
-of the agent's unit, after checking that the new bridge imports in the node's venv,
-and waits for the node to reconnect. `node rollback` restores everything the last
+of the agent's unit, after checking that the new bridge imports in the node's venv
+and parses the node's `apps.yaml`, and waits until the scheduler reports the node
+READY with a heartbeat newer than the restart (a drained node never reports READY, so
+for it a newer heartbeat is enough; check READY once it's undrained). Without the
+control host's `fleetctl` and admin token, it only checks the agent's log for the
+connection, and warns. A
+parse error stops the upgrade before the agent is touched. The release form also
+stages the package's `trusted-shim-runtime` and `trusted-router-tunnel` under
+`libexec/<name>/<sha256>/` and prints their paths, without switching the running shim. `node rollback` restores everything the last
 upgrade replaced. In the local form, the last two arguments are optional: the proof
 app binary staged for its next explicit endpoint restart, and the launch scripts'
-directory. Running proof endpoints keep their current processes; node upgrades
-and rollbacks no longer restart `FLEET_PROOF_APP_UNITS`.
+directory. Running proof endpoints keep their current processes.
 
 The companion installer refreshes only recognized generated units, preserving
 operator edits and drop-ins. Ray uses `KillMode=process`: losing its watchdog does
-not kill the Ray processes. Before any service starts, an install failure restores
-configuration and partial unit changes. Once service startup begins, configuration
-is committed; repair the reported failure and rerun the installer. It must not
-restore stale YAML over writes from a newly started agent. A former oneshot Ray
-unit needs a watchdog restart after unit conversion; schedule this during the
-maintenance window after checking that `KillMode=process` is loaded.
-Re-running `install.sh node` refreshes install-owned watchdog settings from its
-arguments and retains custom settings and supervision ownership.
+not kill the Ray processes. The installer hands the agent to systemd only once Ray
+and the shim run, the shim check passes, the units are enabled and
+`zkm-fleet-node.service` is active. A failure before that restores `apps.yaml`,
+`watchdog.env` and the units it changed, and disables the units it enabled, so the
+previous supervision resumes; repair the reported failure and rerun the installer.
+A former oneshot Ray unit needs a watchdog restart after unit conversion; schedule
+this during the maintenance window after checking that `KillMode=process` is loaded.
+Re-running `install.sh node` changes an install-owned `watchdog.env` setting
+(`FLEET_NODE_NAME`, `CUDA_VISIBLE_DEVICES`, `RAY_NUM_CPUS`, `FLEET_SCHEDULER_CA`,
+`FLEET_WORKDIR`, `FLEET_JOBS_DIR` and the like) only when you pass its flag, and
+retains custom settings and supervision ownership. A `--scheduler` that differs from
+`apps.yaml`'s `scheduler` updates it there too.
 
 
 Ray keeps running, and so do apps and batches, through the agent restart. The upgrade
@@ -119,7 +148,10 @@ the agent, upgrade and rollback use the candidate Python adapter to negotiate
 protocol version 1 with the running daemon. An unavailable or incompatible daemon,
 or a rollback adapter without daemon support, rejects the operation while the old
 node continues running. Set `FLEET_ETC` (or `FLEET_ENV`) when configuration lives
-outside the default `$FLEET_PREFIX/etc`.
+outside the default `$FLEET_PREFIX/etc`. With `FLEET_NODE_SSH`, node commands run on the
+node over ssh with `FLEET_PREFIX` set to `FLEET_NODE_PREFIX`, and pass `FLEET_ETC`,
+`FLEET_ENV` and `FLEET_NODE_UNIT` along when they're set. They run `sudo systemctl`
+there, so the ssh user needs passwordless sudo.
 
 These commands do not change the configured shim executable, restart its service,
 release existing Ray reservations, or change allocation/lease/generation identities.
@@ -136,25 +168,41 @@ node-upgrade continuity guarantee. Shim/Ray/Docker/host upgrades are separate
 operations and must not be bundled into this restart.
 
 ClawUp's Fleet adapter requires shim's authenticated `GET /logs?tail=N`
-management endpoint. The release bundle includes that implementation. Installing
-an updated node package only stages its shim binary; it does not switch an
-already running shim. For an older shim, schedule a separate maintenance window:
-drain the node, finish/stop affected workloads and confirm their cleanup; stop
-`zkm-fleet-shim.service`, update `shim_binary` in the existing `apps.yaml` to the
-staged executable, then start the service and run `fleet_bridge.shim check` before
-resuming workloads. Preserve `shim_state_dir` and its allocation/replay journals.
-Do not turn a routine node upgrade into an implicit runtime migration.
+management endpoint. The release bundle includes that implementation. `node upgrade`
+and a re-install only stage a new shim binary under `libexec/trusted-shim/<sha256>/`
+and print its path; neither switches an already running shim. For an older shim,
+schedule a separate maintenance window: drain the node, finish/stop affected
+workloads and confirm their cleanup; stop `zkm-fleet-shim.service`, update
+`shim_binary` in the existing `apps.yaml` to the staged executable, then start the
+service and run the shim check before resuming workloads, from the bridge directory
+so the current bridge code runs:
+
+```bash
+(. ~/app/fleet/etc/watchdog.env && cd "$FLEET_HOME/bridge" &&
+  ../venv/bin/python -m fleet_bridge.shim check --apps "$FLEET_ETC/apps.yaml" --wait-seconds 30 --network)
+```
+
+It parses the whole `apps.yaml` and checks the running shim. Invalid node-wide settings
+fail it. An invalid app entry prints a warning only: `node-start.sh` runs this check before
+every start, and the agent must stay online so the entry can be fixed or disabled through
+the scheduler. With `--network`, it also
+fails when `shim_network.tunnel_binary` isn't an absolute path to a regular executable
+that group and others can't write, or the running shim doesn't report
+`chisel-network-v1`; without it, those only print a warning. Preserve
+`shim_state_dir` and its allocation/replay journals. Do not turn a routine node
+upgrade into an implicit runtime migration.
 
 To move a shim node's service forwarding onto the pinned Chisel transport, use the
 same maintenance window: drain the node and confirm cleanup as above, then set
 `shim_network.tunnel_binary` in the existing `apps.yaml` to the staged
-`libexec/trusted-router-tunnel/<sha256>/trusted-router-tunnel` path the installer
-printed, and run `fleet_bridge.shim check`. The node then advertises
+`libexec/trusted-router-tunnel/<sha256>/trusted-router-tunnel` path that `node upgrade`
+or the installer printed, and run the shim check above with `--network`. Once it
+passes, and the shim reports `data-plane-v1`, the node advertises
 `shim-chisel-network-v1`; a configured helper that fails does not fall back to the
 old transport. The helper must be a regular executable that neither group nor
-others can modify. A missing or modifiable one withdraws only the network
-capabilities, so apps with services stop being placed there; provers and apps
-without services keep running and stay scheduled. Rollback is the reverse edit: restore the previous path, or remove
+others can modify. A missing or modifiable one, or a shim without `chisel-network-v1`,
+withdraws only the network capabilities, so apps with services stop being placed there;
+provers and apps without services keep running and stay scheduled. Rollback is the reverse edit: restore the previous path, or remove
 the key to return to the existing transport. Staged hashes are never replaced or
 removed by reinstalling, so the previous helper stays available.
 
@@ -220,18 +268,23 @@ host. The release notes say which applies.
 
 ## Self-built node programs
 
-CI builds on Ubuntu 24.04 (glibc 2.39). Older nodes (22.04 has 2.35) run those
-binaries with a loader warning, so production node programs are usually built in a
-matching image instead. Build from the release's revision and name the release, so
-the agent reports it in `fleetctl node`'s VERSION column (`-` otherwise):
+Release and image binaries are built on Ubuntu 22.04 (glibc 2.35), so they run on
+22.04 and newer. A binary built on a newer system needs that system's glibc: build
+production node programs on the oldest release your nodes run, or in a matching image.
+Build from the release's revision and name the release, so the agent reports it in
+`fleetctl node`'s VERSION column (`-` otherwise):
 
 ```bash
-FLEET_VERSION=0.2.0 cargo build --locked --release \
+FLEET_VERSION=0.2.4 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 ```
 
 Install it with the local form of `node upgrade` on systemd nodes, and the manual
 procedure on cron nodes.
+
+`fleet-ziren-node`, which legacy native provers (`node_binary`) and
+`--proof-storage-roots` need, isn't in the release package: build it the same way with
+`-p fleet-ziren-node` and install it as the node's `bin/fleet-ziren-node`.
 
 ## Changing a node's capacity
 
@@ -264,7 +317,9 @@ These are the node's total capacity, shared by every allocation, within its hard
 an empty `RAY_NUM_CPUS` detects CPUs automatically. Stop the agent with its
 supervisor, of which each agent has exactly one: `sudo systemctl stop zkm-fleet-node.service`, or on cron, comment out the
 watchdog line and send `fleet-node` SIGTERM, waiting for it to exit. Then restart Ray
-while holding the watchdog lock, so the minute watchdog can't race the restart:
+while holding the watchdog lock, so the watchdog can't race the restart. On a systemd
+node, leave out the last line (`ray-start.sh`): `zkm-fleet-ray.service` starts Ray
+again within 30 seconds with the new settings, under its own unit.
 
 ```bash
 bash <<'SH'
@@ -280,7 +335,7 @@ ray stop
 SH
 ```
 
-**Restart the agent.** On systemd, `sudo systemctl start zkm-fleet-node.service`. On
+**Restart the agent.** On systemd, once Ray is back, `sudo systemctl start zkm-fleet-node.service`. On
 cron, restore the watchdog line and run
 `FLEET_ENV="$HOME/app/fleet/etc/watchdog.env" ~/app/fleet/deploy/fleet-watchdog.sh`.
 
@@ -307,11 +362,12 @@ Nothing here monitors itself. Check these on a schedule, such as a five-minute t
 and alert when they change:
 
 - **Control host:** the gateway's `/healthz`; the scheduler, MCP, Postgres and gateway
-  containers running; no repeated `job dispatch retained durable intents` in the
-  scheduler log (a [blocked scale](#an-app-is-stuck-starting-failed-or-a-job-waits-on-quota));
+  containers running, and `openshell-gateway` and `trustee-as` where enabled; no
+  repeated `job dispatch retained durable intents` in the scheduler log (a [blocked scale](#an-app-is-stuck-starting-failed-or-a-job-waits-on-quota));
   the root disk under 90%, since upgrades stage about 400 MB in /tmp.
 - **Each node:** READY in `fleetctl node`, with a fresh heartbeat and the expected
-  VERSION; its disk under 90%; a quiet `work/logs/watchdog.log`.
+  VERSION; its disk under 90%; a quiet `work/logs/watchdog.log` on cron nodes, or
+  `journalctl -u zkm-fleet-node -u zkm-fleet-ray -u zkm-fleet-shim` on systemd nodes.
 - **Workloads:** no app in `fleetctl app` sitting `failed` or `starting` beyond its
   ready timeout, and no job in `fleetctl job` stuck `waiting_quota` for hours.
 
@@ -319,14 +375,20 @@ and alert when they change:
 
 ### A node is offline or not READY
 
-Check its supervisor (the unit or the cron watchdog), `work/logs/ray.log` and
-`watchdog.log`, the gateway URL, the cluster token and CA trust. Then the node's own
-traps:
+Check its supervisor and its logs: on cron nodes `work/logs/watchdog.log` and
+`node.log`, on systemd nodes `journalctl -u zkm-fleet-node -u zkm-fleet-ray -u
+zkm-fleet-shim`; then `work/logs/ray.log`, the gateway URL, the cluster token and CA
+trust. Then the node's own traps:
 
+- **`local Ray snapshot unavailable`**, repeated in the agent's log, means the bridge
+  can't build its report: Ray isn't up, or `apps.yaml` or `batches.yaml` doesn't
+  parse (the traceback names the setting, such as a bad `shim_network`). The node
+  stays not READY until it can.
 - **The Ray temp link** `/tmp/zkf-ray-<uid>` must resolve. A dead link, after a reboot
   or a stray `ray-start.sh` run against a cleaned-up temp workspace, aborts every
   agent restart with an opaque log-path error. The watchdog repairs it every minute
-  from v0.1.7; by hand, `ln -sfn ~/app/fleet/work/ray /tmp/zkf-ray-$(id -u)`.
+  from v0.1.7 (every 30 seconds under `zkm-fleet-ray.service`); by hand,
+  `ln -sfn ~/app/fleet/work/ray /tmp/zkf-ray-$(id -u)`.
 - **A full disk** fails bridge writes, app starts and even the agent's log.
 
 ### An app is stuck starting, failed, or a job waits on quota
@@ -390,20 +452,24 @@ has:
 | Directory | Contents |
 |---|---|
 | `bin/`, `bridge/`, `venv/`, `deploy/` | Fleet's programs and launch scripts |
+| `libexec/` | Pinned shim and tunnel-helper binaries (`<name>/<sha256>/`) that a running shim executes, and copies of the units the installer wrote; keep every hash `apps.yaml` names |
 | `apps/` | Packaged application binaries and guest ELFs |
 | `etc/` | Machine configuration and private credentials |
 | `work/jobs/` | Local batch job records and output workspaces (`FLEET_JOBS_DIR`) |
 | `work/apps/` | App-owned checkpoints, inputs, outputs and reports |
 | `work/logs/`, `work/ray/`, `work/spill/` | Process logs, Ray runtime and spilled objects |
 | `work/.maintenance/` | Deployment and resource provisioning receipts |
+| `work/shim/` | The shim's state (`shim_state_dir`): its control socket and allocation and replay journals |
 | `backup/` | The last upgrade's rollback copy; remove it once the upgrade checks out |
 
 Back up the control host's Postgres and `data_dir` together, since batch records and
-app intents are under `data_dir/workloads/`, and keep tokens private. Across any
-update, keep `etc/`, Postgres, the control `data_dir` and each node's `work/`, and back
-them up first: rollbacks restore programs, not data. Delete old build packages and
-logs only after checking running processes and rollback needs; proof retention is the
-app's own policy.
+app intents are under `data_dir/workloads/` and the policy ledger is in
+`data_dir/policy`, and keep tokens private. Where they're enabled, back up the
+`openshell-data` and `trustee-data` volumes too ([installation](installation.md#openshell-gateway)).
+Across any update, keep `etc/`, Postgres, the control `data_dir`, those volumes and
+each node's `work/`, and back them up first: rollbacks restore programs, not data.
+Delete old build packages and logs only after checking running processes and rollback
+needs; proof retention is the app's own policy.
 
 Pin validated GPU images by digest. Update EthProofs to its committed submodule
 revision with `git submodule update --init --recursive`, never a moving branch.
@@ -415,6 +481,15 @@ Package the GOAT worker from its committed `third_party/bitvm-node` revision wit
 ## One-time migrations
 
 Each applies only to the versions it names.
+
+### OpenShell gateway in the default stack (before v0.2.4)
+
+These releases started `openshell-gateway` with the rest of the stack; from v0.2.4 it
+is the `openshell` profile, and upgrades leave an existing container as it is. On a
+host without `policy_gateway.openshell`, where that container keeps restarting, remove
+it with `docker rm -f zkm-fleet-openshell-gateway-1`; its volumes stay. On a host that
+uses the gateway, run `fleet-ctl.sh openshell up` once
+([installation](installation.md#openshell-gateway)), so `compose.env` lists the profile.
 
 ### Owner-controlled runtime settings
 
@@ -466,7 +541,7 @@ tenant signer tokens are removed.
   `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`, since
   `admin_token_file` no longer applies.
 
-The 0.2.0 runtime release also migrates schema 16 through 19 automatically to 20.
+The 0.2 runtime release also migrates schema 16 through 19 automatically to 20.
 For an unsupported schema, stop and prepare a tested migration; never reset
 production metadata. Preserve job history, namespace/token identities and application
 storage. After migration, rollback requires a schema-20-compatible scheduler.
@@ -495,27 +570,35 @@ their own complete worker image; the SDK converter refuses to guess their packag
 3. Build with `deploy/build-proof-image.sh REGISTRY/PROOF:VERSION GPU_IMAGE@sha256:DIGEST` on the build host
    (Rust toolchain, Docker and Python 3.11+). Publish through the normal release process
    and record the resulting registry digest. This build does not start a prover.
-   Deploy the persistent shim service and configure its existing fields in `apps.yaml`.
-4. Prepare the existing configuration while every selected entry is disabled:
+   Upgrade the control host and CLI, then each affected node to the same release with
+   the persistent shim service: `install.sh node --with-shim`
+   ([installation](installation.md#nodes-with-persistent-shim-services)) on a node
+   without it, `fleet-ctl.sh node upgrade` on one with it.
+4. Prepare the existing configuration while every selected entry is disabled. Run the
+   release package's migrator (`PACKAGE` as in the [cron procedure](#cron-supervised-nodes))
+   with the node's venv Python, which has PyYAML:
 
    ```bash
-   python3 deploy/migrate-proof-runtime.py \
-     --apps /etc/zkm-fleet/apps.yaml --name policy-prover \
+   "$FLEET_PREFIX/venv/bin/python" "$PACKAGE/deploy/migrate-proof-runtime.py" \
+     --apps "$FLEET_PREFIX/etc/apps.yaml" --name policy-prover \
      --image REGISTRY/PROOF@sha256:DIGEST \
      --output-dir /private/upgrade-review
    ```
 
-   Repeat `--name` for more entries. The directory must be new; it contains a private
-   `apps.yaml` preview, an update index and one settings JSON per entry. The tool
-   leaves the source configuration, database and every storage file untouched and
-   never reads token contents. Review mounts and identities. All overrides of the
-   removed `prover_binary` field must be converted before the new bridge starts.
+   Repeat `--name` for more entries. The directory must be new; it
+   contains a private `apps.yaml` preview, an update index and one settings JSON per
+   entry. The tool leaves the source configuration, database and every storage file
+   untouched and never reads token contents. Shim volumes are `PATH[:ro|rw|rslave]`,
+   mounted at the same path inside the container: the tool rewrites a `PATH:PATH[:OPTS]`
+   volume to that form and refuses one whose container path differs. A GPU entry needs
+   `cpus` (at least 1), in the entry or from `--cpus N`, which sets it on every selected
+   entry, because its one container now caps the GPU server and the worker together at
+   that many cores. Review mounts and identities.
 5. Stop only the control agent while installing the reviewed `apps.yaml` through an
-   atomic replacement, retaining its original permissions and a backup. Upgrade the
-   scheduler, node/bridge and CLI together, then restart the control agent. This
-   removes the old executable-path report field; its protobuf number is reserved.
-   Confirm the node advertises `shim-prover-v1`. Keep each app disabled and apply its
-   settings to the existing scheduler record, selecting `--node NODE` when needed:
+   atomic replacement, retaining its original permissions and a backup, then start it
+   again. Confirm the node advertises `shim-prover-v1`. Keep each app disabled and
+   apply its settings to the existing scheduler record, selecting `--node NODE` when
+   needed:
 
    ```bash
    fleetctl --namespace NS app update APP \
@@ -524,6 +607,9 @@ their own complete worker image; the SDK converter refuses to guess their packag
 
    Wait for the settings operation to complete. Do not use `app delete`/`app add`:
    those operations would discard identity/history that an in-place update retains.
+   Before enabling it, give the record the entry's CPUs (`cpus` in `updates.json`)
+   with `fleetctl --namespace NS app scale APP --cpus N`: settings don't carry CPUs,
+   and the scheduler otherwise restores its own count.
 6. Compare the backed-up job inventory and stored hashes, verify historical outputs
    remain fetchable, then enable one app and submit its approved guest through the
    proof network. Verify the returned proof with the matching verifier before

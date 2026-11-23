@@ -818,8 +818,6 @@ class AppsConfig(Record):
         cluster = from_dict(ControlPlaneConfig, {k: v for k, v in data.items() if k != "apps"})
         apps = [from_dict(AppSpec, a, where=f"app {a.get('name', '?')}") for a in data.get("apps", [])]
         for a in data.get("apps", []):
-            if a.get("prover_binary") is not None:
-                raise ModelError("prover_binary was removed; drain and migrate this entry with deploy/migrate-proof-runtime.py")
             if "runtime" in a:
                 from_dict(RuntimeSelection, a["runtime"], strict=True)
         result = cls(cluster=cluster, apps=apps, raw=dict(data))

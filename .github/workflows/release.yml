@@ -44,13 +44,28 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+          # SemVer only: the workspace version must equal the tag, and Cargo has no v1.2.3.4.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Invalid release tag: $TAG" >&2
             exit 1
           fi
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
           echo "FLEET_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      # The binaries report CARGO_PKG_VERSION (MCP serverInfo, OpenShell extension metadata).
+      - name: Require the workspace version to match the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORKSPACE_VERSION=$(awk '
+            /^\[/ { section = $0; next }
+            section == "[workspace.package]" && /^version[[:space:]]*=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }
+          ' Cargo.toml)
+          if [ "$WORKSPACE_VERSION" != "$RELEASE_VERSION" ]; then
+            echo "Cargo.toml's workspace version is '$WORKSPACE_VERSION', but the tag $RELEASE_TAG needs $RELEASE_VERSION" >&2
+            exit 1
+          fi
 
       # Fail before publishing an image for a tag that has no Release to attach assets to.
       - name: Require an existing GitHub Release
@@ -124,7 +139,7 @@ jobs:
         run: |
           set -euo pipefail
           DIST="dist/zkm-fleet-${RELEASE_VERSION}-linux-x86_64"
-          mkdir -p "$DIST/bin" "$DIST/deploy" "$DIST/bridge" "dist"
+          mkdir -p "$DIST/bin" "$DIST/deploy" "$DIST/bridge" "$DIST/docs" "dist"
           install -m 755 target/release/fleet-scheduler "$DIST/bin/"
           install -m 755 target/release/fleetctl "$DIST/bin/"
           install -m 755 target/release/fleet-mcp "$DIST/bin/"
@@ -134,10 +149,13 @@ jobs:
           install -m 755 target/shim/bin/trusted-router-tunnel "$DIST/bin/"
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
             deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh \
-            deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh "$DIST/deploy/"
+            deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh \
+            deploy/migrate-proof-runtime.py "$DIST/deploy/"
           cp -a deploy/trustee "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"
-          cp README.md docs/installation.md docs/maintenance.md docs/reference.md "$DIST/"
+          # README.md links docs/*.md, so they keep their place beside it.
+          cp README.md "$DIST/"
+          cp docs/*.md "$DIST/docs/"
           printf 'version=%s\n' "$RELEASE_VERSION" > "$DIST/VERSION"
           printf 'trusted_shim_revision=%s\n' "$TRUSTED_SHIM_REV" >> "$DIST/VERSION"
           printf 'trusted_router_tunnel_revision=%s\n' "$TRUSTED_ROUTER_REV" >> "$DIST/VERSION"

@@ -68,21 +68,80 @@ def test_runtime_install_is_idempotent_and_never_restarts_services(services):
     assert not log.exists()
 
 
-@pytest.mark.parametrize('failure',['FAIL_SHIM','FAIL_NODE'])
-def test_failed_handover_keeps_committed_configuration_and_retry_finishes(services,failure):
+UNITS={'zkm-fleet-ray.service','zkm-fleet-shim.service','zkm-fleet-node.service'}
+
+
+def enabled(root):
+    path=root/'enabled'
+    return set(path.read_text().split()) if path.exists() else set()
+
+
+@pytest.mark.parametrize('failure',['FAIL_SHIM','FAIL_NODE','FAIL_ACTIVE'])
+def test_failed_handover_returns_the_agent_to_cron_and_retry_finishes(services,failure):
     root,prefix,etc,capture,log,binary,config,run=services
     before=config.read_bytes();watchdog=(etc/'watchdog.env').read_bytes()
     failed=run(**{failure:'1'})
     assert failed.returncode!=0
-    assert config.read_bytes() != before and config.stat().st_mode & 0o777 == 0o640
-    assert yaml.safe_load(config.read_text())['shim_daemon'] is True
-    assert (etc/'watchdog.env').read_bytes().startswith(watchdog)
-    # Simulate a node write after handover: retry must not restore stale YAML.
+    # Nothing is committed until the node unit is active: cron keeps supervising the agent.
+    assert config.read_bytes() == before and config.stat().st_mode & 0o777 == 0o640
+    assert (etc/'watchdog.env').read_bytes() == watchdog
+    assert 'FLEET_NODE_SUPERVISED' not in (etc/'watchdog.env').read_text()
+    assert enabled(root) == set() and not list(capture.glob('*.service'))
+    assert 'cron watchdog keeps supervising' in failed.stderr
+    calls=log.read_text()
+    if failure == 'FAIL_SHIM':
+        assert 'systemctl enable' not in calls and 'start zkm-fleet-node.service' not in calls
+    else:
+        assert 'systemctl disable' in calls and 'systemctl stop zkm-fleet-node.service' in calls
+    # The Ray watcher and shim daemon this run started do not outlive the restored settings,
+    # and they stop before their units are removed.
+    stop = 'systemctl stop zkm-fleet-ray.service zkm-fleet-shim.service'
+    assert stop in calls
+    assert calls.index(stop) < calls.index('systemctl daemon-reload', calls.index('systemctl start zkm-fleet-ray'))
+    assert not (root/'active').read_text().split()
+    # A node write between the failure and the retry survives the retry.
     config.write_text(config.read_text() + 'later_setting: retain-me\n')
     retried = run()
     assert retried.returncode == 0, retried.stderr
-    assert yaml.safe_load(config.read_text())['later_setting'] == 'retain-me'
-    assert ' restart ' not in log.read_text() and ' stop ' not in log.read_text()
+    settings=yaml.safe_load(config.read_text())
+    assert settings['later_setting'] == 'retain-me' and settings['shim_daemon'] is True
+    assert (etc/'watchdog.env').read_text().endswith('FLEET_NODE_SUPERVISED=1\n')
+    assert enabled(root) == UNITS
+    assert ' restart ' not in log.read_text()
+
+
+def test_failed_handover_leaves_already_running_services_alone(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    failed=run(FAIL_SHIM='1', PREACTIVE='zkm-fleet-ray.service zkm-fleet-shim.service')
+    assert failed.returncode != 0 and 'cron watchdog keeps supervising' in failed.stderr
+    assert ' stop ' not in log.read_text()
+    assert set((root/'active').read_text().split()) == {'zkm-fleet-ray.service','zkm-fleet-shim.service'}
+
+
+def test_failed_rerun_keeps_units_a_previous_handover_enabled(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    assert run().returncode == 0
+    config_before=config.read_bytes();watchdog=(etc/'watchdog.env').read_bytes()
+    log.unlink();failed=run(FAIL_NODE='1')
+    assert failed.returncode != 0
+    # This run enabled nothing, so it disables and stops nothing: systemd keeps retrying the agent.
+    assert enabled(root) == UNITS
+    assert 'systemctl disable' not in log.read_text() and ' stop ' not in log.read_text()
+    assert config.read_bytes() == config_before and (etc/'watchdog.env').read_bytes() == watchdog
+    assert watchdog.decode().endswith('FLEET_NODE_SUPERVISED=1\n')
+
+
+def test_supervision_flag_is_written_only_after_the_node_unit_is_active(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    result=run();assert result.returncode==0,result.stderr
+    calls=log.read_text().splitlines()
+    order=[c for c in calls if c.startswith('systemctl ')]
+    assert order.index('systemctl start zkm-fleet-ray.service zkm-fleet-shim.service') \
+        < order.index('systemctl enable zkm-fleet-ray.service zkm-fleet-shim.service zkm-fleet-node.service') \
+        < order.index('systemctl start zkm-fleet-node.service') \
+        < order.index('systemctl is-active --quiet zkm-fleet-node.service')
+    assert (root/'supervised-at-active').read_text() == 'no'
+    assert (etc/'watchdog.env').read_text().endswith('FLEET_NODE_SUPERVISED=1\n')
 
 
 def test_operator_unit_and_corrupted_pinned_artifact_are_handled(services):
@@ -166,3 +225,24 @@ def test_non_executable_bundled_tunnel_helper_is_rejected_before_changes(service
     assert result.returncode!=0 and 'trusted-router-tunnel is not an executable' in result.stderr
     assert config.read_bytes()==before and not log.exists()
     assert not (prefix/'libexec').exists()
+
+
+def test_stage_only_publishes_runtime_binaries_beside_a_live_agent(services):
+    root,prefix,etc,capture,log,binary,config,run=services
+    helper=root/'trusted-router-tunnel';helper.write_bytes(b'helper');helper.chmod(0o755)
+    (root/'work').mkdir();before=config.read_bytes();watchdog=(etc/'watchdog.env').read_bytes()
+    command=['bash',str(ROOT/'deploy/install-node-services.sh'),str(prefix),'','',str(binary),'--stage-only']
+    env={**os.environ,'PATH':str(root/'commands')+':'+os.environ['PATH']}
+    # fleet-ctl stages while the agent still holds its lock.
+    with (root/'work/node-agent.lock').open('w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        result=subprocess.run(command,env=env,text=True,capture_output=True,timeout=20)
+    assert result.returncode==0,result.stderr
+    shim=prefix/'libexec/trusted-shim'/hashlib.sha256(b'first-runtime').hexdigest()/'trusted-shim-runtime'
+    tunnel=prefix/'libexec/trusted-router-tunnel'/hashlib.sha256(b'helper').hexdigest()/'trusted-router-tunnel'
+    assert shim.read_bytes()==b'first-runtime' and tunnel.read_bytes()==b'helper'
+    assert str(shim) in result.stderr and str(tunnel) in result.stderr
+    # Never selects, switches or restarts anything.
+    assert config.read_bytes()==before and (etc/'watchdog.env').read_bytes()==watchdog
+    assert not log.exists() and not list(capture.glob('*.service'))
+    assert not (prefix/'libexec/node-services').exists()

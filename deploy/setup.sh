@@ -1,9 +1,9 @@
 #!/bin/bash
 # Bootstrap Fleet from a published GitHub Release package.
 #
-# setup.sh --version v0.1.2 node --name gpu-1 \
+# setup.sh --version v0.2.4 node --name gpu-1 \
 #   --scheduler https://fleet.example:8905 --cluster-token FILE
-# setup.sh --version v0.1.2 control --public-url https://fleet.example:8905
+# setup.sh --version v0.2.4 control --public-url https://fleet.example:8905
 set -euo pipefail
 
 REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}
@@ -75,4 +75,8 @@ fi
 
 FORWARD=("${ARGS[@]:1}" "--bin" "$PACKAGE_ROOT/bin")
 echo "setup.sh: installing $TAG from GitHub Release package"
-exec bash "$PACKAGE_ROOT/deploy/install.sh" "$ROLE" "${FORWARD[@]}"
+# Not exec: the EXIT trap removes the package once the installer is done.
+STATUS=0
+bash "$PACKAGE_ROOT/deploy/install.sh" "$ROLE" "${FORWARD[@]}" || STATUS=$?
+[ "$KEEP" = 0 ] || echo "setup.sh: package kept in $STAGE"
+exit "$STATUS"

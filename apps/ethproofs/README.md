@@ -97,7 +97,7 @@ restarts. Run only one worker for the stream and preserve GOAT's entry.
 
 ## Production deployment
 
-The worker runs on `ant-5090-2` as one replica of app `ethproofs-z4`. Inspect its current GPU/CPU
+The worker runs on one GPU node as one replica of app `ethproofs-z4`. Inspect its current GPU/CPU
 allocation with `fleetctl app scale`; resource settings can change independently
 of the worker package.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;

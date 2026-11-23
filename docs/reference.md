@@ -28,6 +28,8 @@ client, submission CLI, policy editor or HTTP listener.
 | `fleet-ziren-node` | Optional SDK-driven proving and retained-artifact fetching | Ziren runtime, installed only where used |
 | App worker | The app's own preparation, proving calls, outputs, checkpoints and reporting | Whatever its owner packages |
 | `fleetctl` / `fleet-mcp` | Clients of the same authenticated API | MCP is optional and runs `fleetctl` |
+| `openshell-gateway` | Optional (`openshell` Compose profile): the unmodified OpenShell access gateway, with Fleet as its compute driver | The scheduler's `policy_gateway.openshell` compute socket; no Docker socket |
+| `trustee-as` | Optional (`trustee` Compose profile): Trustee's attestation service for legacy prechecks | Its `trustee-data` volume; no TEE devices or Docker socket |
 
 Fleet checks that processes and containers are up; it doesn't read an app's
 checkpoints, so follow an app's progress in its logs. Prepare code, datasets and
@@ -93,7 +95,7 @@ Proof jobs, namespaces, tokens and quota reservations are in Postgres. Batch, ap
 deployment and command records are durable files in the control host's `data_dir`;
 back that up with Postgres. The scheduler holds a Postgres advisory lock while it
 runs, so only one process dispatches from a database. A new database is created at
-schema 16, and the scheduler checks the version at startup;
+schema 20, and the scheduler checks the version at startup;
 [maintenance](maintenance.md#database-schema-14-or-15-to-16) covers older ones.
 
 Through a scheduler restart or a lost connection, nodes keep running locally,
@@ -418,7 +420,8 @@ Tini owns process reaping and signals; a failed worker or GPU server ends the
 container. The optional worker `/healthz` endpoint remains healthy during an active
 proof and is published only on node loopback through shim.
 
-The manifest explicitly supplies environment and bind mounts. Container templates
+The manifest explicitly supplies environment and bind mounts. Each volume is
+`PATH[:ro|rw|rslave]`, mounted at the same path inside the container. Container templates
 can reference app scalar fields and `{name}`, `{machine}`, `{index}`, `{port}`,
 `{gpus}` (container GPU ordinals), `{gpu_count}`, `{cpu_count}`, `{scheduler}`,
 `{cluster_token_file}` and `{scheduler_ca_file}`. Credential contents are never
@@ -427,11 +430,10 @@ Keep proof storage mounted at the same absolute path so persisted `file://`
 references and completed lease records remain usable. The existing host storage
 fetch handler remains available for fetching historical outputs.
 
-`prover_binary` and native executable-path reports have been removed. Existing
-native entries using the shared `node_binary` remain readable for an explicit
-cutover; a packaged worker does not use that binary. Entries with an override must
-first be drained and converted using `deploy/migrate-proof-runtime.py`. See the
-maintenance procedure for an upgrade that retains queued jobs and all stored data.
+Existing native entries using the shared `node_binary` remain readable for an
+explicit cutover; a packaged worker does not use that binary. See the
+[maintenance procedure](maintenance.md#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)
+for an upgrade that retains queued jobs and all stored data.
 Guest/verifier compatibility still needs validation for the pinned image tuple;
 an immutable image alone does not attest to hardware or prove compatibility.
 Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
@@ -582,21 +584,22 @@ program and remote `preflight` proof-network settings:
 policy_gateway:
   # Existing program_elf, program_sha256, program_vkey and preflight settings.
   openshell:
-    compute_socket: /run/zkm-fleet/openshell-compute.sock
+    compute_socket: /run/zkm-fleet/openshell/compute.sock
     admission_policy: '<exact native driver resource-admission acknowledgement>'
     # Optional: required to publish native application services.
     gateway:
-      endpoint: https://openshell.example:8080
+      endpoint: https://openshell-gateway:17670
       ca_file: /etc/zkm-fleet/openshell-ca.pem
       cert_file: /etc/zkm-fleet/openshell-client.pem
       key_file: /etc/zkm-fleet/openshell-client.key
 ```
 
 The socket directory must already exist, owned by the scheduler/gateway UID with
-mode 0700. Fleet creates a 0600 socket and accepts only that UID. Configure the
-unmodified gateway with `--compute-driver docker --compute-driver-socket` pointing
-to this socket. Fleet's default [Compose service](installation.md#openshell-gateway)
-deploys the unchanged gateway beside the scheduler. Operators deploy the node's
+mode 0700; in Compose, `fleet-ctl.sh openshell up` prepares it. Fleet creates a 0600
+socket and accepts only that UID. Configure the unmodified gateway with
+`--compute-driver docker --compute-driver-socket` pointing to this socket. Fleet's
+optional `openshell` [Compose profile](installation.md#openshell-gateway) deploys the
+unchanged gateway beside the scheduler. Operators deploy the node's
 native compute driver separately; the scheduler does not launch either process.
 The admission acknowledgement must match
 the node's `shim_openshell` settings. This profile supports CPU/memory
@@ -884,7 +887,9 @@ spec or its `apps.yaml` entry, and point the SDK's `ENDPOINT` at the stage port,
 On the node, give the agent `--proof-node-binary /path/to/fleet-ziren-node` and a
 `--proof-storage-root /srv/goat` for each approved root. With `deploy/node-start.sh`,
 set `FLEET_PROOF_STORAGE_ROOTS_FILE` to an administrator-owned file with one absolute
-root per line; `deploy/install.sh node --proof-storage-roots FILE` installs it. Keep
+root per line; `deploy/install.sh node --proof-storage-roots FILE` installs it.
+`fleet-ziren-node` isn't in the release package; build it from source
+([self-built programs](maintenance.md#self-built-node-programs)). Keep
 the roots configured while GPU actors are stopped. The agent runs storage-only
 fetches apart from its heartbeats and Ray work.
 
@@ -1372,7 +1377,7 @@ Give external MCP users these connection details:
 
 - **Server:** ZKM Fleet
 - **Transport:** Streamable HTTP over HTTPS
-- **URL:** `https://34.215.238.232:8905/mcp`
+- **URL:** `https://fleet.example:8905/mcp`
 - **Authentication:** `Authorization: Bearer <user-token>`
 
 An administrator issues each user a namespace- and tag-scoped token and delivers it
@@ -1381,6 +1386,12 @@ token, so clients can discover the tools and their schemas first. `tools/call` n
 current user token, and the scheduler applies its namespace, tag and grants. A client
 must support remote Streamable HTTP and a configurable Bearer header; one that runs
 only local `stdio` servers can't connect.
+
+The repository's `.mcp.json` configures this server for Claude Code from two
+environment variables: `FLEET_MCP_URL` (your gateway's `/mcp` URL) and
+`FLEET_MCP_AUTH` (the user token). The server accepts only the `Host` values in
+`FLEET_MCP_ALLOWED_HOSTS`, which the control host install sets from `--public-url`;
+without it, only loopback.
 
 | Tool | Does |
 |---|---|
@@ -1408,12 +1419,18 @@ Proofs are submitted through the Ziren network SDK; MCP lists and inspects them.
 | Apps, deployments, batches, jobs and commands | `data_dir/workloads/{apps,deployments,jobs,commands}` on the control host: durable JSON records, including lease and cleanup fences |
 | Batch inputs, outputs and checkpoints | The owner's shared or object storage |
 | Batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes keep execution files in `FLEET_JOBS_DIR/<job-id>/`, normally `work/jobs/` |
+| Policy ledger | `data_dir/policy` on the control host (mode 0700): SQLite with its WAL and signing secret |
+| OpenShell gateway state | The `openshell-data` Compose volume: the gateway's SQLite database and WAL |
+| Trustee AS policies and reference values | The `trustee-data` Compose volume |
 
 ## Ports
 
 | Port | Serves |
 |---|---|
-| 8905 | The HTTPS gateway: the API, MCP and node heartbeats. Nodes need outbound HTTPS (HTTP/2) to it; the scheduler's own listeners stay private behind it. |
+| 8905 | The HTTPS gateway: the API, MCP and node heartbeats. Nodes need outbound HTTPS (HTTP/2) to it; the scheduler's own listeners stay private behind it. `GATEWAY_BIND` in `compose.env` limits the interface. |
+| `127.0.0.1:9191` | The scheduler's HTTP API, for `fleetctl` on the control host |
+| `127.0.0.1:17670` | The OpenShell gateway (`openshell` profile), with mTLS; `FLEET_OPENSHELL_BIND` and `FLEET_OPENSHELL_PORT` in `compose.env` change the address and port, for example to reach remote supervisors |
+| 51001, 8906, 50004, 8081 | Private to the Compose network: the scheduler's node gRPC, MCP, Trustee AS and the OpenShell gateway's health check |
 | `127.0.0.1:51012`, `51013` | GOAT's proof endpoint: SDK stage and HTTP, loopback only |
 | 6379–6381, 52365, 8080, 10002–19999 | Each node's local Ray; the metrics port (8080) and the worker range (10002–19999) [move](operations.md#configure-resources) in `etc/watchdog.env` |
 
@@ -1465,8 +1482,9 @@ administrator operation and uses the existing drain/reconfigure path. This adds
 no host network access, storage replication or automatic task migration.
 
 The existing node apps.yaml accepts `shim_network` with `gateway_url`, `relay_url`,
-`token_file`, `public_key_file`, and `issuer`. These are trusted node settings,
-never passed into the workload environment. The central gateway URL serves only
+`token_file`, `public_key_file`, `issuer` and optionally `tunnel_binary`, the absolute
+path of the Chisel tunnel helper ([maintenance](maintenance.md#execution-node)).
+These are trusted node settings, never passed into the workload environment. The central gateway URL serves only
 registration/control requests; `relay_url` is the independent WSS data plane.
 Shim obtains and verifies exact-execution grants and owns outbound connections.
 The gateway must authorize against live Fleet execution metadata before issuing

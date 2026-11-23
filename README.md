@@ -12,9 +12,9 @@ Fleet schedules apps and batch jobs on shared GPU and CPU machines.
 ![Fleet architecture: apps and batches share machine resources](images/diagram.svg)
 
 The control host runs the Rust scheduler, Postgres, an HTTPS gateway and, optionally,
-MCP. Each execution machine runs `fleet-node` and its own local Ray, and connects
-outward to register. Fleet handles admission, quotas, placement and lifecycle; apps
-own their data and pipelines. The [code model](docs/reference.md#code-names) follows
+MCP, the OpenShell gateway and Trustee AS. Each execution machine runs `fleet-node`
+and its own local Ray, and connects outward to register. Fleet handles admission,
+quotas, placement and lifecycle; apps own their data and pipelines. The [code model](docs/reference.md#code-names) follows
 Kubernetes' jobs, deployments and controllers, without needing Kubernetes.
 
 Namespace owners create apps and batches and manage their priority, enabled state and
@@ -36,22 +36,26 @@ Two integrated app workers prove on their node's own GPU server:
 
 Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
 node-agent upgrades leave that process and existing containers running.
-OpenShell is the default shared access layer for Docker and TEE drivers; without
-user rules it adds no restrictions beyond driver limits. Its gateway is included
-in Fleet’s default Compose stack. Trustee AS is an optional `trustee` Compose
-profile for legacy attestation/prechecks; its appraisal RPC uses the existing
+OpenShell is the shared access layer for Docker and TEE drivers; without user
+rules it adds no restrictions beyond driver limits. Its gateway is the optional
+`openshell` Compose profile, started by `fleet-ctl.sh openshell up` once the
+scheduler's `policy_gateway.openshell` is configured
+([installation](docs/installation.md#openshell-gateway)). Trustee AS is an optional
+`trustee` Compose profile for legacy attestation/prechecks; its appraisal RPC uses the existing
 HTTPS ingress with node client certificates. TDX DCAP admission verifies original
 evidence in a Ziren guest and does not require AS. Rail is embedded policy evaluation plus a remote proof guest.
-The [Data Router](https://github.com/attestx/trusted-data-router/tree/feat/rust-framework/deploy)
+The [Data Router](https://github.com/attestx/trusted-data-router/tree/main/deploy)
 has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
 
 GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}`
 with `sha-<full-commit>` tags and release versions. The unchanged native gateway
-uses `zkm-fleet-openshell:<upstream-revision>`. The manual proof-image workflow
+uses `zkm-fleet-openshell:<upstream-revision>`, built once per revision, and
+`fleet-ctl.sh openshell up` pins its digest. The manual proof-image workflow
 publishes `zkm-fleet-ziren-node:sha-<full-commit>` from an operator-validated
-Ziren 2.0 GPU image digest; building it does not run a prover. The node image also
-distributes binaries for the existing host installer; it does not replace local
-Ray/bridge supervision or combine the shim lifecycle with the node process.
+Ziren 2.0 GPU image digest; building it does not run a prover. The node image holds
+only Fleet's binaries: installing a node still needs the release package, which also
+carries the shim, its tunnel helper, the bridge and the scripts. The image does not
+replace local Ray/bridge supervision or combine the shim lifecycle with the node process.
 
 Existing workloads are not automatically migrated. Schema 20 requires a
 [backup and compatible rollback plan](docs/maintenance.md); preserve application

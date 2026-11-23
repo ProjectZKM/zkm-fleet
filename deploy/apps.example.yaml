@@ -1,15 +1,23 @@
 # Local apps advertised by fleet-node to the Rust scheduler.
 scheduler: https://scheduler.example.com:8905
-# Copy the public CA certificate to every Ray worker at this path when using a
-# private CA; the cluster token remains the node's bearer credential.
-scheduler_ca_file: /etc/zkm-fleet/tls/ca.pem
+# With a private CA, install.sh node --scheduler-ca copies it here and sets this.
+scheduler_ca_file: /etc/zkm-fleet/scheduler-ca.pem
 cluster_token_file: /etc/zkm-fleet/cluster.token
+# Legacy native provers (cpu-wrap below) run this binary. Release packages don't ship
+# it: build it with `cargo build --locked --release -p fleet-ziren-node`.
 node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
 gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
+# The persistent shim that runs packaged provers; install.sh node --with-shim sets these.
+shim_binary: /opt/zkm-fleet/libexec/trusted-shim/SHA256/trusted-shim-runtime
+shim_state_dir: /opt/zkm-fleet/work/shim
+shim_daemon: true
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
 apps:
   # Resources not reserved by enabled apps remain available to batch jobs.
+  # A packaged SDK prover: the worker and its Ziren GPU server in one image built by
+  # deploy/build-proof-image.sh, run by the shim. deploy/migrate-proof-runtime.py
+  # writes these settings for an existing entry.
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user
@@ -19,11 +27,34 @@ apps:
     proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1
     gpus: 2
-    cpus: 48
+    cpus: 48                           # caps the GPU server and the worker together
     memory_gb: 256
     shm_gb: 64
-    image: ghcr.io/projectzkm/ziren-gpu@sha256:REPLACE
+    image: REGISTRY/PROOF@sha256:REPLACE
+    runtime: {executor: shim, driver: docker}
+    port_base: 0                       # the shim picks the loopback port
+    container_port: 8080               # the worker's health endpoint
+    health_path: /healthz
+    volumes:                           # mounted at the same path inside
+      - /srv/ethproofs
+      - "{cluster_token_file}:ro"
+      - "{scheduler_ca_file}:ro"
     env:
+      FLEET_NODE_NAME: "{name}"
+      FLEET_MACHINE: "{machine}"
+      FLEET_SCHEDULER: "{scheduler}"
+      FLEET_CLUSTER_TOKEN_FILE: "{cluster_token_file}"
+      FLEET_SCHEDULER_CA_FILE: "{scheduler_ca_file}"
+      FLEET_APP_NAMESPACE: "{namespace}"
+      FLEET_APP: "{app}"
+      FLEET_APP_ELF_ID: "{elf_id}"
+      FLEET_APP_STORAGE_ROOT: "{proof_storage_root}"
+      FLEET_GPUS: "{gpu_count}"
+      FLEET_CPUS: "{cpu_count}"
+      FLEET_IMAGE: "{image}"
+      CUDA_VISIBLE_DEVICES: "{gpus}"
+      ZKM_GPU_DEVICES: "{gpus}"
+      RAYON_NUM_THREADS: "{cpu_count}"
       VERIFY_VK: "true"
       SHARD_SIZE: "16777216"
       ZIREN_LEAF_HOST_THREADS: "3"
@@ -31,6 +62,7 @@ apps:
       ZIREN_FUSE_LEAVES: "1"
       ZIREN_REDUCE_OVERLAP: "1"
       TMPDIR: /dev/shm
+  # A legacy native CPU prover: it runs node_binary, so that binary must be installed.
   - name: cpu-wrap
     kind: ziren-cpu
     replicas: 1

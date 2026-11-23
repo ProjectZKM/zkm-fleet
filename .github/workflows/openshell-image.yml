@@ -1,12 +1,22 @@
 name: OpenShell gateway image
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and push the revision tag even though it is already published
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
         description: Fleet source ref containing the reviewed upstream pin
         required: false
         type: string
+      force:
+        description: Rebuild and push the revision tag even though it is already published
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
   packages: write
@@ -27,13 +37,43 @@ jobs:
           assert len(revisions) == 1, 'one reviewed OpenShell revision is required'
           print('OPENSHELL_REV=' + revisions.pop())
           PY
+      # A published revision tag is immutable: installs may already run it unpinned, and
+      # rebuilding the same source changes its digest. Only a manual force replaces it.
+      - name: Skip a revision that is already published
+        id: published
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}-openshell:$OPENSHELL_REV"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          if out=$(docker manifest inspect "$IMAGE" 2>&1); then
+            if [ "$FORCE" = true ]; then
+              echo "$IMAGE exists; rebuilding it because force is set"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "$IMAGE is already published; leaving it unchanged (run this workflow with force to replace it)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          # GHCR answers "name unknown" before a package's first publish. An auth error still stops.
+          elif grep -qiE 'no such manifest|manifest unknown|name unknown|not found' <<<"$out"; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "cannot tell whether $IMAGE is published: $out" >&2
+            exit 1
+          fi
       - name: Install build dependencies
+        if: steps.published.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libclang-dev libz3-dev
-      - run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - if: steps.published.outputs.skip != 'true'
+        run: rustup show active-toolchain
+      - if: steps.published.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           key: openshell-${{ env.OPENSHELL_REV }}
       - name: Build unchanged upstream gateway
+        if: steps.published.outputs.skip != 'true'
         env:
           CARGO_TARGET_DIR: ${{ github.workspace }}/target
         run: |
@@ -41,6 +81,7 @@ jobs:
             --rev "$OPENSHELL_REV" --no-default-features --bin openshell-gateway \
             --root target/openshell openshell-gateway
       - name: Publish gateway image
+        if: steps.published.outputs.skip != 'true'
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
