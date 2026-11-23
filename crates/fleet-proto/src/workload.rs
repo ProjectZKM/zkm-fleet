@@ -32,6 +32,9 @@ impl<'a> Entry<'a> {
     /// Missing selection is permanently the legacy path, including old records.
     pub fn runtime_capability(self) -> Option<&'static str> {
         if self.native_access() {
+            if self.0["service_protocol"] == "tcp" {
+                return Some("shim-openshell-tcp-services-v1");
+            }
             return Some(if self.0["services"].as_array().is_some_and(|s| !s.is_empty()) { "shim-openshell-services-v1" } else { "shim-openshell-provisioning-v1" });
         }
         if self.is_prover() && self.0["runtime"] == json!({"executor":"shim", "driver":"docker"}) {
@@ -223,7 +226,7 @@ impl NodeReport {
     /// Native provisioning holds resources before there is an application route.
     /// Only a complete set of exact, durable replica reservations counts here.
     pub fn native_allocated(&self, entry: Entry<'_>) -> bool {
-        if !matches!(entry.runtime_capability(), Some("shim-openshell-provisioning-v1" | "shim-openshell-services-v1")) || entry.disabled() {
+        if !entry.native_access() || entry.disabled() {
             return false;
         }
         let instances: Vec<_> = self.runtime_instances.iter().filter(|r| r.entry_name == entry.name()).collect();

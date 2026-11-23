@@ -4,6 +4,8 @@ use std::{path::Path, process::Command};
 
 #[path = "route.rs"]
 mod route;
+#[path = "tcp.rs"]
+mod tcp;
 
 // Every Docker operation is scoped to this test's unique operator namespace.
 struct DockerScope(String);
@@ -88,6 +90,16 @@ async fn driver(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
 async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() {
+    startup(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
+async fn stock_docker_tcp_services_require_banner_and_drain_on_revocation() {
+    startup(true).await;
+}
+
+async fn startup(tcp: bool) {
     let image = std::env::var("OPENSHELL_TEST_WORKLOAD_IMAGE").expect("pinned workload image");
     let command = vec![
         "python3".to_string(),
@@ -100,8 +112,12 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
             report.apps[0]["image"] = json!(image);
             report.apps[0]["command"] = json!(command);
             report.apps[0]["services"] = json!(["native-http"]);
-            report.apps[0]["container_port"] = json!(8090);
-            report.apps[0]["health_path"] = json!("/health");
+            report.apps[0]["container_port"] = json!(if tcp { 8091 } else { 8090 });
+            report.apps[0]["health_path"] = json!(if tcp { "/" } else { "/health" });
+            if tcp {
+                report.apps[0]["service_protocol"] = json!("tcp");
+                report.apps[0]["health_tcp_banner"] = json!("SSH-2.0-");
+            }
         })
         .await;
     // Retain private diagnostics outside the repository, including on failure.
@@ -197,9 +213,11 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
     launch.command = command;
     launch.services = serde_json::from_value(json!([{
         "id":{"namespace":request.execution.namespace,"workload":request.execution.workload,"service":"native-http"},
-        "protocol":"http1","endpoint_ref":"app"
+        "protocol":if tcp {"tcp"} else {"http1"},"endpoint_ref":"app"
     }])).unwrap();
-    launch.driver_options = json!({"container_port":8090,"health_path":"/health"});
+    launch.driver_options = if tcp {
+        json!({"container_port":8091,"health_path":"/","health_tcp_banner":"SSH-2.0-"})
+    } else { json!({"container_port":8090,"health_path":"/health"}) };
     let native_policy = SandboxPolicy {
         version: 1,
         process: Some(protocol::sandbox::v1::ProcessPolicy {
@@ -428,6 +446,19 @@ async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() 
                 .as_object()
                 .is_some_and(|p| p.is_empty())
     );
+    if tcp {
+        tcp::exercise(&root, c.clone(), report, &request.execution, &shim_socket,
+            &owned_native, &host_key, observer).await;
+        assert!(scope.ids("container").is_empty());
+        assert_eq!(network.submitted.load(Ordering::SeqCst), 1);
+        stop.cancel();
+        daemon.await.unwrap();
+        native.kill().await.unwrap();
+        gateway_process.kill().await.unwrap();
+        compute.abort();
+        http.abort();
+        return;
+    }
     let supervisor_image = std::env::var("OPENSHELL_TEST_SUPERVISOR_IMAGE").unwrap();
     let transport_stop = tokio_util::sync::CancellationToken::new();
     // These inputs belong to the node adapter. No service route is published by

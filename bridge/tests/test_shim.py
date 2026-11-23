@@ -628,7 +628,29 @@ def test_native_service_capability_requires_health_protocol_and_network_config(t
     assert "shim-openshell-services-v1" not in shim.capabilities(cfg)
     value["features"].append("openshell-service-health-v1")
     assert "shim-openshell-services-v1" in shim.capabilities(cfg)
+    assert "shim-openshell-tcp-services-v1" not in shim.capabilities(cfg)
+    value["features"].append("openshell-tcp-services-v1")
+    assert "shim-openshell-tcp-services-v1" in shim.capabilities(cfg)
     assert "shim-openshell-services-v1" not in shim.capabilities(replace(cfg,shim_network=None))
+    assert "shim-openshell-tcp-services-v1" not in shim.capabilities(replace(cfg,shim_network=None))
+
+
+def test_native_tcp_requires_banner_health_and_distinct_node_capability(tmp_path):
+    raw = native_service_config(tmp_path)
+    raw["apps"][0].update(service_protocol="tcp", health_path="/", health_tcp_banner="SSH-2.0-", services=["ssh"])
+    cfg = reconcile.load_apps(raw)
+    spec = reconcile.replica_specs(cfg)["web-0"]
+    assert shim.required_capability(spec) == "shim-openshell-tcp-services-v1"
+    for banner in (None, "", "a" * 129, "SSH\n", "非ASCII"):
+        bad = copy.deepcopy(raw)
+        bad["apps"][0]["health_tcp_banner"] = banner
+        with pytest.raises(ValueError):
+            reconcile.load_apps(bad)
+    for field, value in (("health_path", "/ignored"), ("service_protocol", "http1")):
+        bad = copy.deepcopy(raw)
+        bad["apps"][0][field] = value
+        with pytest.raises(ValueError):
+            reconcile.load_apps(bad)
 
 
 @pytest.mark.parametrize("key,value", [("services",["control"]),("container_port",None),

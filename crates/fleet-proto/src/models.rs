@@ -419,7 +419,7 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 12] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256"];
+    pub const CONTAINER_SETTINGS: [&'static str; 13] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner"];
 
     pub fn local_container_runtime(runtime: Option<&Value>) -> bool {
         runtime.is_some_and(|v| ["docker", "tee", "tee-simulation"].iter().any(|driver|
@@ -442,6 +442,9 @@ impl RegisterAppRequest {
                 && Self::local_container_runtime(spec.get("runtime")), "access policy requires SHA256 and a runtime driver");
         }
         let native = crate::workload::Entry(&Value::Object(spec.clone())).native_access();
+        let tcp = spec.get("service_protocol").is_some_and(|v| v == "tcp");
+        let banner = spec.get("health_tcp_banner").filter(|v| !v.is_null());
+        anyhow::ensure!(banner.is_none() || native && tcp, "TCP banner health requires native OpenShell TCP services");
         if native {
             let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
             let health = spec.get("health_path").map_or(Some("/"), Value::as_str);
@@ -451,12 +454,14 @@ impl RegisterAppRequest {
                 && ["port_base", "entrypoint", "user", "workdir", "shm_gb"].iter().all(|k| !spec.contains_key(*k))
                 && spec.get("volumes").is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()))
                 && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty()))
-                && spec.get("service_protocol").is_none_or(|v| v == "http1")
+                && spec.get("service_protocol").is_none_or(|v| v == "http1" || v == "tcp")
+                && (!tcp || health == Some("/") && banner.and_then(Value::as_str).is_some_and(|s|
+                    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic() || b == b' ')))
                 && spec.get("services").and_then(Value::as_array).is_none_or(|s| s.iter().all(|s| s != "control"))
                 && services == spec.contains_key("container_port")
                 && health.is_some_and(|p| p.starts_with('/') && !p.starts_with("//") && p.len() <= 2048
                     && !p.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'#') && (services || p == "/")),
-                "native OpenShell requires CPU/memory limits and optional private HTTP app services");
+                "native OpenShell requires CPU/memory limits and private HTTP services or TCP services with banner health");
         }
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
             anyhow::ensure!(native || Self::local_container_runtime(spec.get("runtime")),
@@ -712,6 +717,23 @@ mod tests {
         let mut http=spec.clone();http["services"]=json!(["http"]);http["container_port"]=json!(8090);http["health_path"]=json!("/health");
         request(http.clone()).validate().unwrap();
         assert_eq!(crate::workload::Entry(&http).runtime_capability(),Some("shim-openshell-services-v1"));
+        let mut tcp = http.clone();
+        tcp["service_protocol"] = json!("tcp"); tcp["health_path"] = json!("/");
+        tcp["health_tcp_banner"] = json!("SSH-2.0-");
+        request(tcp.clone()).validate().unwrap();
+        let entry = crate::workload::Entry(&tcp);
+        assert_eq!(entry.runtime_capability(), Some("shim-openshell-tcp-services-v1"));
+        let mut node = NodeReport::default();
+        node.runtime_capabilities = vec!["shim-openshell-services-v1".into()];
+        assert!(!node.supports_runtime(entry));
+        node.runtime_capabilities.push("shim-openshell-tcp-services-v1".into());
+        assert!(node.supports_runtime(entry));
+        for banner in [Value::Null, json!(""), json!("a".repeat(129)), json!("SSH\n"), json!("非ASCII")] {
+            let mut bad = tcp.clone(); bad["health_tcp_banner"] = banner;
+            assert!(request(bad).validate().is_err());
+        }
+        let mut bad = http.clone(); bad["health_tcp_banner"] = json!("SSH-2.0-");
+        assert!(request(bad).validate().is_err());
         for (field,value) in [("services",json!(["control"])),("services",json!([])),("container_port",json!(0)),
             ("service_protocol",json!("tcp")),("health_path",json!("//other/health")),("health_path",json!("/a#b")),
             ("health_path",json!("/a\\b")),("health_path",json!("/a\n")),("health_path",Value::Null)] {

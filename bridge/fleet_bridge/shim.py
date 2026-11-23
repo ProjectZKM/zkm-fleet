@@ -39,6 +39,8 @@ def required_capability(spec: AppReplicaSpec) -> str:
     if spec.kind is not AppRuntime.APP:
         return "shim-prover-v1"
     if spec.app.native_access:
+        if spec.app.service_protocol is ServiceProtocol.TCP:
+            return "shim-openshell-tcp-services-v1"
         return "shim-openshell-services-v1" if spec.app.services else "shim-openshell-provisioning-v1"
     if spec.app.runtime and spec.app.runtime.driver in ("tee", "tee-simulation"):
         return "shim-" + spec.app.runtime.driver + "-v1"
@@ -109,6 +111,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
                 native.append("shim-openshell-provisioning-v1")
                 if config.shim_network and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
+                    if "openshell-tcp-services-v1" in features:
+                        native.append("shim-openshell-tcp-services-v1")
         local = "docker" in value.get("drivers", [])
         if config.shim_tee and config.shim_tee.driver in value.get("drivers", []) and "tee-startup-v1" in features:
             native.append("shim-" + config.shim_tee.driver + "-v1")

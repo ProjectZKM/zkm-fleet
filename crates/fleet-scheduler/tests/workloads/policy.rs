@@ -245,6 +245,7 @@ async fn policy_setup_with_inventory(
     report.runtime_capabilities = vec![
         "shim-openshell-provisioning-v1".into(),
         "shim-openshell-services-v1".into(),
+        "shim-openshell-tcp-services-v1".into(),
         "shim-docker-v1".into(),
         "shim-network-v1".into(),
         "shim-management-v1".into(),
@@ -885,6 +886,35 @@ async fn native_service_admission_binds_manifest_and_local_readiness_cannot_publ
         c.app_resources(&r.execution.namespace, "model", None)["runtime_instances"],
         json!([])
     );
+}
+
+#[tokio::test]
+async fn native_tcp_admission_binds_protocol_and_health_to_manifest() {
+    let (_dir, c, _, _, r) = policy_setup_with_inventory("openshell", |report| {
+        report.apps[0]["services"] = json!(["ssh"]);
+        report.apps[0]["container_port"] = json!(22);
+        report.apps[0]["service_protocol"] = json!("tcp");
+        report.apps[0]["health_tcp_banner"] = json!("SSH-2.0-");
+    }).await;
+    let mut launch = provisioning(&r).request;
+    launch.services = serde_json::from_value(json!([{
+        "id":{"namespace":r.execution.namespace,"workload":r.execution.workload,"service":"ssh"},
+        "protocol":"tcp","endpoint_ref":"app"
+    }])).unwrap();
+    launch.driver_options = json!({"container_port":22,"health_path":"/","health_tcp_banner":"SSH-2.0-"});
+    c.with_runtime_delivery(&r.execution, None, Some(&launch), |_| Ok(())).unwrap();
+    for field in 0..3 {
+        let mut changed = launch.clone();
+        match field {
+            0 => changed.driver_options["health_tcp_banner"] = json!("other"),
+            1 => changed.driver_options["container_port"] = json!(2222),
+            _ => {
+                changed.services[0].protocol = serde_json::from_value(json!("http1")).unwrap();
+                changed.driver_options.as_object_mut().unwrap().remove("health_tcp_banner");
+            }
+        }
+        assert!(c.with_runtime_delivery(&r.execution, None, Some(&changed), |_| Ok(())).is_err());
+    }
 }
 async fn delivery_node(
     c: &Arc<WorkloadController>,

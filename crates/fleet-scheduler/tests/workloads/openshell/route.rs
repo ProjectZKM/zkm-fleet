@@ -40,7 +40,7 @@ impl Drop for Route {
 }
 impl Route {
     pub(super) async fn start(root: &Path, execution: &ExecutionIdentity, app: SocketAddr) -> Self {
-        Self::prepare(root, execution, Some(app), None).await
+        Self::prepare(root, execution, Some(app), None, "http1").await
     }
 
     pub(super) async fn managed(
@@ -48,7 +48,13 @@ impl Route {
         execution: &ExecutionIdentity,
         controller: Arc<crate::workloads::WorkloadController>,
     ) -> Self {
-        Self::prepare(root, execution, None, Some(controller)).await
+        Self::prepare(root, execution, None, Some(controller), "http1").await
+    }
+
+    pub(super) async fn managed_tcp(
+        root: &Path, execution: &ExecutionIdentity, controller: Arc<crate::workloads::WorkloadController>,
+    ) -> Self {
+        Self::prepare(root, execution, None, Some(controller), "tcp").await
     }
 
     async fn prepare(
@@ -56,6 +62,7 @@ impl Route {
         execution: &ExecutionIdentity,
         app: Option<SocketAddr>,
         controller: Option<Arc<crate::workloads::WorkloadController>>,
+        protocol: &'static str,
     ) -> Self {
         let private = root.join("router-key.pem");
         let public = root.join("router-public.pem");
@@ -151,7 +158,7 @@ impl Route {
                         || !published
                         || headers.get("authorization").and_then(|s|s.to_str().ok()) != Some("Bearer fixture-enrollment")
                         || body["execution"] != serde_json::json!(grant.execution)
-                        || body["service"] != serde_json::json!({"id":grant.service,"protocol":"http1","endpoint_ref":"app"}) {
+                        || body["service"] != serde_json::json!({"id":grant.service,"protocol":protocol,"endpoint_ref":"app"}) {
                         return Err(axum::http::StatusCode::FORBIDDEN);
                     }
                     accepted.fetch_add(1, Ordering::SeqCst);
@@ -284,6 +291,16 @@ impl Route {
         request
             .headers_mut()
             .insert("x-trusted-access", self.access.parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    pub(super) async fn open_tcp(
+        &self,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("{}/v1/tunnel/{}", self.base.replace("http://", "ws://"), self.route)
+            .into_client_request().unwrap();
+        request.headers_mut().insert("authorization", format!("Bearer {}", self.access).parse().unwrap());
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
 

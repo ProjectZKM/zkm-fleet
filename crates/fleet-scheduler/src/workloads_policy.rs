@@ -277,13 +277,16 @@ impl WorkloadController {
             let options = trusted_shim::openshell_services::ServiceOptions::from_request(r)
                 .map_err(|_| Error::Rejected)?;
             let names: Vec<_> = r.services.iter().map(|s| s.id.service.as_str()).collect();
+            let protocol = spec.get("service_protocol").and_then(serde_json::Value::as_str).unwrap_or("http1");
             if serde_json::json!(names)
                 != spec
                     .get("services")
                     .cloned()
                     .unwrap_or(serde_json::json!([]))
+                || r.services.iter().any(|s| serde_json::json!(s.protocol) != protocol)
                 || options.as_ref().is_some_and(|o| {
                     spec["container_port"] != o.container_port
+                        || spec.get("health_tcp_banner").and_then(serde_json::Value::as_str) != o.health_tcp_banner.as_deref()
                         || spec
                             .get("health_path")
                             .and_then(serde_json::Value::as_str)

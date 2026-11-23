@@ -3,6 +3,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import base64
 import hashlib
 import time
+import socketserver
+import threading
 
 
 class Application(BaseHTTPRequestHandler):
@@ -63,4 +65,18 @@ class Application(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+class BannerEcho(socketserver.BaseRequestHandler):
+    def handle(self):
+        if not Application.healthy:
+            return
+        self.request.sendall(b"SSH-2.0-native-fixture\r\n")
+        while chunk := self.request.recv(65536):
+            self.request.sendall(chunk)
+
+
+# A protocol fixture, not an SSH implementation. Real SSH/rsync acceptance lives
+# in Film; this tests raw binary forwarding and application banner readiness.
+tcp = socketserver.ThreadingTCPServer(("127.0.0.1", 8091), BannerEcho)
+tcp.daemon_threads = True
+threading.Thread(target=tcp.serve_forever, daemon=True).start()
 ThreadingHTTPServer(("127.0.0.1", 8090), Application).serve_forever()

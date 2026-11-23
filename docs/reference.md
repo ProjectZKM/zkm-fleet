@@ -562,8 +562,17 @@ deploys the unchanged gateway beside the scheduler. Operators deploy the node's
 native compute driver separately; the scheduler does not launch either process.
 The admission acknowledgement must match
 the node's `shim_openshell` settings. This initial profile supports CPU/memory
-limits and private HTTP app routes; it does not advertise gateway-managed lifecycle
+limits and private HTTP or banner-checked TCP app routes; it does not advertise gateway-managed lifecycle
 or GPU support.
+
+For native SSH services, set `service_protocol: tcp`, `container_port: 22`,
+`health_path: /` and `health_tcp_banner: "SSH-2.0-"` in the existing app spec.
+The launch request must carry the same banner, port and protocol. The banner is
+a nonempty printable ASCII prefix of at most 128 bytes; shim must receive it
+within three seconds before reporting health. A tunnel ACK alone is insufficient.
+Fleet requires `shim-openshell-tcp-services-v1`; old HTTP-only nodes cannot accept
+these workloads. TCP protocols that do not send a banner remain unsupported in
+this native profile. No additional node port is exposed.
 
 The scheduler's observer calls the stock API over mTLS; the key must be a
 same-UID 0600 regular file and certificates must not be group/world writable.

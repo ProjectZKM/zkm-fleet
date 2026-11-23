@@ -36,7 +36,7 @@ fs2 = "0.4"
 prost-native = { package = "prost", version = "0.14" }
 tonic-native = { package = "tonic", version = "0.14", features = ["transport", "tls-ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "d518f38a0c7c214004a71271ac4511af56dfd3ab", features = ["ziren"] }
+trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "e9b5d730738896d0011ab8e9271c14c8c0a289cc", features = ["ziren"] }
 
 [dev-dependencies]
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -49,6 +49,6 @@ fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }
 k256 = { version = "0.13", features = ["ecdsa"] }
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
-trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "e830a0328752d24ac90c99e9e25f417a9d7f467c" }
+trusted-router-transport = { git = "https://github.com/attestx/trusted-data-router", rev = "a57030dfb2787afb76e3f4ee46e03a334eed60e9" }
 tokio-tungstenite = "0.29"
 futures-util = "0.3"
