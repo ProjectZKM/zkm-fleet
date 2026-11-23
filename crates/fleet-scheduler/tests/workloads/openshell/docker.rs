@@ -6,6 +6,16 @@ use std::{path::Path, process::Command};
 mod route;
 #[path = "tcp.rs"]
 mod tcp;
+#[path = "managed.rs"]
+mod managed;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Http,
+    Tcp,
+    /// Single-use ingress, logs-only control, administrative exec and a durable volume.
+    Services,
+}
 
 // Every Docker operation is scoped to this test's unique operator namespace.
 struct DockerScope(String);
@@ -47,6 +57,7 @@ async fn driver(
     socket: &Path,
     port: u16,
     scope: &DockerScope,
+    allow_driver_config: bool,
 ) -> tokio::process::Child {
     let binary =
         std::env::var_os("OPENSHELL_DOCKER_DRIVER_BINARY").expect("native Docker driver binary");
@@ -55,7 +66,7 @@ async fn driver(
     let supervisor =
         std::env::var("OPENSHELL_TEST_SUPERVISOR_IMAGE").expect("pinned supervisor image");
     std::fs::write(root.join("driver.toml"), format!(
-        "sandbox_label={:?}\ngrpc_endpoint=\"https://127.0.0.1:{port}\"\nsupervisor_network_mode=\"host\"\nguest_tls_ca={:?}\nsandbox_runtime_image={runtime:?}\nsupervisor_image={supervisor:?}\n",
+        "sandbox_label={:?}\ngrpc_endpoint=\"https://127.0.0.1:{port}\"\nsupervisor_network_mode=\"host\"\nguest_tls_ca={:?}\nsandbox_runtime_image={runtime:?}\nsupervisor_image={supervisor:?}\nallow_driver_config={allow_driver_config}\n",
         scope.0, root.join("ca.pem")
     )).unwrap();
     let log = std::fs::File::create(root.join("driver.log")).unwrap();
@@ -90,16 +101,30 @@ async fn driver(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
 async fn stock_docker_startup_reaches_gateway_readiness_and_cleans_up_offline() {
-    startup(false).await;
+    startup(Mode::Http).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
 async fn stock_docker_tcp_services_require_banner_and_drain_on_revocation() {
-    startup(true).await;
+    startup(Mode::Tcp).await;
 }
 
-async fn startup(tcp: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires stock gateway/driver binaries, supervisor with shim socket helper, pinned images, Docker and openssl"]
+async fn stock_docker_ingress_logs_exec_and_durable_volume() {
+    startup(Mode::Services).await;
+}
+
+async fn startup(mode: Mode) {
+    let tcp = mode == Mode::Tcp;
+    let services_mode = mode == Mode::Services;
+    let service_names: Vec<String> = if services_mode {
+        vec!["chat".into(), "control".into()]
+    } else {
+        vec!["native-http".into()]
+    };
+    let admission = if services_mode { managed::permissive() } else { admission() };
     let image = std::env::var("OPENSHELL_TEST_WORKLOAD_IMAGE").expect("pinned workload image");
     let command = vec![
         "python3".to_string(),
@@ -111,9 +136,15 @@ async fn startup(tcp: bool) {
         policy_setup_with_inventory("openshell", |report| {
             report.apps[0]["image"] = json!(image);
             report.apps[0]["command"] = json!(command);
-            report.apps[0]["services"] = json!(["native-http"]);
+            report.apps[0]["services"] = json!(if services_mode { json!(["chat", "control"]) } else { json!(["native-http"]) });
             report.apps[0]["container_port"] = json!(if tcp { 8091 } else { 8090 });
             report.apps[0]["health_path"] = json!(if tcp { "/" } else { "/health" });
+            if services_mode {
+                report.apps[0]["ingress"] = json!({"chat": managed::rule()});
+                report.apps[0]["mounts"] = json!([{"name":"scratch","target":managed::VOLUME_TARGET}]);
+                report.runtime_capabilities.push("shim-openshell-ingress-v1".into());
+                report.runtime_capabilities.push("shim-openshell-attachments-v1".into());
+            }
             if tcp {
                 report.apps[0]["service_protocol"] = json!("tcp");
                 report.apps[0]["health_tcp_banner"] = json!("SSH-2.0-");
@@ -141,9 +172,13 @@ async fn startup(tcp: bool) {
     let mut c = Arc::try_unwrap(c).ok().unwrap();
     let p = Arc::get_mut(c.policy.as_mut().unwrap()).unwrap();
     p.test_network(network.clone());
-    p.openshell = Some(Arc::new(
-        crate::openshell::Launches::open(&root.join("launches"), admission()).unwrap(),
-    ));
+    // Exec reaches the stock gateway, which starts after the launch store.
+    let late = Arc::new(managed::LateGateway::default());
+    let mut launches = crate::openshell::Launches::open(&root.join("launches"), admission.clone()).unwrap();
+    if services_mode {
+        launches = launches.with_control(late.clone());
+    }
+    p.openshell = Some(Arc::new(launches));
     let c = Arc::new(c);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -159,7 +194,7 @@ async fn startup(tcp: bool) {
     socket_ready(&compute_socket).await;
     let api_port = gateway::port();
     let (mut gateway_process, mut gateway) =
-        gateway::start_at(&root, &compute_socket, api_port).await;
+        gateway::start_at(&root, &compute_socket, api_port, services_mode).await;
     let gateway_config = crate::config::OpenShellGatewayConfig {
         endpoint: format!("https://127.0.0.1:{api_port}"),
         ca_file: root.join("ca.pem"),
@@ -167,14 +202,18 @@ async fn startup(tcp: bool) {
         key_file: root.join("client.key"),
     };
     let observer = crate::openshell::Observer::new(&gateway_config).unwrap();
+    if services_mode {
+        assert!(late.0.set(crate::openshell::StockGateway::new(&gateway_config).unwrap()).is_ok());
+    }
     let native_socket = root.join("native.sock");
-    let mut native = driver(&root, &native_socket, api_port, &scope).await;
+    let mut native = driver(&root, &native_socket, api_port, &scope, services_mode).await;
     let state = root.join("shim");
     let shim_socket = state.join("control.sock");
     let start_daemon = || {
         let state = state.clone();
         let socket = native_socket.clone();
         let ledger_endpoint = address.clone();
+        let admission_policy = admission.clone();
         let stop = tokio_util::sync::CancellationToken::new();
         let shutdown = stop.clone();
         let daemon = tokio::spawn(async move {
@@ -185,7 +224,7 @@ async fn startup(tcp: bool) {
                     machine: Default::default(),
                     openshell: Some(trusted_shim::openshell_daemon::OpenShellConfig {
                         socket,
-                        admission_policy: admission(),
+                        admission_policy,
                         ledger_endpoint,
                         ledger_ca_file: None,
                         supervisor_image: Some(
@@ -211,13 +250,25 @@ async fn startup(tcp: bool) {
     launch.policy = policy.policy.clone();
     launch.image = image;
     launch.command = command;
-    launch.services = serde_json::from_value(json!([{
-        "id":{"namespace":request.execution.namespace,"workload":request.execution.workload,"service":"native-http"},
-        "protocol":if tcp {"tcp"} else {"http1"},"endpoint_ref":"app"
-    }])).unwrap();
+    let id = |service: &str| json!({"namespace":request.execution.namespace,"workload":request.execution.workload,"service":service});
+    launch.services = serde_json::from_value(if services_mode {
+        json!([{"id":id("chat"),"protocol":"http1","endpoint_ref":"ingress:chat"},
+            {"id":id("control"),"protocol":"http1","endpoint_ref":"control"}])
+    } else {
+        json!([{"id":id("native-http"),"protocol":if tcp {"tcp"} else {"http1"},"endpoint_ref":"app"}])
+    }).unwrap();
     launch.driver_options = if tcp {
         json!({"container_port":8091,"health_path":"/","health_tcp_banner":"SSH-2.0-"})
+    } else if services_mode {
+        json!({"container_port":8090,"health_path":"/health","ingress":{"chat":managed::rule()}})
     } else { json!({"container_port":8090,"health_path":"/health"}) };
+    if services_mode {
+        launch.mounts = vec![trusted_shim::runtime::DurableMount {
+            name: "scratch".into(),
+            target: managed::VOLUME_TARGET.into(),
+            read_only: false,
+        }];
+    }
     let native_policy = SandboxPolicy {
         version: 1,
         process: Some(protocol::sandbox::v1::ProcessPolicy {
@@ -228,7 +279,11 @@ async fn startup(tcp: bool) {
             read_only: ["/usr", "/lib", "/lib64", "/bin", "/etc"]
                 .map(str::to_owned)
                 .to_vec(),
-            read_write: vec!["/tmp".into()],
+            read_write: if services_mode {
+                vec!["/tmp".into(), managed::VOLUME_TARGET.into()]
+            } else {
+                vec!["/tmp".into()]
+            },
             include_workdir: true,
         }),
         ..Default::default()
@@ -379,7 +434,7 @@ async fn startup(tcp: bool) {
     // must independently join the active policy and exact physical instance.
     report.apps[0]["ready"] = json!(true);
     report.runtime_instances[0].ready = true;
-    report.runtime_instances[0].services = vec!["native-http".into()];
+    report.runtime_instances[0].services = service_names.clone();
     c.report("gpu", "session", report.clone()).await.unwrap();
     let published = || {
         c.app_resources(&request.execution.namespace, "model", None)["runtime_instances"]
@@ -446,6 +501,21 @@ async fn startup(tcp: bool) {
                 .as_object()
                 .is_some_and(|p| p.is_empty())
     );
+    if services_mode {
+        let volume = managed::volume(&prepared);
+        managed::exercise(&root, c.clone(), report, &request.execution, &shim_socket,
+            prepared["name"].as_str().unwrap(), observer).await;
+        assert!(scope.ids("container").is_empty());
+        managed::durable(&volume);
+        assert_eq!(network.submitted.load(Ordering::SeqCst), 1);
+        stop.cancel();
+        daemon.await.unwrap();
+        native.kill().await.unwrap();
+        gateway_process.kill().await.unwrap();
+        compute.abort();
+        http.abort();
+        return;
+    }
     if tcp {
         tcp::exercise(&root, c.clone(), report, &request.execution, &shim_socket,
             &owned_native, &host_key, observer).await;

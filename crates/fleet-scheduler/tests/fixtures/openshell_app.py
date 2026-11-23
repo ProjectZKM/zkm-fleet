@@ -57,12 +57,20 @@ class Application(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
         else:
-            assert "X-Trusted-Access" not in self.headers
-            body = self.headers.get("Authorization", "missing").encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.echo(b"")
+
+    def do_POST(self):
+        self.echo(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+
+    def echo(self, request):
+        assert "X-Trusted-Access" not in self.headers
+        body = self.headers.get("Authorization", "missing").encode()
+        if request:
+            body += b"|" + request
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class BannerEcho(socketserver.BaseRequestHandler):
@@ -79,4 +87,7 @@ class BannerEcho(socketserver.BaseRequestHandler):
 tcp = socketserver.ThreadingTCPServer(("127.0.0.1", 8091), BannerEcho)
 tcp.daemon_threads = True
 threading.Thread(target=tcp.serve_forever, daemon=True).start()
-ThreadingHTTPServer(("127.0.0.1", 8090), Application).serve_forever()
+server = ThreadingHTTPServer(("127.0.0.1", 8090), Application)
+# Application output for the logs-only control service.
+print("native fixture listening", flush=True)
+server.serve_forever()

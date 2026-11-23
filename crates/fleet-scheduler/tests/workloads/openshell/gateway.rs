@@ -27,13 +27,15 @@ pub(super) async fn start(
     tokio::process::Child,
     protocol::open_shell_client::OpenShellClient<tonic_native::transport::Channel>,
 ) {
-    start_at(root, socket, port()).await
+    start_at(root, socket, port(), false).await
 }
 
+/// `allow_driver_config` must equal what the compute socket advertises.
 pub(super) async fn start_at(
     root: &Path,
     socket: &Path,
     api_port: u16,
+    allow_driver_config: bool,
 ) -> (
     tokio::process::Child,
     protocol::open_shell_client::OpenShellClient<tonic_native::transport::Channel>,
@@ -116,10 +118,13 @@ pub(super) async fn start_at(
         &["pkey", "-in", "jwt.key", "-pubout", "-out", "jwt.pub"],
     );
     std::fs::write(root.join("jwt.kid"), "shim-acceptance").unwrap();
-    let config = format!(
+    let mut config = format!(
         "[openshell]\nversion=2\n[openshell.gateway.gateway_jwt]\nsigning_key_path={:?}\npublic_key_path={:?}\nkid_path={:?}\ngateway_id=\"shim-acceptance\"\n",
         root.join("jwt.key"), root.join("jwt.pub"), root.join("jwt.kid")
     );
+    if allow_driver_config {
+        config.push_str("[openshell.drivers.docker]\nallow_driver_config = true\n");
+    }
     std::fs::write(root.join("gateway.toml"), config).unwrap();
     let log = std::fs::File::create(root.join("gateway.log")).unwrap();
     let mut gateway = tokio::process::Command::new(binary)

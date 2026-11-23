@@ -21,6 +21,8 @@ use trusted_shim::contracts::{ExecutionIdentity, PolicyRef, ServiceId};
 pub(super) struct Route {
     base: String,
     access: String,
+    key: Vec<u8>,
+    template: Grant,
     revoke: String,
     route: String,
     client: reqwest::Client,
@@ -40,7 +42,7 @@ impl Drop for Route {
 }
 impl Route {
     pub(super) async fn start(root: &Path, execution: &ExecutionIdentity, app: SocketAddr) -> Self {
-        Self::prepare(root, execution, Some(app), None, "http1").await
+        Self::prepare(root, execution, Some(app), None, &[("native-http", "http1", "app")]).await
     }
 
     pub(super) async fn managed(
@@ -48,13 +50,21 @@ impl Route {
         execution: &ExecutionIdentity,
         controller: Arc<crate::workloads::WorkloadController>,
     ) -> Self {
-        Self::prepare(root, execution, None, Some(controller), "http1").await
+        Self::prepare(root, execution, None, Some(controller), &[("native-http", "http1", "app")]).await
+    }
+
+    /// Several services of one allocation, each `(service, protocol, endpoint_ref)`.
+    pub(super) async fn managed_services(
+        root: &Path, execution: &ExecutionIdentity, controller: Arc<crate::workloads::WorkloadController>,
+        services: &'static [(&'static str, &'static str, &'static str)],
+    ) -> Self {
+        Self::prepare(root, execution, None, Some(controller), services).await
     }
 
     pub(super) async fn managed_tcp(
         root: &Path, execution: &ExecutionIdentity, controller: Arc<crate::workloads::WorkloadController>,
     ) -> Self {
-        Self::prepare(root, execution, None, Some(controller), "tcp").await
+        Self::prepare(root, execution, None, Some(controller), &[("native-http", "tcp", "app")]).await
     }
 
     async fn prepare(
@@ -62,7 +72,7 @@ impl Route {
         execution: &ExecutionIdentity,
         app: Option<SocketAddr>,
         controller: Option<Arc<crate::workloads::WorkloadController>>,
-        protocol: &'static str,
+        services: &'static [(&'static str, &'static str, &'static str)],
     ) -> Self {
         let private = root.join("router-key.pem");
         let public = root.join("router-public.pem");
@@ -116,7 +126,7 @@ impl Route {
             service: ServiceId {
                 namespace: execution.namespace.clone(),
                 workload: execution.workload.clone(),
-                service: "native-http".into(),
+                service: services[0].0.into(),
             },
             policy: PolicyRef {
                 issuer: "native-test".into(),
@@ -151,6 +161,11 @@ impl Route {
                 async move {
                     grant.nbf = grants::now();
                     grant.exp = grant.nbf + trusted_router_transport::control::REGISTRATION_LIFETIME;
+                    // Exactly a declared service of this allocation, with its declared endpoint.
+                    let Some((name, protocol, endpoint)) = services.iter().find(|s| body["service"]["id"]["service"] == s.0) else {
+                        return Err(axum::http::StatusCode::FORBIDDEN);
+                    };
+                    grant.service.service = (*name).into();
                     let published = controller.as_ref().is_none_or(|c| c.app_resources(&grant.service.namespace, &grant.service.workload, None)["runtime_instances"]
                         .as_array().is_some_and(|instances| instances.iter().any(|i| i["execution"] == serde_json::json!(grant.execution)
                             && i["services"].as_array().is_some_and(|s| s.iter().any(|s|s==&grant.service.service)))));
@@ -158,7 +173,7 @@ impl Route {
                         || !published
                         || headers.get("authorization").and_then(|s|s.to_str().ok()) != Some("Bearer fixture-enrollment")
                         || body["execution"] != serde_json::json!(grant.execution)
-                        || body["service"] != serde_json::json!({"id":grant.service,"protocol":protocol,"endpoint_ref":"app"}) {
+                        || body["service"] != serde_json::json!({"id":grant.service,"protocol":protocol,"endpoint_ref":endpoint}) {
                         return Err(axum::http::StatusCode::FORBIDDEN);
                     }
                     accepted.fetch_add(1, Ordering::SeqCst);
@@ -225,7 +240,7 @@ impl Route {
         }
         let mut other = Grant {
             purpose: Purpose::Access,
-            ..grant
+            ..grant.clone()
         };
         other.execution.namespace = "other-tenant".into();
         other.service.namespace = "other-tenant".into();
@@ -239,6 +254,8 @@ impl Route {
         Self {
             base,
             access,
+            key,
+            template: grant,
             revoke,
             route,
             client,
@@ -269,6 +286,43 @@ impl Route {
         })
         .await
         .expect("managed outbound connector readiness");
+    }
+
+    /// Another declared service's route and access grant.
+    pub(super) fn service(&self, service: &str) -> (String, String) {
+        let mut grant = Grant { purpose: Purpose::Access, sub: "app-user".into(), ..self.template.clone() };
+        grant.service.service = service.into();
+        (grant.route_id(), grants::sign(&self.key, &grant).unwrap())
+    }
+    pub(super) fn base_url(&self) -> &str {
+        &self.base
+    }
+    pub(super) fn client_for_tests(&self) -> &reqwest::Client {
+        &self.client
+    }
+    /// An access grant bound to exactly one request, as single-use ingress requires.
+    pub(super) fn bound(&self, service: &str, method: &str, path: &str, body: &[u8]) -> String {
+        use sha2::Digest;
+        let mut grant = Grant { purpose: Purpose::Access, sub: "app-user".into(), ..self.template.clone() };
+        grant.service.service = service.into();
+        grant.http_request = Some(grants::HttpRequestBinding {
+            id: hex::encode(sha2::Sha256::digest(uuid::Uuid::new_v4().as_bytes())),
+            method: method.into(),
+            path: path.into(),
+            body_sha256: hex::encode(sha2::Sha256::digest(body)),
+        });
+        grants::sign(&self.key, &grant).unwrap()
+    }
+    pub(super) fn request(&self, service: &str, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let (route, access) = self.service(service);
+        self.client
+            .request(method, format!("{}/v1/http/{route}/{path}", self.base))
+            .header("x-trusted-access", access)
+    }
+    pub(super) async fn service_ready(&self, service: &str) -> bool {
+        let (route, access) = self.service(service);
+        self.client.get(format!("{}/v1/ready/{route}", self.base)).bearer_auth(access)
+            .send().await.unwrap().status() == 204
     }
 
     pub(super) fn get(&self, path: &str) -> reqwest::RequestBuilder {

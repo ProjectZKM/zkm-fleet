@@ -543,7 +543,12 @@ plus an exact `gpu.count`) and rejects any native request that differs. It creat
 each missing volume with the policy's required labels before dispatch and refuses
 existing volumes that upstream admission would not accept. The native driver must
 run with `--admission-config-json` allowing driver config, and with CDI enabled on
-its Docker daemon for GPUs.
+its Docker daemon for GPUs. The gateway's `[openshell.drivers.docker]` section
+needs the same `allow_driver_config = true`, or it refuses the driver at startup.
+Neither the shim nor the driver changes ownership: Docker gives a fresh volume
+the owner and mode of the image's directory at `target`, or `root:root 0755`
+when the image has none. An image whose policy user must write a mount has to
+create that directory with that owner.
 Only a companion advertising `openshell-allocation-v1` exposes its placement
 capability. Native reservations remain `ready: false` with no services; a complete
 reservation set holds quota without repeatedly scheduling another start. With
@@ -809,6 +814,17 @@ doubles; no prover is started and this is not a fresh cryptographic proof test.
 Containers and volumes are scoped by a unique test namespace. Private diagnostics
 and ephemeral certificates remain in the printed temporary directory, outside the
 repository. Cleanup targets only that namespace, including after test failure.
+
+`stock_docker_ingress_logs_exec_and_durable_volume` runs the same stack with a
+permissive admission policy and declares `chat` (single-use ingress) and
+`control`. Through the real router, it checks that a bound request reaches the
+app once, with the caller's own `Authorization`, and that replays, unbound
+grants, other bodies, paths and methods never do. Control returns the app's
+stdout and has no metadata, exec or restart routes. Administrative exec goes
+through the stock gateway as UID 1000, including multi-megabyte stdin, and a
+caller-chosen `root` is refused. Data the exec writes to the durable volume can
+still be read after the sandbox is deleted. The shim-created volume is removed
+when the test ends.
 
 For local acceptance, build the companion `trusted-shim-runtime`, preload
 `python:3.12-slim`, then run from this repository:
