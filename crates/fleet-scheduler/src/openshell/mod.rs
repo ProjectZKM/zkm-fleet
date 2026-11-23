@@ -109,6 +109,8 @@ pub(crate) struct Launches {
     running: Mutex<BTreeSet<String>>,
     permits: Arc<Semaphore>,
     admission_policy: String,
+    /// The acknowledged node policy accepts GPU/volume `driver_config`.
+    attachments: bool,
     readiness: readiness::Cache,
 }
 impl Launches {
@@ -163,6 +165,7 @@ impl Launches {
             running: Mutex::new(BTreeSet::new()),
             permits: Arc::new(Semaphore::new(4)),
             admission_policy,
+            attachments: admission.allow_driver_config,
             readiness: Default::default(),
         })
     }
@@ -280,10 +283,23 @@ fn prepare_inner(
         policy: None,
         instance_id: None,
     };
+    // Callers never learn node-local device ids: an omitted GPU list is
+    // filled from the owning node's Ray grant, which delivery then requires.
+    let mut launch = record.launch()?;
+    if launch.gpus.is_empty() {
+        launch.gpus = c.native_gpus(&launch.execution)?;
+        if !launch.gpus.is_empty() {
+            record.preparation.request = serde_json::to_value(&launch)
+                .map_err(|_| Error::InvalidInput)?
+                .into();
+        }
+    }
+    if (!launch.gpus.is_empty() || !launch.mounts.is_empty()) && !store.attachments {
+        return Err(Error::Rejected);
+    }
     let binding = record.binding()?;
     let request = binding.request();
     record.name = request.name.clone();
-    let launch = record.launch()?;
     c.with_runtime_delivery(&launch.execution, None, Some(&launch), |_| {
         let (policy, _, _) = c
             .policy
@@ -687,7 +703,11 @@ impl compute_driver_server::ComputeDriver for Compute {
                 memory: Some(MemoryResourceCapabilities {
                     limit_supported: true,
                 }),
-                gpu: None,
+                // Only an exact count: Fleet binds it to the Ray-granted devices.
+                gpu: Some(GpuResourceCapabilities {
+                    default_selection_supported: false,
+                    count_selection_supported: true,
+                }),
             }),
             gateway_manages_lifecycle: false,
             driver_reports_runtime_readiness: false,

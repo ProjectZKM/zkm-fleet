@@ -63,6 +63,8 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
     """Requirements compose; automatic ports never replace network support."""
     app = spec.app
     required = {required_capability(spec)}
+    if app.native_access and (app.gpus or app.mounts):
+        required.add("shim-openshell-attachments-v1")
     if app.runtime and app.runtime.driver == "docker":
         required.add(CAPABILITY)
     if app.access_policy_sha256 is not None:
@@ -111,6 +113,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             check_openshell(config, value)
             if "openshell-allocation-v1" in features:
                 native.append("shim-openshell-provisioning-v1")
+                if "openshell-attachments-v1" in features:
+                    native.append("shim-openshell-attachments-v1")
                 if config.shim_network and upstream and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
                     if "openshell-tcp-services-v1" in features:
@@ -387,6 +391,8 @@ class _ProvisionedApp:
     """Holds Ray resources; private creation credentials never enter the actor."""
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
+        # Reported to Fleet, which requires the native launch to attach exactly these.
+        self.gpus = actors._granted_gpus() if spec.app.gpus else []
         status = self.call("allocate")
         if status.get("phase") not in ("reserved", "authorizing", "dispatched", "created"):
             raise RuntimeError("native allocation requires explicit cleanup")
@@ -406,7 +412,7 @@ class _ProvisionedApp:
         # Fleet joins it with authenticated gateway policy readiness.
         ready = bool(self.spec.app.services and status.get("platform_ready") and status.get("application_ready"))
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
-            execution=self.spec.execution, machine=socket.gethostname(), ready=ready,
+            execution=self.spec.execution, machine=socket.gethostname(), ready=ready, gpus=self.gpus,
             native_observation_base64=status.get("native_observation_base64"),
             allocation_reserved=status.get("phase") in ("reserved", "authorizing", "dispatched", "created")).dump()
 

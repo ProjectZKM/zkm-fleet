@@ -101,6 +101,10 @@ impl<'a> Entry<'a> {
     pub fn cleaned(self) -> bool {
         self.0["cleaned"].as_bool() == Some(true)
     }
+    /// A native replica's durable named volumes, each `{name, target, read_only?}`.
+    pub fn durable_mounts(self) -> &'a [Value] {
+        self.0["mounts"].as_array().map(Vec::as_slice).unwrap_or_default()
+    }
     /// The GPUs of each replica, when the entry gives them.
     pub fn gpus(self) -> Option<f64> {
         self.0["gpus"].as_f64()
@@ -239,6 +243,10 @@ impl NodeReport {
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
         if !entry.runtime_capability().is_none_or(has) { return false; }
+        if entry.native_access() && (entry.gpus().is_some_and(|g| g > 0.0) || !entry.durable_mounts().is_empty())
+            && !has("shim-openshell-attachments-v1") {
+            return false;
+        }
         if entry.0["access_policy_sha256"].is_string() {
             let base = match entry.0["runtime"]["driver"].as_str() {
                 Some("docker") => "shim-docker-v1", Some("tee") => "shim-tee-v1",

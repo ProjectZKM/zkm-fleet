@@ -638,6 +638,29 @@ class HttpIngress(Record):
 
 
 @dataclass(kw_only=True)
+class DurableMount(Record):
+    """A native replica's workload-scoped named volume; never a host path.
+    The node's shim derives the volume from the execution and `name`."""
+
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    name: str
+    target: str
+    read_only: bool = False
+
+    def __post_init__(self) -> None:
+        parts = self.target[1:].split("/")
+        if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name)
+                or len(self.target) > 1024 or not self.target.startswith("/")
+                or any(not 33 <= ord(c) <= 126 or c in "\\,:" for c in self.target)
+                or any(p in ("", ".", "..") for p in parts)):
+            raise ModelError("invalid durable mount")
+
+
+# At most this many GPUs or durable mounts per native replica, as in shim.
+MAX_NATIVE_ATTACHMENTS = 16
+
+
+@dataclass(kw_only=True)
 class AppSpec(Record):
     """One entry of `apps:`."""
 
@@ -669,6 +692,8 @@ class AppSpec(Record):
     image: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     volumes: list[str] = field(default_factory=list)
+    # Native OpenShell only: durable named volumes that outlive generations.
+    mounts: list[DurableMount] = field(default_factory=list)
     shm_gb: int | None = None
     ready_timeout_s: float = 600
     # Integrated app worker sharing the replica's dedicated GPU server.
@@ -698,8 +723,17 @@ class AppSpec(Record):
                 raise ModelError("access policy requires a SHA256 commitment and shim runtime")
         if self.health_tcp_banner is not None and not (self.native_access and self.service_protocol is ServiceProtocol.TCP):
             raise ModelError("TCP banner health requires native OpenShell TCP services")
+        if self.mounts and not self.native_access:
+            raise ModelError("durable mounts require native OpenShell")
         if self.native_access:
-            if (self.gpus != 0 or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
+            if (len(self.mounts) > MAX_NATIVE_ATTACHMENTS
+                    or len({m.name for m in self.mounts}) != len(self.mounts)
+                    or len({m.target for m in self.mounts}) != len(self.mounts)):
+                raise ModelError("invalid durable mounts")
+            # Whole GPUs only: shim attaches exactly the device ids Ray granted.
+            if (self.gpus or self.mounts) and self.runtime.driver not in ("docker", "openshell"):
+                raise ModelError("native GPUs and durable mounts require a non-TEE driver")
+            if (not 0 <= self.gpus <= MAX_NATIVE_ATTACHMENTS or self.gpus != int(self.gpus) or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
                     or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
                     or self.ingress or self.volumes or self.shm_gb is not None
                     or any(v is not None for v in (self.port_base, self.entrypoint, self.user, self.workdir))
@@ -822,6 +856,8 @@ class RuntimeInstance(Record):
     ready: bool
     services: list[str] = field(default_factory=list)
     native_observation_base64: str | None = None
+    # Ray's device grant to a native reservation; the launch must attach exactly these.
+    gpu_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(kw_only=True)

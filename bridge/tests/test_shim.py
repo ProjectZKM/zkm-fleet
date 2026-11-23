@@ -553,11 +553,71 @@ def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_pat
     assert next_spec.execution.generation == spec.execution.generation + 1
 
 
-@pytest.mark.parametrize("key,value", [("port_base",123), ("services",["http"]), ("gpus",1),
+@pytest.mark.parametrize("key,value", [("port_base",123), ("services",["http"]), ("gpus",0.5), ("gpus",17),
     ("volumes",["/tmp"]),("memory_gb",0),("cpus",0.5),("user","root"),("entrypoint","/bin/sh")])
 def test_native_profile_rejects_unmapped_settings(tmp_path,key,value):
     data=native_config(tmp_path);data["apps"][0][key]=value
     with pytest.raises(ValueError): reconcile.load_apps(data)
+
+
+def attached_config(tmp_path):
+    data = native_config(tmp_path)
+    data["apps"][0].update(gpus=2, mounts=[{"name":"data","target":"/data"},
+        {"name":"models","target":"/models","read_only":True}])
+    return data
+
+
+@pytest.mark.parametrize("mounts", [[{"name":"Data","target":"/d"}], [{"name":"d","target":"d"}],
+    [{"name":"d","target":"/"}], [{"name":"d","target":"/a/../b"}], [{"name":"d","target":"/a:ro"}],
+    [{"name":"d","target":"/a b"}], [{"name":"d","target":"/d","source":"/host"}],
+    [{"name":"d","target":"/a"},{"name":"d","target":"/b"}], [{"name":"a","target":"/d"},{"name":"b","target":"/d"}],
+    [{"name":f"v{i}","target":f"/v{i}"} for i in range(17)]])
+def test_native_durable_mounts_reject_unscoped_shapes(tmp_path, mounts):
+    data = attached_config(tmp_path); data["apps"][0]["mounts"] = mounts
+    with pytest.raises(ValueError): reconcile.load_apps(data)
+
+
+def test_native_attachments_require_node_capability_and_stay_out_of_docker_and_tee(tmp_path, monkeypatch):
+    spec = reconcile.replica_specs(reconcile.load_apps(attached_config(tmp_path)))["web-0"]
+    assert [m.target for m in spec.app.mounts] == ["/data", "/models"] and spec.app.mounts[1].read_only
+    assert "shim-openshell-attachments-v1" in shim.required_capabilities(spec)
+    plain = reconcile.replica_specs(reconcile.load_apps(native_config(tmp_path)))["web-0"]
+    assert "shim-openshell-attachments-v1" not in shim.required_capabilities(plain)
+    docker = config(tmp_path); docker["apps"][0]["mounts"] = [{"name":"d","target":"/d"}]
+    with pytest.raises(ValueError): reconcile.load_apps(docker)
+    tee = attached_config(tmp_path)
+    tee["apps"][0].update(access_policy_sha256="ab"*32, runtime={"executor":"shim","driver":"tee"})
+    with pytest.raises(ValueError, match="non-TEE"): reconcile.load_apps(tee)
+    config_ = reconcile.load_apps(native_config(tmp_path)).cluster
+    digest = shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(config_)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value = {"protocol":1,"drivers":["docker"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1","openshell-allocation-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-attachments-v1" not in shim.capabilities(config_)
+    value["features"].append("openshell-attachments-v1")
+    assert "shim-openshell-attachments-v1" in shim.capabilities(config_)
+
+
+def test_native_reservation_reports_its_ray_granted_gpu_ids(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    raw = attached_config(tmp_path)
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    spec = e.runtimes.bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    monkeypatch.setattr(actors, "_granted_gpus", lambda: ["3", "5"])
+    monkeypatch.setattr(shim, "invoke", lambda *a, **k: {"phase":"reserved"})
+    health = ReplicaHealth.load(shim._ProvisionedApp(spec).health())
+    assert health.gpus == ["3", "5"] and health.allocation_reserved
+    monkeypatch.setattr(node, "alive_nodes", lambda: [{}])
+    monkeypatch.setattr(node, "resources", lambda: ({"GPU": 8, "CPU": 1}, {"GPU": 6, "CPU": 0}))
+    monkeypatch.setattr(reconcile, "running", lambda: {"web-0": object()})
+    monkeypatch.setattr(reconcile, "health_of", lambda *a, **kw: health)
+    monkeypatch.setattr(shim, "capabilities", lambda _: [])
+    assert e.report()["runtime_instances"][0]["gpu_ids"] == ["3", "5"]
+    # Without GPUs the actor asks Ray for none.
+    plain = native_config(tmp_path)
+    monkeypatch.setattr(actors, "_granted_gpus", Mock(side_effect=AssertionError))
+    plain_spec = shim.RuntimeBook(tmp_path/"plain").bind(reconcile.replica_specs(reconcile.load_apps(plain))["web-0"], "plain")
+    assert ReplicaHealth.load(shim._ProvisionedApp(plain_spec).health()).gpus == []
 
 
 def test_native_capability_requires_matching_configuration_and_allocation_protocol(tmp_path,monkeypatch):

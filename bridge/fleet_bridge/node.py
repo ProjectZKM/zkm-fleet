@@ -701,7 +701,8 @@ class NodeExecutor:
                             services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
                             if (record.driver == "openshell" or record.access_policy_sha256 is not None) and health.allocation_reserved:
                                 runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
-                                    ready=healthy, services=services if healthy else [], native_observation_base64=health.native_observation_base64).dump())
+                                    ready=healthy, services=services if healthy else [], native_observation_base64=health.native_observation_base64,
+                                    gpu_ids=health.gpus).dump())
                             elif services:
                                 runtime_instances.append(RuntimeInstance(entry_name=app["name"], execution=health.execution,
                                     ready=True, services=services).dump())

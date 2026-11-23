@@ -2729,6 +2729,7 @@ dependencies = [
  "parking_lot",
  "prost 0.13.5",
  "prost 0.14.6",
+ "prost-types 0.14.6",
  "rand 0.8.8",
  "rcgen 0.14.10",
  "reqwest 0.12.28",
@@ -8965,7 +8966,7 @@ dependencies = [
 [[package]]
 name = "trusted-attestation-types"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=f7e64eecce1ac36954b42bd703481dd3b091f31c#f7e64eecce1ac36954b42bd703481dd3b091f31c"
+source = "git+https://github.com/attestx/trusted-shim?rev=48d5144bd67a4af7468bb4d26bff195d8f716682#48d5144bd67a4af7468bb4d26bff195d8f716682"
 dependencies = [
  "anyhow",
  "hex",
@@ -9043,7 +9044,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=f7e64eecce1ac36954b42bd703481dd3b091f31c#f7e64eecce1ac36954b42bd703481dd3b091f31c"
+source = "git+https://github.com/attestx/trusted-shim?rev=48d5144bd67a4af7468bb4d26bff195d8f716682#48d5144bd67a4af7468bb4d26bff195d8f716682"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",

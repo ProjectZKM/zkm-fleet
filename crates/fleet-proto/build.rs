@@ -133,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for path in ["RouterSubjectRevocation.application_only", "RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64"] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
+    build = build.field_attribute(".fleet.model.v1.RuntimeInstance.gpu_ids", "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]");
     build = build
         .type_attribute(".fleet.model.v1.NodePin", "#[serde(transparent)]")
         .type_attribute(".fleet.model.v1.StringList", "#[serde(transparent)]")

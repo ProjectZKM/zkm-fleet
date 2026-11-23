@@ -142,6 +142,12 @@ impl NodeReport {
             let e = &instance.execution;
             let entry = self.entry(&instance.entry_name).ok_or_else(|| anyhow::anyhow!("runtime instance has no app"))?;
             anyhow::ensure!(instance.native_observation_base64.is_none() || entry.native_access(), "native observation requires an access-policy allocation");
+            // A native reservation reports exactly its Ray-granted devices.
+            let mut ids = std::collections::HashSet::new();
+            anyhow::ensure!(instance.gpu_ids.len() == if entry.native_access() { entry.gpus().unwrap_or(0.0) as usize } else { 0 }
+                && instance.gpu_ids.iter().all(|id| !id.is_empty() && id.len() <= 64
+                    && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') && ids.insert(id)),
+                "runtime GPU ids differ from the app's grant");
             anyhow::ensure!(entry.0["runtime"]["executor"] == "shim" && (entry.is_container() || entry.is_prover())
                 && e.node_id == self.machine && e.generation > 0
                 && e.workload == entry.app() && (e.namespace == entry.namespace() || Some(e.namespace.as_str()) == entry.namespace_reference())
@@ -419,7 +425,29 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 11] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 13] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner"];
+    pub const CONTAINER_SETTINGS: [&'static str; 14] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner", "mounts"];
+    /// At most this many GPUs or durable mounts per native replica, as in shim.
+    pub const MAX_NATIVE_ATTACHMENTS: usize = 16;
+
+    /// Durable named volumes of a native replica: `{name, target, read_only?}`.
+    /// Shapes match shim's own checks so an admitted app never fails on a node.
+    pub fn valid_durable_mounts(mounts: &Value) -> bool {
+        let Some(mounts) = mounts.as_array() else { return false };
+        let (mut names, mut targets) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+        mounts.len() <= Self::MAX_NATIVE_ATTACHMENTS && mounts.iter().all(|m| {
+            let Some(m) = m.as_object() else { return false };
+            let name = m.get("name").and_then(Value::as_str).unwrap_or("");
+            let target = m.get("target").and_then(Value::as_str).unwrap_or("");
+            m.keys().all(|k| ["name", "target", "read_only"].contains(&k.as_str()))
+                && m.get("read_only").is_none_or(Value::is_boolean)
+                && !name.is_empty() && name.len() <= 63 && name.as_bytes()[0].is_ascii_alphanumeric()
+                && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && target.len() <= 1024 && target.starts_with('/')
+                && target.bytes().all(|b| b.is_ascii_graphic() && !b"\\,:".contains(&b))
+                && target[1..].split('/').all(|p| !p.is_empty() && p != "." && p != "..")
+                && names.insert(name) && targets.insert(target)
+        })
+    }
 
     pub fn local_container_runtime(runtime: Option<&Value>) -> bool {
         runtime.is_some_and(|v| ["docker", "tee", "tee-simulation"].iter().any(|driver|
@@ -448,7 +476,13 @@ impl RegisterAppRequest {
         if native {
             let services = spec.get("services").and_then(Value::as_array).is_some_and(|v| !v.is_empty());
             let health = spec.get("health_path").map_or(Some("/"), Value::as_str);
-            anyhow::ensure!(spec.get("gpus").and_then(Value::as_f64) == Some(0.0)
+            // Whole GPUs only: shim attaches exactly the device ids Ray granted.
+            let gpus = spec.get("gpus").and_then(Value::as_f64);
+            let attached = gpus.is_some_and(|g| g > 0.0) || spec.get("mounts").is_some();
+            anyhow::ensure!(!attached || matches!(spec["runtime"]["driver"].as_str(), Some("docker" | "openshell")),
+                "native GPUs and durable mounts require a non-TEE driver");
+            anyhow::ensure!(spec.get("mounts").is_none_or(Self::valid_durable_mounts), "invalid durable mounts");
+            anyhow::ensure!(gpus.is_some_and(|g| g >= 0.0 && g <= Self::MAX_NATIVE_ATTACHMENTS as f64 && g.fract() == 0.0)
                 && spec.get("cpus").and_then(Value::as_u64).is_some_and(|v| v > 0 && v <= u32::MAX as u64 / 1000)
                 && spec.get("memory_gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v * (1u64 << 30) as f64 >= (6 * 1024 * 1024) as f64 && v * ((1u64 << 30) as f64) < u64::MAX as f64)
                 && ["port_base", "entrypoint", "user", "workdir", "shm_gb"].iter().all(|k| !spec.contains_key(*k))
@@ -463,6 +497,7 @@ impl RegisterAppRequest {
                     && !p.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'#') && (services || p == "/")),
                 "native OpenShell requires CPU/memory limits and private HTTP services or TCP services with banner health");
         }
+        anyhow::ensure!(native || !spec.contains_key("mounts"), "durable mounts require native OpenShell");
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
             anyhow::ensure!(native || Self::local_container_runtime(spec.get("runtime")),
                 "transport settings require explicit shim execution");
@@ -709,8 +744,8 @@ mod tests {
         let spec = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"approved", "cpus":1,"gpus":0,"memory_gb":0.125});
         let request = |spec:Value| RegisterAppRequest {name:"native".into(),spec:spec.into(),..Default::default()};
         request(spec.clone()).validate().unwrap();
-        for (field,value) in [("port_base",json!(8080)),("services",json!(["http"])),("gpus",json!(1)),
-            ("cpus",json!(0)),("cpus",json!(0.5)),("memory_gb",json!(0.001)),("volumes",json!(["/host"])),("entrypoint",json!("/bin/sh"))] {
+        for (field,value) in [("port_base",json!(8080)),("services",json!(["http"])),("gpus",json!(0.5)),("gpus",json!(17)),
+            ("gpus",Value::Null),("cpus",json!(0)),("cpus",json!(0.5)),("memory_gb",json!(0.001)),("volumes",json!(["/host"])),("entrypoint",json!("/bin/sh"))] {
             let mut bad = spec.clone(); bad[field] = value;
             assert!(request(bad).validate().is_err(),"{field}");
         }
@@ -739,6 +774,69 @@ mod tests {
             ("health_path",json!("/a\\b")),("health_path",json!("/a\n")),("health_path",Value::Null)] {
             let mut bad=http.clone();bad[field]=value;assert!(request(bad).validate().is_err(),"{field}");
         }
+    }
+
+    #[test]
+    fn native_gpus_and_durable_mounts_are_validated_and_require_attachment_capability() {
+        let request = |spec:&Value| RegisterAppRequest {name:"native".into(),spec:spec.clone().into(),..Default::default()};
+        let spec = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"approved","cpus":1,"gpus":2,"memory_gb":0.125,
+            "mounts":[{"name":"data","target":"/data"},{"name":"models-1","target":"/srv/models","read_only":true}]});
+        request(&spec).validate().unwrap();
+        let entry = crate::workload::Entry(&spec);
+        let mut node = NodeReport::default();
+        node.runtime_capabilities = vec!["shim-openshell-provisioning-v1".into()];
+        assert!(!node.supports_runtime(entry));
+        node.runtime_capabilities.push("shim-openshell-attachments-v1".into());
+        assert!(node.supports_runtime(entry));
+        let mut plain = spec.clone(); plain["gpus"] = json!(0); plain.as_object_mut().unwrap().remove("mounts");
+        node.runtime_capabilities.pop();
+        assert!(node.supports_runtime(crate::workload::Entry(&plain)));
+        for mounts in [json!({}), json!([{"name":"Data","target":"/d"}]), json!([{"name":"-d","target":"/d"}]),
+            json!([{"name":"d","target":"d"}]), json!([{"name":"d","target":"/"}]), json!([{"name":"d","target":"/a/../b"}]),
+            json!([{"name":"d","target":"/a:ro"}]), json!([{"name":"d","target":"/a,b"}]), json!([{"name":"d","target":"/a b"}]),
+            json!([{"name":"d","target":"/d","read_only":"yes"}]), json!([{"name":"d","target":"/d","source":"/host"}]),
+            json!([{"name":"d","target":"/a"},{"name":"d","target":"/b"}]), json!([{"name":"a","target":"/d"},{"name":"b","target":"/d"}]),
+            Value::Array((0..17).map(|i| json!({"name":format!("v{i}"),"target":format!("/v{i}")})).collect())] {
+            let mut bad = spec.clone(); bad["mounts"] = mounts.clone();
+            assert!(request(&bad).validate().is_err(), "{mounts}");
+        }
+        // Durable mounts are native-only; attachments stay out of TEE drivers.
+        let docker = json!({"runtime":{"executor":"shim","driver":"docker"},"image":"x","port_base":8000,"mounts":[{"name":"d","target":"/d"}]});
+        assert!(request(&docker).validate().is_err());
+        for driver in ["tee", "tee-simulation"] {
+            let mut tee = spec.clone();
+            tee["runtime"]["driver"] = json!(driver); tee["access_policy_sha256"] = json!("ab".repeat(32));
+            assert!(request(&tee).validate().is_err(), "{driver}");
+            tee["gpus"] = json!(0); tee.as_object_mut().unwrap().remove("mounts");
+            request(&tee).validate().unwrap();
+        }
+        let mut rules = spec.clone();
+        rules["runtime"]["driver"] = json!("docker"); rules["access_policy_sha256"] = json!("ab".repeat(32));
+        request(&rules).validate().unwrap();
+    }
+
+    #[test]
+    fn native_reservations_report_exactly_their_granted_gpu_ids() {
+        let report = |gpus: u64, ids: &[&str], native: bool| {
+            let mut app = json!({"name":"model","app":"model","namespace":"ns","kind":"app","replicas":1,"gpus":gpus,
+                "runtime":{"executor":"shim","driver":if native {"openshell"} else {"docker"}},"services":[]});
+            if !native { app["services"] = json!(["http"]); }
+            let mut r = NodeReport { machine: "m".into(), apps: vec![app.into()], ..Default::default() };
+            r.runtime_instances = serde_json::from_value(json!([{"entry_name":"model","ready":!native,
+                "services":if native { json!([]) } else { json!(["http"]) },"gpu_ids":ids,
+                "execution":{"namespace":"ns","workload":"model","allocation_id":"model-0","lease_id":"l","generation":1,"node_id":"m"}}])).unwrap();
+            r
+        };
+        report(2, &["3", "5"], true).validate_runtime_instances().unwrap();
+        report(0, &[], true).validate_runtime_instances().unwrap();
+        report(1, &[], false).validate_runtime_instances().unwrap();
+        for (gpus, ids, native) in [(2, &["3"][..], true), (2, &["3", "3"], true), (1, &["3", "5"], true),
+            (1, &["gpu/3"], true), (1, &[""], true), (0, &["3"], true), (1, &["3"], false)] {
+            assert!(report(gpus, ids, native).validate_runtime_instances().is_err(), "{gpus} {ids:?} {native}");
+        }
+        // Absent ids stay off the wire, so older schedulers read new reports unchanged.
+        let encoded = serde_json::to_value(&report(0, &[], true).runtime_instances[0]).unwrap();
+        assert!(encoded.get("gpu_ids").is_none());
     }
 
     #[test]

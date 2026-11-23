@@ -36,13 +36,14 @@ fs2 = "0.4"
 prost-native = { package = "prost", version = "0.14" }
 tonic-native = { package = "tonic", version = "0.14", features = ["transport", "tls-ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "f7e64eecce1ac36954b42bd703481dd3b091f31c", features = ["ziren"] }
+trusted-shim = { git = "https://github.com/attestx/trusted-shim", rev = "48d5144bd67a4af7468bb4d26bff195d8f716682", features = ["ziren"] }
 
 [dev-dependencies]
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 bincode.workspace = true
 prost.workspace = true
+prost-types-native = { package = "prost-types", version = "0.14" }
 rcgen = "0.14"
 fleet-proof-app = { path = "../fleet-proof-app" }
 fleet-ziren-node = { path = "../fleet-ziren-node", default-features = false }

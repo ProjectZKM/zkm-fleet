@@ -358,6 +358,9 @@ message RuntimeInstance {
   // Bounded, sanitized native compute observation. Never includes a spec,
   // credentials, node-local service endpoints or platform diagnostic messages.
   optional string native_observation_base64 = 5;
+  // Host GPU ids Ray granted this native reservation; empty without GPUs.
+  // The launch must attach exactly these devices.
+  repeated string gpu_ids = 6;
 }
 
 message JobReport {

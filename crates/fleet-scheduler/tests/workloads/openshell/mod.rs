@@ -269,6 +269,8 @@ async fn stock_gateway_startup_through_fleet_and_persistent_shim() {
     startup(false, true, "docker").await;
 }
 
+mod attachments;
+
 mod docker;
 
 mod gateway;

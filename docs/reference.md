@@ -506,11 +506,32 @@ from the selected OpenShell rules; there is no enable toggle. Omit it when the
 user has no rules: effective permissions then remain exactly the driver boundary.
 Legacy `driver: openshell` records remain readable for recovery. A rule change
 requires confirmed cleanup and a new generation; an upgrade never migrates one.
-This profile requires `gpus: 0`, positive integer `cpus`, and `memory_gb` (at least
-6 MiB); command/environment are literal. Optional HTTP app services declare
-`services`, one `container_port` and `health_path` (default `/`). These ports are
-private to the workload; `port_base`, `control`, TCP, ingress rewriting, volumes,
-entrypoint, workdir, user overrides and GPU mappings remain unsupported.
+This profile requires a whole `gpus` count (0 to 16), positive integer `cpus`, and
+`memory_gb` (at least 6 MiB); command/environment are literal. Optional HTTP app
+services declare `services`, one `container_port` and `health_path` (default `/`).
+These ports are private to the workload; `port_base`, `control`, TCP, ingress
+rewriting, host `volumes`, entrypoint, workdir and user overrides remain unsupported.
+
+**GPUs and durable storage.** With `gpus` above zero, the reservation actor reports
+the device ids Ray granted it as `RuntimeInstance.gpu_ids`; a report whose ids are
+not exactly that many distinct ids is dropped. Durable storage is `mounts`, a list
+of up to 16 `{name, target, read_only}` entries (`name` lowercase letters, digits
+and `-`; `target` an absolute container path). Each becomes a node-local named
+Docker volume derived from the namespace, workload and `name`: stable across
+generations, unnameable by another workload, and never removed by runtime
+cleanup. Both stay out of TEE drivers. Placement requires
+`shim-openshell-attachments-v1`, which a companion advertises only when its
+driver's acknowledged admission policy has `allow_driver_config: true`; the
+scheduler's `admission_policy` acknowledgement must then carry the same setting,
+or preparation is refused. The launch request carries `gpus` and `mounts`: Fleet
+requires `gpus` to equal the owning node's report and `mounts` to equal the
+admitted manifest. The shim translates them into the stock driver's own
+`driver_config` (`nvidia.com/gpu=<id>` CDI devices and `type: volume` mounts,
+plus an exact `gpu.count`) and rejects any native request that differs. It creates
+each missing volume with the policy's required labels before dispatch and refuses
+existing volumes that upstream admission would not accept. The native driver must
+run with `--admission-config-json` allowing driver config, and with CDI enabled on
+its Docker daemon for GPUs.
 Only a companion advertising `openshell-allocation-v1` exposes its placement
 capability. Native reservations remain `ready: false` with no services; a complete
 reservation set holds quota without repeatedly scheduling another start. With
@@ -561,9 +582,9 @@ to this socket. Fleet's default [Compose service](installation.md#openshell-gate
 deploys the unchanged gateway beside the scheduler. Operators deploy the node's
 native compute driver separately; the scheduler does not launch either process.
 The admission acknowledgement must match
-the node's `shim_openshell` settings. This initial profile supports CPU/memory
-limits and private HTTP or banner-checked TCP app routes; it does not advertise gateway-managed lifecycle
-or GPU support.
+the node's `shim_openshell` settings. This profile supports CPU/memory
+limits, exact-count GPUs, durable volumes, and private HTTP or banner-checked TCP app routes. It
+advertises GPU count selection only (no driver-chosen default devices) and no gateway-managed lifecycle.
 
 For native SSH services, set `service_protocol: tcp`, `container_port: 22`,
 `health_path: /` and `health_tcp_banner: "SSH-2.0-"` in the existing app spec.
@@ -618,6 +639,8 @@ The startup flow is synchronous through proof verification and native creation:
 2. `POST /policy/openshell/launches` with `request` (the exact admitted
    `LaunchRequest`), `native_policy_base64` (stock `SandboxPolicy` protobuf),
    `principal`, `cost`, and `expires_at` (Unix seconds, at most 15 minutes ahead).
+   Omit `gpus`: Fleet fills the owning node's reported grant before translating, so
+   callers never handle node-local device ids. An explicit list must match it.
    The response contains a deterministic `name`, mapped `workspace`, and
    `create_request_base64` (stock
    public `CreateSandboxRequest` protobuf). It is private and `no-store`; workload

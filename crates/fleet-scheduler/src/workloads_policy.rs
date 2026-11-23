@@ -179,6 +179,10 @@ impl WorkloadController {
             Ok(instance.native_observation_base64.clone())
         })
     }
+    /// Ray's device grant for a native reservation, as its owning node reports it.
+    pub(crate) fn native_gpus(&self, e: &ExecutionIdentity) -> Result<Vec<String>> {
+        self.with_runtime_delivery_info(e, None, None, |_, instance, _| Ok(instance.gpu_ids.clone()))
+    }
     pub(crate) fn native_readiness_basis(
         &self,
         launch: &trusted_shim::runtime::LaunchRequest,
@@ -271,6 +275,13 @@ impl WorkloadController {
                     _ => false,
                 }
                 || r.trust.policy_proof != trusted_shim::proof::ProofRequirement::NotRequired
+                // Exactly the devices Ray granted this reservation on its node,
+                // and exactly the admitted durable volumes.
+                || r.gpus != instance.gpu_ids
+                || r.gpus.len() as f64 != spec["gpus"].as_f64().unwrap_or(0.0)
+                || spec.get("mounts").map_or(Some(Vec::new()), |m| {
+                    serde_json::from_value::<Vec<trusted_shim::runtime::DurableMount>>(m.clone()).ok()
+                }).as_ref() != Some(&r.mounts)
             {
                 return Err(Error::Rejected);
             }

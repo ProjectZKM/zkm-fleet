@@ -209,6 +209,9 @@ Use the reviewed proof guest and remote proof endpoint in the existing `fleet.ya
 `/run/zkm-fleet/openshell/compute.sock` and `gateway.endpoint` to
 `https://openshell-gateway:17670`. Its CA and operator certificate/key paths must
 refer to files under `/etc/zkm-fleet`. Admission policy must match the node driver.
+For native GPUs or durable `mounts`, run the node driver with an admission policy
+that sets `allow_driver_config: true` and use the same acknowledgement here; see
+[GPUs and durable storage](reference.md#proofs).
 Do not enable this block until the approved guest and remote proof worker are ready.
 
 Initialize the two new named volumes **once**, before enabling the scheduler's
