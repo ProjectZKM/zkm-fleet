@@ -44,7 +44,7 @@ fn same_slot(a: &ExecutionIdentity, b: &ExecutionIdentity) -> bool {
 
 impl WorkloadController {
     pub(crate) fn active_native_names(&self) -> Vec<String> {
-        let i = self.inner.lock();
+        let i = self.inner.read();
         i.workers
             .values()
             .filter(|w| !w.ended && now() - w.seen < self.fleet.cfg.node_stale_secs as f64)
@@ -165,12 +165,13 @@ impl WorkloadController {
         {
             return false;
         }
-        let Ok(_quota) = self.fleet.policy_allocation_guard(
-            &execution.namespace,
-            &format!("deployment:{worker_id}-{}", instance.entry_name),
-        ) else {
+        if self
+            .fleet
+            .policy_allocation_admits(&execution.namespace, &format!("deployment:{worker_id}-{}", instance.entry_name))
+            .is_err()
+        {
             return false;
-        };
+        }
         crate::openshell::services_ready(self, instance, &worker.session)
     }
 
@@ -202,7 +203,8 @@ impl WorkloadController {
             },
         )
     }
-    /// Hold the live deployment/quota fence through a private delivery transition.
+    /// Hold the execution fence through a private delivery transition: the
+    /// deployment, session and quota checked here stay valid until `op` returns.
     /// Native reservations must be reported by the owning fresh node session.
     pub(crate) fn with_runtime_delivery<T>(
         &self,
@@ -220,7 +222,18 @@ impl WorkloadController {
         launch: Option<&trusted_shim::runtime::LaunchRequest>,
         op: impl FnOnce(&str, &fleet_proto::model::v1::RuntimeInstance, &str) -> Result<T>,
     ) -> Result<T> {
-        let i = self.inner.lock();
+        let _fence = self.fleet.execution_fence.read();
+        let (worker_id, instance, session) = self.delivery_basis(e, caller, launch)?;
+        op(&worker_id, &instance, &session)
+    }
+    /// Validates under brief locks; the caller holds the execution fence.
+    fn delivery_basis(
+        &self,
+        e: &ExecutionIdentity,
+        caller: Option<(&str, &str)>,
+        launch: Option<&trusted_shim::runtime::LaunchRequest>,
+    ) -> Result<(String, fleet_proto::model::v1::RuntimeInstance, String)> {
+        let i = self.inner.read();
         let (worker_id, worker) = owner(&i, e, self.fleet.cfg.node_stale_secs)?;
         if caller.is_some_and(|(id, session)| id != worker_id || session != worker.session)
             || worker.draining
@@ -314,11 +327,11 @@ impl WorkloadController {
                 return Err(Error::Rejected);
             }
         }
-        let _quota = self.fleet.policy_allocation_guard(
+        self.fleet.policy_allocation_admits(
             &e.namespace,
             &format!("deployment:{worker_id}-{}", instance.entry_name),
         )?;
-        op(worker_id, instance, &worker.session)
+        Ok((worker_id.to_owned(), instance.clone(), worker.session.clone()))
     }
 
     /// An operator may prepare exactly one identity for an already admitted
@@ -336,9 +349,9 @@ impl WorkloadController {
         }) {
             return Err(Error::Conflict);
         }
-        let _quota = self
-            .fleet
-            .policy_allocation_guard(&e.namespace, &format!("deployment:{worker_id}-{entry}"))?;
+        // Exclusive: this lock holds the execution fence for the durable write.
+        self.fleet
+            .policy_allocation_admits(&e.namespace, &format!("deployment:{worker_id}-{entry}"))?;
         if let Some(previous) = i.policy_preparations.get(&key) {
             return if previous == e {
                 Ok(())
@@ -361,8 +374,19 @@ impl WorkloadController {
 }
 
 impl ExecutionAuthority for WorkloadController {
+    /// The fence, held shared, is the guard: every change that could invalidate
+    /// these checks waits for it, while unrelated readers of the workload state
+    /// and other guards proceed through the ledger transaction.
     fn guard(&self, execution: &ExecutionIdentity) -> Result<Box<dyn ExecutionGuard + '_>> {
-        let i = self.inner.lock();
+        let fence = self.fleet.execution_fence.read();
+        self.admit(execution)?;
+        Ok(Box::new(fence))
+    }
+}
+
+impl WorkloadController {
+    fn admit(&self, execution: &ExecutionIdentity) -> Result<()> {
+        let i = self.inner.read();
         let (worker_id, worker) = owner(&i, execution, self.fleet.cfg.node_stale_secs)?;
         if i.policy_preparations
             .values()
@@ -395,10 +419,9 @@ impl ExecutionAuthority for WorkloadController {
             pending_entry(&i, worker_id, execution)?
         };
         intent(&i, worker_id, worker, entry, execution)?;
-        let quota = self.fleet.policy_allocation_guard(
+        self.fleet.policy_allocation_admits(
             &execution.namespace,
             &format!("deployment:{worker_id}-{entry}"),
-        )?;
-        Ok(Box::new((i, quota)))
+        )
     }
 }

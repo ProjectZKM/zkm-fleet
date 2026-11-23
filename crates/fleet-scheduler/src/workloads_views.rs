@@ -15,7 +15,7 @@ impl WorkloadController {
         let machine = machine
             .filter(|m| !m.is_empty())
             .or(proof_machine.as_deref());
-        let i = self.inner.lock();
+        let i = self.inner.read();
         if let Some(machine) = machine {
             return Some(
                 i.workers
@@ -61,7 +61,7 @@ impl WorkloadController {
     /// apps keep their settings. Quotas are shared namespace limits, not independent limits for
     /// each app.
     pub(crate) fn app_resources(&self, namespace: &str, app: &str, tag: Option<&str>) -> Value {
-        let i = self.inner.lock();
+        let i = self.inner.read();
         let deployments: Vec<_> = i
             .deployments
             .values()
@@ -195,7 +195,7 @@ impl WorkloadController {
     /// A template's job records (not purged; the selected tag's when one is), counted the way
     /// every app's `jobs` are.
     fn template_jobs(&self, app: &WorkloadTemplate, tag: Option<&str>) -> Value {
-        let i = self.inner.lock();
+        let i = self.inner.read();
         let jobs: Vec<&Job> = i.jobs.values()
             .filter(|r| !r.purged && r.batch == app.name && r.namespace == app.namespace
                 && tag.is_none_or(|tag| r.tag.as_deref().unwrap_or("") == tag))
@@ -281,7 +281,7 @@ impl WorkloadController {
             "diagnostics": {"anchor_replica": anchored},
         });
         let mut sections = vec![("proof", proof)];
-        let template = self.inner.lock().apps.get(&app.name).filter(|t| t.persistent && !t.removed && t.namespace == app.namespace).cloned();
+        let template = self.inner.read().apps.get(&app.name).filter(|t| t.persistent && !t.removed && t.namespace == app.namespace).cloned();
         if let Some(template) = template {
             sections.push(("spec", Self::spec_value(&template)));
         }

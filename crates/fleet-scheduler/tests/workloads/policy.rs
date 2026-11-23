@@ -296,6 +296,44 @@ async fn policy_setup() -> (
     policy_setup_with_driver("docker").await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_execution_guard_fences_invalidating_changes_but_not_readers() {
+    let (_dir, c, _report, _p, r) = policy_setup().await;
+    let guard = c.guard(&r.execution).unwrap();
+    // Other guards and plain readers proceed while a ledger transaction runs.
+    std::thread::scope(|s| s.spawn(|| assert!(c.guard(&r.execution).is_ok())).join().unwrap());
+    let done = |f: Box<dyn FnOnce() + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            f();
+            tx.send(()).unwrap();
+        });
+        rx
+    };
+    // Anything that could invalidate the guard waits for it.
+    let changed = done(Box::new({
+        let c = c.clone();
+        move || c.inner.lock().workers.get_mut("gpu").unwrap().draining = true
+    }));
+    let suspended = done(Box::new({
+        let (fleet, ns) = (c.fleet.clone(), r.execution.namespace.clone());
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(fleet.suspend_namespace(&ns, true)).unwrap();
+        }
+    }));
+    let waiting = Duration::from_millis(300);
+    assert!(changed.recv_timeout(waiting).is_err());
+    assert!(suspended.recv_timeout(waiting).is_err());
+    // Readers are not queued behind the waiting writers.
+    c.active_native_names();
+    assert!(c.inner.read().workers.contains_key("gpu"));
+    drop(guard);
+    changed.recv_timeout(Duration::from_secs(5)).unwrap();
+    suspended.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(c.guard(&r.execution).is_err());
+}
+
 #[tokio::test]
 async fn native_reservation_completes_starting_before_application_readiness() {
     let (_dir,c,report,_,_) = policy_setup_with_driver("openshell").await;

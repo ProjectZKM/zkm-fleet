@@ -148,12 +148,59 @@ pub struct WorkloadController {
     fleet: Arc<Scheduler>,
     cluster: String,
     dir: PathBuf,
-    inner: Mutex<WorkloadState>,
+    inner: WorkloadLock,
     ops: tokio::sync::Mutex<()>,
     notify: tokio::sync::Notify,
     pub(crate) policy: Option<Arc<crate::policy_gateway::PolicyGateway>>,
     pub(crate) deliveries: crate::runtime_delivery::DeliveryQueue,
 }
+/// Workload state behind the scheduler's execution fence. `lock` is for any
+/// change: it takes the fence exclusively, so it waits for in-flight execution
+/// guards. `read` cannot change anything and does not wait for them, so views
+/// and guard validation never stall behind a policy ledger write.
+struct WorkloadLock {
+    fleet: Arc<Scheduler>,
+    state: Mutex<WorkloadState>,
+}
+
+struct WorkloadWrite<'a> {
+    // Declared first, so the state is released before the fence.
+    state: parking_lot::MutexGuard<'a, WorkloadState>,
+    _fence: parking_lot::RwLockWriteGuard<'a, ()>,
+}
+
+struct WorkloadRead<'a>(parking_lot::MutexGuard<'a, WorkloadState>);
+
+impl WorkloadLock {
+    fn lock(&self) -> WorkloadWrite<'_> {
+        let fence = self.fleet.execution_fence.write();
+        WorkloadWrite { state: self.state.lock(), _fence: fence }
+    }
+    fn read(&self) -> WorkloadRead<'_> {
+        WorkloadRead(self.state.lock())
+    }
+}
+
+impl std::ops::Deref for WorkloadWrite<'_> {
+    type Target = WorkloadState;
+    fn deref(&self) -> &WorkloadState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for WorkloadWrite<'_> {
+    fn deref_mut(&mut self) -> &mut WorkloadState {
+        &mut self.state
+    }
+}
+
+impl std::ops::Deref for WorkloadRead<'_> {
+    type Target = WorkloadState;
+    fn deref(&self) -> &WorkloadState {
+        &self.0
+    }
+}
+
 /// The proof apps an enabled integrated worker feeds: (namespace, app).
 fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
     inner.deployments.values()
@@ -192,10 +239,10 @@ impl WorkloadController {
         let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;
         let controller = Self {
             deliveries: crate::runtime_delivery::DeliveryQueue::open(&dir.join("runtime-deliveries"))?,
+            inner: WorkloadLock { fleet: fleet.clone(), state: Mutex::new(inner) },
             fleet,
             cluster,
             dir,
-            inner: Mutex::new(inner),
             ops: tokio::sync::Mutex::new(()),
             notify: tokio::sync::Notify::new(),
             policy,
@@ -207,7 +254,7 @@ impl WorkloadController {
         &self.fleet
     }
     fn refresh_worker_owned_apps(&self) {
-        self.update_worker_owned_apps(&self.inner.lock());
+        self.update_worker_owned_apps(&self.inner.read());
     }
     fn update_worker_owned_apps(&self, inner: &WorkloadState) {
         self.fleet.set_worker_owned_apps(worker_owned(inner));
