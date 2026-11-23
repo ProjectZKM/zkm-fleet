@@ -704,6 +704,15 @@ impl WorkloadController {
                                 set[k] = scale.target[k].clone();
                             }
                         }
+                        // A hard limit the node's entry has and the target doesn't, from a local
+                        // edit, goes too; an entry without one is sent none.
+                        let configured = self.inner.lock().workers.get(&intent.worker)
+                            .and_then(|w| w.report.entry(intent.entry().name()).map(|e| e.0.clone()));
+                        for k in Entry::LIMITS {
+                            if scale.target[k].is_null() && configured.as_ref().is_some_and(|e| !e[k].is_null()) {
+                                set[k] = Value::Null;
+                            }
+                        }
                         EntryMut(&mut set).set_disabled(scale.disabled);
                         let sent = self.tell_nodes([&intent.worker], message::entry(intent.entry().name()), message::set(set))?;
                         scale.update = sent.into_iter().next();
