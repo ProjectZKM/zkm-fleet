@@ -123,7 +123,7 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
             factory = ProvisionedApp if spec.app.native_access else ShimApp
             # A distinct worker environment loads the new adapter without
             # restarting Ray or any detached legacy app during bridge upgrades.
-            adapter = "openshell-allocation-v1" if spec.app.native_access else "runtime-daemon-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
+            adapter = "openshell-allocation-v1" if spec.app.native_access else "runtime-resume-v1" if spec.cluster.shim_daemon else "runtime-recovery-v1"
             extra["runtime_env"] = {"env_vars": {"FLEET_SHIM_ADAPTER": adapter}}
         options = factory.options(
             name=spec.name,
