@@ -47,9 +47,20 @@ cp -p "$ETC/apps.yaml" "$STAGE/apps.before"
 cp -p "$ETC/watchdog.env" "$STAGE/watchdog.before"
 COMMITTED=0
 CHANGED=()
+ENABLED=()
+RELOADED=0
+STARTED_NODE=0
+# Until the node unit is active, a failure hands the agent back to the cron watchdog: the
+# configuration is restored and the units this run enabled are disabled again, with the agent
+# this run started under them. A unit systemd already owned keeps retrying. Ray and the shim
+# keep running, so no runtime state is reverted.
 restore() {
   local status=$?
   if [ "$status" != 0 ] && [ "$COMMITTED" = 0 ]; then
+    if [ "$STARTED_NODE" = 1 ] && [[ " ${ENABLED[*]} " = *" zkm-fleet-node.service "* ]]; then
+      sudo systemctl stop zkm-fleet-node.service || true
+    fi
+    [ "${#ENABLED[@]}" = 0 ] || sudo systemctl disable "${ENABLED[@]}" || true
     for name in "${CHANGED[@]}"; do
       if [ -f "$STAGE/$name.before" ]; then
         sudo install -m 644 "$STAGE/$name.before" "/etc/systemd/system/$name"
@@ -57,10 +68,12 @@ restore() {
         sudo rm -f "/etc/systemd/system/$name"
       fi
     done
+    [ "$RELOADED" = 0 ] || sudo systemctl daemon-reload || true
     cp -p "$STAGE/apps.before" "$ETC/apps.yaml.restore"
     mv "$ETC/apps.yaml.restore" "$ETC/apps.yaml"
     cp -p "$STAGE/watchdog.before" "$ETC/watchdog.env.restore"
     mv "$ETC/watchdog.env.restore" "$ETC/watchdog.env"
+    echo '[node-services] handover failed; restored apps.yaml and watchdog.env and disabled the units this run enabled, so the cron watchdog keeps supervising the agent. Repair the failure and rerun.' >&2
   elif [ "$status" != 0 ]; then
     echo '[node-services] configuration committed; services retained. Repair the failure and rerun to finish handover.' >&2
   fi
@@ -158,6 +171,20 @@ for unit in "$STAGE/"*.service; do
   CHANGED+=("$name")
   sudo install -m 644 "$unit" "$target"
 done
+RELOADED=1
+sudo systemctl daemon-reload
+sudo systemctl start zkm-fleet-ray.service zkm-fleet-shim.service
+(cd "$PREFIX/bridge" && "$PYTHON" -m fleet_bridge.shim check --apps "$ETC/apps.yaml" --wait-seconds 30)
+for unit in zkm-fleet-ray.service zkm-fleet-shim.service zkm-fleet-node.service; do
+  sudo systemctl is-enabled --quiet "$unit" || ENABLED+=("$unit")
+done
+sudo systemctl enable zkm-fleet-ray.service zkm-fleet-shim.service zkm-fleet-node.service
+flock -u 9
+STARTED_NODE=1
+sudo systemctl start zkm-fleet-node.service
+sudo systemctl is-active --quiet zkm-fleet-node.service || die "node unit did not remain active"
+# Commit only now that systemd runs the agent: from here the cron watchdog leaves it alone, and
+# an interrupted handover is resumed in place.
 (cd "$PREFIX/bridge" && "$PYTHON" - "$ETC/watchdog.env" <<'PY'
 import sys
 from pathlib import Path
@@ -167,15 +194,6 @@ if not text.rstrip().endswith('FLEET_NODE_SUPERVISED=1'):
     _replace(p,text.rstrip()+'\nFLEET_NODE_SUPERVISED=1\n')
 PY
 )
-# No rollback may overwrite configuration after any new service can read it.
-# An interrupted handover is resumed in place; runtime state is never reverted.
 mkdir -p "$PREFIX/libexec/node-services"
 for name in "${CHANGED[@]}"; do cp "$STAGE/$name" "$PREFIX/libexec/node-services/$name"; done
 COMMITTED=1
-sudo systemctl daemon-reload
-sudo systemctl start zkm-fleet-ray.service zkm-fleet-shim.service
-(cd "$PREFIX/bridge" && "$PYTHON" -m fleet_bridge.shim check --apps "$ETC/apps.yaml" --wait-seconds 30)
-sudo systemctl enable zkm-fleet-ray.service zkm-fleet-shim.service zkm-fleet-node.service
-flock -u 9
-sudo systemctl start zkm-fleet-node.service
-sudo systemctl is-active --quiet zkm-fleet-node.service || die "node unit did not remain active"

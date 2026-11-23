@@ -21,3 +21,18 @@ if sys.argv[1] == "install":
     shutil.copy2(sys.argv[-2], capture / Path(sys.argv[-1]).name)
 if sys.argv[1:] == ["systemctl", "start", "zkm-fleet-node.service"]:
     sys.exit(int(os.getenv("FAIL_NODE", "0")))
+# Enabled units persist in a file, so a test sees what a failed handover disabled again.
+enabled = root / "enabled"
+units = set(enabled.read_text().split()) if enabled.exists() else set()
+if sys.argv[1:3] == ["systemctl", "is-enabled"]:
+    sys.exit(0 if sys.argv[-1] in units else 1)
+if sys.argv[1:3] in (["systemctl", "enable"], ["systemctl", "disable"]):
+    names = {a for a in sys.argv[3:] if not a.startswith("-")}
+    units = units | names if sys.argv[2] == "enable" else units - names
+    enabled.write_text("\n".join(sorted(units)))
+if sys.argv[1:] == ["systemctl", "is-active", "--quiet", "zkm-fleet-node.service"]:
+    # What the cron watchdog would read while systemd is still proving the agent runs.
+    watchdog = root / "etc/watchdog.env"
+    flag = watchdog.exists() and "FLEET_NODE_SUPERVISED=1" in watchdog.read_text()
+    (root / "supervised-at-active").write_text("yes" if flag else "no")
+    sys.exit(int(os.getenv("FAIL_ACTIVE", "0")))
