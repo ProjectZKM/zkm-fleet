@@ -10,7 +10,9 @@ PREFIX=/opt/zkm-fleet; ETC=/etc/zkm-fleet; BIN=./target/release; WORKDIR=""; JOB
 CUDA=""; CPUS=""; NAME=$(hostname); SCHEDULER=""; TOKEN=""; CA=""; PUBLIC_URL=""; TLS_NAMES=""; CRON=1; PROOF_ROOTS=""; MCP=1
 WITH_SHIM=0
 SUBNET=172.28.250.0/24; IP=$(hostname -I | awk '{print $1}')
+GIVEN=""
 while [ $# -gt 0 ]; do
+  GIVEN="$GIVEN $1"
   case "$1" in
     --proof-storage-roots) PROOF_ROOTS=$2; shift 2;;
     --prefix) PREFIX=$2; shift 2;; --etc) ETC=$2; shift 2;; --bin) BIN=$2; shift 2;;
@@ -28,6 +30,42 @@ case "$ROLE" in control|node) ;; *) sed -n '2,6p' "$0"; exit 2;; esac
 SRC=$(cd "$(dirname "$0")/.." && pwd)
 die(){ echo "[install] $*" >&2; exit 1; }
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || die "Docker must be installed and accessible"
+# A re-run keeps the node's settings: an install-owned watchdog.env key changes only when its flag
+# is given or the key is missing, and this run's paths and name follow the kept values.
+given() { [[ " $GIVEN " = *" $1 "* ]]; }
+if [ "$ROLE" = node ] && [ -f "$ETC/watchdog.env" ]; then
+  KEEP=(); for pair in FLEET_HOME:--prefix FLEET_WORKDIR:--workdir FLEET_JOBS_DIR:--jobs-dir FLEET_NODE_NAME:--name; do
+    given "${pair#*:}" || KEEP+=("${pair%%:*}")
+  done
+  if [ "${#KEEP[@]}" -gt 0 ]; then
+    command -v python3 >/dev/null || die "Python >= 3.10 is required on execution machines"
+    KEPT=$(mktemp)
+    python3 - "$ETC/watchdog.env" "${KEEP[@]}" > "$KEPT" <<'PY' || { rm -f "$KEPT"; die "pass that setting's flag, or fix $ETC/watchdog.env"; }
+import re, shlex, sys
+path, keys = sys.argv[1], sys.argv[2:]
+values = {}
+for line in open(path):  # read, never sourced; the last assignment wins, as in the shell
+    m = re.match(r'(?:export )?([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line.rstrip('\n'))
+    if m and m.group(1) in keys:
+        values[m.group(1)] = m.group(2)
+for key, raw in values.items():
+    try:
+        words = shlex.split(raw, comments=True)
+    except ValueError:
+        words = None
+    if words is None or len(words) > 1 or '$' in raw or '`' in raw:
+        sys.exit(f'[install] {key} in {path} is not a plain value this installer can keep')
+    sys.stdout.write(f'{key}\0{words[0] if words else ""}\0')
+PY
+    while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+      case "$key" in
+        FLEET_HOME) PREFIX=$value;; FLEET_WORKDIR) WORKDIR=$value;;
+        FLEET_JOBS_DIR) JOBS_DIR=$value;; FLEET_NODE_NAME) NAME=$value;;
+      esac
+    done < "$KEPT"
+    rm -f "$KEPT"
+  fi
+fi
 [ -n "$WORKDIR" ] || WORKDIR="$PREFIX/work"
 [ -n "$JOBS_DIR" ] || JOBS_DIR="$WORKDIR/jobs"
 mkdir -p "$PREFIX/bin" "$ETC" "$WORKDIR/logs"
@@ -184,6 +222,42 @@ node_binary: $PREFIX/bin/fleet-ziren-node
 log_dir: $WORKDIR/logs
 apps: [] # configured proof servers and persistent apps for this machine
 EOF
+  # A different --scheduler reaches apps.yaml too; only its scheduler line changes.
+  (cd "$PREFIX/bridge" && "$PREFIX/venv/bin/python" - "$ETC/apps.yaml" "$SCHEDULER" <<'PY'
+import json, re, sys, yaml
+from pathlib import Path
+path, url = Path(sys.argv[1]), sys.argv[2]
+refuse = f'[install] cannot change scheduler in {path} safely; set it to {url} there and rerun'
+text = path.read_text()
+try:
+    data = yaml.safe_load(text) or {}
+except yaml.YAMLError:
+    sys.exit(refuse)
+if not isinstance(data, dict):
+    sys.exit(refuse)
+if data.get('scheduler') == url:
+    sys.exit(0)
+lines = text.splitlines(keepends=True)
+own = [i for i, line in enumerate(lines) if re.match(r'scheduler\s*:', line)]
+new = None
+if 'scheduler' not in data and not own:
+    new = f'scheduler: {json.dumps(url)}\n' + text
+elif len(own) == 1:
+    # Keep a comment after a plain value; quoted or multi-line values fail the check below.
+    m = re.match(r'scheduler\s*:\s*(?:[^\'"\s#][^#]*?)?(\s+#.*)?\s*$', lines[own[0]].rstrip('\r\n'))
+    comment = (m.group(1) or '') if m else ''
+    lines[own[0]] = f'scheduler: {json.dumps(url)}{comment}\n'
+    new = ''.join(lines)
+try:
+    safe = new is not None and yaml.safe_load(new) == {**data, 'scheduler': url}
+except yaml.YAMLError:
+    safe = False
+if not safe:
+    sys.exit(refuse)
+from fleet_bridge.node import _replace
+_replace(path, new)
+PY
+  ) || die "apps.yaml and watchdog.env still name the previous scheduler"
   if [ -n "$CA" ] && ! grep -q '^scheduler_ca_file:' "$ETC/apps.yaml"; then
     printf '\nscheduler_ca_file: %s\n' "$CA" >> "$ETC/apps.yaml"
   fi
@@ -196,16 +270,26 @@ EOF
     fi
   fi
   WATCHDOG_STAGE=$(mktemp "$ETC/watchdog.env.XXXXXX")
-  {
-    # Refresh install-owned settings while retaining custom settings and the
-    # independent service-supervision flag. Never source operator shell here.
-    if [ -f "$ETC/watchdog.env" ]; then
-      awk '!/^(export )?(FLEET_HOME|FLEET_ETC|FLEET_LOG|FLEET_WORKDIR|FLEET_SCHEDULER|FLEET_NODE_NAME|FLEET_JOBS_DIR|FLEET_SCHEDULER_CA|FLEET_PROOF_STORAGE_ROOTS_FILE|RAY_NUM_CPUS|CUDA_VISIBLE_DEVICES)=/' "$ETC/watchdog.env"
+  # Rewrite an install-owned setting only when its flag was given or it is missing, retaining
+  # custom settings and the independent service-supervision flag. Never source operator shell here.
+  REWRITE=(); NEW=()
+  owned() { # KEY FLAG VALUE
+    if given "$2" || ! grep -Eq "^(export )?$1=" "$ETC/watchdog.env" 2>/dev/null; then
+      REWRITE+=("$1"); NEW+=("$(printf '%s=%q' "$1" "$3")")
     fi
-    printf 'FLEET_HOME=%q\nFLEET_ETC=%q\nFLEET_LOG=%q\nFLEET_WORKDIR=%q\n' "$PREFIX" "$ETC" "$WORKDIR/logs" "$WORKDIR"
-    printf 'FLEET_SCHEDULER=%q\nFLEET_NODE_NAME=%q\nFLEET_JOBS_DIR=%q\nFLEET_SCHEDULER_CA=%q\n' "$SCHEDULER" "$NAME" "$JOBS_DIR" "$CA"
-    [ ! -f "$ETC/proof-storage-roots" ] || printf 'FLEET_PROOF_STORAGE_ROOTS_FILE=%q\n' "$ETC/proof-storage-roots"
-    printf 'RAY_NUM_CPUS=%q\nCUDA_VISIBLE_DEVICES=%q\n' "$CPUS" "$CUDA"
+  }
+  owned FLEET_HOME --prefix "$PREFIX"; owned FLEET_ETC --etc "$ETC"
+  owned FLEET_LOG --workdir "$WORKDIR/logs"; owned FLEET_WORKDIR --workdir "$WORKDIR"
+  owned FLEET_SCHEDULER --scheduler "$SCHEDULER"; owned FLEET_NODE_NAME --name "$NAME"
+  owned FLEET_JOBS_DIR --jobs-dir "$JOBS_DIR"; owned FLEET_SCHEDULER_CA --scheduler-ca "$CA"
+  [ ! -f "$ETC/proof-storage-roots" ] || owned FLEET_PROOF_STORAGE_ROOTS_FILE --proof-storage-roots "$ETC/proof-storage-roots"
+  owned RAY_NUM_CPUS --cpus "$CPUS"; owned CUDA_VISIBLE_DEVICES --cuda "$CUDA"
+  {
+    if [ -f "$ETC/watchdog.env" ]; then
+      awk -v keys=" ${REWRITE[*]} " '{ k = $0; sub(/^export /, "", k); sub(/=.*/, "", k) }
+        !(index($0, "=") && index(keys, " " k " "))' "$ETC/watchdog.env"
+    fi
+    [ "${#NEW[@]}" = 0 ] || printf '%s\n' "${NEW[@]}"
   } > "$WATCHDOG_STAGE"
   if [ -f "$ETC/watchdog.env" ]; then chmod --reference="$ETC/watchdog.env" "$WATCHDOG_STAGE"; fi
   mv "$WATCHDOG_STAGE" "$ETC/watchdog.env"
