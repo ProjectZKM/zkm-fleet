@@ -8966,7 +8966,7 @@ dependencies = [
 [[package]]
 name = "trusted-attestation-types"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=f6f65130980b59382a98f6e8a5f38d2715c6e594#f6f65130980b59382a98f6e8a5f38d2715c6e594"
+source = "git+https://github.com/attestx/trusted-shim?rev=23414952b888ea2328ae1fcbbcfdcdafb498655d#23414952b888ea2328ae1fcbbcfdcdafb498655d"
 dependencies = [
  "anyhow",
  "hex",
@@ -9044,7 +9044,7 @@ dependencies = [
 [[package]]
 name = "trusted-shim"
 version = "0.1.0"
-source = "git+https://github.com/attestx/trusted-shim?rev=f6f65130980b59382a98f6e8a5f38d2715c6e594#f6f65130980b59382a98f6e8a5f38d2715c6e594"
+source = "git+https://github.com/attestx/trusted-shim?rev=23414952b888ea2328ae1fcbbcfdcdafb498655d#23414952b888ea2328ae1fcbbcfdcdafb498655d"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
