@@ -363,6 +363,7 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   local b; b=$PREFIX/backup/node-$(stamp)
   # Check the new bridge imports in the node's own venv before the agent is touched.
   [ "$DRY" = 1 ] || (cd "$bridge" && "$PREFIX/venv/bin/python" -c "import fleet_bridge.node") || die "the new bridge does not import; nothing changed"
+  node_config_check "$bridge"
   node_runtime_check "$bridge"
   run mkdir -p "$b"; run cp -a "$PREFIX/bin/fleet-node" "$PREFIX/bridge" "$b/"
   [ -z "$proof_app" ] || [ ! -f "$PREFIX/bin/fleet-proof-app" ] || run cp -a "$PREFIX/bin/fleet-proof-app" "$b/"
@@ -427,10 +428,7 @@ node_rollback() {
   echo "restored $b"
 }
 
-node_runtime_check() {
-  # Use the candidate adapter against the live daemon before stopping the node.
-  # Older adapters lacking daemon support are incompatible, not a fallback.
-  [ "$DRY" = 1 ] && return 0
+node_locate() { # NODE_ENV and NODE_ETC: the watchdog.env and configuration directory the agent reads
   local etc=${FLEET_ETC:-$PREFIX/etc} node_env=${FLEET_ENV:-}
   if [ -z "$node_env" ] && [ -z "${FLEET_ETC:-}" ]; then
     node_env=$(systemctl show --property=Environment --value "$NODE_UNIT" 2>/dev/null | python3 -c \
@@ -440,6 +438,43 @@ node_runtime_check() {
   if [ -z "${FLEET_ETC:-}" ] && [ -f "$node_env" ]; then
     etc=$(bash -c '. "$1"; printf "%s" "${FLEET_ETC:-$2}"' _ "$node_env" "$etc")
   fi
+  NODE_ENV=$node_env NODE_ETC=$etc
+}
+node_config_check() { # the candidate bridge loads apps.yaml as the new agent's reports will
+  [ "$DRY" = 1 ] && return 0
+  node_locate
+  [ -f "$NODE_ETC/apps.yaml" ] || die "cannot locate apps.yaml; set FLEET_ETC before upgrading; node was not stopped"
+  (cd "$1" && "$PREFIX/venv/bin/python" - "$NODE_ETC/apps.yaml" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+from fleet_bridge.reconcile import load_apps
+path = Path(sys.argv[1])
+try:
+    data = yaml.safe_load(path.read_text()) or {}
+except (OSError, yaml.YAMLError) as error:
+    sys.exit(f"fleet-ctl: cannot read {path}: {error}")
+# Parsed entries drop prover_binary, so find it in the file's own mapping.
+entries = data.get("apps") if isinstance(data, dict) else None
+legacy = [str(a.get("name", "?")) for a in entries if isinstance(a, dict) and a.get("prover_binary") is not None] \
+    if isinstance(entries, list) else []
+try:
+    load_apps(data, validate_launch=False)
+except Exception as error:
+    also = f" (entries with prover_binary: {', '.join(legacy)})" if legacy else ""
+    sys.exit(f"fleet-ctl: the new bridge cannot load {path}: {error}{also}")
+if legacy:
+    print(f"fleet-ctl: warning: {', '.join(legacy)} in {path} still set prover_binary; the scheduler "
+          "quarantines them until they are converted with deploy/migrate-proof-runtime.py", file=sys.stderr)
+PY
+  ) || die "the new bridge cannot load apps.yaml; node was not stopped"
+}
+node_runtime_check() {
+  # Use the candidate adapter against the live daemon before stopping the node.
+  # Older adapters lacking daemon support are incompatible, not a fallback.
+  [ "$DRY" = 1 ] && return 0
+  node_locate
+  local etc=$NODE_ETC
   [ -f "$etc/apps.yaml" ] || die "cannot locate apps.yaml; set FLEET_ETC before upgrading; node was not stopped"
   (cd "$1" && "$PREFIX/venv/bin/python" - "$etc/apps.yaml" <<'PY'
 import sys

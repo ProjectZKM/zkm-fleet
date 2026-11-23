@@ -266,6 +266,85 @@ def test_rollback_restores_proof_binary_even_if_agent_cannot_reconnect(tmp_path)
     assert 'restored-node' in (prefix/'bin/fleet-node').read_text()
 
 
+def checked_node(tmp_path, bridge="quarantine"):
+    """node_fixture with a working venv python and a candidate bridge: the real one, or a stand-in
+    whose load_apps loads prover_binary entries ("quarantine") or refuses them as older bridges do."""
+    import shutil, sys
+    prefix, commands = node_fixture(tmp_path)
+    executable(prefix / "venv/bin/python", f'exec {sys.executable} "$@"\n')
+    candidate = tmp_path / "candidate"
+    if bridge == "real":
+        shutil.copytree(ROOT / "bridge/fleet_bridge", candidate / "fleet_bridge")
+    else:
+        (candidate / "fleet_bridge").mkdir(parents=True)
+        for name in ("__init__.py", "node.py"):
+            (candidate / "fleet_bridge" / name).write_text("")
+        (candidate / "fleet_bridge/reconcile.py").write_text(
+            "def load_apps(data, *, validate_launch=True):\n"
+            "    assert validate_launch is False and isinstance(data, dict)\n"
+            + ("    if any('prover_binary' in a for a in data.get('apps', [])):\n"
+               "        raise ValueError('prover_binary was removed; drain and migrate this entry')\n"
+               if bridge == "refuse" else ""))
+    newbin = tmp_path / "release/bin/fleet-node"
+    executable(newbin, "echo new-node\n")
+    calls = tmp_path / "systemctl.calls"
+    executable(commands / "systemctl", f'echo "$*" >> {calls}\n'
+               'case "$*" in *"--property=InvocationID"*) echo 0123456789abcdef0123456789abcdef;; esac\n')
+    env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
+           "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_NODE_SSH": "", "FLEET_ETC": str(prefix / "etc")}
+    return prefix, commands, candidate, newbin, calls, env
+
+
+def stopped(calls):
+    return calls.exists() and "stop" in calls.read_text()
+
+
+def ctl(env, *args, timeout=60):
+    return subprocess.run(["bash", str(ROOT / "deploy/fleet-ctl.sh"), *args], env=env,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+LEGACY = (f"apps:\n- name: old-gpu\n  kind: ziren-gpu\n  elf_id: {'a' * 64}\n  prover_binary: /opt/prover\n"
+          "  disabled: true\n")
+
+
+@pytest.mark.parametrize("apps,bridge,message", [
+    (LEGACY, "refuse", "prover_binary was removed"),
+    ("apps: [\n", "real", "cannot read"),
+    ("apps:\n- name: bad\n  kind: no-such-kind\n", "real", "the new bridge cannot load"),
+    ("apps:\n- name: gpu\n  kind: ziren-gpu\n", "real", "set its elf_id"),
+])
+def test_upgrade_refuses_apps_yaml_the_new_bridge_cannot_load(tmp_path, apps, bridge, message):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path, bridge=bridge)
+    (prefix / "etc/apps.yaml").write_text(apps)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert "node was not stopped" in result.stderr
+    if apps == LEGACY:
+        assert "entries with prover_binary: old-gpu" in result.stderr
+    assert not stopped(calls) and "old-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_upgrade_warns_about_prover_binary_entries_the_new_bridge_quarantines(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path)
+    (prefix / "etc/apps.yaml").write_text(LEGACY)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    assert result.returncode == 0, result.stderr
+    assert "warning: old-gpu" in result.stderr and "quarantines them" in result.stderr
+    assert "migrate-proof-runtime.py" in result.stderr
+    assert "new-node" in (prefix / "bin/fleet-node").read_text()
+
+
+def test_prover_binary_entries_are_named_whichever_way_the_bridge_treats_them(tmp_path):
+    prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path, bridge="real")
+    (prefix / "etc/apps.yaml").write_text(LEGACY)
+    result = ctl(env, "node", "upgrade", str(newbin), str(candidate))
+    if result.returncode:  # a bridge that still rejects the key: nothing changes
+        assert "entries with prover_binary: old-gpu" in result.stderr and not stopped(calls)
+    else:  # one that loads it for the scheduler to quarantine
+        assert "warning: old-gpu" in result.stderr, result.stderr
+
+
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
     """A remote dry run ships nothing, so the node sees paths to no files: it prints the local
     upgrade of just those files, not a download of a release named after them."""
