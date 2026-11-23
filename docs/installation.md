@@ -218,6 +218,8 @@ not mean that a release has already been published. To package a locally built,
 unchanged upstream `openshell-gateway`, use `deploy/openshell/Dockerfile` from a source
 checkout with a minimal build context containing only that Dockerfile and binary.
 Ubuntu 24.04 builds require the matching runtime base supplied by that Dockerfile.
+Set `FLEET_OPENSHELL_IMAGE` to that local tag. `openshell up` uses a local image that is
+in no registry as is, and warns that it is not pinned. Push it to a registry to pin it by digest.
 
 After the control host install, create `$FLEET_ETC/openshell/` (`mkdir -m 700`) and
 prepare these files in it, none empty and all owned by the `FLEET_UID:FLEET_GID` in

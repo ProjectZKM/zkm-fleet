@@ -66,7 +66,9 @@ case "$*" in
   *" config --format json openshell-gateway")  # interpolated from compose.env, as Compose does
     image=$(sed -n 's/^FLEET_OPENSHELL_IMAGE=//p' {self.compose_env})
     printf '{{"services":{{"openshell-gateway":{{"image":"%s"}}}}}}\\n' "${{image:-$FAKE_OPENSHELL_IMAGE}}" ;;
-  "image inspect "*) printf 'other.example/mirror@sha256:{"cd" * 32}\\n{REPO}@{DIGEST}\\n' ;;
+  # FAKE_IMAGE=local: present here without a registry digest; FAKE_IMAGE=missing: not here.
+  "image inspect "*) case "${{FAKE_IMAGE:-}}" in local) exit 0;; missing) exit 1;; esac
+    printf 'other.example/mirror@sha256:{"cd" * 32}\\n{REPO}@{DIGEST}\\n' ;;
   *" exec -T postgres psql "*) cat {self.schema} ;;
   *" ps -aq scheduler") echo abc123 ;;
   "inspect -f "*) echo "running 0" ;;
@@ -199,6 +201,25 @@ def test_openshell_up_keeps_an_image_pinned_by_digest(control):
     assert result.returncode == 0, result.stderr
     assert not any(c.startswith(("pull ", "image inspect ")) for c in control.calls())
     assert "FLEET_OPENSHELL_IMAGE" not in control.compose_env.read_text()
+
+
+def test_openshell_up_uses_a_locally_built_gateway_unpinned(control):
+    local = "zkm-fleet-openshell:local"
+    result = control.run("openshell", "up", FAKE_OPENSHELL_IMAGE=local, FAKE_FAIL="pull ", FAKE_IMAGE="local")
+    assert result.returncode == 0, result.stderr
+    assert f"{local} is a local build with no registry digest; using it unpinned" in result.stderr
+    assert "FLEET_OPENSHELL_IMAGE" not in control.compose_env.read_text()
+    assert any("--wait openshell-gateway" in c for c in control.calls())
+    assert "COMPOSE_PROFILES=mcp,openshell" in control.compose_env.read_text()
+
+
+@pytest.mark.parametrize("image, message", [("missing", "is not a local image"), ("", "from its registry")])
+def test_openshell_up_refuses_an_image_it_can_neither_pull_nor_find_locally(control, image, message):
+    before = control.compose_env.read_text()
+    result = control.run("openshell", "up", FAKE_FAIL="pull ", FAKE_IMAGE=image)
+    assert result.returncode != 0 and message in result.stderr, result.stderr
+    assert control.compose_env.read_text() == before
+    assert not any("--force-recreate scheduler" in c for c in control.calls())
 
 
 def test_openshell_up_leaves_the_profile_off_when_the_gateway_fails(control):

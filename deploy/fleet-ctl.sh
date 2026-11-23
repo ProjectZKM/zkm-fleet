@@ -271,8 +271,16 @@ openshell_up() {
     echo "OpenShell gateway image is pinned: $image"
   else
     repo=${image%%@*}; [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
-    run docker pull "$image" || die "cannot pull $image; nothing changed"
-    if [ "$DRY" = 1 ]; then
+    if ! run docker pull "$image"; then
+      # A gateway built here (deploy/openshell/Dockerfile) is in no registry, so it has no
+      # digest to pin: use the local image as is. Anything else must come from its registry.
+      local_digests=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" 2>/dev/null) \
+        || die "cannot pull $image and it is not a local image; nothing changed"
+      if grep -q "^$repo@sha256:" <<<"$local_digests"; then
+        die "cannot pull $image from its registry; nothing changed"
+      fi
+      echo "fleet-ctl: $image is a local build with no registry digest; using it unpinned (push it to a registry to pin it by digest)" >&2
+    elif [ "$DRY" = 1 ]; then
       echo "+ set FLEET_OPENSHELL_IMAGE=$repo@sha256:<registry digest of $image> in $PREFIX/compose.env"
     else
       digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
