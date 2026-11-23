@@ -179,6 +179,7 @@ impl Route {
             token_file,
             public_key_file: public,
             issuer: "native-test".into(),
+            tunnel_binary: None,
         };
         let access = grants::sign(
             &key,

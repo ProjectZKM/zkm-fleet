@@ -376,6 +376,29 @@ def test_services_require_network_capability_and_are_bound_into_request(tmp_path
     assert actors.spec_hash(reconcile.replica_specs(reconcile.load_apps(legacy))["web-0"])==before
 
 
+def test_chisel_selection_preserves_legacy_wire_and_requires_a_ready_companion(tmp_path, monkeypatch):
+    from fleet_bridge.model import to_dict
+    cfg = config(tmp_path)
+    cfg["shim_network"] = {"gateway_url":"https://control.example", "relay_url":"wss://data.example",
+        "token_file":"/private/node.jwt", "public_key_file":"/private/gateway.pem", "issuer":"control"}
+    parsed = reconcile.load_apps(cfg)
+    assert to_dict(parsed.cluster.shim_network) == cfg["shim_network"]
+    helper = tmp_path / "trusted-router-tunnel"
+    helper.write_bytes(b"fixture")
+    helper.chmod(0o755)
+    cfg["shim_network"]["tunnel_binary"] = str(helper)
+    parsed = reconcile.load_apps(cfg)
+    monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1"]}'))
+    assert "shim-network-v1" not in shim.capabilities(parsed.cluster)
+    monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1","chisel-network-v1"]}'))
+    assert "shim-chisel-network-v1" in shim.capabilities(parsed.cluster)
+    helper.unlink()
+    assert "shim-network-v1" not in shim.capabilities(parsed.cluster)
+    cfg["shim_network"]["tunnel_binary"] = "relative/helper"
+    with pytest.raises(ValueError, match="absolute"):
+        reconcile.load_apps(cfg)
+
+
 @pytest.mark.parametrize("services", [["../control"], ["http","http"], ["http"]*9])
 def test_invalid_services_never_reach_an_executor(tmp_path,services):
     cfg=config(tmp_path);cfg["apps"][0]["services"]=services

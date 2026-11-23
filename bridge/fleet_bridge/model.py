@@ -135,7 +135,8 @@ def from_dict(cls: type[T], data: Mapping[str, Any], *, strict: bool = False, wh
 def to_dict(obj: Any) -> Any:
     """JSON-ready: records become mappings, enums their values, tuples lists."""
     if is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: to_dict(getattr(obj, f.name)) for f in fields(obj)}
+        return {f.name: to_dict(getattr(obj, f.name)) for f in fields(obj)
+                if not (f.metadata.get("omit_none") and getattr(obj, f.name) is None)}
     if isinstance(obj, enum.Enum):
         return obj.value
     if isinstance(obj, (list, tuple, set, frozenset)):
@@ -582,6 +583,7 @@ class ShimNetworkConfig(Record):
     token_file: str
     public_key_file: str
     issuer: str
+    tunnel_binary: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
         from urllib.parse import urlsplit
@@ -592,6 +594,8 @@ class ShimNetworkConfig(Record):
                 raise ModelError("shim network requires TLS URLs without credentials or paths")
         if not self.issuer or not all(os.path.isabs(p) and "\x00" not in p for p in (self.token_file,self.public_key_file)):
             raise ModelError("shim network needs an issuer and absolute credential/key paths")
+        if self.tunnel_binary is not None and (not os.path.isabs(self.tunnel_binary) or "\x00" in self.tunnel_binary):
+            raise ModelError("upstream tunnel helper requires an absolute node-owned path")
 
 
 class ServiceProtocol(str, enum.Enum):

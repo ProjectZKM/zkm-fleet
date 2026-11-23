@@ -100,7 +100,9 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         if config.shim_daemon:
             check_machine(config, value)
         features = value.get("features", [])
-        modern = "data-plane-v1" in features
+        upstream = not config.shim_network or config.shim_network.tunnel_binary is None or (
+            "chisel-network-v1" in features and os.access(config.shim_network.tunnel_binary, os.X_OK))
+        modern = "data-plane-v1" in features and upstream
         management = "runtime-management-v1" in features
         network = bool(config.shim_network) and modern
         managed_network = network and management
@@ -109,7 +111,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             check_openshell(config, value)
             if "openshell-allocation-v1" in features:
                 native.append("shim-openshell-provisioning-v1")
-                if config.shim_network and "openshell-service-health-v1" in features:
+                if config.shim_network and upstream and "openshell-service-health-v1" in features:
                     native.append("shim-openshell-services-v1")
                     if "openshell-tcp-services-v1" in features:
                         native.append("shim-openshell-tcp-services-v1")
@@ -118,6 +120,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             native.append("shim-" + config.shim_tee.driver + "-v1")
             local = True
         return native + [name for name, supported in (
+            ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
             ("shim-cleanup-v1", True),
             ("shim-private-env-v1", managed_network),
             ("shim-prover-v1", modern and management and "docker" in value.get("drivers", [])),
