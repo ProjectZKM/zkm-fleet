@@ -509,8 +509,20 @@ requires confirmed cleanup and a new generation; an upgrade never migrates one.
 This profile requires a whole `gpus` count (0 to 16), positive integer `cpus`, and
 `memory_gb` (at least 6 MiB); command/environment are literal. Optional HTTP app
 services declare `services`, one `container_port` and `health_path` (default `/`).
-These ports are private to the workload; `port_base`, `control`, TCP, ingress
-rewriting, host `volumes`, entrypoint, workdir and user overrides remain unsupported.
+These ports are private to the workload; `port_base`, host `volumes`, entrypoint,
+workdir and user overrides remain unsupported.
+
+**Ingress and logs.** An HTTP application service may have an `ingress` rule
+(`paths`, `methods`, optional `single_use`), as on shim Docker, but never
+`bearer_env`: a native node holds no copy of the application's credential, so the
+shim forwards the caller's own `Authorization` header and the application checks
+it. `services` may also name `control` beside at least one application service
+(TCP ones included) for `GET /logs?tail=N` with Docker's bounds, read on the node
+from the owned workload container. Native control has no exec, restart or
+metadata routes; see administrative exec and lifecycle below. Placement requires
+`shim-openshell-ingress-v1`. A launch request must carry exactly the admitted
+rules in `driver_options.ingress`, endpoint `ingress:<service>` for a service with
+a rule, `app` otherwise, and `control` (always `http1`) for control.
 
 **GPUs and durable storage.** With `gpus` above zero, the reservation actor reports
 the device ids Ray granted it as `RuntimeInstance.gpu_ids`; a report whose ids are
@@ -690,7 +702,8 @@ exit status reports unavailable, not success.
 Native lifecycle stays with Fleet allocations: the compute extension refuses
 gateway stop/start, so "restart" is a replacement generation, and durable `mounts`
 carry state across it. Gateway sandbox logs are supervisor events only; the
-application's own stdout/stderr stay on its node and are not exposed here.
+application's own stdout/stderr stay on its node, readable through a declared
+`control` service rather than this API.
 
 Persist `data_dir/policy/openshell`, the policy ledger and allocation/delivery
 journals together. A durable proof claim precedes submission; after an ambiguous

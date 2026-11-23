@@ -735,9 +735,12 @@ class AppSpec(Record):
                 raise ModelError("native GPUs and durable mounts require a non-TEE driver")
             if (not 0 <= self.gpus <= MAX_NATIVE_ATTACHMENTS or self.gpus != int(self.gpus) or not 0 < self.cpus <= 2**32 / 1000 or self.cpus != int(self.cpus)
                     or not self.memory_gb or not 6 * 1024**2 <= self.memory_gb * 2**30 < 2**64
-                    or self.ingress or self.volumes or self.shm_gb is not None
+                    # A native node holds no application credential: callers send their own.
+                    or any(rule.bearer_env for rule in self.ingress.values())
+                    or self.volumes or self.shm_gb is not None
                     or any(v is not None for v in (self.port_base, self.entrypoint, self.user, self.workdir))
-                    or "control" in self.services
+                    # `control` is the logs-only service beside an application service.
+                    or self.services and all(s == "control" for s in self.services)
                     or self.service_protocol is ServiceProtocol.TCP and (
                         self.health_path != "/" or not self.health_tcp_banner
                         or len(self.health_tcp_banner) > 128
@@ -746,7 +749,7 @@ class AppSpec(Record):
                     or not self.health_path.startswith("/") or self.health_path.startswith("//")
                     or len(self.health_path.encode()) > 2048 or any(ord(c) < 32 or ord(c) == 127 or c in "\\#" for c in self.health_path)
                     or not self.services and self.health_path != "/"):
-                raise ModelError("native OpenShell requires CPU/memory limits and private HTTP services or TCP services with banner health")
+                raise ModelError("native OpenShell requires CPU/memory limits, private HTTP services (ingress without bearer_env, control beside an application service) or TCP services with banner health")
         if self.service_protocol is ServiceProtocol.TCP:
             if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
                     or not any(s != "control" for s in self.services) or self.ingress):

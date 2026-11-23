@@ -718,6 +718,35 @@ def test_native_service_capability_requires_health_protocol_and_network_config(t
     assert "shim-openshell-tcp-services-v1" not in shim.capabilities(replace(cfg,shim_network=None))
 
 
+def test_native_ingress_and_control_forward_caller_credentials_and_need_node_capability(tmp_path, monkeypatch):
+    raw = native_service_config(tmp_path)
+    raw["apps"][0].update(services=["http", "control"],
+        ingress={"http":{"paths":["/v1/chat/completions"],"methods":["POST"],"single_use":True}})
+    cfg = reconcile.load_apps(raw)
+    spec = reconcile.replica_specs(cfg)["web-0"]
+    assert "shim-openshell-ingress-v1" in shim.required_capabilities(spec)
+    plain = reconcile.replica_specs(reconcile.load_apps(native_service_config(tmp_path)))["web-0"]
+    assert "shim-openshell-ingress-v1" not in shim.required_capabilities(plain)
+    control = copy.deepcopy(raw); control["apps"][0].pop("ingress")
+    assert "shim-openshell-ingress-v1" in shim.required_capabilities(
+        reconcile.replica_specs(reconcile.load_apps(control))["web-0"])
+    # A native node holds no application credential; control needs an application.
+    for change in ({"ingress":{"http":{"paths":["/"],"methods":["POST"],"bearer_env":"TOKEN"}},"env":{"TOKEN":"x"}},
+                   {"services":["control"],"ingress":{}}, {"ingress":{"control":{"paths":["/"],"methods":["GET"]}}},
+                   {"service_protocol":"tcp","health_path":"/","health_tcp_banner":"SSH-2.0-"}):
+        bad = copy.deepcopy(raw); bad["apps"][0].update(change)
+        with pytest.raises(ValueError):
+            reconcile.load_apps(bad)
+    digest=shim.hashlib.sha256(shim.json.dumps(shim.daemon_options(cfg.cluster)["openshell"],sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    value={"protocol":1,"drivers":["docker","openshell"],"openshell_config_sha256":digest,
+        "features":["openshell-provisioning-v1","openshell-allocation-v1","openshell-local-services-v1","openshell-service-health-v1"]}
+    monkeypatch.setattr(shim,"daemon_call",lambda *a,**k:value)
+    assert "shim-openshell-ingress-v1" not in shim.capabilities(cfg.cluster)
+    value["features"].append("openshell-ingress-v1")
+    assert "shim-openshell-ingress-v1" in shim.capabilities(cfg.cluster)
+    assert "shim-openshell-ingress-v1" not in shim.capabilities(replace(cfg.cluster,shim_network=None))
+
+
 def test_native_tcp_requires_banner_health_and_distinct_node_capability(tmp_path):
     raw = native_service_config(tmp_path)
     raw["apps"][0].update(service_protocol="tcp", health_path="/", health_tcp_banner="SSH-2.0-", services=["ssh"])

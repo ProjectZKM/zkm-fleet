@@ -247,6 +247,11 @@ impl NodeReport {
             && !has("shim-openshell-attachments-v1") {
             return false;
         }
+        if entry.native_access() && (entry.0["ingress"].as_object().is_some_and(|i| !i.is_empty())
+            || entry.0["services"].as_array().is_some_and(|s| s.iter().any(|v| v == "control")))
+            && !has("shim-openshell-ingress-v1") {
+            return false;
+        }
         if entry.0["access_policy_sha256"].is_string() {
             let base = match entry.0["runtime"]["driver"].as_str() {
                 Some("docker") => "shim-docker-v1", Some("tee") => "shim-tee-v1",

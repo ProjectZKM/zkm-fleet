@@ -65,6 +65,8 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
     required = {required_capability(spec)}
     if app.native_access and (app.gpus or app.mounts):
         required.add("shim-openshell-attachments-v1")
+    if app.native_access and (app.ingress or "control" in app.services):
+        required.add("shim-openshell-ingress-v1")
     if app.runtime and app.runtime.driver == "docker":
         required.add(CAPABILITY)
     if app.access_policy_sha256 is not None:
@@ -119,6 +121,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
                     native.append("shim-openshell-services-v1")
                     if "openshell-tcp-services-v1" in features:
                         native.append("shim-openshell-tcp-services-v1")
+                    if "openshell-ingress-v1" in features:
+                        native.append("shim-openshell-ingress-v1")
         local = "docker" in value.get("drivers", [])
         if config.shim_tee and config.shim_tee.driver in value.get("drivers", []) and "tee-startup-v1" in features:
             native.append("shim-" + config.shim_tee.driver + "-v1")

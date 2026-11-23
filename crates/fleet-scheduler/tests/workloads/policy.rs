@@ -916,6 +916,40 @@ async fn native_tcp_admission_binds_protocol_and_health_to_manifest() {
         assert!(c.with_runtime_delivery(&r.execution, None, Some(&changed), |_| Ok(())).is_err());
     }
 }
+#[tokio::test]
+async fn native_ingress_and_control_admission_binds_rules_and_endpoints_to_manifest() {
+    let rule = json!({"paths":["/v1/chat/completions"],"methods":["POST"],"single_use":true});
+    let (_dir, c, _, _, r) = policy_setup_with_inventory("openshell", |report| {
+        report.apps[0]["services"] = json!(["chat", "control"]);
+        report.apps[0]["container_port"] = json!(18789);
+        report.apps[0]["health_path"] = json!("/health");
+        report.apps[0]["ingress"] = json!({"chat": rule});
+        report.runtime_capabilities.push("shim-openshell-ingress-v1".into());
+    }).await;
+    let mut launch = provisioning(&r).request;
+    let id = |service: &str| json!({"namespace":r.execution.namespace,"workload":r.execution.workload,"service":service});
+    launch.services = serde_json::from_value(json!([
+        {"id":id("chat"),"protocol":"http1","endpoint_ref":"ingress:chat"},
+        {"id":id("control"),"protocol":"http1","endpoint_ref":"control"}
+    ])).unwrap();
+    launch.driver_options = json!({"container_port":18789,"health_path":"/health","ingress":{"chat":rule}});
+    c.with_runtime_delivery(&r.execution, None, Some(&launch), |_| Ok(())).unwrap();
+    for field in 0..8 {
+        let mut changed = launch.clone();
+        match field {
+            0 => changed.driver_options["ingress"]["chat"]["paths"] = json!(["/v1/chat/completions", "/admin"]),
+            1 => changed.driver_options["ingress"]["chat"]["methods"] = json!(["POST", "GET"]),
+            2 => { changed.driver_options["ingress"]["chat"].as_object_mut().unwrap().remove("single_use"); }
+            3 => { changed.driver_options.as_object_mut().unwrap().remove("ingress"); changed.services[0].endpoint_ref = "app".into(); }
+            4 => changed.services[0].endpoint_ref = "app".into(),
+            5 => changed.services[1].endpoint_ref = "app".into(),
+            6 => { changed.services.pop(); }
+            _ => changed.driver_options["ingress"]["chat"]["bearer_env"] = json!("OPENCLAW_GATEWAY_TOKEN"),
+        }
+        assert!(c.with_runtime_delivery(&r.execution, None, Some(&changed), |_| Ok(())).is_err(), "{field}");
+    }
+}
+
 async fn delivery_node(
     c: &Arc<WorkloadController>,
     ticket: &str,

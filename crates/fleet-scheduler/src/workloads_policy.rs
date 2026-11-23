@@ -294,9 +294,15 @@ impl WorkloadController {
                     .get("services")
                     .cloned()
                     .unwrap_or(serde_json::json!([]))
-                || r.services.iter().any(|s| serde_json::json!(s.protocol) != protocol)
+                // The logs-only control service is always HTTP.
+                || r.services.iter().any(|s| serde_json::json!(s.protocol) != if s.id.service == "control" { "http1" } else { protocol })
                 || options.as_ref().is_some_and(|o| {
                     spec["container_port"] != o.container_port
+                        // Exactly the admitted ingress rules; shim binds each
+                        // service's endpoint to its rule's presence.
+                        || spec.get("ingress").map_or(Some(Default::default()), |i| {
+                            serde_json::from_value::<std::collections::BTreeMap<String, trusted_shim::management::Ingress>>(i.clone()).ok()
+                        }).as_ref() != Some(&o.ingress)
                         || spec.get("health_tcp_banner").and_then(serde_json::Value::as_str) != o.health_tcp_banner.as_deref()
                         || spec
                             .get("health_path")

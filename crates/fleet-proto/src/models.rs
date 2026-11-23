@@ -487,15 +487,17 @@ impl RegisterAppRequest {
                 && spec.get("memory_gb").and_then(Value::as_f64).is_some_and(|v| v.is_finite() && v * (1u64 << 30) as f64 >= (6 * 1024 * 1024) as f64 && v * ((1u64 << 30) as f64) < u64::MAX as f64)
                 && ["port_base", "entrypoint", "user", "workdir", "shm_gb"].iter().all(|k| !spec.contains_key(*k))
                 && spec.get("volumes").is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty()))
-                && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(|a| a.is_empty()))
+                // A native node holds no application credential: the caller sends its own.
+                && spec.get("ingress").and_then(Value::as_object).is_none_or(|i| i.values().all(|r| r.get("bearer_env").is_none_or(Value::is_null)))
                 && spec.get("service_protocol").is_none_or(|v| v == "http1" || v == "tcp")
                 && (!tcp || health == Some("/") && banner.and_then(Value::as_str).is_some_and(|s|
                     !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic() || b == b' ')))
-                && spec.get("services").and_then(Value::as_array).is_none_or(|s| s.iter().all(|s| s != "control"))
+                // `control` is the logs-only service beside an application service.
+                && spec.get("services").and_then(Value::as_array).is_none_or(|s| s.is_empty() || s.iter().any(|s| s != "control"))
                 && services == spec.contains_key("container_port")
                 && health.is_some_and(|p| p.starts_with('/') && !p.starts_with("//") && p.len() <= 2048
                     && !p.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'#') && (services || p == "/")),
-                "native OpenShell requires CPU/memory limits and private HTTP services or TCP services with banner health");
+                "native OpenShell requires CPU/memory limits, private HTTP services (ingress without bearer_env, control beside an application service) or TCP services with banner health");
         }
         anyhow::ensure!(native || !spec.contains_key("mounts"), "durable mounts require native OpenShell");
         if ["services", "container_port", "entrypoint", "ingress", "service_protocol"].iter().any(|k| spec.contains_key(*k)) {
@@ -813,6 +815,42 @@ mod tests {
         let mut rules = spec.clone();
         rules["runtime"]["driver"] = json!("docker"); rules["access_policy_sha256"] = json!("ab".repeat(32));
         request(&rules).validate().unwrap();
+    }
+
+    #[test]
+    fn native_ingress_and_logs_control_forward_caller_credentials_and_require_capability() {
+        let request = |spec:&Value| RegisterAppRequest {name:"native".into(),spec:spec.clone().into(),..Default::default()};
+        let spec = json!({"runtime":{"executor":"shim","driver":"openshell"},"image":"approved","cpus":1,"gpus":0,"memory_gb":0.125,
+            "services":["chat","control"],"container_port":18789,"health_path":"/health",
+            "ingress":{"chat":{"paths":["/v1/chat/completions"],"methods":["POST"],"single_use":true}}});
+        request(&spec).validate().unwrap();
+        let mut node = NodeReport::default();
+        node.runtime_capabilities = vec!["shim-openshell-services-v1".into()];
+        let mut control = spec.clone(); control.as_object_mut().unwrap().remove("ingress");
+        let mut plain = control.clone(); plain["services"] = json!(["chat"]);
+        for entry in [&spec, &control] {
+            assert!(!node.supports_runtime(crate::workload::Entry(entry)));
+        }
+        assert!(node.supports_runtime(crate::workload::Entry(&plain)));
+        node.runtime_capabilities.push("shim-openshell-ingress-v1".into());
+        for entry in [&spec, &control, &plain] {
+            request(entry).validate().unwrap();
+            assert!(node.supports_runtime(crate::workload::Entry(entry)));
+        }
+        // A native node holds no application credential; control needs an application.
+        let mut bad = Vec::new();
+        let mut v = spec.clone(); v["ingress"]["chat"]["bearer_env"] = json!("TOKEN"); v["env"] = json!({"TOKEN":"x"}); bad.push(v);
+        let mut v = control.clone(); v["services"] = json!(["control"]); bad.push(v);
+        let mut v = spec.clone(); v["ingress"] = json!({"control":{"paths":["/"],"methods":["GET"]}}); bad.push(v);
+        let mut v = spec.clone(); v["service_protocol"] = json!("tcp"); v["health_path"] = json!("/"); v["health_tcp_banner"] = json!("SSH-2.0-"); bad.push(v);
+        for (index, v) in bad.iter().enumerate() {
+            assert!(request(v).validate().is_err(), "{index}");
+        }
+        // TCP applications may still carry the logs-only control service.
+        let mut tcp = control.clone();
+        tcp["services"] = json!(["ssh","control"]); tcp["service_protocol"] = json!("tcp");
+        tcp["health_path"] = json!("/"); tcp["health_tcp_banner"] = json!("SSH-2.0-");
+        request(&tcp).validate().unwrap();
     }
 
     #[test]
