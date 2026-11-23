@@ -1,4 +1,5 @@
-# Fleet control plane, OpenShell gateway and Trustee AS. Started by deploy/install.sh control.
+# Fleet control plane, with the optional OpenShell gateway (profile openshell) and Trustee AS (profile trustee).
+# Started by deploy/install.sh control.
 # Site config and secrets live in ${FLEET_ETC:-/etc/zkm-fleet}.
 services:
   postgres:
@@ -28,6 +29,8 @@ services:
       interval: 15s
       timeout: 3s
       retries: 3
+      # A busy scheduler loads its records before it listens; match FLEET_CTL_HEALTH_WAIT.
+      start_period: 300s
     restart: unless-stopped
     init: true   # PID 1 reaps the processes it inherits; the scheduler does not
     # The user that owns ${FLEET_ETC}: the secrets there are mode 600.
@@ -50,10 +53,12 @@ services:
     ports:
       - "127.0.0.1:9191:9191" # local fleetctl; remote clients enter through HTTPS
 
-  # Stock access-policy gateway, enabled in the default stack. Fleet implements its remote compute driver; this
-  # container has no Docker socket and cannot create workloads on the control host.
-  # Prepare PKI, signing keys and volume ownership before starting the stack.
+  # Stock access-policy gateway. Fleet implements its remote compute driver; this container has no Docker
+  # socket and cannot create workloads on the control host. It needs the scheduler's compute socket, which
+  # exists only with policy_gateway.openshell, so it is off by default: `fleet-ctl.sh openshell up` checks
+  # its files, prepares its volumes and adds the profile to COMPOSE_PROFILES.
   openshell-gateway:
+    profiles: [openshell]
     image: ${FLEET_OPENSHELL_IMAGE:-ghcr.io/projectzkm/zkm-fleet-openshell:ce58cf8e9b953281352d98a637e41616295b1318}
     restart: unless-stopped
     init: true

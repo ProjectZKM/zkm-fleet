@@ -2,8 +2,12 @@
 # Upgrade, roll back and inspect Fleet: fleet-ctl.sh [-n] COMMAND
 #
 #   status                        control services, health, nodes and apps (and the node, if configured)
+#   openshell up                  check the OpenShell gateway's files and policy_gateway.openshell, pin its
+#                                 image, prepare its volumes, restart the scheduler, start the gateway and
+#                                 add the openshell profile to compose.env
 #   scheduler upgrade [TAG]       pull the release's scheduler image from GHCR, recreate it with Docker
-#                                 Compose and install its fleetctl (default: latest release)
+#                                 Compose, install its fleetctl and re-render gateway.yaml (default: latest
+#                                 release). A rollback refuses after a database schema change unless --force
 #   scheduler rollback            restore the image setting, fleetctl and compose files the last upgrade replaced
 #   node upgrade [TAG]            install a release's fleet-node, bridge, fleet-proof-app and launch scripts
 #   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR]   the same from local files
@@ -119,10 +123,64 @@ scheduler_healthy() {
     sleep 2
   done
 }
-set_scheduler_image() { # compose.env names the image both services run
-  [ "$DRY" = 1 ] && { echo "+ set FLEET_SCHEDULER_IMAGE=$1 in $PREFIX/compose.env"; return; }
-  { grep -v '^FLEET_SCHEDULER_IMAGE=' "$PREFIX/compose.env" || true; echo "FLEET_SCHEDULER_IMAGE=$1"; } > "$PREFIX/compose.env.new"
+compose_env_get() { # KEY [FILE]: the value compose.env (or FILE) gives KEY, or nothing
+  local file=${2:-$PREFIX/compose.env}
+  [ -f "$file" ] || return 0
+  sed -n "s/^\(export \)\{0,1\}$1=//p" "$file" | tail -1 | sed "s/^[\"']\(.*\)[\"']\$/\1/"
+}
+set_compose_env() { # KEY VALUE: replace KEY's line in compose.env, keeping every other line
+  [ "$DRY" = 1 ] && { echo "+ set $1=$2 in $PREFIX/compose.env"; return; }
+  { [ ! -f "$PREFIX/compose.env" ] || grep -v "^\(export \)\{0,1\}$1=" "$PREFIX/compose.env" || true; echo "$1=$2"; } > "$PREFIX/compose.env.new"
+  [ ! -f "$PREFIX/compose.env" ] || chmod --reference="$PREFIX/compose.env" "$PREFIX/compose.env.new"
   mv "$PREFIX/compose.env.new" "$PREFIX/compose.env"
+}
+set_scheduler_image() { set_compose_env FLEET_SCHEDULER_IMAGE "$1"; } # compose.env names the image both services run
+control_etc() { local etc; etc=$(compose_env_get FLEET_ETC); echo "${etc:-/etc/zkm-fleet}"; } # as Compose mounts it
+# The schema the database is at, as the scheduler records it (fleet_schema in
+# crates/fleet-scheduler/src/store.rs), or nothing if Postgres cannot say.
+database_schema() {
+  local v; v=$("${COMPOSE[@]}" exec -T postgres psql -U fleet -d fleet -tAc 'SELECT max(version) FROM fleet_schema' 2>/dev/null) || return 0
+  v=${v//[[:space:]]/}
+  if [[ $v =~ ^[0-9]+$ ]]; then echo "$v"; fi
+}
+record_schema() { # BACKUP: the schema a rollback to BACKUP must still find
+  if [ "$DRY" = 1 ]; then echo "+ record the database schema version in $1/schema_version"; return; fi
+  local v; v=$(database_schema)
+  if [ -n "$v" ]; then echo "$v" > "$1/schema_version"
+  else echo "fleet-ctl: warning: cannot read the database schema version; a rollback to $1 will need --force" >&2; fi
+}
+# A new scheduler migrates the database when it starts, and an older one refuses a schema it does not know.
+rollback_schema_check() { # BACKUP [--force]
+  local b=$1 force=${2:-} was now why
+  was=$(cat "$b/schema_version" 2>/dev/null || true)
+  if [ "$DRY" = 1 ]; then echo "+ check that the database schema is still ${was:-(not recorded)}"; return; fi
+  now=$(database_schema)
+  if [ -n "$was" ] && [ "$now" = "$was" ]; then return 0; fi
+  if [ -z "$was" ]; then why="$b records no database schema version"
+  elif [ -z "$now" ]; then why="cannot read the database schema version (it was $was before the upgrade)"
+  else why="the database is at schema $now, but was at schema $was before the upgrade"; fi
+  if [ "$force" = --force ]; then echo "fleet-ctl: warning: $why; rolling back anyway (--force)" >&2; return 0; fi
+  die "$why, and the previous scheduler may not start on a migrated database. Restore the Postgres and data_dir backups taken before the upgrade instead (see docs/maintenance.md), or pass --force to roll back anyway; nothing changed"
+}
+# The live Envoy config is rendered from the template the way install.sh renders it. A
+# site that manages its own (no gateway.yaml) keeps it.
+gateway_config_refresh() {
+  local live ip; live=$(control_etc)/gateway.yaml
+  ip=$(compose_env_get FLEET_SCHEDULER_IP); ip=${ip:-172.28.250.10}
+  if [ ! -f "$live" ]; then
+    echo "note: no $live, so the gateway's config is site-managed and was left alone; compare it with $PREFIX/deploy/gateway.yaml.in"
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "+ sed s/@SCHEDULER_IP@/$ip/g $PREFIX/deploy/gateway.yaml.in > $live"
+    echo "+ ${COMPOSE[*]} up -d --no-deps --force-recreate gateway   # if $live changed"
+    return 0
+  fi
+  sed "s/@SCHEDULER_IP@/$ip/g" "$PREFIX/deploy/gateway.yaml.in" > "$live.new"
+  if cmp -s "$live.new" "$live"; then rm -f "$live.new"; echo "gateway config unchanged"; return 0; fi
+  chmod --reference="$live" "$live.new"
+  mv "$live.new" "$live"
+  compose up -d --no-deps --force-recreate gateway || die "the gateway did not restart with the new $live; run: fleet-ctl.sh scheduler rollback"
 }
 # The scheduler and MCP run from the image in Docker Compose; only fleetctl is a host binary.
 scheduler_upgrade() {
@@ -134,7 +192,10 @@ scheduler_upgrade() {
   # Pull first so a missing image changes nothing.
   run docker pull "$image"
   run mkdir -p "$b"
+  record_schema "$b"
   run cp -a "$PREFIX/bin/fleetctl" "$PREFIX/deploy/docker-compose.yml" "$PREFIX/deploy/gateway.yaml.in" "$PREFIX/compose.env" "$b/"
+  local live; live=$(control_etc)/gateway.yaml
+  [ ! -f "$live" ] || run cp -a "$live" "$b/gateway.yaml"
   [ ! -d "$PREFIX/deploy/trustee" ] || run cp -a "$PREFIX/deploy/trustee" "$b/"
   run install -m 755 "$RELEASE_ROOT/bin/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$RELEASE_ROOT/deploy/docker-compose.yml" "$RELEASE_ROOT/deploy/gateway.yaml.in" "$PREFIX/deploy/"
@@ -146,20 +207,116 @@ scheduler_upgrade() {
   # The scheduler finishes in-flight calls before it exits, so recreating can take ~90s.
   compose up -d --no-deps --force-recreate $(control_services)
   scheduler_healthy || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
+  # Envoy reads its config only at startup, and the new template may route new services.
+  gateway_config_refresh
   echo "control plane upgraded to $RELEASE_TAG; previous fleetctl and compose files in $b"
 }
-scheduler_rollback() {
+scheduler_rollback() { # [--force]
+  local force=${1:-}
+  [ -z "$force" ] || [ "$force" = --force ] || die "usage: scheduler rollback [--force]"
   local b; b=$(latest_backup control); [ -n "$b" ] || die "no backup in $PREFIX/backup"
+  rollback_schema_check "$b" "$force"
   run install -m 755 "$b/fleetctl" "$PREFIX/bin/fleetctl"
   run cp "$b/docker-compose.yml" "$b/gateway.yaml.in" "$PREFIX/deploy/"
-  run cp "$b/compose.env" "$PREFIX/compose.env"
+  # The upgrade changed only the image; settings added since (OpenShell's pin and profile) stay.
+  local image; image=$(compose_env_get FLEET_SCHEDULER_IMAGE "$b/compose.env")
+  if [ -n "$image" ]; then set_scheduler_image "$image"; else run cp "$b/compose.env" "$PREFIX/compose.env"; fi
   if [ -d "$b/trustee" ]; then
     run mkdir -p "$PREFIX/deploy/trustee"
     run cp -a "$b/trustee/." "$PREFIX/deploy/trustee/"
   fi
-  compose up -d --no-deps --force-recreate $(control_services)
+  local services live; services=$(control_services); live=$(control_etc)/gateway.yaml
+  if [ -f "$b/gateway.yaml" ] && ! cmp -s "$b/gateway.yaml" "$live"; then
+    run cp -a "$b/gateway.yaml" "$live"
+    services="$services gateway"
+  fi
+  compose up -d --no-deps --force-recreate $services
   scheduler_healthy || die "scheduler is not healthy after rollback"
   echo "restored $b"
+}
+# The access-policy gateway needs the scheduler's compute socket, which only
+# policy_gateway.openshell creates, so it is off until this turns it on.
+OPENSHELL_FILES=(gateway.toml server.pem server.key ca.pem jwt.key jwt.pub jwt.kid)
+openshell_up() {
+  local etc dir uid gid f problems=() image repo digest
+  etc=$(control_etc); dir=$etc/openshell
+  uid=$(compose_env_get FLEET_UID); uid=${uid:-10001}
+  gid=$(compose_env_get FLEET_GID); gid=${gid:-10001}
+  # 1. Its PKI, launch-signing keys and config, private to the UID both containers run as.
+  if [ ! -d "$dir" ]; then
+    problems+=("$dir does not exist")
+  else
+    [ "$(stat -c %a "$dir")" = 700 ] || problems+=("$dir must be mode 0700")
+    [ "$(stat -c %u:%g "$dir")" = "$uid:$gid" ] || problems+=("$dir must be owned by $uid:$gid (FLEET_UID:FLEET_GID)")
+    for f in "${OPENSHELL_FILES[@]}"; do
+      if [ ! -f "$dir/$f" ] || [ ! -s "$dir/$f" ]; then problems+=("$dir/$f is missing or empty"); continue; fi
+      [ "$(stat -c %u:%g "$dir/$f")" = "$uid:$gid" ] || problems+=("$dir/$f must be owned by $uid:$gid (FLEET_UID:FLEET_GID)")
+      case "$f" in *.key) [ "$(stat -c %a "$dir/$f")" = 600 ] || problems+=("$dir/$f is a private key and must be mode 0600");; esac
+    done
+  fi
+  if [ ${#problems[@]} -gt 0 ]; then
+    printf 'fleet-ctl: %s\n' "${problems[@]}" >&2
+    die "prepare the OpenShell gateway's files as docs/installation.md describes; nothing changed"
+  fi
+  # 2. Without policy_gateway.openshell the scheduler serves no compute socket, and the gateway exits.
+  openshell_configured "$etc/fleet.yaml" || die "$etc/fleet.yaml has no policy_gateway.openshell block, so the scheduler would serve no compute socket for the gateway; configure it (docs/installation.md) first; nothing changed"
+  # 3. Pin the image by digest: a revision tag can be pushed again.
+  image=$("${COMPOSE[@]}" --profile openshell config --format json openshell-gateway \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["openshell-gateway"]["image"])') \
+    || die "cannot read the openshell-gateway image from the Compose files; nothing changed"
+  if [[ $image == *@sha256:* ]]; then
+    echo "OpenShell gateway image is pinned: $image"
+  else
+    repo=${image%%@*}; [[ ${repo##*/} != *:* ]] || repo=${repo%:*}
+    run docker pull "$image" || die "cannot pull $image; nothing changed"
+    if [ "$DRY" = 1 ]; then
+      echo "+ set FLEET_OPENSHELL_IMAGE=$repo@sha256:<registry digest of $image> in $PREFIX/compose.env"
+    else
+      digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+        | awk -v want="$repo@sha256:" 'index($0, want) == 1 { print; exit }')
+      [ -n "$digest" ] || die "$image has no registry digest; set FLEET_OPENSHELL_IMAGE=$repo@sha256:... in $PREFIX/compose.env"
+      set_compose_env FLEET_OPENSHELL_IMAGE "$digest"
+    fi
+  fi
+  # 4. The volumes are nocopy, so they start out owned by root. Safe to repeat.
+  compose --profile openshell run --rm --no-deps --user 0:0 \
+    --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE \
+    --entrypoint install openshell-gateway -d -m 700 \
+    -o "$uid" -g "$gid" /run/zkm-fleet/openshell /var/lib/openshell \
+    || die "cannot prepare the OpenShell volumes"
+  # 5. The scheduler reads policy_gateway only at startup, and Compose cannot see a change
+  # to the bind-mounted fleet.yaml, so recreate it.
+  compose up -d --no-deps --force-recreate scheduler || die "cannot recreate the scheduler"
+  scheduler_healthy || die "the scheduler is not healthy with policy_gateway.openshell (its compute_socket must be /run/zkm-fleet/openshell/compute.sock); see docker logs zkm-fleet-scheduler-1"
+  # 6. Then the gateway, which connects to that socket as it starts.
+  compose --profile openshell up -d --no-deps --wait openshell-gateway \
+    || die "the OpenShell gateway is not healthy; see docker logs zkm-fleet-openshell-gateway-1. COMPOSE_PROFILES was left unchanged"
+  # 7. Later full `up -d` runs include it.
+  add_compose_profile openshell
+  echo "OpenShell gateway is up; COMPOSE_PROFILES in $PREFIX/compose.env includes openshell"
+}
+add_compose_profile() {
+  local current; current=$(compose_env_get COMPOSE_PROFILES)
+  case ",$current," in *",$1,"*) return 0;; esac
+  set_compose_env COMPOSE_PROFILES "${current:+$current,}$1"
+}
+openshell_configured() { # FLEET_YAML: has a policy_gateway.openshell mapping (block style, as installed)
+  [ -f "$1" ] || return 1
+  awk '
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    done || /^[[:space:]]*(#.*)?$/ { next }
+    pending { found = indent($0) > key; done = 1; next }
+    /^policy_gateway:[[:space:]]*(#.*)?$/ { block = 1; child = -1; next }
+    block && indent($0) == 0 { block = 0 }
+    block {
+      if (child < 0) child = indent($0)
+      if (indent($0) == child && $0 ~ /^ *openshell:([[:space:]]|$)/) {
+        v = $0; sub(/^ *openshell:[[:space:]]*/, "", v); sub(/^#.*$/, "", v); sub(/[[:space:]]+#.*$/, "", v)
+        if (v == "") { pending = 1; key = child } else { found = (v ~ /^\{.*[^[:space:]{}].*\}$/); done = 1 }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' "$1"
 }
 
 node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR], or node upgrade RELEASE_TAG
@@ -342,8 +499,9 @@ status() {
 
 case "${1:-}/${2:-}" in
   status/) status;;
+  openshell/up) openshell_up;;
   scheduler/upgrade) scheduler_upgrade "${3:-}";;
-  scheduler/rollback) scheduler_rollback;;
+  scheduler/rollback) scheduler_rollback "${3:-}";;
   node/upgrade) node_upgrade "${3:-}" "${4:-}" "${5:-}" "${6:-}";;
   node/rollback) if remote; then on_node node rollback; else node_rollback; fi;;
   app/cleanup) if remote; then on_node app cleanup "${3:-}"; else app_cleanup "${3:-}"; fi;;

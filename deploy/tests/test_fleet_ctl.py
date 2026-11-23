@@ -81,6 +81,7 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None, truste
     backup = prefix / "backup/control-20260101T000000Z"
     for name in ["fleetctl", "docker-compose.yml", "gateway.yaml.in", "compose.env"]:
         executable(backup / name, "")
+    (backup / "schema_version").write_text("20\n")  # what the database still reports below
     (prefix / "deploy").mkdir(parents=True)
     if trustee:
         for parent, text in [(backup, "original AS config"), (prefix / "deploy", "new AS config")]:
@@ -91,6 +92,7 @@ def rollback(tmp_path, healthy_after, later_state="running 0", wait=None, truste
     executable(commands / "curl", f'n=$(($(cat {curls} 2>/dev/null || echo 0) + 1)); echo $n > {curls}\n'
                                   f'[ "$n" -ge {healthy_after} ]\n')
     executable(commands / "docker", f'case "$*" in\n'
+                                    f'  *" exec -T postgres psql "*) echo 20 ;;\n'
                                     f'  *" ps -aq scheduler") echo abc123 ;;\n'
                                     f'  inspect*) n=$(($(cat {inspects} 2>/dev/null || echo 0) + 1)); echo $n > {inspects}\n'
                                     f'    if [ "$n" = 1 ]; then echo "running 0"; else echo {shlex.quote(later_state)}; fi ;;\n'

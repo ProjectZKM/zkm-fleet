@@ -34,11 +34,12 @@ mkdir -p "$PREFIX/bin" "$ETC" "$WORKDIR/logs"
 chmod 750 "$ETC"
 if [ "$ROLE" = control ]; then
   docker compose version >/dev/null || die "Docker compose v2 is required"
-  # Access enforcement is in the default stack. Validate prepared operator
-  # identity before replacing deployment files or starting any services.
-  for file in gateway.toml server.pem server.key ca.pem jwt.key jwt.pub jwt.kid; do
-    [ -f "$ETC/openshell/$file" ] || die "prepare $ETC/openshell/$file per docs/installation.md before control installation"
-  done
+  # Check everything before replacing deployment files or starting any services.
+  # The OpenShell gateway is optional: fleet-ctl.sh openshell up checks its files.
+  command -v openssl >/dev/null || die "openssl is required on the control host (it generates the database password)"
+  command -v python3 >/dev/null || die "python3 is required on the control host (fleet-ctl.sh uses it)"
+  # An install without openssl used to leave an empty password, which Postgres refuses.
+  [ ! -e "$ETC/pg_password" ] || [ -s "$ETC/pg_password" ] || die "$ETC/pg_password is empty. If Postgres was never initialised (its volume is new or empty), remove $ETC/pg_password and $ETC/database_url and run the installer again; otherwise write the database's password into $ETC/pg_password and $ETC/database_url"
   [ -x "$BIN/fleetctl" ] || die "build fleetctl first, or pass --bin"
   install -m 755 "$BIN/fleetctl" "$PREFIX/bin/"
 else
@@ -74,11 +75,18 @@ fi
 mkdir -p "$PREFIX/deploy"
 if [ "$ROLE" = control ]; then
   cp "$SRC"/deploy/{docker-compose.yml,gateway.yaml.in} "$PREFIX/deploy/"
+  install -m 755 "$SRC/deploy/fleet-ctl.sh" "$PREFIX/deploy/fleet-ctl.sh"
   mkdir -p "$PREFIX/deploy/trustee"
   cp "$SRC/deploy/trustee/as.json" "$PREFIX/deploy/trustee/as.json"
   FLEETCTL="$PREFIX/bin/fleetctl"
   [ -f "$ETC/cluster.token" ] || "$FLEETCTL" init token --out "$ETC/cluster.token" >/dev/null
-  [ -f "$ETC/pg_password" ] || (umask 077; openssl rand -hex 24 > "$ETC/pg_password")
+  if [ ! -f "$ETC/pg_password" ]; then # written whole or not at all
+    PG_STAGE=$(mktemp "$ETC/pg_password.XXXXXX")
+    if ! openssl rand -hex 24 > "$PG_STAGE" || [ ! -s "$PG_STAGE" ]; then
+      rm -f "$PG_STAGE"; die "openssl could not generate the database password"
+    fi
+    mv "$PG_STAGE" "$ETC/pg_password"
+  fi
   [ -f "$ETC/database_url" ] || (umask 077; printf 'postgres://fleet:%s@postgres:5432/fleet\n' "$(cat "$ETC/pg_password")" > "$ETC/database_url")
   [ -n "$PUBLIC_URL" ] || PUBLIC_URL="https://$IP:8905"
   [ -f "$ETC/tls/ca.pem" ] || "$FLEETCTL" init tls --dir "$ETC/tls" --names "${TLS_NAMES:-stage,$(hostname),$IP}" >/dev/null
@@ -99,7 +107,20 @@ EOF
   ln -sf "$ETC/admin.token" "$HOME/.config/zkm-fleet/admin.token"
   ln -sf "$FLEETCTL" "$HOME/.local/bin/fleetctl"
   IMG=${FLEET_SCHEDULER_IMAGE:-zkm-fleet-scheduler:local}
-  cat > "$PREFIX/compose.env" <<EOF
+  # Rewrite only the keys this installer owns, and keep every other line (FLEET_OPENSHELL_*
+  # and other site settings). Of COMPOSE_PROFILES it manages only mcp; profiles enabled
+  # elsewhere (openshell, trustee) stay.
+  PROFILES=()
+  if [ -f "$PREFIX/compose.env" ]; then
+    IFS=, read -ra OLD_PROFILES <<< "$(sed -n 's/^\(export \)\{0,1\}COMPOSE_PROFILES=//p' "$PREFIX/compose.env" | tail -1 | tr -d "\"' ")"
+    for p in "${OLD_PROFILES[@]}"; do [ -z "$p" ] || [ "$p" = mcp ] || PROFILES+=("$p"); done
+  fi
+  [ "$MCP" = 0 ] || PROFILES+=(mcp)
+  {
+    if [ -f "$PREFIX/compose.env" ]; then
+      awk '!/^(export )?(FLEET_ETC|FLEET_DATA|FLEET_UID|FLEET_GID|FLEET_SUBNET|FLEET_SCHEDULER_IP|FLEET_MCP_ALLOWED_HOSTS|COMPOSE_PROFILES|FLEET_SCHEDULER_IMAGE)=/' "$PREFIX/compose.env"
+    fi
+    cat <<EOF
 FLEET_ETC=$ETC
 FLEET_DATA=$PREFIX/data
 FLEET_UID=$(id -u)
@@ -107,9 +128,15 @@ FLEET_GID=$(id -g)
 FLEET_SUBNET=$SUBNET
 FLEET_SCHEDULER_IP=$SCHED_IP
 FLEET_MCP_ALLOWED_HOSTS=$MCP_AUTHORITY,localhost:8906,127.0.0.1:8906
-COMPOSE_PROFILES=$([ "$MCP" = 1 ] && echo mcp || true)
+COMPOSE_PROFILES=$(IFS=,; echo "${PROFILES[*]}")
 FLEET_SCHEDULER_IMAGE=$IMG
 EOF
+  } > "$PREFIX/compose.env.new"
+  [ ! -f "$PREFIX/compose.env" ] || chmod --reference="$PREFIX/compose.env" "$PREFIX/compose.env.new"
+  mv "$PREFIX/compose.env.new" "$PREFIX/compose.env"
+  # The release's compose file, then this site's changes to it, as fleet-ctl.sh runs them.
+  COMPOSE=(docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml")
+  [ ! -f "$PREFIX/deploy/docker-compose.override.yml" ] || COMPOSE+=(-f "$PREFIX/deploy/docker-compose.override.yml")
   if ! docker image inspect "$IMG" >/dev/null 2>&1; then
     if [ -n "${FLEET_SCHEDULER_IMAGE:-}" ]; then
       docker pull "$IMG" || die "cannot pull $IMG"
@@ -118,18 +145,22 @@ EOF
       docker build -f "$SRC/deploy/Dockerfile.scheduler" -t "$IMG" "$SRC"
     fi
   fi
-  docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" up -d
+  "${COMPOSE[@]}" up -d
   for _ in $(seq 1 30); do curl -sf http://127.0.0.1:9191/healthz >/dev/null && break; sleep 2; done
   curl -sf http://127.0.0.1:9191/healthz >/dev/null || die "scheduler health check failed"
   # The first administrator's token goes into the database; its secret lands in the data
   # directory (the configuration is mounted read-only) and moves beside the other secrets.
   if [ ! -f "$ETC/admin.token" ]; then
-    docker compose --env-file "$PREFIX/compose.env" -p zkm-fleet -f "$PREFIX/deploy/docker-compose.yml" exec -T scheduler \
+    "${COMPOSE[@]}" exec -T scheduler \
       fleet-scheduler -c /etc/zkm-fleet/fleet.yaml issue-admin --label install --out /var/lib/zkm-fleet/admin.token >/dev/null
     (umask 077; mv "$PREFIX/data/admin.token" "$ETC/admin.token")
   fi
   echo "[install] control plane ready; fleetctl connects to http://127.0.0.1:9191"
   echo "[install] HTTPS gateway: $PUBLIC_URL; MCP: $PUBLIC_URL/mcp"
+  case ",$(IFS=,; echo "${PROFILES[*]}")," in
+    *,openshell,*) ;;
+    *) echo "[install] OpenShell gateway: off; run $PREFIX/deploy/fleet-ctl.sh openshell up once policy_gateway.openshell is configured";;
+  esac
 else
   cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh} "$PREFIX/deploy/"
   cp "$SRC"/deploy/{shim-start.sh,ray-watch.sh,install-node-services.sh} "$PREFIX/deploy/"
