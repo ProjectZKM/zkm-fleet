@@ -217,7 +217,9 @@ struct CreateApp {
     name: String,
     /// The app's container settings, the keys of its apps.yaml entry: kind (app, the default,
     /// or ziren-gpu/ziren-cpu for a prover), image, replicas, gpus, cpus, shm_gb, memory_gb, env,
-    /// volumes, ready_timeout_s, stop_timeout_s; for an app also command, port_base, health_path,
+    /// volumes, ready_timeout_s, stop_timeout_s; for a shim app (runtime executor shim, driver
+    /// docker, tee or tee-simulation) the hard limits cpu_limit (CPUs) and memory_limit_gb (GiB),
+    /// beside cpus and memory_gb, which Ray reserves; for an app also command, port_base, health_path,
     /// workdir, user; for a prover proof_storage_root, backend, rust_log. image is required, and
     /// port_base for an app; user, volumes and proof_storage_root require administrator credentials.
     spec: serde_json::Map<String, Value>,
