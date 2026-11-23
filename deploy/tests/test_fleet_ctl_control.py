@@ -70,6 +70,9 @@ case "$*" in
   "image inspect "*) case "${{FAKE_IMAGE:-}}" in local) exit 0;; missing) exit 1;; esac
     printf 'other.example/mirror@sha256:{"cd" * 32}\\n{REPO}@{DIGEST}\\n' ;;
   *" exec -T postgres psql "*) cat {self.schema} ;;
+  *" config --format json postgres") echo '{{"services":{{"postgres":{{"image":"postgres:16"}}}}}}' ;;
+  # An external database: psql from the Postgres image, the URL only in the environment.
+  "run --rm --network host -e DATABASE_URL "*) [ "$DATABASE_URL" = "$FAKE_DATABASE_URL" ] && cat {self.schema} ;;
   *" ps -aq scheduler") echo abc123 ;;
   "inspect -f "*) echo "running 0" ;;
 esac
@@ -323,6 +326,31 @@ def test_rollback_refuses_unless_the_schema_is_unchanged_or_forced(control, now,
     assert result.returncode == 0, result.stderr
     assert reason in result.stderr and "rolling back anyway (--force)" in result.stderr
     assert (control.prefix / "bin/fleetctl").read_text().endswith("echo old-fleetctl\n")
+
+
+def test_upgrade_keeps_an_edited_gateway_config(control):
+    control.release("9.9.9", "new template @SCHEDULER_IP@ with ledger route\n")
+    live = control.etc / "gateway.yaml"
+    live.write_text("old template 172.28.250.10\nsite route\n")
+    result = control.run("scheduler", "upgrade", "v9.9.9")
+    assert result.returncode == 0, result.stderr
+    assert live.read_text() == "old template 172.28.250.10\nsite route\n"
+    assert (control.etc / "gateway.yaml.release").read_text() == "new template 172.28.250.10 with ledger route\n"
+    assert "differs from what the previous release rendered" in result.stderr
+    assert not any("--force-recreate gateway" in c for c in control.calls())
+
+
+def test_schema_is_read_from_an_external_database(control):
+    url = "postgres://fleet:pw@db.example:5432/fleet"
+    (control.etc / "database_url").write_text(url + "\n")
+    control.release("9.9.9", "old template @SCHEDULER_IP@\n")
+    result = control.run("scheduler", "upgrade", "v9.9.9", FAKE_FAIL="exec -T postgres", FAKE_DATABASE_URL=url)
+    assert result.returncode == 0, result.stderr
+    backup = next((control.prefix / "backup").glob("control-*"))
+    assert (backup / "schema_version").read_text() == "20\n"
+    assert not any("pw@" in c for c in control.calls()), "the password never reaches argv"
+    result = control.run("scheduler", "rollback", FAKE_FAIL="exec -T postgres", FAKE_DATABASE_URL=url)
+    assert result.returncode == 0, result.stderr
 
 
 def test_upgrade_warns_when_it_cannot_record_the_schema(control):

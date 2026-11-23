@@ -140,9 +140,19 @@ set_compose_env() { # KEY VALUE: replace KEY's line in compose.env, keeping ever
 set_scheduler_image() { set_compose_env FLEET_SCHEDULER_IMAGE "$1"; } # compose.env names the image both services run
 control_etc() { local etc; etc=$(compose_env_get FLEET_ETC); echo "${etc:-/etc/zkm-fleet}"; } # as Compose mounts it
 # The schema the database is at, as the scheduler records it (fleet_schema in
-# crates/fleet-scheduler/src/store.rs), or nothing if Postgres cannot say.
+# crates/fleet-scheduler/src/store.rs), or nothing if Postgres cannot say. A site whose
+# database_url points elsewhere is asked with psql from the Compose Postgres image; the URL
+# carries the password, so it travels in the environment, never in argv.
 database_schema() {
-  local v; v=$("${COMPOSE[@]}" exec -T postgres psql -U fleet -d fleet -tAc 'SELECT max(version) FROM fleet_schema' 2>/dev/null) || return 0
+  local v url image query='SELECT max(version) FROM fleet_schema'
+  if ! v=$("${COMPOSE[@]}" exec -T postgres psql -U fleet -d fleet -tAc "$query" 2>/dev/null); then
+    url=$(cat "$(control_etc)/database_url" 2>/dev/null) || return 0
+    case "$url" in *@postgres:*|*@postgres/*|"") return 0;; esac  # the bundled one, and it did not answer
+    image=$("${COMPOSE[@]}" config --format json postgres 2>/dev/null \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["postgres"]["image"])' 2>/dev/null) || return 0
+    v=$(DATABASE_URL=$url docker run --rm --network host -e DATABASE_URL -e PGCONNECT_TIMEOUT=10 \
+      --entrypoint sh "$image" -c 'exec psql "$DATABASE_URL" -tAc "$0"' "$query" 2>/dev/null) || return 0
+  fi
   v=${v//[[:space:]]/}
   if [[ $v =~ ^[0-9]+$ ]]; then echo "$v"; fi
 }
@@ -166,8 +176,8 @@ rollback_schema_check() { # BACKUP [--force]
   die "$why, and the previous scheduler may not start on a migrated database. Restore the Postgres and data_dir backups taken before the upgrade instead (see docs/maintenance.md), or pass --force to roll back anyway; nothing changed"
 }
 # The live Envoy config is rendered from the template the way install.sh renders it. A
-# site that manages its own (no gateway.yaml) keeps it.
-gateway_config_refresh() {
+# site that manages its own (no gateway.yaml), or edited the rendered one, keeps it.
+gateway_config_refresh() { # BACKUP: holds the previous gateway.yaml.in
   local live ip; live=$(control_etc)/gateway.yaml
   ip=$(compose_env_get FLEET_SCHEDULER_IP); ip=${ip:-172.28.250.10}
   if [ ! -f "$live" ]; then
@@ -175,12 +185,19 @@ gateway_config_refresh() {
     return 0
   fi
   if [ "$DRY" = 1 ]; then
-    echo "+ sed s/@SCHEDULER_IP@/$ip/g $PREFIX/deploy/gateway.yaml.in > $live"
+    echo "+ sed s/@SCHEDULER_IP@/$ip/g $PREFIX/deploy/gateway.yaml.in > $live   # unless $live was edited"
     echo "+ ${COMPOSE[*]} up -d --no-deps --force-recreate gateway   # if $live changed"
     return 0
   fi
   sed "s/@SCHEDULER_IP@/$ip/g" "$PREFIX/deploy/gateway.yaml.in" > "$live.new"
   if cmp -s "$live.new" "$live"; then rm -f "$live.new"; echo "gateway config unchanged"; return 0; fi
+  # Replace only what the previous template rendered; an edited file is the site's.
+  if ! sed "s/@SCHEDULER_IP@/$ip/g" "$1/gateway.yaml.in" 2>/dev/null | cmp -s - "$live"; then
+    chmod --reference="$live" "$live.new"
+    mv "$live.new" "$live.release"
+    echo "fleet-ctl: $live differs from what the previous release rendered, so it was left alone and the gateway was not restarted; merge the new release's render, $live.release, into it and recreate the gateway" >&2
+    return 0
+  fi
   chmod --reference="$live" "$live.new"
   mv "$live.new" "$live"
   compose up -d --no-deps --force-recreate gateway || die "the gateway did not restart with the new $live; run: fleet-ctl.sh scheduler rollback"
@@ -211,7 +228,7 @@ scheduler_upgrade() {
   compose up -d --no-deps --force-recreate $(control_services)
   scheduler_healthy || die "scheduler is not healthy; run: fleet-ctl.sh scheduler rollback"
   # Envoy reads its config only at startup, and the new template may route new services.
-  gateway_config_refresh
+  gateway_config_refresh "$b"
   echo "control plane upgraded to $RELEASE_TAG; previous fleetctl and compose files in $b"
 }
 scheduler_rollback() { # [--force]
@@ -445,19 +462,22 @@ scheduler_access() { # fleetctl and the admin token file it would use; sets ADMI
 # The agent logs that it connected as soon as its channel opens, before the scheduler accepts a
 # report. Proof that it works is the node READY with a report newer than RESTARTED (date +%s.%N).
 node_reported() { # NAME RESTARTED
-  local name=$1 state
+  local name=$1 state deadline=$((SECONDS + 90)) left
   if ! [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || ! scheduler_access; then
     echo "fleet-ctl: warning: cannot ask the scheduler about ${name:-the node} (this needs $PREFIX/bin/fleetctl, an admin token and the node's FLEET_NODE_NAME); only the agent's log was checked, so confirm it is READY in: fleetctl node" >&2
     return 0
   fi
   echo "waiting up to 90s for the scheduler to report $name READY"
+  # One deadline for the whole wait: a scheduler that stops answering costs 90s, not 90s per try.
   for _ in $(seq 45); do
-    state=$(python3 - "$PREFIX/bin/fleetctl" "$name" "$ADMIN_TOKEN" "$2" <<'PY'
+    left=$((deadline - SECONDS)); [ "$left" -gt 0 ] || break
+    state=$(python3 - "$PREFIX/bin/fleetctl" "$name" "$ADMIN_TOKEN" "$2" "$left" <<'PY'
 import json, os, subprocess, sys, time
 fleetctl, name, token, restarted = sys.argv[1], sys.argv[2], sys.argv[3], float(sys.argv[4])
 asked = time.time()
 try:
-    out = subprocess.run([fleetctl, "--json", "node", name], capture_output=True, text=True, timeout=30,
+    out = subprocess.run([fleetctl, "--json", "node", name], capture_output=True, text=True,
+                         timeout=min(30, int(sys.argv[5])),
                          env={**os.environ, "FLEET_TOKEN_FILE": token})
     node = json.loads(out.stdout)
     # The scheduler measures the age when it answers, after `asked`: this never makes a report newer.

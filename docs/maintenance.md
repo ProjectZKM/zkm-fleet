@@ -57,7 +57,9 @@ image changes nothing), backs up `fleetctl`, the Compose files, `compose.env`,
 `$FLEET_ETC/gateway.yaml` and the database schema version, records the new image,
 recreates `scheduler` (and `mcp` when enabled) and waits for `/healthz`. It re-renders
 `gateway.yaml` from the new `gateway.yaml.in` and recreates the HTTPS gateway when that
-changes it, so don't edit `gateway.yaml` by hand; a site without that file (it runs
+changes it. It replaces `gateway.yaml` only while it still matches what the previous
+template rendered: an edited one is left alone and the gateway is not restarted, with the
+new render beside it as `gateway.yaml.release` to merge by hand. A site without that file (it runs
 its own gateway) gets a note instead. It leaves the OpenShell gateway alone. The old
 scheduler can take about 90 seconds to finish in-flight calls, and the new one reads
 every job and command record it keeps before it listens, a minute or more on a busy
@@ -68,8 +70,10 @@ the scheduler image, so settings added since (such as the OpenShell image pin an
 profile) stay. It recreates the HTTPS gateway if its configuration changes back. It refuses when
 the database schema changed since the upgrade (as from 0.1 to schema 20), because the
 older scheduler can't start on the migrated database: restore the Postgres and
-`data_dir` backups taken before the upgrade instead. `scheduler rollback --force` skips
-that check. Keep site changes to the Compose file, such as another gateway or an
+`data_dir` backups taken before the upgrade instead. The version is read from the bundled
+Postgres or, when `database_url` points elsewhere, with `psql` from the Compose Postgres
+image on the host network. A backup without a recorded version, such as one taken by an
+older `fleet-ctl.sh`, needs `--force`. `scheduler rollback --force` skips that check. Keep site changes to the Compose file, such as another gateway or an
 existing Postgres volume, in
 `deploy/docker-compose.override.yml`: an upgrade replaces only `docker-compose.yml`,
 and every Compose call, the installer's included, applies the override after it.
