@@ -12,8 +12,8 @@ checksums and runs `deploy/install.sh` with the packaged binaries.
 ## Control host
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.3/deploy/setup.sh | bash -s -- \
-  --version v0.2.3 control --public-url https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.4/deploy/setup.sh | bash -s -- \
+  --version v0.2.4 control --public-url https://fleet.example:8905 \
   --tls-names stage,fleet.example --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc"
 ```
 
@@ -40,8 +40,8 @@ Copy the control host's `etc/cluster.token` to the node (mode 600), and its
 `etc/tls/ca.pem` when using the private CA. Then run on the node:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.3/deploy/setup.sh | bash -s -- \
-  --version v0.2.3 node --name gpu-1 --scheduler https://fleet.example:8905 \
+curl -fsSL https://raw.githubusercontent.com/ProjectZKM/zkm-fleet/v0.2.4/deploy/setup.sh | bash -s -- \
+  --version v0.2.4 node --name gpu-1 --scheduler https://fleet.example:8905 \
   --cluster-token "$HOME/cluster.token" --scheduler-ca "$HOME/ca.pem" \
   --prefix "$HOME/app/fleet" --etc "$HOME/app/fleet/etc" --cuda 0,1,2,3 --cpus 32
 ```
@@ -259,7 +259,7 @@ Then start the gateway, on a new or an upgraded control host:
 "$FLEET_PREFIX/deploy/fleet-ctl.sh" openshell up
 ```
 
-A host installed before v0.2.3 has no copy of `fleet-ctl.sh` there; run the release's
+A host installed before v0.2.4 has no copy of `fleet-ctl.sh` there; run the release's
 `deploy/fleet-ctl.sh` with `FLEET_PREFIX` set instead ([maintenance](maintenance.md#upgrading)).
 
 `openshell up` checks the files above and the `policy_gateway.openshell` block, pins the image

@@ -19,7 +19,7 @@ to report the node READY with a heartbeat newer than the restart, and the matchi
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-1   # or ~/.config/zkm-fleet/ctl.env
 export FLEET_NODE_PREFIX=/path/to/node/install                      # default ~/app/fleet
 deploy/fleet-ctl.sh status                       # control services, health, nodes and apps
-deploy/fleet-ctl.sh -n scheduler upgrade v0.2.3  # -n prints every step and changes nothing
+deploy/fleet-ctl.sh -n scheduler upgrade v0.2.4  # -n prints every step and changes nothing
 ```
 
 ### Control host
@@ -49,7 +49,7 @@ The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 
 ```bash
-deploy/fleet-ctl.sh scheduler upgrade v0.2.3
+deploy/fleet-ctl.sh scheduler upgrade v0.2.4
 ```
 
 It downloads the release package and checks its SHA-256, pulls the image (a missing
@@ -96,7 +96,7 @@ stop existing workloads automatically.
 ### Execution node
 
 ```bash
-deploy/fleet-ctl.sh node upgrade v0.2.3
+deploy/fleet-ctl.sh node upgrade v0.2.4
 # or from a local build of the same revision:
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
   target/release/fleet-proof-app deploy
@@ -273,7 +273,7 @@ Build from the release's revision and name the release, so the agent reports it 
 `fleetctl node`'s VERSION column (`-` otherwise):
 
 ```bash
-FLEET_VERSION=0.2.3 cargo build --locked --release \
+FLEET_VERSION=0.2.4 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 ```
 
@@ -480,9 +480,9 @@ Package the GOAT worker from its committed `third_party/bitvm-node` revision wit
 
 Each applies only to the versions it names.
 
-### OpenShell gateway in the default stack (before v0.2.3)
+### OpenShell gateway in the default stack (before v0.2.4)
 
-These releases started `openshell-gateway` with the rest of the stack; from v0.2.3 it
+These releases started `openshell-gateway` with the rest of the stack; from v0.2.4 it
 is the `openshell` profile, and upgrades leave an existing container as it is. On a
 host without `policy_gateway.openshell`, where that container keeps restarting, remove
 it with `docker rm -f zkm-fleet-openshell-gateway-1`; its volumes stay. On a host that

@@ -38,16 +38,16 @@ def executable(path, body):
 def test_workspace_version_is_the_next_release():
     # No tomllib: CI also runs these tests on Python 3.10.
     manifest = (ROOT / "Cargo.toml").read_text()
-    assert re.search(r'^\[workspace\.package\]\nversion = "([^"]+)"$', manifest, re.M)[1] == "0.2.3"
+    assert re.search(r'^\[workspace\.package\]\nversion = "([^"]+)"$', manifest, re.M)[1] == "0.2.4"
     lock = (ROOT / "Cargo.lock").read_text()
     for name in WORKSPACE:
         # Workspace crates are the entries without a source line.
         entries = re.findall(r'^\[\[package\]\]\nname = "%s"\nversion = "([^"]+)"\n(?!source)' % re.escape(name),
                              lock, re.M)
-        assert entries == ["0.2.3"], name
+        assert entries == ["0.2.4"], name
 
 
-@pytest.mark.parametrize("tag, ok", [("v0.2.3", True), ("v0.2.4", False), ("v0.2.3-rc.1", False)])
+@pytest.mark.parametrize("tag, ok", [("v0.2.4", True), ("v0.2.5", False), ("v0.2.4-rc.1", False)])
 def test_release_requires_the_workspace_version_to_match_the_tag(tmp_path, tag, ok):
     # Another section's version comes first, so only [workspace.package] may count.
     (tmp_path / "Cargo.toml").write_text('[package]\nversion = "9.9.9"\n\n' + (ROOT / "Cargo.toml").read_text())
@@ -55,7 +55,7 @@ def test_release_requires_the_workspace_version_to_match_the_tag(tmp_path, tag, 
     result = bash(check["run"], tmp_path, RELEASE_TAG=tag, RELEASE_VERSION=tag[1:])
     assert (result.returncode == 0) == ok, result.stderr
     if not ok:
-        assert f"workspace version is '0.2.3', but the tag {tag} needs {tag[1:]}" in result.stderr
+        assert f"workspace version is '0.2.4', but the tag {tag} needs {tag[1:]}" in result.stderr
     steps = [s.get("name") for s in workflow("release.yml")["jobs"]["build-release"]["steps"]]
     assert steps.index(check["name"]) < steps.index("Build release components"), "check before building"
 
