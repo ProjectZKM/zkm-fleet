@@ -428,7 +428,8 @@ node_reconnected() { # RESTARTED: the agent logged its connection and the schedu
 scheduler_access() { # fleetctl and the admin token file it would use; sets ADMIN_TOKEN
   [ -x "$PREFIX/bin/fleetctl" ] || return 1
   if [ -n "${FLEET_TOKEN_FILE:-}" ]; then ADMIN_TOKEN=$FLEET_TOKEN_FILE; [ -r "$ADMIN_TOKEN" ]; return; fi
-  local d; for d in ${FLEET_ETC:+"$FLEET_ETC"} "$HOME/.config/zkm-fleet" /etc/zkm-fleet; do
+  # FLEET_ETC may name the node's directory; the control host's own is the one compose.env names.
+  local d; for d in ${FLEET_ETC:+"$FLEET_ETC"} "$(control_etc)" "$HOME/.config/zkm-fleet" /etc/zkm-fleet; do
     ADMIN_TOKEN=$d/admin.token; [ ! -r "$ADMIN_TOKEN" ] || return 0
   done
   return 1

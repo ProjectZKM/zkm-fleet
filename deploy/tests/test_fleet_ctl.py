@@ -510,6 +510,20 @@ def test_remote_upgrade_and_rollback_ask_the_scheduler_from_the_control_host(tmp
         assert result.returncode != 0 and hint in result.stderr
 
 
+def test_the_control_host_finds_its_admin_token_where_compose_env_puts_its_config(tmp_path):
+    """FLEET_ETC set for the node names a directory on the node; the control host's own is in compose.env."""
+    prefix, env, log = remote_control(tmp_path, FLEET_ETC="/srv/node etc", HOME=str(tmp_path / "home"))
+    env, asked, _ = scheduler_view(tmp_path, prefix, env, {"name": "gpu-a", "ready": True, "heartbeat_age_ms": 0})
+    del env["FLEET_TOKEN_FILE"]
+    control_etc = tmp_path / "control etc"
+    control_etc.mkdir()
+    (control_etc / "admin.token").write_text("secret\n")
+    (prefix / "compose.env").write_text(f"FLEET_ETC={control_etc}\n")
+    result = ctl(env, "node", "rollback")
+    assert result.returncode == 0 and "reports gpu-a READY" in result.stdout, result.stderr
+    assert asked.read_text().splitlines()[0] == f"{control_etc / 'admin.token'} --json node gpu-a"
+
+
 def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(tmp_path):
     """A remote dry run ships nothing, so the node sees paths to no files: it prints the local
     upgrade of just those files, not a download of a release named after them."""
