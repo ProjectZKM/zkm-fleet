@@ -108,7 +108,7 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
             ("shim-single-use-ingress-v1", app.runtime.driver != "docker" and any(r.single_use for r in app.ingress.values())),
             (LIMITS_CAPABILITY, app.cpu_limit is not None or app.memory_limit_gb is not None),
             (CPU_SHARES_CAPABILITY, app.cpus == 0),
-            (TEE_CPU_OVERCOMMIT_CAPABILITY, app.cpus == 0 and app.runtime.driver != "docker"),
+            (TEE_CPU_OVERCOMMIT_CAPABILITY, app.cpus == 0 and app.runtime.driver in TEE_DRIVERS),
         ) if needed)
     return required
 
