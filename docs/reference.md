@@ -466,7 +466,11 @@ cleanup retains its reservation and never falls back to Docker directly. A stopp
 or lost shim execution needs explicit cleanup and a new generation to run again.
 With the persistent shim (`runtime-resume-v1`), a Docker runtime whose container
 exited is started again in place: by a health probe, and when its actor starts
-again after a Ray restart or a reboot.
+again after a Ray restart or a reboot. A TEE runtime is started again the same way when the
+shim advertises `runtime-resume-tee-v1`, only behind a fresh attestation admission
+with new evidence and its own proof. An admission can take 300 s: meanwhile the
+replica reports `starting`, and the daemon continues it if the bridge stops
+waiting. Its retries back off from 5 min, doubling up to an hour.
 Keep the allocation and shim journals across upgrades and restarts.
 
 Shim delegates lifecycle to upstream Docker and checks a container's effective

@@ -1104,11 +1104,126 @@ def test_tee_lifecycle_preserves_driver_and_extends_launch_timeout(tmp_path, mon
     call = Mock(return_value={"cleaned":True}); monkeypatch.setattr(shim, "daemon_call", call)
     actor.call({"operation":"launch", "request":shim.launch_request(bound, [])})
     assert call.call_args.kwargs["timeout"] == 330
+    # A resume waits for its own admission too; other operations do not.
+    actor.call({"operation":"resume", "execution":bound.execution})
+    assert call.call_args.kwargs["timeout"] == 330 and call.call_args.args[2]["driver"] == "tee-simulation"
+    actor.call({"operation":"inspect", "execution":bound.execution})
+    assert call.call_args.kwargs["timeout"] == 150
     for operation in ("inspect", "stop", "delete", "network"):
         actor.call({"operation":operation,"execution":bound.execution})
         assert call.call_args.args[2]["driver"] == "tee-simulation"
     shim.RuntimeBook(tmp_path / "book").cleanup(bound.name)
     assert call.call_args.args[2]["driver"] == "tee-simulation"
+
+
+@pytest.mark.parametrize("mode,driver", [("simulation","tee-simulation"),("hardware","tee")])
+def test_tee_resume_needs_the_daemons_tee_resume_for_the_nodes_driver(tmp_path, monkeypatch, mode, driver):
+    import hashlib
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config(mode), shim_machine_labels={"runtime.driver":driver})
+    raw["apps"][0]["runtime"]["driver"] = driver
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    machine = shim.daemon_options(spec.cluster)["machine"]
+    digest = hashlib.sha256(shim.json.dumps(machine, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    response = dict(protocol=1, drivers=[driver], machine_config_sha256=digest,
+        features=["runtime-daemon-v1", "tee-startup-v1", "data-plane-v1", "runtime-management-v1", "runtime-resume-v1"])
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: response)
+    # Docker's resume says nothing about a TEE runtime.
+    assert not {"shim-resume-v1", "shim-resume-tee-v1"} & set(shim.capabilities(spec.cluster))
+    response["features"].append("runtime-resume-tee-v1")
+    assert "shim-resume-tee-v1" in shim.capabilities(spec.cluster)
+    response["drivers"] = ["docker"]
+    assert "shim-resume-tee-v1" not in shim.capabilities(spec.cluster)
+
+
+def tee_bound(tmp_path):
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    raw["apps"][0]["runtime"]["driver"] = "tee-simulation"
+    return shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+
+
+PENDING = shim.ShimPending("shim daemon did not answer in time; the operation continues there")
+
+
+def test_a_restarted_tee_actor_resumes_its_container_behind_a_fresh_admission(tmp_path, monkeypatch):
+    bound = tee_bound(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}],
+        "resume": [{"state": "ready", "port": 18080}]})
+    actor = shim._ShimApp(bound)
+    # The whole admission's budget (see the lifecycle test), not a probe's.
+    assert calls == [("launch", None), ("resume", None)] and actor.resumable and actor.logs is None
+    start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}]}, resumable=False)
+    with pytest.raises(RuntimeError, match="web-0 is not running: its container exited; only the persistent "
+                       "shim with runtime-resume-tee-v1 starts it again; explicit cleanup is required"):
+        shim._ShimApp(bound)
+
+
+def test_a_resume_that_outlasts_its_call_is_waited_for_as_starting(tmp_path, monkeypatch):
+    bound = tee_bound(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}], "resume": [PENDING],
+        "inspect": [{"state": "starting"}, {"state": "starting"}, {"state": "ready"}]})
+    ready = iter([False, False, False, True])
+    monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: next(ready))
+    monkeypatch.setattr(shim.time, "sleep", lambda seconds: None)
+    actor = shim._ShimApp(bound)
+    assert [operation for operation, _ in calls] == ["launch", "resume", "inspect", "inspect", "inspect"]
+    # A probe while it is admitted: the shim reports it starting, and nothing resumes it again.
+    actor.call = Mock(return_value={"state": "starting"})
+    assert actor.health()["ready"] is False
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list] == ["inspect"]
+
+
+def test_a_tee_resume_backs_off_longer_and_a_slow_one_is_not_a_failure(tmp_path, monkeypatch, caplog):
+    bound = tee_bound(tmp_path)
+    start_actor(monkeypatch, bound, {"launch": [{"state": "ready", "port": 18080}]})
+    actor = shim._ShimApp(bound)
+    clock = [1000.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    actor.call = Mock(side_effect=lambda command, timeout=None: {"state": "stopped", "port": 18080}
+        if command["operation"] == "inspect" else (_ for _ in ()).throw(PENDING))
+    health = actor.health()
+    assert health["ready"] is False and health["management_ready"] is False
+    assert actor.call.call_args.kwargs["timeout"] == shim.RESUME_TIMEOUT_S
+    assert "shim resume failed" not in caplog.text
+    # Each attempt costs an admission and a proof: 5 min, doubling to an hour.
+    assert actor.resume_at == 1000 + 300
+    clock[0] += 299
+    actor.health()
+    clock[0] += 1
+    actor.health()
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list].count("resume") == 2
+    assert actor.resume_at == clock[0] + 600
+    for _ in range(10):
+        actor.resume_at = 0
+        actor.health()
+    assert actor.resume_at - clock[0] == 3600
+
+
+def test_daemon_call_tells_an_unanswered_operation_from_an_unavailable_daemon(tmp_path):
+    import threading
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    path = state / "control.sock"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    shim.os.chmod(path, 0o600)
+    server.listen(1)
+    held = []
+    def take():
+        connection, _ = server.accept()
+        held.append(connection)
+        connection.recv(65536)  # and never answers
+    threading.Thread(target=take, daemon=True).start()
+    with pytest.raises(shim.ShimPending, match="the operation continues there"):
+        shim.daemon_call(str(state), "node", {"operation": "resume"}, timeout=0.5)
+    server.close()
+    for connection in held:
+        connection.close()
+    path.unlink()
+    with pytest.raises(RuntimeError, match="unavailable") as unavailable:
+        shim.daemon_call(str(state), "node", {"operation": "resume"}, timeout=0.5)
+    assert not isinstance(unavailable.value, shim.ShimPending)
 
 
 @pytest.mark.parametrize("mode", ["simulation", "hardware"])
@@ -1227,7 +1342,7 @@ def start_actor(monkeypatch, bound, answers, resumable=True):
     monkeypatch.setattr(shim._ShimApp, "call", call)
     monkeypatch.setattr(shim._ShimApp, "start_network", lambda self, timeout=None: None)
     monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: True)
-    supported = set(shim.required_capabilities(bound)) | ({"shim-resume-v1"} if resumable else set())
+    supported = set(shim.required_capabilities(bound)) | ({"shim-resume-v1", "shim-resume-tee-v1"} if resumable else set())
     monkeypatch.setattr(shim, "capabilities", lambda _: sorted(supported))
     return calls
 

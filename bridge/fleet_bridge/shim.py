@@ -166,6 +166,9 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
             ("shim-cleanup-v1", True),
             ("shim-resume-v1", config.shim_daemon and "runtime-resume-v1" in features and "docker" in value.get("drivers", [])),
+            # A TEE restart is admitted afresh: new evidence and a proof each time.
+            ("shim-resume-tee-v1", config.shim_daemon and "runtime-resume-tee-v1" in features and config.shim_tee is not None
+                and config.shim_tee.driver in value.get("drivers", [])),
             ("shim-private-env-v1", managed_network),
             ("shim-prover-v1", modern and management and "docker" in value.get("drivers", [])),
             ("shim-tcp-v1", managed_network),
@@ -180,9 +183,15 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         return []
 
 
+class ShimPending(RuntimeError):
+    """The daemon took the operation but did not answer within the caller's
+    timeout. It runs daemon operations to completion, so this one continues."""
+
+
 def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
     """No TCP listener or credentials in argv. Never fall back to direct Docker."""
     path = Path(state_dir) / "control.sock"
+    sent = False
     try:
         info = path.lstat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -198,6 +207,7 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
                 raise ValueError("untrusted shim peer")
             connection.sendall(payload)
             connection.shutdown(socket.SHUT_WR)
+            sent = True
             data = bytearray()
             while chunk := connection.recv(65536):
                 data.extend(chunk)
@@ -207,6 +217,10 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
         if not isinstance(response, dict) or response.get("protocol") != 1 or not isinstance(response.get("result"), dict) or "error" in response:
             raise ValueError("shim rejected operation")
         return response["result"]
+    except TimeoutError:
+        if sent:
+            raise ShimPending("shim daemon did not answer in time; the operation continues there") from None
+        raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
     except (OSError, ValueError, TypeError):
         raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
 
@@ -219,14 +233,20 @@ RESUME_TIMEOUT_S = 20
 # Consecutive resumes back off from the first to the last delay, in seconds.
 # A runtime that stays healthy this long after a resume counts as recovered.
 RESUME_BACKOFF_S = (5, 300)
+# Each TEE resume costs an attestation admission, with its own proof, of up to
+# 300 s; the daemon continues an admission whose caller stopped waiting.
+TEE_RESUME_BACKOFF_S = (300, 3600)
 RESUME_STABLE_S = 60
+TEE_DRIVERS = ("tee", "tee-simulation")
 
 
 def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False,
            timeout: float | None = None) -> dict[str, Any]:
     if daemon:
         if timeout is None:
-            timeout = 330 if command.get("operation") == "launch" and command.get("request", {}).get("driver") in ("tee", "tee-simulation") else 150
+            # A TEE launch or resume waits for its attestation admission (300 s).
+            driver = (command.get("request", {}) if command.get("operation") == "launch" else command).get("driver")
+            timeout = 330 if command.get("operation") in ("launch", "resume") and driver in TEE_DRIVERS else 150
         return daemon_call(state_dir, node_id, command, timeout=timeout)
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
@@ -594,20 +614,25 @@ class _ShimApp:
         if not required_capabilities(spec).issubset(supported):
             raise RuntimeError("shim no longer supports the admitted runtime")
         docker = spec.app.runtime.driver == "docker"
-        # Only a daemon-managed Docker runtime can be resumed in place.
-        self.resumable = spec.cluster.shim_daemon and docker and "shim-resume-v1" in supported
+        # Only a daemon-managed runtime can be resumed in place; a TEE one only
+        # behind a fresh attestation admission.
+        self.resumable = spec.cluster.shim_daemon and (docker and "shim-resume-v1" in supported
+            or spec.app.runtime.driver in TEE_DRIVERS and "shim-resume-tee-v1" in supported)
         self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
         status = self.launch(request, pull=docker)
-        if status.get("state") == "stopped" and self.resumable:
+        resumed = status.get("state") == "stopped" and self.resumable
+        if resumed:
             # The actor started again (a Ray restart, a reboot) after this
             # replica's container exited. The replayed launch starts nothing:
             # start that same container again, as a health probe would.
             status = self.resume(status, timeout=None)
         state = status.get("state")
-        if state != "ready":
+        # A resume still being admitted continues in the daemon; readiness waits for it.
+        if state != "ready" and not (resumed and state == "starting"):
+            feature = "runtime-resume-v1" if docker else "runtime-resume-tee-v1"
             reason = ("its container exited and the shim did not start it again" if state == "stopped" and self.resumable
-                else "its container exited; only the persistent shim with runtime-resume-v1 starts it again"
+                else f"its container exited; only the persistent shim with {feature} starts it again"
                 if state == "stopped" else "its container is missing or failed" if state == "failed" else f"it is {state}")
             raise RuntimeError(f"shim execution of {spec.name} is not running: {reason}; explicit cleanup is required")
         if docker and CONTAINER_NAME.fullmatch(str(status.get("runtime_id"))):
@@ -621,7 +646,9 @@ class _ShimApp:
         self.start_network()
         deadline = time.monotonic() + spec.app.ready_timeout_s
         while not self.application_ready():
-            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get("state") != "ready":
+            # `starting` is a container being created or started, or a resume being admitted.
+            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get(
+                    "state") not in ("ready", "starting"):
                 raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
             time.sleep(2)
 
@@ -683,12 +710,17 @@ class _ShimApp:
             return status
         self.resumes += 1
         self.resumed_at = now
-        first, last = RESUME_BACKOFF_S
+        first, last = TEE_RESUME_BACKOFF_S if self.spec.app.runtime.driver in TEE_DRIVERS else RESUME_BACKOFF_S
         self.resume_at = now + min(last, first * 2 ** (self.resumes - 1))
         logging.getLogger(__name__).warning("shim runtime for %s exited; resuming it (attempt %d)",
                                             self.spec.name, self.resumes)
         try:
             return self.call({"operation": "resume", "execution": self.spec.execution}, timeout=timeout)
+        except ShimPending:
+            # A TEE resume outlasts a probe while it is admitted; the shim
+            # reports it as starting until it ends.
+            logging.getLogger(__name__).info("shim resume of %s continues in the daemon", self.spec.name)
+            return {**status, "state": "starting"}
         except (RuntimeError, OSError, ValueError):
             logging.getLogger(__name__).warning("shim resume failed for %s", self.spec.name)
             return status
