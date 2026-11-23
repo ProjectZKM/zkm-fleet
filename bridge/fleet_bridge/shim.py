@@ -87,6 +87,15 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
     return required
 
 
+def _operator_executable(path: str) -> bool:
+    """Shim's own helper check: a regular executable nobody else can modify."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and not mode & 0o022 and bool(mode & 0o111)
+
+
 def capabilities(config: ControlPlaneConfig) -> list[str]:
     if not all(isinstance(p, str) and os.path.isabs(p) and "\x00" not in p
                for p in (config.shim_binary, config.shim_state_dir)):
@@ -105,7 +114,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             check_machine(config, value)
         features = value.get("features", [])
         upstream = not config.shim_network or config.shim_network.tunnel_binary is None or (
-            "chisel-network-v1" in features and os.access(config.shim_network.tunnel_binary, os.X_OK))
+            "chisel-network-v1" in features and _operator_executable(config.shim_network.tunnel_binary))
         modern = "data-plane-v1" in features and upstream
         management = "runtime-management-v1" in features
         network = bool(config.shim_network) and modern

@@ -392,6 +392,11 @@ def test_chisel_selection_preserves_legacy_wire_and_requires_a_ready_companion(t
     assert "shim-network-v1" not in shim.capabilities(parsed.cluster)
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1","chisel-network-v1"]}'))
     assert "shim-chisel-network-v1" in shim.capabilities(parsed.cluster)
+    # Shim refuses a helper others can modify; never advertise one it would reject.
+    for mode in (0o775, 0o757, 0o644):
+        helper.chmod(mode)
+        assert "shim-network-v1" not in shim.capabilities(parsed.cluster), oct(mode)
+    helper.chmod(0o755)
     helper.unlink()
     assert "shim-network-v1" not in shim.capabilities(parsed.cluster)
     cfg["shim_network"]["tunnel_binary"] = "relative/helper"
