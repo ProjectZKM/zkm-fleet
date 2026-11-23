@@ -79,35 +79,35 @@ jobs:
           cargo build --locked --release \
             -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 
-      - name: Build the pinned node runtime companion
-        run: |
-          TRUSTED_SHIM_REV=$(python3 -c 'import tomllib; print(tomllib.load(open("crates/fleet-scheduler/Cargo.toml", "rb"))["dependencies"]["trusted-shim"]["rev"])')
-          echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
-          cargo install --locked --force --git https://github.com/attestx/trusted-shim \
-            --rev "$TRUSTED_SHIM_REV" \
-            --features ziren --bin trusted-shim-runtime --root target/shim
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache: false
 
-      # The helper is built by the pinned shim's own script from the Router
-      # revision shim locks, so it always matches the shim binary bundled above.
-      - name: Build the pinned Chisel tunnel helper
+      # Both come from one checkout of the shim revision Fleet pins. `cargo
+      # install --git` cannot be used: it scans the whole repository and stops
+      # at shim's nested workspaces. The helper is built by the pinned shim's
+      # own script from the Router revision shim locks, so it always matches
+      # the shim binary bundled beside it.
+      - name: Build the pinned node runtime companion and Chisel tunnel helper
         shell: bash
         run: |
           set -euo pipefail
+          TRUSTED_SHIM_REV=$(sed -n 's/^trusted-shim = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' crates/fleet-scheduler/Cargo.toml)
+          [ -n "$TRUSTED_SHIM_REV" ] || { echo "crates/fleet-scheduler/Cargo.toml pins no trusted-shim rev" >&2; exit 1; }
           SRC=$(mktemp -d)
           git -C "$SRC" init -q
           git -C "$SRC" fetch -q --depth 1 https://github.com/attestx/trusted-shim "$TRUSTED_SHIM_REV"
           git -C "$SRC" checkout -q --detach FETCH_HEAD
+          cargo install --locked --force --path "$SRC" \
+            --features ziren --bin trusted-shim-runtime --root target/shim
           locked() { awk -v n="name = \"$1\"" '$0 == n { f = 1; next } f && /^source = / { sub(/.*#/, ""); sub(/"$/, ""); print; exit }' "$2"; }
           SHIM_ROUTER=$(locked trusted-router-transport "$SRC/Cargo.lock")
           FLEET_ROUTER=$(locked trusted-router-transport Cargo.lock)
           [ -n "$SHIM_ROUTER" ] && [ "$SHIM_ROUTER" = "$FLEET_ROUTER" ] \
             || { echo "Fleet locks router $FLEET_ROUTER but shim $TRUSTED_SHIM_REV locks $SHIM_ROUTER" >&2; exit 1; }
           "$SRC/scripts/build_tunnel_helper.sh" "$PWD/target/shim/bin/trusted-router-tunnel"
+          echo "TRUSTED_SHIM_REV=$TRUSTED_SHIM_REV" >> "$GITHUB_ENV"
           echo "TRUSTED_ROUTER_REV=$SHIM_ROUTER" >> "$GITHUB_ENV"
           rm -rf "$SRC"
 
