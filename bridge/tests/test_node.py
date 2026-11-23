@@ -383,7 +383,8 @@ def test_deleting_an_app_deletes_what_its_entries_held(executor,monkeypatch,tmp_
     data=tmp_path_factory.mktemp("data")
     files(data,"eth/run/checkpoint","eth/store/outputs/job-1/lease/proof.json","eth/store/outputs/job-2/lease/proof.json",
           "eth/store/inputs/i1","eth/store/elf/e1","models/weights","worker.env","elsewhere/proof.json",
-          "logs/eth-worker-0.node.log","logs/eth-worker-11.node.log","logs/eth-worker-db-0.node.log","logs/node.log")
+          "logs/eth-worker-0.node.log","logs/eth-worker-0.node.log.cursor","logs/eth-worker-11.node.log",
+          "logs/eth-worker-db-0.node.log","logs/eth-worker-db-0.node.log.cursor","logs/node.log")
     configure(executor,worker("eth-worker","eth",data,worker_env_file=str(data/"worker.env"),volumes=[f"{data/'models'}:ro"]),
               log_dir=data/"logs")
     listed=[str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1","eth/store/inputs/gone",
@@ -391,10 +392,11 @@ def test_deleting_an_app_deletes_what_its_entries_held(executor,monkeypatch,tmp_
     result,error=app_message(executor,"remove-1",{"remove":True,"delete":{"keep":[],"files":listed}},app="eth")
     assert error is None and result["removed"]==["eth-worker"]
     assert sorted(result["deleted"])==sorted(str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1",
-        "logs/eth-worker-0.node.log","logs/eth-worker-11.node.log","eth/run"))
+        "logs/eth-worker-0.node.log","logs/eth-worker-0.node.log.cursor","logs/eth-worker-11.node.log","eth/run"))
     assert result["kept"]==[{"path":str(data/p),"reason":"not in the app's proof storage on this node"} for p in ("eth/store","elsewhere/proof.json")]
     left=sorted(str(f.relative_to(data)) for f in data.rglob("*") if f.is_file())
-    assert left==["elsewhere/proof.json","eth/store/outputs/job-2/lease/proof.json","logs/eth-worker-db-0.node.log","logs/node.log",
+    assert left==["elsewhere/proof.json","eth/store/outputs/job-2/lease/proof.json","logs/eth-worker-db-0.node.log",
+                  "logs/eth-worker-db-0.node.log.cursor","logs/node.log",
                   "models/weights","worker.env"]
 
 

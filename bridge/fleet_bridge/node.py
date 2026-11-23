@@ -625,7 +625,8 @@ class NodeExecutor:
             self._delete(path, self._refusal(path, in_use, log_dir, inside_ok=True), deleted, kept)
         logs = sorted(os.listdir(log_dir)) if os.path.isdir(log_dir) else []
         for a in removed:
-            pattern = re.compile(rf"{re.escape(a.name)}-\d+\.node\.log")
+            # With the cursor file a shim app's log follower keeps beside it.
+            pattern = re.compile(rf"{re.escape(a.name)}-\d+\.node\.log(?:\.cursor)?")
             for name in filter(pattern.fullmatch, logs):
                 self._delete(os.path.join(log_dir, name), None, deleted, kept)
             if a.worker_workdir and os.path.lexists(a.worker_workdir):

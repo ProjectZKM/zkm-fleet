@@ -9,17 +9,58 @@ import yaml
 from fleet_bridge import actors, reconcile, shim, node
 from fleet_bridge.model import ExecutorKind, ReplicaHealth, AppSpec
 
-PULL_IMAGE, FOLLOW = shim.pull_image, shim.LogFollower.follow
+PULL_IMAGE, IMAGE_PRESENT, FOLLOW = shim.pull_image, shim.image_present, shim.LogFollower.follow
+MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
 
 
 @pytest.fixture(autouse=True)
 def no_docker(monkeypatch):
     """No actor here reaches a Docker daemon: tests of pulls and log followers
-    drive the real functions against their own fakes. Returns the pulls asked for."""
+    drive the real functions against their own fakes. Every image counts as
+    present. Returns the pulls asked for."""
     pulls = []
+    monkeypatch.setattr(shim, "image_present", lambda image: True)
     monkeypatch.setattr(shim, "pull_image", lambda *args: pulls.append(args))
     monkeypatch.setattr(shim.LogFollower, "follow", lambda self: None)
     return pulls
+
+
+@pytest.fixture
+def docker_api(tmp_path):
+    """A Docker Engine API on a unix socket. Each request gets the next
+    (status, content type, body), the last one repeating. Returns the socket
+    path and the request paths it saw."""
+    import http.server
+    import socketserver
+    import threading
+    servers = []
+    def serve(answers):
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.path)
+                status, kind, body = answers.pop(0) if len(answers) > 1 else answers[0]
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        server = Server(str(tmp_path / f"docker-{len(servers)}.sock"), Handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address, seen
+    yield serve
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def frame(stream, payload):
+    """One message of Docker's multiplexed log stream."""
+    return bytes([stream, 0, 0, 0]) + len(payload).to_bytes(4, "big") + payload
 
 
 def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs(tmp_path):
@@ -1240,6 +1281,15 @@ def test_allocation_launched_before_launch_revisions_replays_its_original_reques
     assert pickle.loads(pickle.dumps(old)).launch_revision == 1
 
 
+def test_cpu_count_is_at_least_one_as_on_the_legacy_executor(tmp_path):
+    bound = bound_spec(tmp_path, cpus=0.5, env={"THREADS": "{cpu_count}"})
+    # As legacy's RAYON_NUM_THREADS = max(1, int(cpus)): a fraction still gets one thread.
+    assert shim.launch_request(bound, [])["environment"] == {"THREADS": "1"}
+    assert shim.launch_request(replace(bound, app=replace(bound.app, cpus=4)), [])["environment"] == {"THREADS": "4"}
+    # A revision 1 allocation replays exactly the request it was launched with.
+    assert shim.launch_request(replace(bound, launch_revision=1), [])["environment"] == {"THREADS": "0"}
+
+
 def test_gpu_apps_get_every_nvidia_driver_capability_unless_their_env_sets_one(tmp_path):
     raw = config(tmp_path)
     raw["apps"][0].update(gpus=1)
@@ -1252,23 +1302,26 @@ def test_gpu_apps_get_every_nvidia_driver_capability_unless_their_env_sets_one(t
     assert shim.launch_request(replace(bound, launch_revision=1), ["3"])["environment"] == {}
 
 
-def test_missing_image_is_pulled_from_the_shims_docker(monkeypatch):
+def test_image_check_and_pull_use_the_shims_docker(monkeypatch):
     import subprocess
     monkeypatch.setenv("DOCKER_HOST", "tcp://docker.example:2375")
     image = "registry.example/web@sha256:" + "a" * 64
-    run = Mock(side_effect=[Mock(returncode=0)])
+    run = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
     monkeypatch.setattr(shim.subprocess, "run", run)
-    PULL_IMAGE("web-0", image, 600)
+    assert IMAGE_PRESENT(image) is True
     assert run.call_args.args[0] == ["docker", "--host=unix:///var/run/docker.sock", "image", "inspect",
                                      "--format", "{{.Id}}", "--", image]
-    assert "DOCKER_HOST" not in run.call_args.kwargs["env"]
     assert run.call_args.kwargs["timeout"] == shim.IMAGE_CHECK_TIMEOUT_S
-    for check in (Mock(returncode=1, stderr="No such image"), subprocess.TimeoutExpired("docker", 30)):
-        run.reset_mock()
-        run.side_effect = [check, Mock(returncode=0, stdout="", stderr="")]
-        PULL_IMAGE("web-0", image, 600)
-        assert run.call_args.args[0] == ["docker", "--host=unix:///var/run/docker.sock", "pull", "--", image]
-        assert 0 < run.call_args.kwargs["timeout"] <= 600 and "DOCKER_HOST" not in run.call_args.kwargs["env"]
+    assert "DOCKER_HOST" not in run.call_args.kwargs["env"]
+    for answer in (Mock(returncode=1), subprocess.TimeoutExpired("docker", 30), FileNotFoundError(2, "No such file")):
+        run.side_effect = [answer]
+        assert IMAGE_PRESENT(image) is False
+    run.side_effect = None
+    PULL_IMAGE("web-0", image)
+    assert run.call_args.args[0] == ["docker", "--host=unix:///var/run/docker.sock", "pull", "--", image]
+    # Its own hour, apart from the app's readiness wait.
+    assert run.call_args.kwargs["timeout"] == shim.PULL_TIMEOUT_S == 3600
+    assert "DOCKER_HOST" not in run.call_args.kwargs["env"]
 
 
 @pytest.mark.parametrize("pull,message", [
@@ -1280,44 +1333,82 @@ def test_a_failed_pull_names_the_image(monkeypatch, pull, message):
     import re
     import subprocess
     pull = subprocess.TimeoutExpired("docker", 5) if pull == "timeout" else pull
-    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=[Mock(returncode=1, stderr="No such image"), pull]))
+    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=[pull]))
     with pytest.raises(RuntimeError, match=re.escape("web-0: " + message)):
         PULL_IMAGE("web-0", "web:1", 5)
 
 
-def test_actor_pulls_before_launching_and_a_failed_pull_launches_nothing(tmp_path, monkeypatch, no_docker):
+REFUSED = RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback")
+
+
+def test_only_a_first_launch_without_its_image_pulls(tmp_path, monkeypatch, no_docker):
     bound = bound_spec(tmp_path)
-    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "ready", "port": 18080}]})
+    present = Mock(return_value=False)
+    monkeypatch.setattr(shim, "image_present", present)
+    # A restarted actor's replay finds its container: no image check and no
+    # registry, so a registry outage after a reboot cannot block a resume.
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}],
+        "resume": [{"state": "ready", "port": 18080}]})
     shim._ShimApp(bound)
-    assert no_docker == [("web-0", "python:3.12-slim", bound.app.ready_timeout_s)]
-    assert calls == [("launch", None)]
-    calls.clear()
-    monkeypatch.setattr(shim, "pull_image", Mock(side_effect=RuntimeError("web-0: could not pull image python:3.12-slim: denied")))
-    with pytest.raises(RuntimeError, match="could not pull image python:3.12-slim"):
+    assert calls == [("launch", None), ("resume", None)] and no_docker == [] and not present.called
+    # A first launch on a node without the image creates nothing, and the same
+    # launch follows the pull.
+    requests = []
+    calls = start_actor(monkeypatch, bound, {"launch": [REFUSED, {"state": "ready", "port": 18080}]})
+    recorded = shim._ShimApp.call
+    monkeypatch.setattr(shim._ShimApp, "call", lambda self, command, timeout=None:
+        requests.append(command) or recorded(self, command, timeout))
+    shim._ShimApp(bound)
+    assert calls == [("launch", None), ("launch", None)] and requests[0] == requests[1]
+    assert no_docker == [("web-0", "python:3.12-slim")]
+    present.assert_called_once_with("python:3.12-slim")
+
+
+def test_a_refused_launch_pulls_only_a_missing_image(tmp_path, monkeypatch, no_docker):
+    bound = bound_spec(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [REFUSED]})
+    # The image is there, so the refusal has another cause: nothing is pulled.
+    with pytest.raises(RuntimeError, match="shim did not launch web-0 .*no legacy fallback.*explicit cleanup"):
         shim._ShimApp(bound)
-    assert calls == []
+    assert calls == [("launch", None)] and no_docker == []
+    monkeypatch.setattr(shim, "image_present", lambda image: False)
+    monkeypatch.setattr(shim, "pull_image", Mock(side_effect=RuntimeError("web-0: could not pull image python:3.12-slim: denied")))
+    calls.clear()
+    with pytest.raises(RuntimeError, match="^web-0: could not pull image python:3.12-slim: denied$"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None)]
+    # A launch the pull did not fix reports the shim's answer.
+    monkeypatch.setattr(shim, "pull_image", Mock())
+    calls.clear()
+    with pytest.raises(RuntimeError, match="shim did not launch web-0 .*no legacy fallback"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None), ("launch", None)]
     # Other drivers never pull.
     raw = config(tmp_path)
     raw.update(shim_daemon=True, shim_tee=tee_config())
     raw["apps"][0]["runtime"]["driver"] = "tee-simulation"
     tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
-    start_actor(monkeypatch, tee, {"launch": [{"state": "ready", "port": 18080}]})
-    shim._ShimApp(tee)
-    shim.pull_image.assert_called_once()
+    start_actor(monkeypatch, tee, {"launch": [REFUSED]})
+    shim.pull_image.reset_mock()
+    with pytest.raises(RuntimeError, match="shim did not launch web-0"):
+        shim._ShimApp(tee)
+    shim.pull_image.assert_not_called()
 
 
-def test_a_pull_spends_the_readiness_budget(tmp_path, monkeypatch):
+def test_the_readiness_wait_starts_after_the_pull_and_launch(tmp_path, monkeypatch):
     bound = bound_spec(tmp_path)
-    start_actor(monkeypatch, bound, {"launch": [{"state": "ready", "port": 18080}], "inspect": [{"state": "ready"}]})
+    start_actor(monkeypatch, bound, {"launch": [REFUSED, {"state": "ready", "port": 18080}], "inspect": [{"state": "ready"}]})
     monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: False)
     clock = [0.0]
     monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(shim.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
-    monkeypatch.setattr(shim, "pull_image", lambda name, image, timeout: clock.__setitem__(0, clock[0] + timeout - 4))
+    monkeypatch.setattr(shim, "image_present", lambda image: False)
+    monkeypatch.setattr(shim, "pull_image", lambda name, image: clock.__setitem__(0, clock[0] + 1800))
     with pytest.raises(RuntimeError, match="did not become healthy"):
         shim._ShimApp(bound)
-    # Two 2 s waits after the pull, not another whole ready_timeout_s.
-    assert clock[0] == bound.app.ready_timeout_s
+    # The app's whole ready_timeout_s follows a half-hour pull, as on legacy,
+    # where `docker run` pulls before the readiness clock starts.
+    assert bound.app.ready_timeout_s % 2 == 0 and clock[0] == 1800 + bound.app.ready_timeout_s
 
 
 def test_restarted_actor_resumes_its_exited_container(tmp_path, monkeypatch):
@@ -1365,25 +1456,84 @@ def test_a_deleted_or_missing_container_is_never_replaced(tmp_path, monkeypatch)
     assert calls == [("launch", None)]
 
 
-def test_log_follower_appends_container_output_after_the_last_write(tmp_path, monkeypatch):
-    import sys
-    script = tmp_path / "docker.py"
-    script.write_text("import os, sys\nprint(' '.join(sys.argv[1:]), os.environ.get('DOCKER_CONTEXT'), flush=True)\n"
-                      "print('to stderr', file=sys.stderr, flush=True)\n")
-    monkeypatch.setattr(shim, "DOCKER", (sys.executable, str(script)))
-    monkeypatch.setenv("DOCKER_CONTEXT", "elsewhere")
+def test_log_follower_streams_docker_into_the_node_log_and_resumes_after_its_cursor(tmp_path, docker_api):
+    import calendar
     container = "trusted-shim-" + "b" * 64
+    socket_path, seen = docker_api([
+        (200, MULTIPLEXED, frame(1, b"2026-11-23T10:00:00.000000001Z first\n") + frame(2, b"2026-11-23T10:00:01.5Z to stderr\n")),
+        # `since` includes the cursor's own line; it is written once.
+        (200, MULTIPLEXED, frame(2, b"2026-11-23T10:00:01.5Z to stderr\n") + frame(1, b"2026-11-23T10:00:02Z after a restart\n"))])
     path = tmp_path / "logs" / "web-0.node.log"
-    follower = shim.LogFollower(container, str(path))
-    FOLLOW(follower)
-    first = path.read_text()
-    assert first == f"logs --follow -- {container} None\nto stderr\n"
-    written = path.stat().st_mtime_ns
-    FOLLOW(follower)
-    assert path.read_text() == first + f"logs --follow --since {written // 10**9}.{written % 10**9:09d} -- {container} None\nto stderr\n"
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert path.read_bytes() == b"first\nto stderr\n"
+    cursor = calendar.timegm((2026, 11, 23, 10, 0, 1, 0, 0, 0)) * 10**9 + 500_000_000
+    assert (tmp_path / "logs" / "web-0.node.log.cursor").read_text() == f"{cursor}\n"
+    # A restarted actor's new follower continues after the last line written.
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert path.read_bytes() == b"first\nto stderr\nafter a restart\n"
+    query = "follow=1&stdout=1&stderr=1&timestamps=1"
+    assert seen == [f"/containers/{container}/logs?{query}",
+                    f"/containers/{container}/logs?{query}&since={cursor // 10**9}.500000000"]
 
 
-def test_one_log_follower_at_a_time_and_failures_stay_in_the_bridge_log(tmp_path, monkeypatch, caplog):
+def test_a_log_without_a_cursor_continues_after_its_last_write(tmp_path, docker_api):
+    container = "trusted-shim-" + "b" * 64
+    socket_path, seen = docker_api([(200, "application/vnd.docker.raw-stream",
+        b"2026-11-01T00:00:00Z before the last write\n2026-11-23T10:00:03Z raw line\n")])
+    path = tmp_path / "web-0.node.log"
+    path.write_bytes(b"earlier\n")
+    written = 1_795_000_000_123_456_789
+    shim.os.utime(path, ns=(written, written))
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert seen[0].endswith(f"&since={written // 10**9}.123456789")
+    # A raw stream is split into lines; what predates the log's last write is skipped.
+    assert path.read_bytes() == b"earlier\nraw line\n"
+
+
+def test_docker_log_timestamps():
+    import calendar
+    base = calendar.timegm((2026, 11, 23, 10, 0, 0, 0, 0, 0)) * 10**9
+    assert shim._stamp_ns(b"2026-11-23T10:00:00Z") == base
+    assert shim._stamp_ns(b"2026-11-23T10:00:00.123456789Z") == base + 123456789
+    assert shim._stamp_ns(b"2026-11-23T11:30:00.5+01:30") == base + 500_000_000
+    assert shim._stamp_ns(b"2026-11-23T08:00:00-02:00") == base
+    assert shim._stamp_ns(b"not a stamp") is None
+
+
+def test_follower_failures_stay_in_the_bridge_log_and_back_off(tmp_path, docker_api, monkeypatch, caplog):
+    container = "trusted-shim-" + "c" * 64
+    socket_path, seen = docker_api([(501, "application/json", b'{"message":"configured logging driver does not support reading"}')])
+    path = tmp_path / "web-0.node.log"
+    follower = shim.LogFollower(container, str(path), socket_path)
+    monkeypatch.setattr(shim.LogFollower, "follow", FOLLOW)
+    clock = [100.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    follower.run()
+    assert (f"could not follow the logs of {container}: Docker answered 501: "
+            '{"message":"configured logging driver does not support reading"}') in caplog.text
+    # Docker's answer never reaches the app's own log.
+    assert not path.exists() and (follower.failures, follower.retry_at) == (1, 130.0)
+    # Health probes during the backoff start nothing.
+    follower.ensure()
+    assert follower.thread is None and len(seen) == 1
+    clock[0] = 130.0
+    follower.ensure()
+    follower.thread.join(10)
+    assert len(seen) == 2 and (follower.failures, follower.retry_at) == (2, 190.0)
+    follower.failures = 9
+    follower.run()
+    assert follower.retry_at == 130.0 + 900
+    # Without Docker at all, the same.
+    follower.socket_path = str(tmp_path / "missing.sock")
+    follower.run()
+    assert f"could not follow the logs of {container}: [Errno 2]" in caplog.text
+    # A stream that delivered output, or stayed up, clears the backoff.
+    monkeypatch.setattr(shim.LogFollower, "follow", lambda self: True)
+    follower.run()
+    assert (follower.failures, follower.retry_at) == (0, 0.0)
+
+
+def test_one_log_follower_at_a_time(tmp_path, monkeypatch, caplog):
     import threading
     follower = shim.LogFollower("trusted-shim-" + "c" * 64, str(tmp_path / "web-0.node.log"))
     gate = threading.Event()
@@ -1397,12 +1547,9 @@ def test_one_log_follower_at_a_time_and_failures_stay_in_the_bridge_log(tmp_path
     follower.ensure()
     assert follower.thread is not first
     follower.thread.join(10)
-    monkeypatch.setattr(shim.subprocess, "Popen", Mock(side_effect=OSError("docker is missing")))
-    FOLLOW(follower)
     follower.thread = Mock(is_alive=Mock(side_effect=RuntimeError("can't start new thread")))
     follower.ensure()
-    assert "could not follow the logs of trusted-shim-" + "c" * 64 + ": docker is missing" in caplog.text
-    assert caplog.text.count("could not follow the logs of trusted-shim-") == 2
+    assert caplog.text.count("could not follow the logs of trusted-shim-") == 1
 
 
 def test_actor_follows_its_container_into_the_node_log(tmp_path, monkeypatch):
