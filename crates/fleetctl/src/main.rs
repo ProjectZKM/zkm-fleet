@@ -117,7 +117,10 @@ enum AppCmd {
     /// takes the new settings on its node and starts again, like a scale.
     Update {
         name: String,
-        /// Complete settings object, including runtime and mounts; sent unchanged.
+        /// Settings object, sent unchanged. Accepts image, env, command, user, workdir,
+        /// volumes, port_base, shm_gb, memory_gb, health_path, stop_timeout_s,
+        /// ready_timeout_s, runtime, services, container_port, entrypoint, ingress and
+        /// service_protocol. Durable mounts and access policies need a new deployment.
         #[arg(long, conflicts_with_all = ["image", "env", "shm_gb"])]
         settings: Option<PathBuf>,
         /// Container image.
