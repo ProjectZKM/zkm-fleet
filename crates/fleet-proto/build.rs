@@ -23,6 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Job",
         "CommandRecord",
         "NodeReport",
+        "NodeHardware",
+        "GpuDevice",
         "RuntimeExecutionIdentity",
         "PolicyActivationRequest",
         "PolicyStageRequest",
@@ -79,6 +81,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "RouterSyncResponse",
         "Quota",
         "NodeReport",
+        "NodeHardware",
+        "GpuDevice",
         "RuntimeExecutionIdentity",
         "RuntimeInstance",
         "RuntimeDeliveryOffer",
@@ -115,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NodeReport.results",
         "NodeReport.runtime_capabilities",
         "NodeReport.runtime_instances",
+        "NodeHardware.gpus",
         "RouterControl.capabilities",
         "CreateNamespaceRequest.quota",
         "AllocationRequest.restore",
@@ -130,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default)]");
     }
-    for path in ["RouterSubjectRevocation.application_only", "RouterSubjectRevocation.expires_at", "RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64"] {
+    for path in ["RouterSubjectRevocation.application_only", "RouterSubjectRevocation.expires_at", "RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64", "NodeReport.hardware"] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
     build = build.field_attribute(".fleet.model.v1.RuntimeInstance.gpu_ids", "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]");

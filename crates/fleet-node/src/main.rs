@@ -1,4 +1,5 @@
 //! Outbound machine heartbeats. A slim Python child performs local Ray operations.
+mod hardware;
 mod logs;
 mod runtime_delivery;
 use anyhow::{Context, Result};
@@ -70,14 +71,15 @@ async fn stopped() {
 /// The release this agent was built for, when the build named one (FLEET_VERSION).
 const AGENT_VERSION: Option<&str> = option_env!("FLEET_VERSION");
 /// The snapshot the agent sends: the bridge's report, marked not ready when it is stale,
-/// named with the agent's release when it has one.
-fn outbound(mut report: Value, stale: bool, version: Option<&str>) -> Value {
+/// named with the agent's release when it has one, and with the machine's hardware.
+fn outbound(mut report: Value, stale: bool, version: Option<&str>, hardware: &Value) -> Value {
     if stale {
         report["ready"] = json!(false);
     }
     if let Some(version) = version {
         report["agent_version"] = json!(version);
     }
+    report["hardware"] = hardware.clone();
     report
 }
 /// Tells the control plane this agent's session is over, so the agent that replaces it (a
@@ -174,6 +176,9 @@ async fn main() -> Result<()> {
         .spawn()
         .context("starting local Ray bridge")?;
     let input = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+    // The hardware does not change under a running agent: detect it once.
+    let hardware = serde_json::to_value(tokio::task::spawn_blocking(hardware::detect).await?)?;
+    tracing::info!(%hardware, "node hardware");
     let snapshot = Arc::new(Mutex::new(None::<BridgeSnapshot>));
     let reader_snapshot = snapshot.clone();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
@@ -225,6 +230,7 @@ async fn main() -> Result<()> {
                         s.report.clone(),
                         s.seen.elapsed() > Duration::from_secs(20),
                         AGENT_VERSION,
+                        &hardware,
                     )
                 })
             };
@@ -579,6 +585,8 @@ mod tests {
 
     #[test]
     fn outbound_keeps_the_report_and_stamps_staleness_and_release() {
+        let hardware = json!({"cpu_arch":"x86_64","gpus":[{"index":0,"name":"NVIDIA GeForce RTX 5090","architecture":"Blackwell"}]});
+        let outbound = |r, stale, v| outbound(r, stale, v, &hardware);
         let fresh = outbound(json!({"version":3,"machine":"m","ready":true}), false, Some("0.1.5"));
         assert_eq!(fresh["version"], 3);
         assert_eq!(fresh["machine"], "m");
@@ -589,6 +597,12 @@ mod tests {
         assert_eq!(stale["agent_version"], "0.1.5");
         let unnamed = outbound(json!({"version":3,"machine":"m","ready":true}), false, None);
         assert!(unnamed.get("agent_version").is_none());
+        assert_eq!(fresh["hardware"]["gpus"][0]["architecture"], "Blackwell");
+        // What the agent sends must parse as the typed report it puts on the wire.
+        let mut sent = fresh.clone();
+        for k in ["total_gpus", "total_cpus", "free_gpus", "free_cpus"] { sent[k] = json!(0.0); }
+        let typed: fleet_proto::fleet::model::v1::NodeReport = serde_json::from_value(sent).unwrap();
+        assert_eq!(typed.hardware.unwrap().gpus[0].name, "NVIDIA GeForce RTX 5090");
     }
 
     /// A control plane that records the sessions agents end, with the token they sent.

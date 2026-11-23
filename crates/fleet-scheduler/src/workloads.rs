@@ -615,7 +615,7 @@ impl WorkloadController {
             let apps = w.report.entries().map(Entry::app).collect::<Vec<_>>();
             json!({"id":id,"name":id,"backend":"ray-local",
                 "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
-                "agent_version":w.report.agent_version,
+                "agent_version":w.report.agent_version,"hardware":w.report.hardware,
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
