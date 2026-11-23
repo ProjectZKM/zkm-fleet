@@ -39,8 +39,25 @@ fn unavailable(error: anyhow::Error) -> StatusCode {
     else { StatusCode::SERVICE_UNAVAILABLE }
 }
 
-async fn status(State(s): State<HttpState>, Path(id): Path<String>) -> Result<Json<RouterControl>> {
-    Ok(Json(load_router(&s, &id).await?))
+/// An administrator sees the whole record. A namespace sees the router's sync state and
+/// only its own policies and revocations: enough to tell whether a workload's access is
+/// configured, nothing about other tenants or the relay's credential.
+async fn status(
+    State(s): State<HttpState>,
+    Path(id): Path<String>,
+    Extension(caller): Extension<Option<Token>>,
+) -> Result<Json<RouterControl>> {
+    let mut router = load_router(&s, &id).await?;
+    if let Some(caller) = caller {
+        let namespace = caller.namespace.ok_or(StatusCode::FORBIDDEN)?;
+        router.token_id.clear();
+        router.revoked_routes.clear();
+        if let Some(auth) = router.authorization.as_mut() {
+            auth.policies.retain(|p| p.namespace == namespace);
+            auth.revoked_subjects.retain(|r| r.namespace == namespace);
+        }
+    }
+    Ok(Json(router))
 }
 
 async fn load_router(s: &HttpState, id: &str) -> Result<RouterControl> {
@@ -340,17 +357,25 @@ async fn authorize_access(
     ))
 }
 
+/// Administrators set any policy. A namespace (manage) may only add an enabled policy for
+/// one of its own workloads: namespace-wide defaults, and replacing or re-enabling a policy
+/// that exists (an administrator's denial included), stay with the administrator.
 async fn set_policy(
     State(s): State<HttpState>,
     Path(id): Path<String>,
+    Extension(caller): Extension<Option<Token>>,
     Json(policy): Json<RouterAccessPolicy>,
 ) -> Result<Json<RouterAuthorization>> {
     policy.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
     if policy.enabled && policy.service == "control" && policy.workload == "*" {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let delegated = caller.is_some();
+    if delegated && (policy.workload == "*" || !policy.enabled) {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let _policies = s.fleet.router_policy_ops.lock().await;
-    namespace_scope(&s, None, &policy.namespace, !policy.enabled)?;
+    namespace_scope(&s, caller.as_ref(), &policy.namespace, !policy.enabled)?;
     let next = update_router(&s, &id, |next| {
         let auth = next
             .authorization
@@ -374,6 +399,9 @@ async fn set_policy(
             if *old == policy {
                 return Ok(());
             }
+            if delegated {
+                return Err(StatusCode::FORBIDDEN);
+            }
             if policy.version <= old.version {
                 return Err(StatusCode::CONFLICT);
             }
@@ -390,7 +418,12 @@ async fn set_policy(
             .map_err(|_| StatusCode::INSUFFICIENT_STORAGE)
     })
     .await?;
-    Ok(Json(next.authorization.unwrap()))
+    let mut authorization = next.authorization.unwrap();
+    if delegated {
+        authorization.policies.retain(|p| p.namespace == policy.namespace);
+        authorization.revoked_subjects.retain(|r| r.namespace == policy.namespace);
+    }
+    Ok(Json(authorization))
 }
 
 async fn revoke_subject(
