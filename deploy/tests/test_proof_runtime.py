@@ -109,49 +109,32 @@ def test_cutover_refuses_a_volume_the_shim_would_mount_at_another_path(tmp_path,
     assert json.dumps(cfg) == original
 
 
-@pytest.mark.parametrize('cpus', [None, 0, 0.5, True, '8'])
-def test_gpu_cutover_needs_explicit_cpus_because_one_container_caps_both_processes(tmp_path, cpus):
+@pytest.mark.parametrize('kind', ['ziren-gpu', 'ziren-cpu'])
+@pytest.mark.parametrize('cpus,carried', [(8, 8), (2.5, 2.5), (None, 1)])
+def test_cutover_carries_each_entrys_cpus_as_its_reservation(tmp_path, kind, cpus, carried):
     cfg = configuration(tmp_path)
+    cfg['apps'][0]['kind'] = kind
     if cpus is None:
         del cfg['apps'][0]['cpus']
     else:
         cfg['apps'][0]['cpus'] = cpus
-    original = json.dumps(cfg)
-    with pytest.raises(ValueError, match='policy-node: set an explicit cpus.*--cpus N.*one container'):
-        migration.convert(cfg, ['policy-node'], IMAGE)
-    assert json.dumps(cfg) == original
-    updated, updates = migration.convert(cfg, ['policy-node'], IMAGE, 16)
-    assert updated['apps'][0]['cpus'] == 16 and updates[0]['cpus'] == 16
+    updated, updates = migration.convert(cfg, ['policy-node'], IMAGE)
+    # The entry keeps what it had; an entry without cpus reserves the default one.
+    assert updated['apps'][0].get('cpus') == cpus and updates[0]['cpus'] == carried
     # The scheduler takes CPUs only through a scale, never as an update setting.
     assert 'cpus' not in updates[0]['set'] and updated['apps'][0]['env']['FLEET_CPUS'] == '{cpu_count}'
 
 
-def test_cutover_keeps_explicit_cpus_and_a_cpu_prover_needs_none(tmp_path):
-    cfg = configuration(tmp_path)
-    updated, updates = migration.convert(cfg, ['policy-node'], IMAGE)
-    assert updated['apps'][0]['cpus'] == 8 and updates[0]['cpus'] == 8
-    cfg['apps'][0].update(kind='ziren-cpu')
-    del cfg['apps'][0]['cpus']
-    updated, updates = migration.convert(cfg, ['policy-node'], IMAGE)
-    assert 'cpus' not in updated['apps'][0] and updates[0]['cpus'] == 1
-
-
-def test_cli_takes_cpus_for_the_selected_entries(tmp_path):
+def test_cli_migrates_a_gpu_entry_without_cpus(tmp_path):
     cfg = configuration(tmp_path)
     del cfg['apps'][0]['cpus']
     apps = tmp_path / 'apps.yaml'
     apps.write_text(yaml.safe_dump(cfg))
-    command = [os.sys.executable, str(ROOT / 'deploy/migrate-proof-runtime.py'), '--apps', str(apps),
-        '--name', 'policy-node', '--image', IMAGE]
-    refused = subprocess.run(command + ['--output-dir', str(tmp_path / 'refused')], capture_output=True, text=True)
-    assert refused.returncode != 0 and 'explicit cpus' in refused.stderr
-    assert not (tmp_path / 'refused').exists()
-    for invalid in ('0', '1.5', '-2'):
-        result = subprocess.run(command + ['--cpus', invalid, '--output-dir', str(tmp_path / 'bad')], capture_output=True, text=True)
-        assert result.returncode == 2 and 'CPU cores' in result.stderr, invalid
-    result = subprocess.run(command + ['--cpus', '24', '--output-dir', str(tmp_path / 'review')], capture_output=True, text=True)
+    result = subprocess.run([os.sys.executable, str(ROOT / 'deploy/migrate-proof-runtime.py'), '--apps', str(apps),
+        '--name', 'policy-node', '--image', IMAGE, '--output-dir', str(tmp_path / 'review')], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert yaml.safe_load((tmp_path / 'review' / 'apps.yaml').read_text())['apps'][0]['cpus'] == 24
+    assert 'cpus' not in yaml.safe_load((tmp_path / 'review' / 'apps.yaml').read_text())['apps'][0]
+    assert json.loads((tmp_path / 'review' / 'updates.json').read_text())[0]['cpus'] == 1
 
 
 @pytest.mark.parametrize('failed,code', [('zkm-gpu-server',7), ('fleet-ziren-node',0), (None,None)])

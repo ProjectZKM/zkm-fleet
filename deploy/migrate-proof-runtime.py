@@ -31,7 +31,7 @@ def shim_volume(name, volume):
     return host + (':' + options[0] if options and options[0] else '')
 
 
-def convert(config, names, image, cpus=None):
+def convert(config, names, image):
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("use the complete proof-worker image by registry digest")
     result = copy.deepcopy(config)
@@ -57,13 +57,6 @@ def convert(config, names, image, cpus=None):
         root = entry.get('proof_storage_root', '')
         if not Path(root).is_absolute() or not re.fullmatch('[0-9a-fA-F]{64}', entry.get('elf_id', '')):
             raise ValueError("retain an absolute proof_storage_root and the existing full ELF identity")
-        if cpus is not None:
-            entry['cpus'] = cpus
-        explicit = entry.get('cpus')
-        if entry['kind'] == 'ziren-gpu' and not (type(explicit) in (int, float) and explicit >= 1):
-            raise ValueError(f"{entry['name']}: set an explicit cpus (at least 1) on the entry or pass --cpus N. "
-                "The migrated entry runs the GPU server and the worker in one container, hard-capped at cpus "
-                "cores for both (the legacy GPU server had no CPU cap)")
         env = dict(entry.get('env') or {})
         env.update(FLEET_NODE_NAME='{name}', FLEET_MACHINE='{machine}',
             FLEET_SCHEDULER='{scheduler}', FLEET_CLUSTER_TOKEN_FILE='{cluster_token_file}',
@@ -106,25 +99,16 @@ def convert(config, names, image, cpus=None):
     return result, updates
 
 
-def cores(value):
-    if not value.isdigit() or int(value) < 1:
-        raise argparse.ArgumentTypeError('a whole number of CPU cores, at least 1')
-    return int(value)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apps', type=Path, required=True)
     parser.add_argument('--name', action='append', required=True)
     parser.add_argument('--image', required=True)
-    parser.add_argument('--cpus', type=cores, metavar='N',
-        help='CPU cores for every selected entry, replacing its cpus; a ziren-gpu entry without an '
-             'explicit cpus needs it, because one container now runs and caps both GPU server and worker')
     parser.add_argument('--output-dir', type=Path, required=True,
         help='new private review directory, outside the repository; never applied automatically')
     args = parser.parse_args()
     with args.apps.open() as source:
-        config, updates = convert(yaml.safe_load(source), args.name, args.image, args.cpus)
+        config, updates = convert(yaml.safe_load(source), args.name, args.image)
     args.output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     files = [('apps.yaml', yaml.safe_dump(config, sort_keys=False)),
              ('updates.json', json.dumps(updates, indent=2) + '\n')]
