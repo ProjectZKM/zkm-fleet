@@ -391,9 +391,10 @@ async fn startup(forged: bool, stock: bool, driver: &str) {
         401
     );
     if !stock && !forged {
-        let mut short = input.clone(); short["expires_at"] = json!(crate::workloads::now() as u64 + 1);
+        // Short enough to expire here, long enough to be admitted on a loaded runner.
+        let mut short = input.clone(); short["expires_at"] = json!(crate::workloads::now() as u64 + 3);
         assert_eq!(admin(&c,"POST","/policy/openshell/launches",short).await.status(),200);
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
     }
     let prepared =
         json_body(admin(&c, "POST", "/policy/openshell/launches", input.clone()).await).await;

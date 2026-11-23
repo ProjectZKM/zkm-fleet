@@ -2309,6 +2309,23 @@ async fn shim_placement_and_pending_commands_require_explicit_node_capability() 
 }
 
 #[tokio::test]
+async fn running_shim_resources_stay_accounted_while_node_capabilities_are_incomplete() {
+    let (_dir,c,ns)=setup().await;
+    // A slow companion answer leaves only cleanup support in the report.
+    let mut report=scale_inventory(&ns,false,false);
+    report.apps[0]["runtime"]=json!({"executor":"shim","driver":"docker"});
+    report.runtime_capabilities=vec!["shim-cleanup-v1".into()];
+    // The scheduler restarts during that window: nothing else may take the GPUs.
+    let c=Arc::new(WorkloadController::new(c.fleet.clone(),"cluster".into()).unwrap());
+    c.report("gpu","session",report.clone()).await.unwrap();
+    assert_eq!(c.fleet.usage(&ns).gpus,2.0);
+    assert!(heartbeat_commands(&c.inner.lock(),"gpu").is_empty(), "no command for an unsupported runtime");
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-cleanup-v1".into()];
+    c.report("gpu","session",report).await.unwrap();
+    assert_eq!(c.fleet.usage(&ns).gpus,2.0, "restored once, not twice");
+}
+
+#[tokio::test]
 async fn invalid_prover_entry_does_not_suppress_other_workloads_and_ingress_secrets_stay_local() {
     let (_dir,c,ns)=setup().await;
     let mut report=scale_inventory(&ns,false,false);

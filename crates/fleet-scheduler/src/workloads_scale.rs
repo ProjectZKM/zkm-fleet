@@ -331,12 +331,6 @@ impl WorkloadController {
         if set.get("runtime").is_some_and(|r| r != &json!({"executor":"shim","driver":"docker"})) && intent.entry().is_prover() {
             return Err(fail(400, "packaged provers require shim Docker"));
         }
-        if let Some(runtime) = set.get("runtime") {
-            let candidate = json!({"kind":intent.entry().kind(), "runtime": runtime});
-            let supported = self.inner.lock().workers.get(&intent.worker)
-                .is_some_and(|w| w.report.supports_runtime(Entry(&candidate)));
-            if !supported { return Err(fail(409, "node does not support the selected runtime")); }
-        }
         if set.iter().all(|(k, v)| intent.spec.get(k) == Some(v)) {
             return Ok(self.scale_value(&intent));
         }
@@ -346,8 +340,10 @@ impl WorkloadController {
         }
         fleet_proto::model::v1::RegisterAppRequest::validate_transport(target.as_object().ok_or_else(|| fail(400,"invalid target"))?)
             .map_err(|e| fail(400,e.to_string()))?;
+        // The complete target covers the runtime alone and every service it needs.
         if !self.inner.lock().workers.get(&intent.worker).is_some_and(|w| w.report.supports_runtime(Entry(&target))) {
-            return Err(fail(409,"node does not support the selected runtime services"));
+            return Err(fail(409, if set.contains_key("runtime") { "node does not support the selected runtime" }
+                else { "node does not support the selected runtime services" }));
         }
         let disabled = intent.scale.as_ref().filter(|s| s.phase() == Phase::Failed).map(|s| s.disabled).unwrap_or(intent.disabled);
         let mut scale = new_scale(target, disabled);

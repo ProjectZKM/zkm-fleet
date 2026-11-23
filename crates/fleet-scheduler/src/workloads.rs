@@ -1078,19 +1078,25 @@ impl WorkloadController {
                 intent
             };
             // An older/downgraded bridge cannot attest cleanup of a shim allocation.
-            if !(if intent.disabled { report.supports_cleanup(intent.entry()) } else { report.supports_runtime(intent.entry()) }) {
-                continue;
-            }
+            let supported = if intent.disabled { report.supports_cleanup(intent.entry()) } else { report.supports_runtime(intent.entry()) };
             if observed.holds_allocation() {
                 let id = format!("deployment:{key}");
                 if observed.cleaned() && intent.disabled {
-                    self.fleet.release_job(&namespace.id, &id).await?;
+                    if supported {
+                        self.fleet.release_job(&namespace.id, &id).await?;
+                    }
                 } else if observed.ready() || report.native_allocated(observed) {
+                    // Resources the node reports in use stay accounted even while
+                    // its capabilities are briefly incomplete: nothing else may be
+                    // placed on them.
                     let (gpus, cpus) = observed.total(0.0);
                     self.fleet
                         .reserve_job(&namespace.id, observed.tag(), &id, gpus, cpus, true)
                         .await?;
                 }
+            }
+            if !supported {
+                continue;
             }
             let mismatch = observed.disabled() != intent.disabled
                 || if intent.disabled { !observed.cleaned() } else { !observed.ready() && !report.native_allocated(observed) };

@@ -127,6 +127,12 @@ pub struct Scheduler {
     token_ops: tokio::sync::Mutex<()>,
     namespaces: Mutex<HashMap<String, Namespace>>,
     allocations: Mutex<HashMap<String, Allocation>>,
+    /// Allocations whose durable release is in progress: no new execution guard
+    /// admits them, while their quota stays held until the release commits.
+    releasing: Mutex<HashMap<String, usize>>,
+    /// Tests hold this to pause a suspension or release before its durable write.
+    #[cfg(test)]
+    durable_hold: tokio::sync::RwLock<()>,
     quota_ops: tokio::sync::Mutex<()>,
     /// The registered proof apps, (namespace, name) -> record, mirrored from the store. A job
     /// executes only for one of them.
@@ -186,6 +192,9 @@ impl Scheduler {
             token_ops: tokio::sync::Mutex::new(()),
             namespaces: Mutex::new(HashMap::new()),
             allocations: Mutex::new(HashMap::new()),
+            releasing: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            durable_hold: tokio::sync::RwLock::new(()),
             quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
             worker_owned_apps: Mutex::new(HashSet::new()),
@@ -357,7 +366,9 @@ impl Scheduler {
             return Err(trusted_shim::rail::Error::Rejected);
         }
         let allocations = self.allocations.lock();
-        if !allocations.get(allocation).is_some_and(|a| a.namespace == namespace) {
+        if !allocations.get(allocation).is_some_and(|a| a.namespace == namespace)
+            || self.releasing.lock().contains_key(allocation)
+        {
             return Err(trusted_shim::rail::Error::Rejected);
         }
         Ok(Box::new((namespaces, allocations)))
@@ -409,8 +420,25 @@ impl Scheduler {
         let _policies = self.router_policy_ops.lock().await;
         let _ops = self.quota_ops.lock().await;
         let mut n = self.namespace(reference).ok_or_else(|| refuse(404, "no such namespace".into()))?;
+        let previous = n.suspended_ms;
         n.suspended_ms = suspended.then(now_ms);
-        self.store.suspend_namespace(&n.id, n.suspended_ms).await?;
+        if suspended {
+            // Stricter first. Taking the lock waits for in-flight execution
+            // guards; later ones see the suspension before it is durable.
+            if let Some(held) = self.namespaces.lock().get_mut(&n.id) {
+                held.suspended_ms = n.suspended_ms;
+            }
+            #[cfg(test)]
+            drop(self.durable_hold.read().await);
+            if let Err(e) = self.store.suspend_namespace(&n.id, n.suspended_ms).await {
+                if let Some(held) = self.namespaces.lock().get_mut(&n.id) {
+                    held.suspended_ms = previous;
+                }
+                return Err(e);
+            }
+        } else {
+            self.store.suspend_namespace(&n.id, n.suspended_ms).await?;
+        }
         self.namespaces.lock().insert(n.id.clone(), n.clone());
         Ok(n)
     }
@@ -541,8 +569,28 @@ impl Scheduler {
     }
 
     async fn release_quota(&self, id: &str) -> anyhow::Result<()> {
-        self.store.release(id).await?;
-        self.allocations.lock().remove(id);
+        {
+            // Taking the lock waits for in-flight execution guards; later ones
+            // refuse this allocation before its release is durable.
+            let _allocations = self.allocations.lock();
+            *self.releasing.lock().entry(id.to_owned()).or_default() += 1;
+        }
+        #[cfg(test)]
+        drop(self.durable_hold.read().await);
+        let released = self.store.release(id).await;
+        if released.is_ok() {
+            self.allocations.lock().remove(id);
+        }
+        {
+            let mut releasing = self.releasing.lock();
+            if let Some(count) = releasing.get_mut(id) {
+                *count -= 1;
+                if *count == 0 {
+                    releasing.remove(id);
+                }
+            }
+        }
+        released?;
         self.wake.notify_one();
         Ok(())
     }
@@ -1373,6 +1421,65 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn scheduler() -> (tempfile::TempDir, Arc<Scheduler>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: SchedulerConfig = serde_yaml::from_str(&format!(
+            "data_dir: {}\ncluster_token_file: cluster\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let fleet = Scheduler::new(cfg, Arc::new(crate::store::MemoryStore::default()), "cluster".into());
+        let quota = Quota { gpus: Some(2.0), cpus: Some(8.0) };
+        let ns = fleet.create_namespace("test", quota).await.unwrap().id;
+        fleet.reserve_job(&ns, None, "deployment:gpu-model", 1.0, 1.0, false).await.unwrap();
+        (dir, fleet, ns)
+    }
+
+    #[tokio::test]
+    async fn execution_guards_are_fenced_before_suspension_or_release_is_durable() {
+        let (_dir, fleet, ns) = scheduler().await;
+        let allocation = "deployment:gpu-model";
+        assert!(fleet.policy_allocation_guard(&ns, allocation).is_ok());
+
+        // Paused just before the durable write, the suspension already refuses.
+        let hold = fleet.durable_hold.write().await;
+        let suspending = tokio::spawn({
+            let (fleet, ns) = (fleet.clone(), ns.clone());
+            async move { fleet.suspend_namespace(&ns, true).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.policy_allocation_guard(&ns, allocation).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(hold);
+        suspending.await.unwrap().unwrap();
+        assert!(fleet.policy_allocation_guard(&ns, allocation).is_err());
+        fleet.suspend_namespace(&ns, false).await.unwrap();
+        assert!(fleet.policy_allocation_guard(&ns, allocation).is_ok());
+
+        // A release refuses new guards, yet keeps its quota until it commits.
+        let hold = fleet.durable_hold.write().await;
+        let releasing = tokio::spawn({
+            let (fleet, ns) = (fleet.clone(), ns.clone());
+            async move { fleet.release_job(&ns, allocation).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fleet.policy_allocation_guard(&ns, allocation).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fleet.usage(&ns).gpus, 1.0);
+        drop(hold);
+        releasing.await.unwrap().unwrap();
+        assert_eq!(fleet.usage(&ns).gpus, 0.0);
+        assert!(fleet.releasing.lock().is_empty());
+    }
 
     #[test]
     fn new_tags_require_a_single_key_value_pair() {
