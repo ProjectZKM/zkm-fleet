@@ -212,6 +212,99 @@ def test_network_recovery_failure_preserves_observed_runtime_and_repair(tmp_path
     assert actor.health()['ready'] is True
 
 
+def resumable_actor(tmp_path, monkeypatch, states):
+    s = spec(tmp_path)
+    actor = object.__new__(shim._ShimApp)
+    actor.spec = replace(s, cluster=replace(s.cluster, shim_daemon=True))
+    actor.port, actor.gpus, actor.network, actor.resumable = 12345, [], None, True
+    calls = []
+    def call(command, timeout=None):
+        calls.append(command["operation"])
+        if command["operation"] == "resume":
+            return {"state": states.pop(0) if states else "ready"}
+        return {"state": "stopped"} if "resume" not in calls or states else {"state": "ready"}
+    actor.call = call
+    actor.start_network = Mock()
+    actor.application_ready = Mock(return_value=True)
+    clock = [1000.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    return actor, calls, clock
+
+
+def test_crashed_daemon_runtime_is_resumed_in_place_and_reconnected(tmp_path, monkeypatch):
+    actor, calls, _ = resumable_actor(tmp_path, monkeypatch, ["ready"])
+    value = actor.health()
+    assert calls == ["inspect", "resume"]
+    assert value["ready"] is True and value["management_ready"] is True
+    # The resumed runtime's routes are registered again in the same probe.
+    actor.start_network.assert_called_once()
+
+
+def test_resume_backs_off_and_recovers_after_a_stable_period(tmp_path, monkeypatch):
+    actor, calls, clock = resumable_actor(tmp_path, monkeypatch, ["stopped", "stopped", "stopped"])
+    assert actor.health()["ready"] is False
+    actor.health()
+    assert calls.count("resume") == 1  # within the first 5 s delay
+    clock[0] += 5
+    actor.health()
+    clock[0] += 5
+    actor.health()
+    assert calls.count("resume") == 2  # now 10 s
+    clock[0] += 5
+    actor.health()
+    assert calls.count("resume") == 3
+    assert actor.resume_at - clock[0] == 20
+    # A failing resume is logged and the observed state is still reported.
+    actor.call = Mock(side_effect=lambda command, timeout=None: {"state": "stopped"}
+        if command["operation"] == "inspect" else (_ for _ in ()).throw(RuntimeError("refused")))
+    clock[0] += 3600
+    assert actor.health()["ready"] is False
+    assert actor.resumes == 4 and actor.resume_at - clock[0] == 40
+    for _ in range(10):
+        actor.resume_at = 0
+        actor.health()
+    assert actor.resume_at - clock[0] == 300
+    # Healthy long enough after the last resume: the next crash starts over.
+    actor.call = Mock(return_value={"state": "ready"})
+    actor.health()
+    assert actor.resumes == 14
+    clock[0] += shim.RESUME_STABLE_S
+    actor.health()
+    assert actor.resumes == 0 and actor.resume_at == 0
+
+
+@pytest.mark.parametrize("state", ["starting", "stopping", "failed", "ready"])
+def test_only_an_exited_runtime_is_resumed(tmp_path, monkeypatch, state):
+    actor, _, _ = resumable_actor(tmp_path, monkeypatch, [])
+    actor.call = Mock(return_value={"state": state})
+    actor.health()
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list] == ["inspect"]
+
+
+def test_resume_requires_daemon_docker_and_advertised_support(tmp_path, monkeypatch):
+    actor, _, _ = resumable_actor(tmp_path, monkeypatch, [])
+    actor.resumable = False
+    actor.call = Mock(return_value={"state": "stopped"})
+    assert actor.health()["ready"] is False
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list] == ["inspect"]
+    # Instances created before this upgrade never resume.
+    legacy = object.__new__(shim._ShimApp)
+    assert legacy.resumable is False and legacy.resumes == 0
+    s = spec(tmp_path)
+    daemon = replace(s.cluster, shim_daemon=True)
+    value = {"protocol": 1, "drivers": ["docker"], "features": ["data-plane-v1", "runtime-management-v1"]}
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: value)
+    monkeypatch.setattr(shim, "check_machine", lambda *a: None)
+    assert "shim-resume-v1" not in shim.capabilities(daemon)
+    value["features"].append("runtime-resume-v1")
+    assert "shim-resume-v1" in shim.capabilities(daemon)
+    # The one-shot CLI cannot keep a resumed runtime connected.
+    monkeypatch.setattr(shim.subprocess, "run", lambda *a, **k: Mock(stdout=shim.json.dumps(value)))
+    assert "shim-resume-v1" not in shim.capabilities(s.cluster)
+    value["drivers"] = ["tee"]
+    assert "shim-resume-v1" not in shim.capabilities(daemon)
+
+
 def test_service_bootstrap_ignores_invalid_apps_but_validates_daemon_settings(tmp_path,monkeypatch):
     path=tmp_path/'apps.yaml'
     # Invalid application and network settings must remain remotely repairable.

@@ -142,6 +142,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         return native + [name for name, supported in (
             ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
             ("shim-cleanup-v1", True),
+            ("shim-resume-v1", config.shim_daemon and "runtime-resume-v1" in features and "docker" in value.get("drivers", [])),
             ("shim-private-env-v1", managed_network),
             ("shim-prover-v1", modern and management and "docker" in value.get("drivers", [])),
             ("shim-tcp-v1", managed_network),
@@ -189,6 +190,13 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
 
 # A health probe's connector recovery must finish within the probe's own budget.
 RECOVERY_TIMEOUT_S = 3
+# Resuming a crashed container also runs inside a health probe (30 s budget).
+# An unanswered resume keeps going in the daemon; the next probe observes it.
+RESUME_TIMEOUT_S = 20
+# Consecutive resumes back off from the first to the last delay, in seconds.
+# A runtime that stays healthy this long after a resume counts as recovered.
+RESUME_BACKOFF_S = (5, 300)
+RESUME_STABLE_S = 60
 
 
 def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False,
@@ -339,10 +347,20 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
 
 
 class _ShimApp:
+    # Crash recovery state; class defaults keep pre-upgrade instances valid.
+    resumable = False
+    resumes = 0
+    resume_at = 0.0
+    resumed_at = 0.0
+
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
-        if not required_capabilities(spec).issubset(capabilities(spec.cluster)):
+        supported = capabilities(spec.cluster)
+        if not required_capabilities(spec).issubset(supported):
             raise RuntimeError("shim no longer supports the admitted runtime")
+        # Only a daemon-managed Docker runtime can be resumed in place.
+        self.resumable = (spec.cluster.shim_daemon and spec.app.runtime.driver == "docker"
+                          and "shim-resume-v1" in supported)
         self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
         status = self.call({"operation": "launch", "request": request})
@@ -382,8 +400,32 @@ class _ShimApp:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command,
             daemon=self.spec.cluster.shim_daemon, timeout=timeout)
 
+    def resume(self, status: dict[str, Any]) -> dict[str, Any]:
+        """Start this replica's own exited container again, keeping its state.
+
+        Without this a crashed runtime stays down: the shim never restarts it
+        and its routes are gone, so nothing remote can reach it. The shim
+        refuses anything but a running allocation's existing container, so a
+        stop or delete that raced this probe stays final."""
+        now = time.monotonic()
+        if now < self.resume_at:
+            return status
+        self.resumes += 1
+        self.resumed_at = now
+        first, last = RESUME_BACKOFF_S
+        self.resume_at = now + min(last, first * 2 ** (self.resumes - 1))
+        logging.getLogger(__name__).warning("shim runtime for %s exited; resuming it (attempt %d)",
+                                            self.spec.name, self.resumes)
+        try:
+            return self.call({"operation": "resume", "execution": self.spec.execution}, timeout=RESUME_TIMEOUT_S)
+        except (RuntimeError, OSError, ValueError):
+            logging.getLogger(__name__).warning("shim resume failed for %s", self.spec.name)
+            return status
+
     def health(self) -> dict[str, Any]:
         status = self.call({"operation": "inspect", "execution": self.spec.execution})
+        if status.get("state") == "stopped" and self.resumable:
+            status = self.resume(status)
         if status.get("state") == "ready" and (self.spec.cluster.shim_daemon or
                 self.network is not None and self.network.poll() is not None):
             try:
@@ -393,11 +435,13 @@ class _ShimApp:
                 # if re-registering its connector temporarily fails. Router
                 # leases independently fence actual reachability.
                 logging.getLogger(__name__).warning("shim connector recovery failed for %s", self.spec.name)
+        ready = status.get("state") == "ready" and self.application_ready()
+        if ready and self.resumes and time.monotonic() - self.resumed_at >= RESUME_STABLE_S:
+            self.resumes, self.resume_at = 0, 0.0
         return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),
-            management_ready=status.get("state") == "ready",
-            ready=status.get("state") == "ready" and self.application_ready()).dump()
+            management_ready=status.get("state") == "ready", ready=ready).dump()
 
     def application_ready(self) -> bool:
         if self.spec.app.service_protocol is ServiceProtocol.HTTP1:
