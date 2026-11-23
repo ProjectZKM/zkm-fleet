@@ -63,7 +63,7 @@ fn rank(i: &WorkloadState, key: &str, intent: &AppDeployment) -> (bool, bool, St
     (!running_now(i, intent), !wants_running(intent), key.to_owned())
 }
 
-const REPLICA_RANGE: &str = "gpus must be nonnegative, cpus positive, and replicas between 1 and 64; use app disable to stop all replicas";
+const REPLICA_RANGE: &str = "gpus must be nonnegative and replicas between 1 and 64; use app disable to stop all replicas";
 
 impl WorkloadController {
     pub(crate) async fn app_lifecycle_guard(
@@ -124,7 +124,7 @@ impl WorkloadController {
         let i = self.inner.lock();
         let observed = i.workers.get(&intent.worker).and_then(|w| w.report.entry(intent.entry().name())).map(|e| e.0);
         let target = intent.scale.as_ref().map(ScaleStatus::target_entry).unwrap_or(intent.entry());
-        json!({"node":intent.worker,"entry":intent.entry().name(),
+        let mut value = json!({"node":intent.worker,"entry":intent.entry().name(),
             "namespace":intent.entry().namespace(),
             "gpus":target.gpus().unwrap_or(1.0),"cpus":target.cpus(),
             "replicas":target.replicas(),
@@ -132,7 +132,17 @@ impl WorkloadController {
             "disabled":intent.scale.as_ref().map(|s|s.disabled).unwrap_or(intent.disabled),
             "operation":intent.scale.as_ref().map(|s|s.id.clone()),
             "error":intent.scale.as_ref().and_then(|s|s.error.clone()),
-            "observed":observed.map(|s|json!({"gpus":s["gpus"],"cpus":s["cpus"],"replicas":s["replicas"],"ready":s["ready"],"disabled":s["disabled"]}))})
+            "observed":observed.map(|s|json!({"gpus":s["gpus"],"cpus":s["cpus"],"replicas":s["replicas"],"ready":s["ready"],"disabled":s["disabled"]}))});
+        // Hard limits, beside the reservation, only where the app sets them.
+        for k in Entry::LIMITS {
+            if !target.0[k].is_null() {
+                value[k] = target.0[k].clone();
+            }
+            if let Some(o) = observed.filter(|s| !s[k].is_null()) {
+                value["observed"][k] = o[k].clone();
+            }
+        }
+        value
     }
 
     /// Reads the last `lines` lines of the app's log from the node that runs it,
@@ -186,11 +196,18 @@ impl WorkloadController {
         let state = parts.iter().map(|p| &p["state"]).find(|s| *s == "failed")
             .or_else(|| parts.iter().map(|p| &p["state"]).find(|s| !matches!(s.as_str(), Some("complete" | "configured"))))
             .unwrap_or(&parts[0]["state"]);
-        json!({"namespace": parts[0]["namespace"], "replicas": parts.iter().filter_map(|p| p["replicas"].as_u64()).sum::<u64>(),
+        let mut value = json!({"namespace": parts[0]["namespace"], "replicas": parts.iter().filter_map(|p| p["replicas"].as_u64()).sum::<u64>(),
             "gpus": parts[0]["gpus"], "cpus": parts[0]["cpus"], "state": state,
             "disabled": parts.iter().all(|p| p["disabled"] == json!(true)),
             "error": parts.iter().find_map(|p| p["error"].as_str()),
-            "nodes": parts.iter().map(|p| p["node"].clone()).collect::<Vec<_>>(), "deployments": parts})
+            "nodes": parts.iter().map(|p| p["node"].clone()).collect::<Vec<_>>()});
+        for k in Entry::LIMITS {
+            if !parts[0][k].is_null() {
+                value[k] = parts[0][k].clone();
+            }
+        }
+        value["deployments"] = json!(parts);
+        value
     }
 
     /// The deployment of `app` (on `node`, when it has several) that a scale or settings update
@@ -340,6 +357,11 @@ impl WorkloadController {
         }
         fleet_proto::model::v1::RegisterAppRequest::validate_transport(target.as_object().ok_or_else(|| fail(400,"invalid target"))?)
             .map_err(|e| fail(400,e.to_string()))?;
+        // A reservation and its limits must still fit the app's memory and runtime.
+        if set.contains_key("memory_gb") || set.contains_key("runtime") {
+            fleet_proto::model::v1::RegisterAppRequest::validate_resources(target.as_object().ok_or_else(|| fail(400,"invalid target"))?)
+                .map_err(|e| fail(400,e.to_string()))?;
+        }
         // The complete target covers the runtime alone and every service it needs.
         if !self.inner.lock().workers.get(&intent.worker).is_some_and(|w| w.report.supports_runtime(Entry(&target))) {
             return Err(fail(409, if set.contains_key("runtime") { "node does not support the selected runtime" }
@@ -368,8 +390,8 @@ impl WorkloadController {
         req: ScaleRequest,
     ) -> anyhow::Result<Value> {
         let _ops = self.ops.lock().await;
-        if req.gpus.is_none() && req.cpus.is_none() && req.replicas.is_none() {
-            return Err(fail(400, "set at least one of gpus, cpus or replicas"));
+        if req.gpus.is_none() && req.cpus.is_none() && req.replicas.is_none() && req.cpu_limit.is_none() && req.memory_limit_gb.is_none() {
+            return Err(fail(400, "set at least one of gpus, cpus, replicas, cpu_limit or memory_limit_gb"));
         }
         if req.node.is_some() {
             return Err(fail(400, "replicas, GPUs and CPUs are the app's settings: scale it without a node, and the scheduler places its replicas"));
@@ -402,15 +424,17 @@ impl WorkloadController {
                 continue;
             }
             let mut target = self.with_priority(intent.spec.clone());
-            EntryMut(&mut target).set_resources(req.gpus, req.cpus, Some(replicas as u32));
+            EntryMut(&mut target).set_resources(&req, Some(replicas as u32));
             let t = Entry(&target);
             let (g, cpu) = (t.gpus().unwrap_or(1.0), t.cpus());
             if t.integrated_worker() && replicas != 1 {
                 return Err(fail(400, "integrated app workers require one machine-pinned replica"));
             }
-            if !g.is_finite() || g < 0.0 || !cpu.is_finite() || cpu <= 0.0 {
+            if !g.is_finite() || g < 0.0 {
                 return Err(fail(400, REPLICA_RANGE));
             }
+            fleet_proto::model::v1::RegisterAppRequest::validate_resources(target.as_object().ok_or_else(|| fail(400, "invalid target"))?)
+                .map_err(|e| fail(400, e.to_string()))?;
             if t.kind() == "ziren-gpu" && (g < 1.0 || g.fract() != 0.0) {
                 return Err(fail(400, "a proof server requires a positive integer GPU count"));
             }
@@ -426,6 +450,7 @@ impl WorkloadController {
                 continue;
             }
             self.check_node_room(&intent.worker, g * replicas as f64, cpu * replicas as f64, replicas)?;
+            self.check_node_limits(&intent.worker, t)?;
             changes.push((key, intent, target));
         }
         let tag_quota = ns.tag_quotas.get(tag.as_deref().unwrap_or("")).cloned().unwrap_or_default();
@@ -478,6 +503,24 @@ impl WorkloadController {
                     node.report.free_cpus,
                 ),
             ));
+        }
+        Ok(())
+    }
+
+    /// Refuses a change that gives `worker`'s deployment hard limits, or no CPU reservation,
+    /// that its node can't enforce: its bridge or shim lacks the capability, or a TEE limit is
+    /// beyond the CPUs the node advertises, its confidential VM's.
+    fn check_node_limits(&self, worker: &str, target: Entry<'_>) -> anyhow::Result<()> {
+        let i = self.inner.lock();
+        let Some(node) = i.workers.get(worker) else { return Ok(()) };
+        let new = Entry::LIMITS.iter().any(|k| target.0.get(*k).is_some_and(|v| !v.is_null())) || target.unreserved();
+        if new && !node.report.supports_runtime(target) {
+            return Err(fail(409, format!("node {worker} can't enforce these limits: give no CPU reservation (cpus 0) only on a node \
+                reporting shim-cpu-shares-v1 (on TEE also shim-tee-cpu-overcommit-v1), and cpu_limit or memory_limit_gb on one reporting shim-limits-v1")));
+        }
+        if !node.report.fits_cpu_limit(target) {
+            return Err(fail(422, format!("cpu_limit {} exceeds node {worker}'s {} CPUs, its confidential VM's",
+                target.cpu_limit().unwrap_or_default(), node.report.total_cpus)));
         }
         Ok(())
     }
@@ -744,7 +787,11 @@ impl WorkloadController {
                 .cloned();
             if let Some(mut app) = app.filter(|a| a.persistent) {
                 for k in Entry::RESOURCES {
-                    app.spec[k] = scale.target[k].clone();
+                    match &scale.target[k] {
+                        // An app without a hard limit keeps no key for it.
+                        Value::Null => { app.spec.0.as_object_mut().map(|o| o.remove(k)); }
+                        v => app.spec[k] = v.clone(),
+                    }
                 }
                 // The count is the app's, over all its nodes.
                 app.spec["replicas"] = json!(self.app_replicas(intent.entry().namespace(), intent.entry().app()));
@@ -892,7 +939,8 @@ impl WorkloadController {
     pub(super) fn place_app(&self, entry: Entry<'_>, except: &[String]) -> anyhow::Result<(String, bool)> {
         let (gpus, cpus) = entry.total(1.0);
         let large: Vec<String> = self.inner.lock().workers.iter()
-            .filter(|(id, w)| !except.contains(id) && w.report.supports_runtime(entry) && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
+            .filter(|(id, w)| !except.contains(id) && w.report.supports_runtime(entry) && w.report.fits_cpu_limit(entry)
+                && w.report.total_gpus + 1e-9 >= gpus && w.report.total_cpus + 1e-9 >= cpus)
             .map(|(id, _)| id.clone()).collect();
         let sizes: Vec<(String, f64, f64)> = large.into_iter()
             .filter_map(|id| self.capacity(&id).map(|(g, c)| (id, g, c)))

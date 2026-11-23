@@ -613,7 +613,17 @@ impl WorkloadController {
                     )
                 .collect::<Vec<_>>();
             let apps = w.report.entries().map(Entry::app).collect::<Vec<_>>();
+            // What the node's enabled apps reserve, beside the hard limits of those that set
+            // them: limits beyond its CPUs mean the node is overcommitted.
+            let (mut reserved, mut cpu_limits, mut memory_limits) = (0.0, 0.0, 0.0);
+            for e in w.report.entries().filter(|e| !e.disabled() && matches!(e.kind(), "app" | "ziren-gpu" | "ziren-cpu")) {
+                let n = e.replicas() as f64;
+                reserved += e.cpus() * n;
+                cpu_limits += e.cpu_limit().unwrap_or(0.0) * n;
+                memory_limits += e.memory_limit_gb().unwrap_or(0.0) * n;
+            }
             json!({"id":id,"name":id,"backend":"ray-local",
+                "reserved_cpus":reserved,"cpu_limits":cpu_limits,"memory_limits_gb":memory_limits,
                 "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
                 "agent_version":w.report.agent_version,"hardware":w.report.hardware,
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,

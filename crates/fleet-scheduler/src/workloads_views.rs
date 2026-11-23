@@ -70,6 +70,8 @@ impl WorkloadController {
             .collect();
         let mut gpus = 0.0;
         let mut cpus = 0.0;
+        // Ray's memory reservation and the containers' hard limits, over the replicas that set them.
+        let (mut memory, mut cpu_limit, mut memory_limit) = (None::<f64>, None::<f64>, None::<f64>);
         let mut replicas = 0u64;
         let mut nodes = std::collections::BTreeSet::new();
         let mut tags = std::collections::BTreeSet::new();
@@ -88,6 +90,11 @@ impl WorkloadController {
             replicas += count;
             gpus += s.gpus_or_default() * count as f64;
             cpus += s.cpus() * count as f64;
+            for (total, each) in [(&mut memory, s.memory_gb()), (&mut cpu_limit, s.cpu_limit()), (&mut memory_limit, s.memory_limit_gb())] {
+                if let Some(each) = each {
+                    *total = Some(total.unwrap_or(0.0) + each * count as f64);
+                }
+            }
             nodes.insert(intent.worker.clone());
             tags.insert(s.tag().unwrap_or("").to_owned());
             if !s.image().is_empty() {
@@ -128,8 +135,17 @@ impl WorkloadController {
         ]
             .into_iter().find(|s| states.contains(s)).unwrap_or("configured");
         let n = self.fleet.namespace(namespace);
+        let resources = (!deployments.is_empty()).then(|| {
+            let mut r = json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes});
+            for (key, total) in [("memory_gb", memory), ("cpu_limit", cpu_limit), ("memory_limit_gb", memory_limit)] {
+                if let Some(total) = total {
+                    r[key] = json!(total);
+                }
+            }
+            r
+        });
         json!({
-            "resources":(!deployments.is_empty()).then(||json!({"gpus":gpus,"cpus":cpus,"replicas":replicas,"nodes":nodes})),
+            "resources":resources,
             "tags":tags, "images":images, "state":state, "runtime_instances": instances,
             "detail":(state == "starting").then(|| reasons.join("; ")),
             "namespace_quota":n.as_ref().map(|n|&n.quota),
