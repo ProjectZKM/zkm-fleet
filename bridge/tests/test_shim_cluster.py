@@ -80,8 +80,9 @@ def test_local_cluster_keeps_legacy_container_and_recovers_shim_allocation(tmp_p
                     f"open({str(storage/'proof.bin')!r},'wb').write(b'retained proof fixture')"],check=True)
             assert status["port"] > 0
             assert current["NetworkSettings"]["Ports"]["8080/tcp"][0]["HostPort"] == str(status["port"])
-            assert current["HostConfig"]["NanoCpus"]==500_000_000
-            assert current["HostConfig"]["Memory"]==134_217_728
+            # cpus and memory_gb are Ray reservations, not container limits.
+            assert current["HostConfig"]["NanoCpus"]==0
+            assert current["HostConfig"]["Memory"]==0
             assert all(p["HostIp"]=="127.0.0.1" for ports in current["HostConfig"]["PortBindings"].values() for p in ports)
             recovered=node.NodeExecutor(str(apps),str(batches),str(tmp_path/"jobs"))
             recovered.set_app({"app":new_app,"disabled":False},"after-adapter-restart")

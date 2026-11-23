@@ -27,7 +27,7 @@ apps:
     proof_storage_root: /srv/ethproofs # app endpoint and every eligible replica access this path
     replicas: 1
     gpus: 2
-    cpus: 48                           # caps the GPU server and the worker together
+    cpus: 48                           # Ray reserves them for the GPU server and the worker together
     memory_gb: 256
     shm_gb: 64
     image: REGISTRY/PROOF@sha256:REPLACE

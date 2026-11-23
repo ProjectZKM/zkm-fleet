@@ -5,19 +5,23 @@ choose their cleanup executable independently of the current apps.yaml.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
+import http.client
 import json
 import logging
 import os
+import re
 import socket
 import stat
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import ray
 
@@ -25,6 +29,14 @@ from . import actors
 from .model import AppReplicaSpec, AppRuntime, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, ServiceProtocol, to_dict
 
 CAPABILITY = "shim-docker-v1"
+
+# How a launch request is formed. Revision 2 runs a Docker container the way the
+# legacy executor runs an app: `cpus` and `memory_gb` are Ray reservations, not
+# container limits, and a GPU app gets every NVIDIA driver capability. Revision 1
+# sets them as hard limits and adds nothing to the environment. The shim replays
+# a launch only when the request is identical, so an allocation keeps the
+# revision it was launched with.
+LAUNCH_REVISION = 2
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
@@ -154,6 +166,9 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
             ("shim-cleanup-v1", True),
             ("shim-resume-v1", config.shim_daemon and "runtime-resume-v1" in features and "docker" in value.get("drivers", [])),
+            # A TEE restart is admitted afresh: new evidence and a proof each time.
+            ("shim-resume-tee-v1", config.shim_daemon and "runtime-resume-tee-v1" in features and config.shim_tee is not None
+                and config.shim_tee.driver in value.get("drivers", [])),
             ("shim-private-env-v1", managed_network),
             ("shim-prover-v1", modern and management and "docker" in value.get("drivers", [])),
             ("shim-tcp-v1", managed_network),
@@ -168,9 +183,15 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         return []
 
 
+class ShimPending(RuntimeError):
+    """The daemon took the operation but did not answer within the caller's
+    timeout. It runs daemon operations to completion, so this one continues."""
+
+
 def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
     """No TCP listener or credentials in argv. Never fall back to direct Docker."""
     path = Path(state_dir) / "control.sock"
+    sent = False
     try:
         info = path.lstat()
         if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -186,6 +207,7 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
                 raise ValueError("untrusted shim peer")
             connection.sendall(payload)
             connection.shutdown(socket.SHUT_WR)
+            sent = True
             data = bytearray()
             while chunk := connection.recv(65536):
                 data.extend(chunk)
@@ -195,6 +217,10 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
         if not isinstance(response, dict) or response.get("protocol") != 1 or not isinstance(response.get("result"), dict) or "error" in response:
             raise ValueError("shim rejected operation")
         return response["result"]
+    except TimeoutError:
+        if sent:
+            raise ShimPending("shim daemon did not answer in time; the operation continues there") from None
+        raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
     except (OSError, ValueError, TypeError):
         raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
 
@@ -207,14 +233,20 @@ RESUME_TIMEOUT_S = 20
 # Consecutive resumes back off from the first to the last delay, in seconds.
 # A runtime that stays healthy this long after a resume counts as recovered.
 RESUME_BACKOFF_S = (5, 300)
+# Each TEE resume costs an attestation admission, with its own proof, of up to
+# 300 s; the daemon continues an admission whose caller stopped waiting.
+TEE_RESUME_BACKOFF_S = (300, 3600)
 RESUME_STABLE_S = 60
+TEE_DRIVERS = ("tee", "tee-simulation")
 
 
 def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *, daemon: bool = False,
            timeout: float | None = None) -> dict[str, Any]:
     if daemon:
         if timeout is None:
-            timeout = 330 if command.get("operation") == "launch" and command.get("request", {}).get("driver") in ("tee", "tee-simulation") else 150
+            # A TEE launch or resume waits for its attestation admission (300 s).
+            driver = (command.get("request", {}) if command.get("operation") == "launch" else command).get("driver")
+            timeout = 330 if command.get("operation") in ("launch", "resume") and driver in TEE_DRIVERS else 150
         return daemon_call(state_dir, node_id, command, timeout=timeout)
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
@@ -236,6 +268,8 @@ class Allocation(Record):
     access_policy_sha256: str | None = None
     daemon: bool = False
     cleaned: bool = False
+    # A record without one holds a revision 1 launch.
+    launch_revision: int = 1
 
 
 class RuntimeBook:
@@ -281,7 +315,7 @@ class RuntimeBook:
             if (previous.spec != binding_hash(spec) or previous.binary != spec.cluster.shim_binary
                     or previous.state_dir != spec.cluster.shim_state_dir or previous.daemon != spec.cluster.shim_daemon):
                 raise ValueError("active shim allocation differs; drain and clean it before changing settings")
-            return replace(spec, execution=previous.execution)
+            return replace(spec, execution=previous.execution, launch_revision=previous.launch_revision)
         if previous and previous.execution.lease_id == command_id:
             raise ValueError("completed allocation cannot be relaunched by replay")
         execution = RuntimeIdentity(namespace=spec.app.namespace, workload=spec.app.app,
@@ -292,8 +326,9 @@ class RuntimeBook:
             raise ValueError("shim is not configured")
         self.write(spec.name, Allocation(executor=ExecutorKind.SHIM, execution=execution,
             spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir,
-            daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver, access_policy_sha256=spec.app.access_policy_sha256))
-        return replace(spec, execution=execution)
+            daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver, access_policy_sha256=spec.app.access_policy_sha256,
+            launch_revision=LAUNCH_REVISION))
+        return replace(spec, execution=execution, launch_revision=LAUNCH_REVISION)
 
     def cleanup(self, name: str) -> None:
         record = self.read(name)
@@ -311,16 +346,30 @@ class RuntimeBook:
         self.write(name, record)
 
 
+def launch_limits(spec: AppReplicaSpec) -> dict[str, int | None]:
+    """The container's hard CPU and memory limits; the shim sets none for a null.
+    A revision 2 Docker launch has none: Ray's reservation of `cpus` and
+    `memory_gb` alone accounts for them. Revision 1 and TEE launches set both."""
+    app = spec.app
+    if app.runtime.driver == "docker" and spec.launch_revision >= 2:
+        return {"cpu_millicores": None, "memory_bytes": None}
+    return {"cpu_millicores": round(app.cpus * 1000),
+        "memory_bytes": round(app.memory_gb * 2**30) if app.memory_gb is not None else None}
+
+
 def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     app = spec.app
     if spec.execution is None or app.port_base is None or not app.image:
         raise ValueError("shim needs a persisted execution, image and port_base")
     port = app.port_base + spec.index if app.port_base else 0
+    revision = spec.launch_revision
     # Explicit manifest substitution, shared by all containers. No credential
     # contents or worker-specific environment is injected into workloads.
+    # Revision 2 counts at least one CPU, as the legacy executor sets RAYON_NUM_THREADS.
     fill = {**{k: v for k, v in to_dict(app).items() if isinstance(v, (str, int, float))},
         "port": app.container_port or port, "index": spec.index, "name": spec.name,
-        "machine": socket.gethostname(), "gpu_count": len(gpus), "cpu_count": int(app.cpus),
+        "machine": socket.gethostname(), "gpu_count": len(gpus),
+        "cpu_count": max(1, int(app.cpus)) if revision >= 2 else int(app.cpus),
         "gpus": ",".join(str(i) for i in range(len(gpus))),
         "scheduler": spec.cluster.scheduler or "",
         "scheduler_ca_file": spec.cluster.scheduler_ca_file or "",
@@ -336,12 +385,15 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         if not spec.cluster.shim_daemon or not tee or tee.driver != driver:
             raise ValueError("TEE launch requires matching node configuration")
         trust.update(attestation={"mode": "required", "profile": tee.platform}, attestation_proof="required")
+    environment = {k: v.format(**fill) for k, v in app.env.items()}
+    if driver == "docker" and revision >= 2 and gpus and spec.kind is AppRuntime.APP:
+        # As the legacy executor runs a GPU app; the app's own value wins.
+        environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
     return {"execution": spec.execution, "driver": driver, "image": app.image,
         **({"access_policy_sha256": app.access_policy_sha256} if app.access_policy_sha256 is not None else {}),
         "command": [v.format(**fill) for v in app.command],
-        "environment": {k: v.format(**fill) for k, v in app.env.items()},
-        "limits": {"cpu_millicores": round(app.cpus * 1000),
-            "memory_bytes": round(app.memory_gb * 2**30) if app.memory_gb is not None else None},
+        "environment": environment,
+        "limits": launch_limits(spec),
         # Application policy admission is separate from the synchronous TEE RA gate.
         "policy": {"issuer": "fleet", "policy_id": "unproved-container-lifecycle", "version": 0, "sha256": ""},
         "trust": trust,
@@ -357,26 +409,235 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
             "shm_bytes": (app.shm_gb if app.shm_gb is not None else 16) * 2**30}}
 
 
+# The Docker daemon the shim's driver uses; the environment cannot select another.
+DOCKER_SOCKET = "/var/run/docker.sock"
+DOCKER = ("docker", f"--host=unix://{DOCKER_SOCKET}")
+# How long `docker image inspect` may take before the image counts as missing.
+IMAGE_CHECK_TIMEOUT_S = 30
+# A pull's own budget. As for a legacy app, whose `docker run` pulls before its
+# readiness clock starts, it is separate from the app's ready_timeout_s.
+PULL_TIMEOUT_S = 3600
+# The shim's Docker driver names each container after its allocation's slot.
+CONTAINER_NAME = re.compile(r"trusted-shim-[0-9a-f]{64}")
+
+
+def _docker_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in ("DOCKER_HOST", "DOCKER_CONTEXT")}
+
+
+def image_present(image: str) -> bool:
+    """Whether the shim's Docker holds `image`; an unanswered check counts as no."""
+    try:
+        return subprocess.run([*DOCKER, "image", "inspect", "--format", "{{.Id}}", "--", image], capture_output=True,
+                              env=_docker_env(), timeout=IMAGE_CHECK_TIMEOUT_S).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def pull_image(name: str, image: str, timeout: float = PULL_TIMEOUT_S) -> None:
+    """Fetches `image` into the shim's Docker within `timeout` seconds."""
+    try:
+        result = subprocess.run([*DOCKER, "pull", "--", image], capture_output=True, text=True,
+                                env=_docker_env(), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"{name}: pulling image {image} did not finish within {timeout:g} s") from None
+    except OSError as error:
+        raise RuntimeError(f"{name}: could not pull image {image}: {error}") from None
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip())[-500:]
+        raise RuntimeError(f"{name}: could not pull image {image}: {detail or f'docker pull exited with {result.returncode}'}")
+
+
+# How long connecting to Docker and its first answer may take; a followed log
+# then waits as long as the container stays quiet.
+DOCKER_API_TIMEOUT_S = 10
+# How often the follower records how far it has written.
+CURSOR_INTERVAL_S = 1.0
+# A follower that fails sooner than this, with no output, retries after a
+# backoff that doubles from the first value up to the second.
+FOLLOW_STABLE_S = 60
+FOLLOW_BACKOFF_S = (30, 900)
+# Docker's RFC 3339 timestamp, which `timestamps=1` puts before each line.
+_STAMP = re.compile(rb"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:\d\d)")
+
+
+def _stamp_ns(raw: bytes) -> int | None:
+    match = _STAMP.fullmatch(raw)
+    if not match:
+        return None
+    seconds = calendar.timegm(tuple(int(v) for v in match.groups()[:6]) + (0, 0, 0))
+    zone = match.group(8)
+    if zone != b"Z":
+        seconds -= (1 if zone[:1] == b"+" else -1) * (int(zone[1:3]) * 3600 + int(zone[4:6]) * 60)
+    return seconds * 10**9 + int((match.group(7) or b"0").ljust(9, b"0"))
+
+
+class _DockerConnection(http.client.HTTPConnection):
+    """The Docker Engine API over its unix socket."""
+
+    def __init__(self, socket_path: str, timeout: float) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+class LogFollower:
+    """Appends a container's stdout and stderr to the replica's node log, the file
+    `fleetctl app logs` reads, as a legacy app's node log holds its process output.
+
+    A thread of this actor streams the container's log from the Docker daemon
+    the shim uses, while the container runs, and stops with the actor. A cursor
+    file beside the log holds the timestamp of the last line written, so a
+    resumed container or a restarted actor appends what follows it. Nothing is
+    skipped; after a crash, up to CURSOR_INTERVAL_S of output can appear twice.
+    The follower's own failures go to the bridge log, never the node log, and
+    never reach the app's health; repeated ones back off (FOLLOW_BACKOFF_S)."""
+
+    def __init__(self, container: str, path: str, socket_path: str = DOCKER_SOCKET) -> None:
+        self.container, self.path, self.socket_path = container, path, socket_path
+        self.cursor_path = path + ".cursor"
+        self.thread: threading.Thread | None = None
+        self.failures = 0
+        self.retry_at = 0.0
+
+    def ensure(self) -> None:
+        """Follows the container unless a follower already does or is backing off."""
+        try:
+            if (self.thread is None or not self.thread.is_alive()) and time.monotonic() >= self.retry_at:
+                self.thread = threading.Thread(target=self.run, daemon=True)
+                self.thread.start()
+        except Exception as error:
+            logging.getLogger(__name__).warning("could not follow the logs of %s: %s", self.container, error)
+
+    def run(self) -> None:
+        started, delivered = time.monotonic(), False
+        try:
+            delivered = bool(self.follow())
+        except Exception as error:
+            logging.getLogger(__name__).warning("could not follow the logs of %s: %s", self.container, error)
+        if delivered or time.monotonic() - started >= FOLLOW_STABLE_S:
+            self.failures, self.retry_at = 0, 0.0
+        else:
+            self.failures += 1
+            first, last = FOLLOW_BACKOFF_S
+            self.retry_at = time.monotonic() + min(last, first * 2 ** (self.failures - 1))
+
+    def cursor(self) -> int:
+        """Nanoseconds since the epoch of the last line written; without a cursor
+        file, the log's last write, or 0 for a new log."""
+        try:
+            with open(self.cursor_path) as file:
+                return int(file.read().strip())
+        except (OSError, ValueError):
+            pass
+        try:
+            return os.stat(self.path).st_mtime_ns
+        except OSError:
+            return 0
+
+    def save_cursor(self, stamp: int) -> None:
+        temp = f"{self.cursor_path}.{os.getpid()}.tmp"
+        with open(temp, "w") as file:
+            file.write(f"{stamp}\n")
+        os.replace(temp, self.cursor_path)
+
+    def follow(self) -> bool:
+        """Streams the container's output into the node log until the stream
+        ends, which it does when the container stops. Returns whether any arrived."""
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        cursor = written = self.cursor()
+        delivered = False
+        query = "follow=1&stdout=1&stderr=1&timestamps=1"
+        if cursor:
+            query += f"&since={cursor // 10**9}.{cursor % 10**9:09d}"
+        connection = _DockerConnection(self.socket_path, DOCKER_API_TIMEOUT_S)
+        saved = time.monotonic()
+        try:
+            connection.request("GET", f"/containers/{self.container}/logs?{query}")
+            # The response reads from this socket, even once the connection lets it go.
+            stream = connection.sock
+            response = connection.getresponse()
+            if response.status != 200:
+                detail = response.read(500).decode(errors="replace").strip()
+                raise RuntimeError(f"Docker answered {response.status}: {detail}")
+            stream.settimeout(None)
+            with open(self.path, "ab") as log:
+                for message in self.messages(response):
+                    stamp_text, _, line = message.partition(b" ")
+                    stamp = _stamp_ns(stamp_text)
+                    if stamp is None:
+                        stamp, line = written, message
+                    elif stamp <= written:
+                        continue  # written before the cursor was saved, or before `since`
+                    log.write(line)
+                    log.flush()
+                    delivered, written = True, stamp
+                    if time.monotonic() - saved >= CURSOR_INTERVAL_S:
+                        self.save_cursor(written)
+                        saved = time.monotonic()
+        finally:
+            connection.close()
+            if written != cursor:
+                self.save_cursor(written)
+        return delivered
+
+    @staticmethod
+    def messages(response: http.client.HTTPResponse) -> Iterator[bytes]:
+        """One log message per item. The shim's containers have no TTY, so Docker
+        frames each message with its stream and size; a raw stream is split into lines."""
+        if response.getheader("Content-Type") == "application/vnd.docker.raw-stream":
+            while line := response.readline(1 << 20):
+                yield line
+            return
+        while len(header := response.read(8)) == 8:
+            payload = response.read(int.from_bytes(header[4:], "big"))
+            if len(payload) < int.from_bytes(header[4:], "big"):
+                return
+            yield payload
+
+
 class _ShimApp:
     # Crash recovery state; class defaults keep pre-upgrade instances valid.
     resumable = False
     resumes = 0
     resume_at = 0.0
     resumed_at = 0.0
+    logs: LogFollower | None = None
 
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
         supported = capabilities(spec.cluster)
         if not required_capabilities(spec).issubset(supported):
             raise RuntimeError("shim no longer supports the admitted runtime")
-        # Only a daemon-managed Docker runtime can be resumed in place.
-        self.resumable = (spec.cluster.shim_daemon and spec.app.runtime.driver == "docker"
-                          and "shim-resume-v1" in supported)
+        docker = spec.app.runtime.driver == "docker"
+        # Only a daemon-managed runtime can be resumed in place; a TEE one only
+        # behind a fresh attestation admission.
+        self.resumable = spec.cluster.shim_daemon and (docker and "shim-resume-v1" in supported
+            or spec.app.runtime.driver in TEE_DRIVERS and "shim-resume-tee-v1" in supported)
         self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
-        status = self.call({"operation": "launch", "request": request})
-        if status.get("state") != "ready":
-            raise RuntimeError("shim execution is not running; explicit cleanup is required")
+        status = self.launch(request, pull=docker)
+        resumed = status.get("state") == "stopped" and self.resumable
+        if resumed:
+            # The actor started again (a Ray restart, a reboot) after this
+            # replica's container exited. The replayed launch starts nothing:
+            # start that same container again, as a health probe would.
+            status = self.resume(status, timeout=None)
+        state = status.get("state")
+        # A resume still being admitted continues in the daemon; readiness waits for it.
+        if state != "ready" and not (resumed and state == "starting"):
+            feature = "runtime-resume-v1" if docker else "runtime-resume-tee-v1"
+            reason = ("its container exited and the shim did not start it again" if state == "stopped" and self.resumable
+                else f"its container exited; only the persistent shim with {feature} starts it again"
+                if state == "stopped" else "its container is missing or failed" if state == "failed" else f"it is {state}")
+            raise RuntimeError(f"shim execution of {spec.name} is not running: {reason}; explicit cleanup is required")
+        if docker and CONTAINER_NAME.fullmatch(str(status.get("runtime_id"))):
+            self.logs = LogFollower(status["runtime_id"], spec.node_log_path())
+            self.logs.ensure()
         self.port = status.get("port") or request["driver_options"]["port"]
         if not self.port:
             raise RuntimeError("shim did not report its assigned service port")
@@ -385,9 +646,35 @@ class _ShimApp:
         self.start_network()
         deadline = time.monotonic() + spec.app.ready_timeout_s
         while not self.application_ready():
-            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get("state") != "ready":
+            # `starting` is a container being created or started, or a resume being admitted.
+            if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get(
+                    "state") not in ("ready", "starting"):
                 raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
             time.sleep(2)
+
+    def launch(self, request: dict[str, Any], *, pull: bool) -> dict[str, Any]:
+        """Launches the allocation, or replays its launch, which finds the
+        container it made and needs no image or registry.
+
+        The shim creates containers with `--pull=never` and records a launch
+        before creating its container, so a first launch on a node without the
+        image fails having created nothing, and the same launch can be made
+        again. Only then is the image pulled, as `docker run` would."""
+        name = self.spec.name
+        try:
+            return self.call({"operation": "launch", "request": request})
+        except RuntimeError as error:
+            if not pull or image_present(self.spec.app.image):
+                raise self.launch_failed(error) from None
+        pull_image(name, self.spec.app.image)
+        try:
+            return self.call({"operation": "launch", "request": request})
+        except RuntimeError as error:
+            raise self.launch_failed(error) from None
+
+    def launch_failed(self, error: Exception) -> RuntimeError:
+        return RuntimeError(f"shim did not launch {self.spec.name} ({error}); if its allocation was stopped or "
+                            "deleted, it needs explicit cleanup and a new generation")
 
     def start_network(self, timeout: float | None = None) -> None:
         spec = self.spec
@@ -411,7 +698,7 @@ class _ShimApp:
         return invoke(self.spec.cluster.shim_binary, self.spec.cluster.shim_state_dir, socket.gethostname(), command,
             daemon=self.spec.cluster.shim_daemon, timeout=timeout)
 
-    def resume(self, status: dict[str, Any]) -> dict[str, Any]:
+    def resume(self, status: dict[str, Any], timeout: float | None = RESUME_TIMEOUT_S) -> dict[str, Any]:
         """Start this replica's own exited container again, keeping its state.
 
         Without this a crashed runtime stays down: the shim never restarts it
@@ -423,12 +710,17 @@ class _ShimApp:
             return status
         self.resumes += 1
         self.resumed_at = now
-        first, last = RESUME_BACKOFF_S
+        first, last = TEE_RESUME_BACKOFF_S if self.spec.app.runtime.driver in TEE_DRIVERS else RESUME_BACKOFF_S
         self.resume_at = now + min(last, first * 2 ** (self.resumes - 1))
         logging.getLogger(__name__).warning("shim runtime for %s exited; resuming it (attempt %d)",
                                             self.spec.name, self.resumes)
         try:
-            return self.call({"operation": "resume", "execution": self.spec.execution}, timeout=RESUME_TIMEOUT_S)
+            return self.call({"operation": "resume", "execution": self.spec.execution}, timeout=timeout)
+        except ShimPending:
+            # A TEE resume outlasts a probe while it is admitted; the shim
+            # reports it as starting until it ends.
+            logging.getLogger(__name__).info("shim resume of %s continues in the daemon", self.spec.name)
+            return {**status, "state": "starting"}
         except (RuntimeError, OSError, ValueError):
             logging.getLogger(__name__).warning("shim resume failed for %s", self.spec.name)
             return status
@@ -446,6 +738,9 @@ class _ShimApp:
                 # if re-registering its connector temporarily fails. Router
                 # leases independently fence actual reachability.
                 logging.getLogger(__name__).warning("shim connector recovery failed for %s", self.spec.name)
+        if status.get("state") == "ready" and self.logs is not None:
+            # A followed log ends with its container; a resumed one is followed again.
+            self.logs.ensure()
         ready = status.get("state") == "ready" and self.application_ready()
         if ready and self.resumes and time.monotonic() - self.resumed_at >= RESUME_STABLE_S:
             self.resumes, self.resume_at = 0, 0.0

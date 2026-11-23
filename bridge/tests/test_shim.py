@@ -9,6 +9,59 @@ import yaml
 from fleet_bridge import actors, reconcile, shim, node
 from fleet_bridge.model import ExecutorKind, ReplicaHealth, AppSpec
 
+PULL_IMAGE, IMAGE_PRESENT, FOLLOW = shim.pull_image, shim.image_present, shim.LogFollower.follow
+MULTIPLEXED = "application/vnd.docker.multiplexed-stream"
+
+
+@pytest.fixture(autouse=True)
+def no_docker(monkeypatch):
+    """No actor here reaches a Docker daemon: tests of pulls and log followers
+    drive the real functions against their own fakes. Every image counts as
+    present. Returns the pulls asked for."""
+    pulls = []
+    monkeypatch.setattr(shim, "image_present", lambda image: True)
+    monkeypatch.setattr(shim, "pull_image", lambda *args: pulls.append(args))
+    monkeypatch.setattr(shim.LogFollower, "follow", lambda self: None)
+    return pulls
+
+
+@pytest.fixture
+def docker_api(tmp_path):
+    """A Docker Engine API on a unix socket. Each request gets the next
+    (status, content type, body), the last one repeating. Returns the socket
+    path and the request paths it saw."""
+    import http.server
+    import socketserver
+    import threading
+    servers = []
+    def serve(answers):
+        seen = []
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.path)
+                status, kind, body = answers.pop(0) if len(answers) > 1 else answers[0]
+                self.send_response(status)
+                self.send_header("Content-Type", kind)
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+            daemon_threads = True
+        server = Server(str(tmp_path / f"docker-{len(servers)}.sock"), Handler)
+        servers.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server.server_address, seen
+    yield serve
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+def frame(stream, payload):
+    """One message of Docker's multiplexed log stream."""
+    return bytes([stream, 0, 0, 0]) + len(payload).to_bytes(4, "big") + payload
+
 
 def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs(tmp_path):
     raw = config(tmp_path)
@@ -30,7 +83,8 @@ def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs
         CPUS='4', GPUS='2', TOKEN_FILE='/private/node.token')
     assert request['driver_options']['gpus'] == ['4', '6']
     assert request['driver_options']['volumes'] == ['/srv/proofs:/srv/proofs', '/private/node.token:/private/node.token:ro']
-    assert request['limits']['cpu_millicores'] == 4000
+    # CPUs are a Ray reservation and a template value, not a container limit.
+    assert request['limits'] == {'cpu_millicores': None, 'memory_bytes': None}
     for update in ({'worker_command':['/old/worker']},
                    {'runtime':{'executor':'shim','driver':'openshell'}}, {'container_port':None},
                    {'services':['http']}, {'service_protocol':'tcp'}):
@@ -439,7 +493,8 @@ def test_lease_is_persisted_and_recovery_cannot_change_request_or_executor(tmp_p
     recovered = shim.RuntimeBook(book.root).bind(s, "different-heartbeat-command")
     assert recovered.execution == first.execution
     assert recovered.execution.node_id == socket.gethostname()
-    assert shim.launch_request(first, [])["limits"] == {"cpu_millicores":500,"memory_bytes":134217728}
+    assert recovered.launch_revision == first.launch_revision == shim.LAUNCH_REVISION
+    assert shim.launch_request(recovered, []) == shim.launch_request(first, [])
     changed = replace(s, config={**s.config,"image":"different"})
     with pytest.raises(ValueError, match="active shim allocation"):
         book.bind(changed,"command-two")
@@ -1049,11 +1104,126 @@ def test_tee_lifecycle_preserves_driver_and_extends_launch_timeout(tmp_path, mon
     call = Mock(return_value={"cleaned":True}); monkeypatch.setattr(shim, "daemon_call", call)
     actor.call({"operation":"launch", "request":shim.launch_request(bound, [])})
     assert call.call_args.kwargs["timeout"] == 330
+    # A resume waits for its own admission too; other operations do not.
+    actor.call({"operation":"resume", "execution":bound.execution})
+    assert call.call_args.kwargs["timeout"] == 330 and call.call_args.args[2]["driver"] == "tee-simulation"
+    actor.call({"operation":"inspect", "execution":bound.execution})
+    assert call.call_args.kwargs["timeout"] == 150
     for operation in ("inspect", "stop", "delete", "network"):
         actor.call({"operation":operation,"execution":bound.execution})
         assert call.call_args.args[2]["driver"] == "tee-simulation"
     shim.RuntimeBook(tmp_path / "book").cleanup(bound.name)
     assert call.call_args.args[2]["driver"] == "tee-simulation"
+
+
+@pytest.mark.parametrize("mode,driver", [("simulation","tee-simulation"),("hardware","tee")])
+def test_tee_resume_needs_the_daemons_tee_resume_for_the_nodes_driver(tmp_path, monkeypatch, mode, driver):
+    import hashlib
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config(mode), shim_machine_labels={"runtime.driver":driver})
+    raw["apps"][0]["runtime"]["driver"] = driver
+    spec = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    machine = shim.daemon_options(spec.cluster)["machine"]
+    digest = hashlib.sha256(shim.json.dumps(machine, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    response = dict(protocol=1, drivers=[driver], machine_config_sha256=digest,
+        features=["runtime-daemon-v1", "tee-startup-v1", "data-plane-v1", "runtime-management-v1", "runtime-resume-v1"])
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: response)
+    # Docker's resume says nothing about a TEE runtime.
+    assert not {"shim-resume-v1", "shim-resume-tee-v1"} & set(shim.capabilities(spec.cluster))
+    response["features"].append("runtime-resume-tee-v1")
+    assert "shim-resume-tee-v1" in shim.capabilities(spec.cluster)
+    response["drivers"] = ["docker"]
+    assert "shim-resume-tee-v1" not in shim.capabilities(spec.cluster)
+
+
+def tee_bound(tmp_path):
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    raw["apps"][0]["runtime"]["driver"] = "tee-simulation"
+    return shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+
+
+PENDING = shim.ShimPending("shim daemon did not answer in time; the operation continues there")
+
+
+def test_a_restarted_tee_actor_resumes_its_container_behind_a_fresh_admission(tmp_path, monkeypatch):
+    bound = tee_bound(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}],
+        "resume": [{"state": "ready", "port": 18080}]})
+    actor = shim._ShimApp(bound)
+    # The whole admission's budget (see the lifecycle test), not a probe's.
+    assert calls == [("launch", None), ("resume", None)] and actor.resumable and actor.logs is None
+    start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}]}, resumable=False)
+    with pytest.raises(RuntimeError, match="web-0 is not running: its container exited; only the persistent "
+                       "shim with runtime-resume-tee-v1 starts it again; explicit cleanup is required"):
+        shim._ShimApp(bound)
+
+
+def test_a_resume_that_outlasts_its_call_is_waited_for_as_starting(tmp_path, monkeypatch):
+    bound = tee_bound(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}], "resume": [PENDING],
+        "inspect": [{"state": "starting"}, {"state": "starting"}, {"state": "ready"}]})
+    ready = iter([False, False, False, True])
+    monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: next(ready))
+    monkeypatch.setattr(shim.time, "sleep", lambda seconds: None)
+    actor = shim._ShimApp(bound)
+    assert [operation for operation, _ in calls] == ["launch", "resume", "inspect", "inspect", "inspect"]
+    # A probe while it is admitted: the shim reports it starting, and nothing resumes it again.
+    actor.call = Mock(return_value={"state": "starting"})
+    assert actor.health()["ready"] is False
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list] == ["inspect"]
+
+
+def test_a_tee_resume_backs_off_longer_and_a_slow_one_is_not_a_failure(tmp_path, monkeypatch, caplog):
+    bound = tee_bound(tmp_path)
+    start_actor(monkeypatch, bound, {"launch": [{"state": "ready", "port": 18080}]})
+    actor = shim._ShimApp(bound)
+    clock = [1000.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    actor.call = Mock(side_effect=lambda command, timeout=None: {"state": "stopped", "port": 18080}
+        if command["operation"] == "inspect" else (_ for _ in ()).throw(PENDING))
+    health = actor.health()
+    assert health["ready"] is False and health["management_ready"] is False
+    assert actor.call.call_args.kwargs["timeout"] == shim.RESUME_TIMEOUT_S
+    assert "shim resume failed" not in caplog.text
+    # Each attempt costs an admission and a proof: 5 min, doubling to an hour.
+    assert actor.resume_at == 1000 + 300
+    clock[0] += 299
+    actor.health()
+    clock[0] += 1
+    actor.health()
+    assert [c.args[0]["operation"] for c in actor.call.call_args_list].count("resume") == 2
+    assert actor.resume_at == clock[0] + 600
+    for _ in range(10):
+        actor.resume_at = 0
+        actor.health()
+    assert actor.resume_at - clock[0] == 3600
+
+
+def test_daemon_call_tells_an_unanswered_operation_from_an_unavailable_daemon(tmp_path):
+    import threading
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    path = state / "control.sock"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    shim.os.chmod(path, 0o600)
+    server.listen(1)
+    held = []
+    def take():
+        connection, _ = server.accept()
+        held.append(connection)
+        connection.recv(65536)  # and never answers
+    threading.Thread(target=take, daemon=True).start()
+    with pytest.raises(shim.ShimPending, match="the operation continues there"):
+        shim.daemon_call(str(state), "node", {"operation": "resume"}, timeout=0.5)
+    server.close()
+    for connection in held:
+        connection.close()
+    path.unlink()
+    with pytest.raises(RuntimeError, match="unavailable") as unavailable:
+        shim.daemon_call(str(state), "node", {"operation": "resume"}, timeout=0.5)
+    assert not isinstance(unavailable.value, shim.ShimPending)
 
 
 @pytest.mark.parametrize("mode", ["simulation", "hardware"])
@@ -1150,3 +1320,386 @@ def test_persisted_binding_digest_is_unchanged_and_shares_the_spec_hash(tmp_path
         sort_keys=True).encode()).hexdigest()
     assert shim.binding_hash(spec) == legacy
     assert actors.spec_hash(spec) == legacy[:16]
+
+
+def bound_spec(tmp_path, daemon=True, **app):
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, **app), cluster=replace(s.cluster, shim_daemon=daemon, log_dir=str(tmp_path / "logs")))
+    return shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
+
+
+def start_actor(monkeypatch, bound, answers, resumable=True):
+    """A mocked shim answering each operation from its list (the last answer repeats).
+    Returns the (operation, timeout) calls the actor makes."""
+    calls = []
+    def call(self, command, timeout=None):
+        calls.append((command["operation"], timeout))
+        replies = answers[command["operation"]]
+        reply = replies.pop(0) if len(replies) > 1 else replies[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+    monkeypatch.setattr(shim._ShimApp, "call", call)
+    monkeypatch.setattr(shim._ShimApp, "start_network", lambda self, timeout=None: None)
+    monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: True)
+    supported = set(shim.required_capabilities(bound)) | ({"shim-resume-v1", "shim-resume-tee-v1"} if resumable else set())
+    monkeypatch.setattr(shim, "capabilities", lambda _: sorted(supported))
+    return calls
+
+
+def test_docker_launch_reserves_cpu_and_memory_without_container_limits(tmp_path):
+    raw = config(tmp_path)
+    raw["apps"][0].update(gpus=2, cpus=4, memory_gb=8, shm_gb=32)
+    s = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    book = shim.RuntimeBook(tmp_path / "book")
+    bound = book.bind(s, "launch")
+    assert bound.launch_revision == book.read(s.name).launch_revision == shim.LAUNCH_REVISION
+    request = shim.launch_request(bound, ["1", "5"])
+    assert request["limits"] == {"cpu_millicores": None, "memory_bytes": None}
+    assert request["driver_options"]["shm_bytes"] == 32 * 2**30
+    assert request["driver_options"]["gpus"] == ["1", "5"]
+    # Ray reserves the entry's CPUs, cards and memory for the replica.
+    assert reconcile.bundle(bound).to_ray() == {"CPU": 4.0, "GPU": 2.0, "memory": 8 * 2**30}
+    # The revision is not part of the admitted deployment or its persisted binding.
+    assert actors.spec_hash(bound) == actors.spec_hash(s) and book.read(s.name).spec == shim.binding_hash(s)
+    # `cpus` the shim would refuse as a limit (0, under a millicore) is a reservation only.
+    for cpus in (0, 0.0004):
+        assert shim.launch_limits(replace(bound, app=replace(bound.app, cpus=cpus))) == request["limits"]
+    # A TEE runtime keeps its limits.
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    raw["apps"][0].update(gpus=0, runtime={"executor": "shim", "driver": "tee-simulation"})
+    tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(tee, [])["limits"] == {"cpu_millicores": 4000, "memory_bytes": 8 * 2**30}
+
+
+def test_allocation_launched_before_launch_revisions_replays_its_original_request(tmp_path):
+    import pickle
+    raw = config(tmp_path)
+    raw["apps"][0].update(gpus=1, env={"MODE": "serve"})
+    s = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    book = shim.RuntimeBook(tmp_path / "book")
+    first = book.bind(s, "launch")
+    assert shim.launch_request(first, ["2"])["environment"] == {"MODE": "serve", "NVIDIA_DRIVER_CAPABILITIES": "all"}
+    # An allocation recorded without a revision holds a revision 1 launch.
+    record = shim.json.loads(book.path(s.name).read_text())
+    del record["launch_revision"]
+    book.path(s.name).write_text(shim.json.dumps(record))
+    replayed = book.bind(s, "heartbeat")
+    assert replayed.execution == first.execution and replayed.launch_revision == 1
+    # The shim replays only an identical request: the one launched before.
+    request = shim.launch_request(replayed, ["2"])
+    assert request["environment"] == {"MODE": "serve"}
+    assert request["limits"] == {"cpu_millicores": 500, "memory_bytes": 134217728}
+    # So does the spec a running actor was created with, which has no revision.
+    old = copy.copy(replayed)
+    del old.__dict__["launch_revision"]
+    assert pickle.loads(pickle.dumps(old)).launch_revision == 1
+
+
+def test_cpu_count_is_at_least_one_as_on_the_legacy_executor(tmp_path):
+    bound = bound_spec(tmp_path, cpus=0.5, env={"THREADS": "{cpu_count}"})
+    # As legacy's RAYON_NUM_THREADS = max(1, int(cpus)): a fraction still gets one thread.
+    assert shim.launch_request(bound, [])["environment"] == {"THREADS": "1"}
+    assert shim.launch_request(replace(bound, app=replace(bound.app, cpus=4)), [])["environment"] == {"THREADS": "4"}
+    # A revision 1 allocation replays exactly the request it was launched with.
+    assert shim.launch_request(replace(bound, launch_revision=1), [])["environment"] == {"THREADS": "0"}
+
+
+def test_gpu_apps_get_every_nvidia_driver_capability_unless_their_env_sets_one(tmp_path):
+    raw = config(tmp_path)
+    raw["apps"][0].update(gpus=1)
+    bound = shim.RuntimeBook(tmp_path / "book").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(bound, ["3"])["environment"] == {"NVIDIA_DRIVER_CAPABILITIES": "all"}
+    chosen = replace(bound, app=replace(bound.app, env={"NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}))
+    assert shim.launch_request(chosen, ["3"])["environment"] == {"NVIDIA_DRIVER_CAPABILITIES": "compute,utility"}
+    # CPU apps and revision 1 launches have none; nor do packaged provers (see the first test).
+    assert shim.launch_request(replace(bound, app=replace(bound.app, gpus=0)), [])["environment"] == {}
+    assert shim.launch_request(replace(bound, launch_revision=1), ["3"])["environment"] == {}
+
+
+def test_image_check_and_pull_use_the_shims_docker(monkeypatch):
+    import subprocess
+    monkeypatch.setenv("DOCKER_HOST", "tcp://docker.example:2375")
+    image = "registry.example/web@sha256:" + "a" * 64
+    run = Mock(return_value=Mock(returncode=0, stdout="", stderr=""))
+    monkeypatch.setattr(shim.subprocess, "run", run)
+    assert IMAGE_PRESENT(image) is True
+    assert run.call_args.args[0] == ["docker", "--host=unix:///var/run/docker.sock", "image", "inspect",
+                                     "--format", "{{.Id}}", "--", image]
+    assert run.call_args.kwargs["timeout"] == shim.IMAGE_CHECK_TIMEOUT_S
+    assert "DOCKER_HOST" not in run.call_args.kwargs["env"]
+    for answer in (Mock(returncode=1), subprocess.TimeoutExpired("docker", 30), FileNotFoundError(2, "No such file")):
+        run.side_effect = [answer]
+        assert IMAGE_PRESENT(image) is False
+    run.side_effect = None
+    PULL_IMAGE("web-0", image)
+    assert run.call_args.args[0] == ["docker", "--host=unix:///var/run/docker.sock", "pull", "--", image]
+    # Its own hour, apart from the app's readiness wait.
+    assert run.call_args.kwargs["timeout"] == shim.PULL_TIMEOUT_S == 3600
+    assert "DOCKER_HOST" not in run.call_args.kwargs["env"]
+
+
+@pytest.mark.parametrize("pull,message", [
+    (Mock(returncode=1, stdout="", stderr="manifest unknown"), "could not pull image web:1: manifest unknown"),
+    (Mock(returncode=1, stdout="", stderr=""), "could not pull image web:1: docker pull exited with 1"),
+    ("timeout", "pulling image web:1 did not finish within 5 s"),
+    (FileNotFoundError(2, "No such file or directory"), "could not pull image web:1")])
+def test_a_failed_pull_names_the_image(monkeypatch, pull, message):
+    import re
+    import subprocess
+    pull = subprocess.TimeoutExpired("docker", 5) if pull == "timeout" else pull
+    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=[pull]))
+    with pytest.raises(RuntimeError, match=re.escape("web-0: " + message)):
+        PULL_IMAGE("web-0", "web:1", 5)
+
+
+REFUSED = RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback")
+
+
+def test_only_a_first_launch_without_its_image_pulls(tmp_path, monkeypatch, no_docker):
+    bound = bound_spec(tmp_path)
+    present = Mock(return_value=False)
+    monkeypatch.setattr(shim, "image_present", present)
+    # A restarted actor's replay finds its container: no image check and no
+    # registry, so a registry outage after a reboot cannot block a resume.
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}],
+        "resume": [{"state": "ready", "port": 18080}]})
+    shim._ShimApp(bound)
+    assert calls == [("launch", None), ("resume", None)] and no_docker == [] and not present.called
+    # A first launch on a node without the image creates nothing, and the same
+    # launch follows the pull.
+    requests = []
+    calls = start_actor(monkeypatch, bound, {"launch": [REFUSED, {"state": "ready", "port": 18080}]})
+    recorded = shim._ShimApp.call
+    monkeypatch.setattr(shim._ShimApp, "call", lambda self, command, timeout=None:
+        requests.append(command) or recorded(self, command, timeout))
+    shim._ShimApp(bound)
+    assert calls == [("launch", None), ("launch", None)] and requests[0] == requests[1]
+    assert no_docker == [("web-0", "python:3.12-slim")]
+    present.assert_called_once_with("python:3.12-slim")
+
+
+def test_a_refused_launch_pulls_only_a_missing_image(tmp_path, monkeypatch, no_docker):
+    bound = bound_spec(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [REFUSED]})
+    # The image is there, so the refusal has another cause: nothing is pulled.
+    with pytest.raises(RuntimeError, match="shim did not launch web-0 .*no legacy fallback.*explicit cleanup"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None)] and no_docker == []
+    monkeypatch.setattr(shim, "image_present", lambda image: False)
+    monkeypatch.setattr(shim, "pull_image", Mock(side_effect=RuntimeError("web-0: could not pull image python:3.12-slim: denied")))
+    calls.clear()
+    with pytest.raises(RuntimeError, match="^web-0: could not pull image python:3.12-slim: denied$"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None)]
+    # A launch the pull did not fix reports the shim's answer.
+    monkeypatch.setattr(shim, "pull_image", Mock())
+    calls.clear()
+    with pytest.raises(RuntimeError, match="shim did not launch web-0 .*no legacy fallback"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None), ("launch", None)]
+    # Other drivers never pull.
+    raw = config(tmp_path)
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    raw["apps"][0]["runtime"]["driver"] = "tee-simulation"
+    tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    start_actor(monkeypatch, tee, {"launch": [REFUSED]})
+    shim.pull_image.reset_mock()
+    with pytest.raises(RuntimeError, match="shim did not launch web-0"):
+        shim._ShimApp(tee)
+    shim.pull_image.assert_not_called()
+
+
+def test_the_readiness_wait_starts_after_the_pull_and_launch(tmp_path, monkeypatch):
+    bound = bound_spec(tmp_path)
+    start_actor(monkeypatch, bound, {"launch": [REFUSED, {"state": "ready", "port": 18080}], "inspect": [{"state": "ready"}]})
+    monkeypatch.setattr(shim._ShimApp, "application_ready", lambda self: False)
+    clock = [0.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(shim.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(shim, "image_present", lambda image: False)
+    monkeypatch.setattr(shim, "pull_image", lambda name, image: clock.__setitem__(0, clock[0] + 1800))
+    with pytest.raises(RuntimeError, match="did not become healthy"):
+        shim._ShimApp(bound)
+    # The app's whole ready_timeout_s follows a half-hour pull, as on legacy,
+    # where `docker run` pulls before the readiness clock starts.
+    assert bound.app.ready_timeout_s % 2 == 0 and clock[0] == 1800 + bound.app.ready_timeout_s
+
+
+def test_restarted_actor_resumes_its_exited_container(tmp_path, monkeypatch):
+    bound = bound_spec(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}],
+        "resume": [{"state": "ready", "port": 18080}], "inspect": [{"state": "ready"}]})
+    actor = shim._ShimApp(bound)
+    # Resumed with the daemon's full budget, not a health probe's.
+    assert calls == [("launch", None), ("resume", None)]
+    assert actor.port == 18080 and actor.resumes == 1
+    assert actor.health()["ready"] is True
+    assert calls[-1] == ("inspect", None)
+
+
+@pytest.mark.parametrize("daemon,resumable", [(False, True), (True, False)])
+def test_exited_container_without_resume_support_needs_cleanup(tmp_path, monkeypatch, daemon, resumable):
+    bound = bound_spec(tmp_path, daemon=daemon)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}]}, resumable=resumable)
+    with pytest.raises(RuntimeError, match="web-0 is not running: its container exited; only the persistent "
+                       "shim with runtime-resume-v1 starts it again; explicit cleanup is required"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None)]
+
+
+@pytest.mark.parametrize("resumed,reason", [
+    (RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback"), "the shim did not start it again"),
+    ({"state": "stopping"}, "it is stopping")])
+def test_a_stop_or_delete_that_raced_the_restart_stays_final(tmp_path, monkeypatch, resumed, reason):
+    bound = bound_spec(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "stopped", "port": 18080}], "resume": [resumed]})
+    with pytest.raises(RuntimeError, match=f"web-0 is not running: .*{reason}; explicit cleanup is required"):
+        shim._ShimApp(bound)
+    # Nothing is launched or started again once the shim refused.
+    assert [operation for operation, _ in calls] == ["launch", "resume"]
+
+
+def test_a_deleted_or_missing_container_is_never_replaced(tmp_path, monkeypatch):
+    bound = bound_spec(tmp_path)
+    calls = start_actor(monkeypatch, bound, {"launch": [RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback")]})
+    with pytest.raises(RuntimeError, match="shim did not launch web-0 .*no legacy fallback.*stopped or deleted.*explicit cleanup"):
+        shim._ShimApp(bound)
+    calls = start_actor(monkeypatch, bound, {"launch": [{"state": "failed", "port": 18080}]})
+    with pytest.raises(RuntimeError, match="its container is missing or failed; explicit cleanup is required"):
+        shim._ShimApp(bound)
+    assert calls == [("launch", None)]
+
+
+def test_log_follower_streams_docker_into_the_node_log_and_resumes_after_its_cursor(tmp_path, docker_api):
+    import calendar
+    container = "trusted-shim-" + "b" * 64
+    socket_path, seen = docker_api([
+        (200, MULTIPLEXED, frame(1, b"2026-11-23T10:00:00.000000001Z first\n") + frame(2, b"2026-11-23T10:00:01.5Z to stderr\n")),
+        # `since` includes the cursor's own line; it is written once.
+        (200, MULTIPLEXED, frame(2, b"2026-11-23T10:00:01.5Z to stderr\n") + frame(1, b"2026-11-23T10:00:02Z after a restart\n"))])
+    path = tmp_path / "logs" / "web-0.node.log"
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert path.read_bytes() == b"first\nto stderr\n"
+    cursor = calendar.timegm((2026, 11, 23, 10, 0, 1, 0, 0, 0)) * 10**9 + 500_000_000
+    assert (tmp_path / "logs" / "web-0.node.log.cursor").read_text() == f"{cursor}\n"
+    # A restarted actor's new follower continues after the last line written.
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert path.read_bytes() == b"first\nto stderr\nafter a restart\n"
+    query = "follow=1&stdout=1&stderr=1&timestamps=1"
+    assert seen == [f"/containers/{container}/logs?{query}",
+                    f"/containers/{container}/logs?{query}&since={cursor // 10**9}.500000000"]
+
+
+def test_a_log_without_a_cursor_continues_after_its_last_write(tmp_path, docker_api):
+    container = "trusted-shim-" + "b" * 64
+    socket_path, seen = docker_api([(200, "application/vnd.docker.raw-stream",
+        b"2026-11-01T00:00:00Z before the last write\n2026-11-23T10:00:03Z raw line\n")])
+    path = tmp_path / "web-0.node.log"
+    path.write_bytes(b"earlier\n")
+    written = 1_795_000_000_123_456_789
+    shim.os.utime(path, ns=(written, written))
+    assert FOLLOW(shim.LogFollower(container, str(path), socket_path)) is True
+    assert seen[0].endswith(f"&since={written // 10**9}.123456789")
+    # A raw stream is split into lines; what predates the log's last write is skipped.
+    assert path.read_bytes() == b"earlier\nraw line\n"
+
+
+def test_docker_log_timestamps():
+    import calendar
+    base = calendar.timegm((2026, 11, 23, 10, 0, 0, 0, 0, 0)) * 10**9
+    assert shim._stamp_ns(b"2026-11-23T10:00:00Z") == base
+    assert shim._stamp_ns(b"2026-11-23T10:00:00.123456789Z") == base + 123456789
+    assert shim._stamp_ns(b"2026-11-23T11:30:00.5+01:30") == base + 500_000_000
+    assert shim._stamp_ns(b"2026-11-23T08:00:00-02:00") == base
+    assert shim._stamp_ns(b"not a stamp") is None
+
+
+def test_follower_failures_stay_in_the_bridge_log_and_back_off(tmp_path, docker_api, monkeypatch, caplog):
+    container = "trusted-shim-" + "c" * 64
+    socket_path, seen = docker_api([(501, "application/json", b'{"message":"configured logging driver does not support reading"}')])
+    path = tmp_path / "web-0.node.log"
+    follower = shim.LogFollower(container, str(path), socket_path)
+    monkeypatch.setattr(shim.LogFollower, "follow", FOLLOW)
+    clock = [100.0]
+    monkeypatch.setattr(shim.time, "monotonic", lambda: clock[0])
+    follower.run()
+    assert (f"could not follow the logs of {container}: Docker answered 501: "
+            '{"message":"configured logging driver does not support reading"}') in caplog.text
+    # Docker's answer never reaches the app's own log.
+    assert not path.exists() and (follower.failures, follower.retry_at) == (1, 130.0)
+    # Health probes during the backoff start nothing.
+    follower.ensure()
+    assert follower.thread is None and len(seen) == 1
+    clock[0] = 130.0
+    follower.ensure()
+    follower.thread.join(10)
+    assert len(seen) == 2 and (follower.failures, follower.retry_at) == (2, 190.0)
+    follower.failures = 9
+    follower.run()
+    assert follower.retry_at == 130.0 + 900
+    # Without Docker at all, the same.
+    follower.socket_path = str(tmp_path / "missing.sock")
+    follower.run()
+    assert f"could not follow the logs of {container}: [Errno 2]" in caplog.text
+    # A stream that delivered output, or stayed up, clears the backoff.
+    monkeypatch.setattr(shim.LogFollower, "follow", lambda self: True)
+    follower.run()
+    assert (follower.failures, follower.retry_at) == (0, 0.0)
+
+
+def test_one_log_follower_at_a_time(tmp_path, monkeypatch, caplog):
+    import threading
+    follower = shim.LogFollower("trusted-shim-" + "c" * 64, str(tmp_path / "web-0.node.log"))
+    gate = threading.Event()
+    monkeypatch.setattr(shim.LogFollower, "follow", lambda self: gate.wait(10))
+    follower.ensure()
+    first = follower.thread
+    follower.ensure()
+    assert follower.thread is first
+    gate.set()
+    first.join(10)
+    follower.ensure()
+    assert follower.thread is not first
+    follower.thread.join(10)
+    follower.thread = Mock(is_alive=Mock(side_effect=RuntimeError("can't start new thread")))
+    follower.ensure()
+    assert caplog.text.count("could not follow the logs of trusted-shim-") == 1
+
+
+def test_actor_follows_its_container_into_the_node_log(tmp_path, monkeypatch):
+    bound = bound_spec(tmp_path)
+    container = "trusted-shim-" + "d" * 64
+    start_actor(monkeypatch, bound, {"launch": [{"state": "ready", "port": 18080, "runtime_id": container}],
+        "inspect": [{"state": "ready", "runtime_id": container}]})
+    ensure = Mock()
+    monkeypatch.setattr(shim.LogFollower, "ensure", ensure)
+    actor = shim._ShimApp(bound)
+    # Where `fleetctl app logs` reads a replica's log.
+    assert (actor.logs.container, actor.logs.path) == (container, str(tmp_path / "logs" / "web-0.node.log"))
+    assert ensure.call_count == 1
+    # Each ready probe follows again a container that was resumed.
+    assert actor.health()["ready"] is True and ensure.call_count == 2
+    actor.call = Mock(return_value={"state": "stopped"})
+    actor.resumable = False
+    assert actor.health()["ready"] is False and ensure.call_count == 2
+
+
+def test_a_follower_that_cannot_start_leaves_health_alone(tmp_path):
+    container = "trusted-shim-" + "d" * 64
+    actor = object.__new__(shim._ShimApp)
+    actor.spec, actor.port, actor.gpus, actor.network = bound_spec(tmp_path), 18080, [], None
+    actor.call = Mock(return_value={"state": "ready"})
+    actor.start_network = Mock()
+    actor.application_ready = Mock(return_value=True)
+    actor.logs = shim.LogFollower(container, str(tmp_path / "web-0.node.log"))
+    actor.logs.thread = Mock(is_alive=Mock(side_effect=RuntimeError("can't start new thread")))
+    assert actor.health()["ready"] is True
+
+
+@pytest.mark.parametrize("status", [{"state": "ready", "port": 18080},
+    {"state": "ready", "port": 18080, "runtime_id": "../trusted-shim-" + "e" * 64}])
+def test_no_follower_without_the_shims_own_container_name(tmp_path, monkeypatch, status):
+    bound = bound_spec(tmp_path)
+    start_actor(monkeypatch, bound, {"launch": [status]})
+    assert shim._ShimApp(bound).logs is None
