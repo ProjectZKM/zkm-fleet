@@ -18,6 +18,16 @@ services:
 
   scheduler:
     image: ${FLEET_SCHEDULER_IMAGE:?set FLEET_SCHEDULER_IMAGE in compose.env}
+    # The component image's entrypoint is the bare binary, with no default
+    # arguments; without this the scheduler looks for ./fleet.yaml and exits.
+    command: ["-c", "/etc/zkm-fleet/fleet.yaml"]
+    # Nor does it declare a health check; services that wait for a healthy
+    # scheduler (openshell-gateway) need this one.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "--max-time", "2", "http://127.0.0.1:9191/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
     init: true   # PID 1 reaps the processes it inherits; the scheduler does not
     # The user that owns ${FLEET_ETC}: the secrets there are mode 600.
