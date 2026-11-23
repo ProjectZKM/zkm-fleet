@@ -879,6 +879,9 @@ class AppReplicaSpec(Record):
     config: dict[str, Any] = field(default_factory=dict)
     # Pinned machine allocation, supplied before entering Ray; absent for legacy.
     execution: RuntimeIdentity | None = None
+    # How the shim launch request for `execution` is formed (shim.LAUNCH_REVISION),
+    # supplied with it; specs pickled for a running actor carry none and mean 1.
+    launch_revision: int = 1
 
     @property
     def kind(self) -> AppRuntime:
