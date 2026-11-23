@@ -1,4 +1,5 @@
 import copy
+import re
 import socket
 from dataclasses import replace
 from unittest.mock import Mock
@@ -613,7 +614,7 @@ def test_services_require_network_capability_and_are_bound_into_request(tmp_path
     assert request["driver_options"]["container_port"]==18789
     assert shim.required_capability(replica)=="shim-network-v1"
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"]}'))
-    assert set(shim.capabilities(parsed.cluster)) == {"shim-cleanup-v1", shim.CAPABILITY}
+    assert set(shim.capabilities(parsed.cluster)) == {"shim-cleanup-v1", shim.CAPABILITY, shim.LIMITS_CAPABILITY}
     monkeypatch.setattr(shim.subprocess,"run",lambda *a,**k:Mock(stdout='{"protocol":1,"drivers":["docker"],"features":["data-plane-v1"]}'))
     assert "shim-network-v1" in shim.capabilities(parsed.cluster)
     legacy=config(tmp_path,False)
@@ -1362,14 +1363,156 @@ def test_docker_launch_reserves_cpu_and_memory_without_container_limits(tmp_path
     assert reconcile.bundle(bound).to_ray() == {"CPU": 4.0, "GPU": 2.0, "memory": 8 * 2**30}
     # The revision is not part of the admitted deployment or its persisted binding.
     assert actors.spec_hash(bound) == actors.spec_hash(s) and book.read(s.name).spec == shim.binding_hash(s)
-    # `cpus` the shim would refuse as a limit (0, under a millicore) is a reservation only.
-    for cpus in (0, 0.0004):
-        assert shim.launch_limits(replace(bound, app=replace(bound.app, cpus=cpus))) == request["limits"]
+    # `cpus` the shim would refuse as a limit (0, under a millicore) is a reservation only;
+    # a replica that reserves none also gets a low CPU weight.
+    for cpus, weight in ((0, {"cpu_shares": shim.UNRESERVED_CPU_SHARES}), (0.0004, {})):
+        assert shim.launch_limits(replace(bound, app=replace(bound.app, cpus=cpus))) == {**request["limits"], **weight}
     # A TEE runtime keeps its limits.
     raw.update(shim_daemon=True, shim_tee=tee_config())
     raw["apps"][0].update(gpus=0, runtime={"executor": "shim", "driver": "tee-simulation"})
     tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
     assert shim.launch_request(tee, [])["limits"] == {"cpu_millicores": 4000, "memory_bytes": 8 * 2**30}
+
+
+def capped(tmp_path, **app):
+    """config() with a shim app that reserves no CPU and is capped, updated by `app`."""
+    raw = config(tmp_path)
+    raw["apps"][0].update(cpus=0, cpu_limit=1.5, memory_gb=1, memory_limit_gb=2, **app)
+    return raw
+
+
+def test_an_entry_without_hard_limits_keeps_its_digest_and_its_launch_request(tmp_path):
+    # Allocations on disk compare against this full digest of the entry as written: the
+    # new settings are no keys of an entry that doesn't set them.
+    entry = {"name": "web", "kind": "app", "image": "web:1", "gpus": 0, "cpus": 2, "memory_gb": 4,
+        "port_base": 18080, "command": ["serve", "{port}"], "runtime": {"executor": "shim", "driver": "docker"}}
+    raw = {"shim_binary": "/opt/trusted-shim-runtime", "shim_state_dir": "/srv/fleet-shim", "apps": [entry]}
+    s = reconcile.replica_specs(reconcile.load_apps(raw))["web-0"]
+    assert "cpu_limit" not in s.config and "memory_limit_gb" not in s.config
+    assert shim.binding_hash(s) == "1d9ef2c57b88c6f8bc19d1f14bc3109dc793838ed919b1524bbcb516efe089e4"
+    # Its limits, at each revision and on TEE, are the ones it had: no CPU weight either.
+    bound = shim.RuntimeBook(tmp_path / "book").bind(s, "launch")
+    assert shim.launch_request(bound, [])["limits"] == {"cpu_millicores": None, "memory_bytes": None}
+    first = replace(bound, launch_revision=1)
+    assert shim.launch_request(first, [])["limits"] == {"cpu_millicores": 2000, "memory_bytes": 4 * 2**30}
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    entry["runtime"]["driver"] = "tee-simulation"
+    tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(tee, [])["limits"] == {"cpu_millicores": 2000, "memory_bytes": 4 * 2**30}
+
+
+def test_hard_limits_cap_the_container_and_an_unreserved_one_gets_a_low_cpu_weight(tmp_path):
+    raw = config(tmp_path)
+    raw["apps"][0].update(cpus=2, memory_gb=4, cpu_limit=2.5)
+    bound = shim.RuntimeBook(tmp_path / "book").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(bound, [])["limits"] == {"cpu_millicores": 2500, "memory_bytes": None}
+    assert shim.required_capabilities(bound) >= {shim.LIMITS_CAPABILITY} and shim.CPU_SHARES_CAPABILITY not in shim.required_capabilities(bound)
+    raw["apps"][0].update(memory_limit_gb=6.5)
+    bound = shim.RuntimeBook(tmp_path / "both").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(bound, [])["limits"] == {"cpu_millicores": 2500, "memory_bytes": round(6.5 * 2**30)}
+    # A replica that reserves no CPU: Ray reserves its memory only, the shim caps it and
+    # gives it a low weight.
+    bound = shim.RuntimeBook(tmp_path / "zero").bind(reconcile.replica_specs(reconcile.load_apps(capped(tmp_path)))["web-0"], "launch")
+    assert shim.UNRESERVED_CPU_SHARES == 64
+    assert shim.launch_request(bound, [])["limits"] == {"cpu_millicores": 1500, "memory_bytes": 2 * 2**30, "cpu_shares": 64}
+    assert reconcile.bundle(bound).to_ray() == {"CPU": 0.0, "memory": 2**30}
+    assert shim.required_capabilities(bound) >= {shim.LIMITS_CAPABILITY, shim.CPU_SHARES_CAPABILITY}
+    assert shim.TEE_CPU_OVERCOMMIT_CAPABILITY not in shim.required_capabilities(bound)
+    # On TEE the limits are the entry's too.
+    raw = capped(tmp_path, gpus=0, runtime={"executor": "shim", "driver": "tee-simulation"})
+    raw.update(shim_daemon=True, shim_tee={**tee_config(), "allow_cpu_overcommit": True})
+    tee = shim.RuntimeBook(tmp_path / "tee").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "launch")
+    assert shim.launch_request(tee, [])["limits"] == {"cpu_millicores": 1500, "memory_bytes": 2 * 2**30, "cpu_shares": 64}
+    assert shim.TEE_CPU_OVERCOMMIT_CAPABILITY in shim.required_capabilities(tee)
+
+
+@pytest.mark.parametrize("app,message", [
+    ({"runtime": None, "cpu_limit": 1}, "need runtime {executor: shim}"),
+    ({"runtime": {"executor": "legacy"}, "memory_limit_gb": 1}, "need runtime {executor: shim}"),
+    ({"runtime": {"executor": "shim", "driver": "openshell"}, "cpus": 1, "port_base": None, "cpu_limit": 1}, "native OpenShell"),
+    ({"cpus": 2, "cpu_limit": 1.5}, "at least cpus"),
+    ({"cpu_limit": 0.001}, "at least 0.01 CPUs"),
+    ({"memory_gb": 4, "memory_limit_gb": 2}, "at least memory_gb"),
+    ({"memory_limit_gb": 0.001}, "at least 6 MiB"),
+])
+def test_hard_limits_are_refused_where_nothing_enforces_them(tmp_path, app, message):
+    raw = config(tmp_path)
+    raw["apps"][0].update(app)
+    if raw["apps"][0]["runtime"] is None:
+        del raw["apps"][0]["runtime"]
+    if raw["apps"][0].get("port_base", 0) is None:
+        del raw["apps"][0]["port_base"]
+    with pytest.raises(ValueError, match=re.escape(message)):
+        reconcile.load_apps(raw, validate_launch=False)
+
+
+@pytest.mark.parametrize("change", [{"cpu_limit": None}, {"memory_gb": None}, {"memory_limit_gb": None}, {"gpus": 1}])
+def test_a_replica_that_reserves_no_cpu_is_always_capped(tmp_path, change):
+    raw = capped(tmp_path)
+    for key, value in change.items():
+        if value is None:
+            del raw["apps"][0][key]
+        else:
+            raw["apps"][0][key] = value
+    reconcile.load_apps(raw, validate_launch=False)
+    with pytest.raises(ValueError, match="cpus 0 reserves no CPU"):
+        reconcile.load_apps(raw)
+
+
+def test_a_tee_node_takes_an_unreserved_tenant_only_with_its_opt_in(tmp_path, monkeypatch):
+    import hashlib
+    raw = capped(tmp_path, runtime={"executor": "shim", "driver": "tee-simulation"})
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    with pytest.raises(ValueError, match="allow_cpu_overcommit"):
+        reconcile.load_apps(raw)
+    machine = shim.machine_options(reconcile.load_apps(raw, validate_launch=False).cluster)
+    raw["shim_tee"]["allow_cpu_overcommit"] = True
+    cluster = reconcile.load_apps(raw).cluster
+    # The opt-in is the bridge's: the running shim's machine configuration is unchanged.
+    assert shim.machine_options(cluster) == machine and "allow_cpu_overcommit" not in machine["tee"]
+    digest = hashlib.sha256(shim.json.dumps(machine, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    response = dict(protocol=1, drivers=["tee-simulation"], machine_config_sha256=digest,
+        features=["runtime-daemon-v1", "tee-startup-v1", "data-plane-v1", "runtime-management-v1"])
+    monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: response)
+    assert shim.TEE_CPU_OVERCOMMIT_CAPABILITY in shim.capabilities(cluster)
+    assert shim.TEE_CPU_OVERCOMMIT_CAPABILITY not in shim.capabilities(replace(cluster, shim_tee=replace(cluster.shim_tee, allow_cpu_overcommit=False)))
+    assert shim.CPU_SHARES_CAPABILITY not in shim.capabilities(cluster)
+    response["features"].append("runtime-cpu-shares-v1")
+    assert {shim.CPU_SHARES_CAPABILITY, shim.LIMITS_CAPABILITY} <= set(shim.capabilities(cluster))
+
+
+def test_the_cpu_weight_capability_follows_the_shim_feature(tmp_path, monkeypatch):
+    cluster = spec(tmp_path).cluster
+    reply = {"protocol": 1, "drivers": ["docker"], "features": ["data-plane-v1"]}
+    monkeypatch.setattr(shim.subprocess, "run", lambda *a, **k: Mock(stdout=shim.json.dumps(reply)))
+    assert shim.CPU_SHARES_CAPABILITY not in shim.capabilities(cluster)
+    reply["features"].append("runtime-cpu-shares-v1")
+    assert shim.CPU_SHARES_CAPABILITY in shim.capabilities(cluster)
+
+
+def test_a_node_refuses_an_unreserved_app_its_shim_cannot_weight_and_a_tee_limit_beyond_its_cpus(tmp_path, monkeypatch):
+    e = executor(tmp_path)
+    raw = capped(tmp_path)
+    app = raw["apps"][0]; app.update(namespace="0"*32, app="web", elf_id="")
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr(node, "alive_nodes", lambda: [{}]); monkeypatch.setattr(reconcile, "running", lambda: {})
+    monkeypatch.setattr(node, "container_gone", lambda _: True)
+    monkeypatch.setattr(shim, "capabilities", lambda _: [shim.CAPABILITY, shim.LIMITS_CAPABILITY])
+    start = Mock(); monkeypatch.setattr(reconcile, "start", start)
+    with pytest.raises(ValueError, match="it lacks shim-cpu-shares-v1"):
+        e.set_app({"app": app, "disabled": False}, "start")
+    start.assert_not_called()
+    monkeypatch.setattr(shim, "capabilities", lambda _: [shim.CAPABILITY, shim.LIMITS_CAPABILITY, shim.CPU_SHARES_CAPABILITY])
+    e.set_app({"app": app, "disabled": False}, "start")
+    assert start.call_count == 1
+    # A TEE node's CPUs are its VM's: a limit beyond them is refused before anything starts.
+    app.update(cpus=1, cpu_limit=9, runtime={"executor": "shim", "driver": "tee-simulation"})
+    raw.update(shim_daemon=True, shim_tee=tee_config())
+    e.apps_file.write_text(yaml.safe_dump(raw))
+    monkeypatch.setattr(node, "resources", lambda: ({"CPU": 8.0}, {"CPU": 8.0}))
+    with pytest.raises(ValueError, match="exceeds this TEE node's 8.0 CPUs"):
+        e.set_app({"app": app, "disabled": False}, "start")
+    assert start.call_count == 1
 
 
 def test_allocation_launched_before_launch_revisions_replays_its_original_request(tmp_path):

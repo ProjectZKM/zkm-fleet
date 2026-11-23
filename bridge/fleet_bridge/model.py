@@ -490,6 +490,9 @@ class ShimTeeConfig(Record):
     program_vkey_hash: str
     elf_file: str
     proof_signer_file: str | None = None
+    # Whether tenants that reserve no CPU (`cpus: 0`) may share this node's confidential
+    # VM. The node's own setting: it is not part of the shim's machine configuration.
+    allow_cpu_overcommit: bool = False
 
     def __post_init__(self) -> None:
         endpoint = urlsplit(self.trustee_endpoint)
@@ -658,6 +661,13 @@ class DurableMount(Record):
 
 # At most this many GPUs or durable mounts per native replica, as in shim.
 MAX_NATIVE_ATTACHMENTS = 16
+# The drivers whose containers take hard limits from an entry.
+LIMITED_DRIVERS = ("docker", "tee", "tee-simulation")
+# The smallest hard CPU limit Docker accepts, and the most CPUs shim counts in 32-bit millicores.
+MIN_CPU_LIMIT = 0.01
+MAX_CPUS = 2**32 / 1000
+# The smallest hard memory limit shim accepts.
+MIN_MEMORY_LIMIT_BYTES = 6 * 1024**2
 
 
 @dataclass(kw_only=True)
@@ -685,9 +695,13 @@ class AppSpec(Record):
     # GPU prover, optional for a CPU one.
     elf_id: str = ""
     proof_storage_root: str | None = None
+    # What Ray reserves for each replica.
     gpus: float = 1
     cpus: float = 1
     memory_gb: float | None = None
+    # A shim container's hard limits, when the entry sets them: CPUs and GiB.
+    cpu_limit: float | None = None
+    memory_limit_gb: float | None = None
     machine: str | None = None
     image: str | None = None
     env: dict[str, str] = field(default_factory=dict)
@@ -729,6 +743,16 @@ class AppSpec(Record):
             raise ModelError("TCP banner health requires native OpenShell TCP services")
         if self.mounts and not self.native_access:
             raise ModelError("durable mounts require native OpenShell")
+        if self.cpu_limit is not None or self.memory_limit_gb is not None:
+            if self.native_access:
+                raise ModelError("cpu_limit and memory_limit_gb don't apply to a native OpenShell app: its cpus and memory_gb are its limits")
+            if not self.runtime or self.runtime.executor is not ExecutorKind.SHIM or self.runtime.driver not in LIMITED_DRIVERS:
+                raise ModelError("cpu_limit and memory_limit_gb need runtime {executor: shim} with driver docker, tee or tee-simulation")
+        if self.cpu_limit is not None and not (MIN_CPU_LIMIT <= self.cpu_limit <= MAX_CPUS and self.cpu_limit >= self.cpus):
+            raise ModelError(f"cpu_limit must be at least {MIN_CPU_LIMIT} CPUs and at least cpus, which Ray reserves")
+        if self.memory_limit_gb is not None and not (MIN_MEMORY_LIMIT_BYTES <= self.memory_limit_gb * 2**30 < 2**63
+                and (self.memory_gb is None or self.memory_limit_gb >= self.memory_gb)):
+            raise ModelError("memory_limit_gb must be at least 6 MiB and at least memory_gb, which Ray reserves")
         if self.native_access:
             if (len(self.mounts) > MAX_NATIVE_ATTACHMENTS
                     or len({m.name for m in self.mounts}) != len(self.mounts)
@@ -838,6 +862,13 @@ class AppsConfig(Record):
                 raise ModelError("TEE apps require a matching node TEE mode and persistent shim")
         if app.native_access and (not cluster.shim_daemon or cluster.shim_openshell is None):
             raise ModelError("OpenShell requires the configured persistent companion")
+        if app.cpus == 0 and app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+            # A replica that reserves no CPU is always capped.
+            if (app.native_access or app.kind is not AppRuntime.APP or app.gpus or app.cpu_limit is None
+                    or not app.memory_gb or app.memory_limit_gb is None):
+                raise ModelError("cpus 0 reserves no CPU: only a kind: app without GPUs that sets cpu_limit, memory_gb and memory_limit_gb")
+            if app.runtime.driver in ("tee", "tee-simulation") and not (cluster.shim_tee and cluster.shim_tee.allow_cpu_overcommit):
+                raise ModelError("cpus 0 on a TEE node requires shim_tee.allow_cpu_overcommit in apps.yaml")
 
 
 @dataclass(kw_only=True)

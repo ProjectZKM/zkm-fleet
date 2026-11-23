@@ -436,6 +436,11 @@ class NodeExecutor:
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
         cfg.validate_launch(configured)
+        if configured.cpu_limit is not None and configured.runtime and configured.runtime.driver in ("tee", "tee-simulation"):
+            # A TEE node's CPUs are its confidential VM's vCPUs, fixed when it boots.
+            total = resources()[0].get("CPU", 0)
+            if configured.cpu_limit > total + 1e-9:
+                raise ValueError(f"cpu_limit {configured.cpu_limit} exceeds this TEE node's {total} CPUs, its confidential VM's")
         replicas = [s for s in reconcile.replica_specs(cfg).values() if s.app.name == configured.name]
         self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
@@ -460,8 +465,8 @@ class NodeExecutor:
             if shim.selected(spec):
                 if capabilities is None:
                     capabilities = shim.capabilities(cfg.cluster)
-                if not shim.required_capabilities(spec).issubset(capabilities):
-                    raise ValueError("node does not support the selected shim runtime")
+                if missing := shim.required_capabilities(spec) - set(capabilities):
+                    raise ValueError(f"node does not support the selected shim runtime: it lacks {', '.join(sorted(missing))}")
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
             spec = self.runtimes.bind(spec, command_id)

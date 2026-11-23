@@ -37,6 +37,16 @@ CAPABILITY = "shim-docker-v1"
 # a launch only when the request is identical, so an allocation keeps the
 # revision it was launched with.
 LAUNCH_REVISION = 2
+# The CPU weight of a container that reserves no CPU (`cpus: 0`), Docker's
+# `--cpu-shares`; the default weight is 1024. Under contention such a replica
+# yields to reserved ones, and its `cpu_limit` caps it either way.
+UNRESERVED_CPU_SHARES = 64
+# A node whose bridge sets an entry's cpu_limit and memory_limit_gb as hard limits.
+LIMITS_CAPABILITY = "shim-limits-v1"
+# A node whose shim gives a container a CPU weight.
+CPU_SHARES_CAPABILITY = "shim-cpu-shares-v1"
+# A TEE node whose operator lets tenants that reserve no CPU share its VM.
+TEE_CPU_OVERCOMMIT_CAPABILITY = "shim-tee-cpu-overcommit-v1"
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
@@ -96,6 +106,9 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
             ("shim-tcp-v1", app.runtime.driver != "docker" and app.service_protocol is ServiceProtocol.TCP),
             ("shim-management-v1", app.runtime.driver != "docker" and (bool(app.ingress) or "control" in app.services)),
             ("shim-single-use-ingress-v1", app.runtime.driver != "docker" and any(r.single_use for r in app.ingress.values())),
+            (LIMITS_CAPABILITY, app.cpu_limit is not None or app.memory_limit_gb is not None),
+            (CPU_SHARES_CAPABILITY, app.cpus == 0),
+            (TEE_CPU_OVERCOMMIT_CAPABILITY, app.cpus == 0 and app.runtime.driver != "docker"),
         ) if needed)
     return required
 
@@ -161,6 +174,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         local = "docker" in value.get("drivers", [])
         if config.shim_tee and config.shim_tee.driver in value.get("drivers", []) and "tee-startup-v1" in features:
             native.append("shim-" + config.shim_tee.driver + "-v1")
+            if config.shim_tee.allow_cpu_overcommit:
+                native.append(TEE_CPU_OVERCOMMIT_CAPABILITY)
             local = True
         return native + [name for name, supported in (
             ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
@@ -178,6 +193,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-runtime-v2", modern),
             ("shim-network-v1", network),
             ("shim-management-v1", managed_network),
+            (LIMITS_CAPABILITY, True),
+            (CPU_SHARES_CAPABILITY, "runtime-cpu-shares-v1" in features),
         ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
@@ -348,13 +365,24 @@ class RuntimeBook:
 
 def launch_limits(spec: AppReplicaSpec) -> dict[str, int | None]:
     """The container's hard CPU and memory limits; the shim sets none for a null.
-    A revision 2 Docker launch has none: Ray's reservation of `cpus` and
-    `memory_gb` alone accounts for them. Revision 1 and TEE launches set both."""
+    An entry's `cpu_limit` and `memory_limit_gb`, when it sets them, are those
+    limits. Otherwise a revision 2 Docker launch has none: Ray's reservation of
+    `cpus` and `memory_gb` alone accounts for them; revision 1 and TEE launches
+    set those. A replica that reserves no CPU also gets a low CPU weight; an
+    entry without the new settings sends exactly the request it always has."""
     app = spec.app
     if app.runtime.driver == "docker" and spec.launch_revision >= 2:
-        return {"cpu_millicores": None, "memory_bytes": None}
-    return {"cpu_millicores": round(app.cpus * 1000),
-        "memory_bytes": round(app.memory_gb * 2**30) if app.memory_gb is not None else None}
+        limits: dict[str, int | None] = {"cpu_millicores": None, "memory_bytes": None}
+    else:
+        limits = {"cpu_millicores": round(app.cpus * 1000),
+            "memory_bytes": round(app.memory_gb * 2**30) if app.memory_gb is not None else None}
+    if app.cpu_limit is not None:
+        limits["cpu_millicores"] = round(app.cpu_limit * 1000)
+    if app.memory_limit_gb is not None:
+        limits["memory_bytes"] = round(app.memory_limit_gb * 2**30)
+    if app.cpus == 0 and spec.launch_revision >= 2:
+        limits["cpu_shares"] = UNRESERVED_CPU_SHARES
+    return limits
 
 
 def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
@@ -820,7 +848,10 @@ def daemon_options(config: ControlPlaneConfig) -> dict[str, Any]:
 
 
 def machine_options(config: ControlPlaneConfig) -> dict[str, Any]:
-    return {"labels": config.shim_machine_labels, **({"tee": to_dict(config.shim_tee)} if config.shim_tee else {})}
+    # The CPU overcommit opt-in is the bridge's to enforce, not the shim's: the running
+    # shim's machine configuration, and its digest, stay as they are.
+    tee = {k: v for k, v in to_dict(config.shim_tee).items() if k != "allow_cpu_overcommit"} if config.shim_tee else None
+    return {"labels": config.shim_machine_labels, **({"tee": tee} if tee is not None else {})}
 
 
 def check_machine(config: ControlPlaneConfig, value: dict[str, Any]) -> None:
