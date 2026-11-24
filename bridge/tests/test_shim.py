@@ -519,6 +519,17 @@ def test_cleanup_uses_persisted_binary_and_failure_keeps_allocation(tmp_path, mo
     assert second.execution.generation==first.execution.generation+1
 
 
+def test_cleanup_waits_for_the_grace_the_app_was_launched_with(tmp_path, monkeypatch):
+    s = spec(tmp_path)
+    s = replace(s, app=replace(s.app, stop_timeout_s=600))
+    book = shim.RuntimeBook(tmp_path / "runtimes")
+    book.bind(s, "first")
+    call = Mock(return_value={"cleaned": True})
+    monkeypatch.setattr(shim, "invoke", call)
+    book.cleanup(s.name)
+    assert call.call_args.kwargs["timeout"] == 720
+
+
 def executor(tmp_path):
     apps=tmp_path/"apps.yaml";apps.write_text(yaml.safe_dump(config(tmp_path)))
     batches=tmp_path/"batches.yaml";batches.write_text("batches: {}\n")
@@ -811,7 +822,7 @@ def test_native_allocation_never_creates_via_ray_or_claims_app_readiness(tmp_pat
     spec = book.bind(spec, "launch")
     calls = []
     def invoke(binary, state, node, command, **kwargs):
-        assert kwargs["daemon"] is True and kwargs.get("timeout") is None
+        assert kwargs["daemon"] is True and kwargs.get("timeout") == (150 if command["operation"] == "delete" else None)
         assert command["driver"] == "openshell"
         assert command["execution"] == spec.execution
         calls.append(command["operation"])
