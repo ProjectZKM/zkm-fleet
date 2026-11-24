@@ -161,6 +161,8 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     newbridge = tmp_path / "bridge"
     (newbridge / "fleet_bridge").mkdir(parents=True)
     (newbridge / "fleet_bridge" / "__init__.py").write_text("")
+    (newbridge / "fleet_bridge" / "added.py").write_text("")
+    (prefix / "bridge/fleet_bridge/dropped.py").write_text("")
     newscripts = tmp_path / "scripts"
     newscripts.mkdir()
     for name in ["node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
@@ -174,6 +176,8 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     for name in ["shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
         assert (prefix / "deploy" / name).read_text() == f"new {name}\n"
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho new-node\n"
+    installed = lambda: sorted(p.name for p in (prefix / "bridge/fleet_bridge").glob("*.py"))
+    assert "added.py" in installed() and "dropped.py" not in installed(), "the bridge is the release's, whole"
     backup = next((prefix / "backup").glob("node-*"))
     assert (backup / "scripts/ray-start.sh").read_text() == "old ray-start\n"
     result = subprocess.run(["bash", str(ROOT / "deploy/fleet-ctl.sh"), "node", "rollback"],
@@ -185,6 +189,7 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     assert (prefix / "deploy/ray-watch.sh").read_text() == "old ray watch\n"
     assert (prefix / "deploy/install-node-services.sh").read_text() == "old install\n"
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho old-node\n"
+    assert "dropped.py" in installed() and "added.py" not in installed(), "and the backup's after a rollback"
 
 
 def test_watchdog_repairs_a_dead_ray_link(tmp_path):
@@ -512,7 +517,8 @@ def test_a_dry_run_on_the_node_takes_the_files_it_never_shipped_for_local_files(
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "curl.log").exists() and "curl" not in result.stdout, result.stdout
     assert f"+ install -m 755 {stage}/fleet-node {prefix}/bin/fleet-node.new" in result.stdout, result.stdout
-    assert f"+ cp -a {stage}/bridge/fleet_bridge/. {prefix}/bridge/fleet_bridge/" in result.stdout, result.stdout
+    assert (f"+ rm -rf {prefix}/bridge/fleet_bridge\n+ cp -a {stage}/bridge/fleet_bridge {prefix}/bridge/"
+            in result.stdout), result.stdout
     assert "fleet-proof-app" not in result.stdout and "ray-start.sh" not in result.stdout, result.stdout
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho old-node\n", "a dry run changes nothing"
 
