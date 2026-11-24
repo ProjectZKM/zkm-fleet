@@ -304,7 +304,9 @@ def ctl(env, *args, timeout=60):
 @pytest.mark.parametrize("apps,bridge,message", [
     ("apps: [\n", "real", "cannot read"),
     ("apps:\n- name: bad\n  kind: no-such-kind\n", "real", "the new bridge cannot load"),
-    ("apps:\n- name: gpu\n  kind: ziren-gpu\n", "real", "set its elf_id"),
+    ("apps:\n- name: web\n  kind: app\n", "real", "an app entry selects its runtime"),
+    ("apps:\n- {name: gpu, kind: ziren-gpu, runtime: {executor: shim, driver: docker}, image: 'prover:1', port_base: 0, container_port: 8080}\n",
+     "real", "set its elf_id"),
 ])
 def test_upgrade_refuses_apps_yaml_the_new_bridge_cannot_load(tmp_path, apps, bridge, message):
     prefix, commands, candidate, newbin, calls, env = checked_node(tmp_path, bridge=bridge)

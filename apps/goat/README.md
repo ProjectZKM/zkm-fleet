@@ -1,12 +1,16 @@
 # GOAT proof builder app worker
 
-The GOAT proof builder (`proof-builder-rpc`) runs as a Fleet integrated app worker. It does
-three things on one machine-pinned replica:
+The GOAT proof builder (`proof-builder-rpc`) runs as its proof app's prover entry on the
+shim, in the GPU image's own container: the worker package lies in the app's storage root,
+which is mounted in, and its `gpu-worker` script ([`apps/gpu-worker.sh`](../gpu-worker.sh))
+is the container's entrypoint. It starts the GPU server, starts the worker once the server
+answers ready, and ends the container when either process ends. The worker does three
+things on one machine-pinned replica:
 
 - It serves the Bitcoin node proof API (`/v1/proofs/*`, signed requests).
 - It proves the header, commit and state chains continuously, and operator and watchtower
   proofs on demand.
-- It proves directly against the replica's loopback Ziren GPU server.
+- It proves directly against the GPU server in its container.
 
 Its task database and proofs stay in the app's storage root. Fleet manages lifecycle,
 resources and exclusive use of the GPU server; it does not interpret the worker's state. The
@@ -53,7 +57,7 @@ A worker-only change keeps the identity and storage root.
 
 For an existing deployment, preserve the task database, proofs and header-chain
 progress. Use the [maintenance guide](../../docs/maintenance.md) for backups and
-cutover; upgrading Fleet 0.2 does not automatically convert this integrated worker.
+cutover.
 
 Fleet reserves the GPU server for exactly the app named by the entry's `app` and `elf_id`.
 No SDK submission reaches that app, because the bundle id is not the digest of any ELF.
@@ -106,55 +110,65 @@ The script:
 - sets `BITCOIN_NETWORK`, and `ZKM_IMM_WRAP_VK=1` (the deployed wrap mode);
 - builds `proof-builder-rpc` with `--locked`;
 - checks each embedded ELF digest and the bundle id;
-- writes `proof-builder-rpc`, `programs.json`, `fleet-app-id`, `source-revision` and
-  `SHA256SUMS`.
+- writes `proof-builder-rpc`, `programs.json`, `fleet-app-id`, `gpu-worker`,
+  `source-revision` and `SHA256SUMS`.
 
 ## Install and configure
 
-1. Install the package at `/opt/zkm-fleet/apps/goat`.
-2. Pre-install the Groth16 circuit artifacts for the Fleet execution user. The Groth16 wrap
-   and the local verification run on the worker's CPU. With `ZKM_IMM_WRAP_VK=1` the SDK reads
-   them from `~/.zkm/circuits/groth16/imm-wrap-vk/v2.0.0`. Copy them from the current proof
-   builder host, which already uses them, and do not rely on a download during proving.
-3. Create the storage root:
+1. Create the storage root and install the package in its `metadata/` directory:
 
    ```text
    /srv/zkm-fleet/apps/goat/            proof_storage_root (FLEET_APP_STORAGE_ROOT)
+     metadata/                          the package: proof-builder-rpc, programs.json, gpu-worker
      proof-builder.lock                 exclusive worker lock
-     run/                               worker_workdir: proof-builder.toml, the sqlite
-                                        database and *.ckpt files
+     run/                               the container's workdir: proof-builder.toml, .env, the
+                                        sqlite database and *.ckpt files
      circuits/data/{header-chain,commit-chain,state-chain,operator,watchtower}/
    ```
 
    The working directory is `run/`. Relative `../circuits/data/...` paths in the database,
    the config and state-chain snapshots therefore resolve inside the root. The worker
-   refuses to start when its working directory or database is outside the root.
-4. Adapt [`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`. Fill
+   refuses to start when its working directory or database is outside the root. The
+   account in the entry's `user` owns the root.
+2. Pre-install the Groth16 circuit artifacts for that account. The Groth16 wrap and the
+   local verification run on the worker's CPU. With `ZKM_IMM_WRAP_VK=1` the SDK reads them
+   from `~/.zkm/circuits/groth16/imm-wrap-vk/v2.0.0`. Copy them from the current proof
+   builder host, which already uses them, and do not rely on a download during proving.
+   The entry mounts the account's `~/.zkm`; where its entries are symbolic links, mount the
+   directory they point into as well.
+3. Adapt [`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`. Fill
    in the namespace, the app name, `elf_id`, the machine and the resources. `elf_id` is the
    content of the package's `fleet-app-id`; YAML does not expand `$(cat ...)`. Size `cpus` for the
-   Groth16 wrap as well as the GPUs. Keep `--drain-timeout-secs` below
-   `worker_stop_timeout_s`, and set both from the longest proof measured in staging.
-5. Put credentials and RPC endpoints in the private file described by
-   [`worker.env.example`](worker.env.example), readable only by the worker account. Fleet
-   supplies the GPU endpoint, storage root, app name (`FLEET_APP`), namespace, `elf_id` and
-   parent-exit behavior. Do not set `ZKM_PROVER`, `ENDPOINT` or `FLEET_TOKEN_FILE`.
+   Groth16 wrap as well as the GPUs. Keep `--drain-timeout-secs` below `stop_timeout_s`,
+   and set both from the longest proof measured in staging. The entry's `env` has two
+   parts:
 
-   Also set `FLEET_APP_TENANT=goat` in this file. The pinned worker still requires
-   `FLEET_APP_TENANT`, but Fleet no longer injects it: apps are named without tenants, and
-   Fleet supplies `FLEET_APP` instead. The worker only uses the value to label its log, and
-   Fleet does not override it. Without it the worker exits at startup with
-   `FLEET_APP_TENANT is required when Fleet launches the proof builder`. Drop the line once
-   the pinned worker reads `FLEET_APP`.
-6. Expose the API through an authenticated HTTPS proxy on the machine. The worker binds
-   `127.0.0.1:7777` and serves metrics on `127.0.0.1:9109`. Either repoint the existing proof
-   builder hostname, or update `PROOF_SERVER_URL` on the Operator and Challenger nodes.
+   - **The GPU server's**: the container's environment, as the entry lists it.
+   - **The worker's**: the entrypoint gives the worker only `PATH`, `HOME`, every
+     `FLEET_*` value, `FLEET_GPU_ENDPOINT` and `RAYON_NUM_THREADS` (from
+     `WORKER_THREADS`).
+
+   The worker reads its Fleet settings from that environment before it loads `.env`, so
+   they belong in the entry, and `PROOF_BUILDER_PROGRAMS_FILE` on its command line. Among
+   them is `FLEET_APP_TENANT`, which the pinned worker requires and only uses to label its
+   log; without it the worker exits at startup with
+   `FLEET_APP_TENANT is required when Fleet launches the proof builder`.
+4. Put credentials and RPC endpoints in `.env` in `run/`, as
+   [`worker.env.example`](worker.env.example) describes, readable only by the account in
+   the entry's `user`. The worker reads it at startup. Do not set `ZKM_PROVER`, `ENDPOINT`,
+   `FLEET_TOKEN_FILE` or `FLEET_EXIT_WITH_PARENT`.
+5. The worker's API listens on port 8080 in the container, which also answers the health
+   check (`GET /`); the shim publishes it on a loopback port of the node. The entrypoint's
+   own health responder takes `HEALTH_PORT` 8081, and metrics are on `127.0.0.1:9200` in
+   the container. Set `PROOF_SERVER_URL` on the Operator and Challenger nodes to where they
+   reach the API.
 
 The example follows the selected `ghcr.io/projectzkm/ziren-gpu:latest` image. Pull it on the
 GPU node before restarting this app and record its resolved digest for recovery. The tag
 can move; this configuration does not establish compatibility with the current `3cf393cd`
 SDK pin. Verify Groth16 proofs against the deployed host and guests before resuming all
-tasks. In Fleet mode the entry's `image` field selects the GPU image; SDK Docker image
-environment variables do not select this external server.
+tasks. The entry's `image` field selects the GPU image; SDK Docker image environment
+variables do not select it.
 
 ## Cutover
 
@@ -167,7 +181,7 @@ runs twice.
 
    ```bash
    fleetctl --namespace NAMESPACE app add goat-proof-builder-v1 --spec goat.json \
-     --elf-id "$(cat /opt/zkm-fleet/apps/goat/fleet-app-id)"
+     --elf-id "$(cat /srv/zkm-fleet/apps/goat/metadata/fleet-app-id)"
    ```
 
    Use `--elf-id`, not `--elf`: the bundle id is not the digest of a single ELF. Then add the
@@ -197,8 +211,7 @@ runs twice.
    ```
 
    Watch `<log_dir>/goat-proof-builder-v1-0.node.log` until the first proof has been committed.
-6. Switch the proxy or `PROOF_SERVER_URL`. Confirm that nodes receive operator and watchtower
-   proofs.
+6. Switch `PROOF_SERVER_URL`. Confirm that nodes receive operator and watchtower proofs.
 7. To roll back: disable the bundle app and confirm its GPUs are released. Then
    restore the SDK apps and the old proof builder, in reverse order, from the cutover
    snapshot.
@@ -219,7 +232,8 @@ from them.
   Its result is written only while it is still `New`, so a timeout from the node wins.
 - **Failures:**
   - A GPU server that stops reporting ready, or a proof that cannot be published, leaves
-    the task pending. The worker exits and Fleet restarts the replica with a new GPU server.
+    the task pending. The worker exits, its container ends, and Fleet starts it again with
+    a new GPU server.
   - A failed GPU call whose guest still executes on the CPU is a prover or transport fault.
     The proof is retried in place, and the failure does not count.
   - A guest that rejects its input, or a proof that does not verify, marks the task `Failed`
@@ -228,8 +242,9 @@ from them.
   committing within `--drain-timeout-secs`; after that the process exits regardless. Exit
   codes: 0 after a clean stop, 1 after a task failure or an abandoned proof, 101 after a
   panic.
-- **Disabling the app.** `fleetctl app disable` stops the actor directly; any unfinished
-  proof is redone after the app is enabled again.
+- **Disabling the app.** `fleetctl app disable` stops the container with its
+  `stop_timeout_s` grace, so the worker shuts down as above; any unfinished proof is redone
+  after the app is enabled again.
 
 Inspect progress through the worker log and its metrics. Each proof attempt is counted with
 an outcome: `success`, `failed`, `transient`, `unavailable` or `cancelled`.

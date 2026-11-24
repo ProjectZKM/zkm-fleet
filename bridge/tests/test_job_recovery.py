@@ -3,8 +3,18 @@ import os
 from types import SimpleNamespace
 import pytest
 
-from fleet_bridge import jobs
-from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
+from fleet_bridge import jobs, shim
+from fleet_bridge.model import Batch, ControlPlaneConfig, JobSpec, JobState, JobStatus, RuntimeIdentity
+
+CLUSTER = ControlPlaneConfig(shim_binary="/opt/trusted-shim-runtime", shim_state_dir="/var/lib/trusted-shim")
+
+
+def shim_run(job, monkeypatch, answer):
+    """Gives the job a launched shim run whose shim answers each question with `answer()`."""
+    shim.JobRun(job.path).book.write(shim.JobRun.NAME, shim.Allocation(executor=shim.ExecutorKind.SHIM, spec=job.id,
+        binary=CLUSTER.shim_binary, state_dir=CLUSTER.shim_state_dir, execution=RuntimeIdentity(namespace="n",
+            workload="p", allocation_id=job.id, lease_id="run-1", generation=1, node_id="node")))
+    monkeypatch.setattr(shim, "invoke", lambda *args, **kwargs: answer())
 
 
 def test_prepare_launch_discards_blocked_placement(monkeypatch):
@@ -33,8 +43,8 @@ def test_launch_reuses_placement_and_atomically_deduplicates_actor_creation(monk
     monkeypatch.setattr(jobs,'JobActor',Actor())
     monkeypatch.setattr(jobs,'PlacementGroupSchedulingStrategy',lambda **kw:kw)
     spec=JobSpec(id='job',batch='p',policy=Batch(image='python:3'),command=['true'],gpus=0,cpus=1,out='/tmp/job/out')
-    jobs.launch(spec,'/tmp/job')
-    jobs.launch(spec,'/tmp/job')
+    jobs.launch(spec,'/tmp/job',CLUSTER)
+    jobs.launch(spec,'/tmp/job',CLUSTER)
     assert all(c['get_if_exists'] and c['name']=='job-job' for c in created)
     assert all(c['scheduling_strategy']['placement_group'] is pg for c in created)
 
@@ -42,21 +52,20 @@ def test_launch_reuses_placement_and_atomically_deduplicates_actor_creation(monk
 def test_cleanup_requires_positive_container_confirmation(tmp_path,monkeypatch):
     job=jobs.JobDirectory(str(tmp_path),'job',must_exist=False)
     os.makedirs(job.path)
-    JobStatus(id='job',state=JobState.CANCELLED,submitted_at=1,gpus_requested=1,cpus=1,node_ip='worker',container='fleet-job-job').write(job.status_path)
+    JobStatus(id='job',state=JobState.CANCELLED,submitted_at=1,gpus_requested=1,cpus=1,node_ip='worker',container='trusted-shim-run').write(job.status_path)
     monkeypatch.setattr(jobs,'_going',lambda _:False)
-    monkeypatch.setattr(jobs,'alive_nodes',lambda:[])
     removed=[]
     monkeypatch.setattr(jobs,'discard_placement',removed.append)
-    assert not jobs.execution_stopped(job), 'an unreachable node can still be running Docker'
-    monkeypatch.setattr(jobs,'alive_nodes',lambda:[{'NodeManagerAddress':'worker'}])
-    class Probe:
-        def options(self,**kw):return self
-        def remote(self,*args):return 'probe'
-    monkeypatch.setattr(jobs,'_container_stopped',Probe())
-    monkeypatch.setattr(jobs.ray,'get',lambda *args,**kw:False)
+    answers=[RuntimeError('shim daemon unavailable'),{'state':'ready'},{'state':'stopped'}]
+    def answer():
+        value=answers.pop(0)
+        if isinstance(value,Exception):
+            raise value
+        return value
+    shim_run(job,monkeypatch,answer)
+    assert not jobs.execution_stopped(job), 'a shim that does not answer can still be running the container'
     assert not jobs.execution_stopped(job)
     assert removed==[]
-    monkeypatch.setattr(jobs.ray,'get',lambda *args,**kw:True)
     assert jobs.execution_stopped(job)
     assert removed==['job']
 
@@ -67,9 +76,10 @@ def test_cancelled_actor_cannot_start_container_after_cleanup(tmp_path,monkeypat
     JobStatus(id='job',state=JobState.CANCELLED,submitted_at=1,gpus_requested=0,cpus=1).write(job.status_path)
     spec=JobSpec(id='job',batch='p',policy=Batch(image='python:3'),command=['true'],gpus=0,cpus=1,out=job.out)
     monkeypatch.setattr(jobs.ray,'get_gpu_ids',lambda:[])
+    monkeypatch.setattr(shim,'image_present',lambda image:True)
     called=[]
-    monkeypatch.setattr(jobs,'_sh',called.append)
-    rank=jobs._Rank(spec)
+    monkeypatch.setattr(shim,'invoke',lambda *args,**kwargs:called.append(args))
+    rank=jobs._Rank(spec,job.path,CLUSTER)
     assert rank.start(1)=='job stopped before container creation'
     assert called==[]
 
@@ -83,10 +93,10 @@ def test_preemption_does_not_release_placement_when_container_is_unreachable(tmp
               gpus_requested=1, cpus=1, node_ip="unreachable").write(job.status_path)
     monkeypatch.setattr(jobs, "_alive", lambda _: True)
     monkeypatch.setattr(jobs, "_going", lambda _: False)
-    monkeypatch.setattr(jobs, "_stop_ranks", lambda *a: None)
     monkeypatch.setattr(jobs, "_end_actors", lambda *a: None)
-    monkeypatch.setattr(jobs, "_on_job_node", lambda *a: None)
-    monkeypatch.setattr(jobs, "alive_nodes", lambda: [])
+    def unreachable():
+        raise RuntimeError("shim daemon unavailable")
+    shim_run(job, monkeypatch, unreachable)
     released = []
     monkeypatch.setattr(jobs, "discard_placement", released.append)
     result = jobs.preempt(str(tmp_path), "job", "higher priority")
@@ -107,7 +117,7 @@ def test_single_machine_actor_retries_oom_and_releases_local_placement(tmp_path,
     actor = jobs._JobActor.__new__(jobs._JobActor)
     actor.spec, actor.dir, actor.gpus = spec, job, ["0"]
     actor.local = Mock(name="container")
-    actor.local.name = "fleet-job-job"
+    actor.local.name = "trusted-shim-run"
     actor.local.check.return_value = None
     actor.local.shortfall.return_value = []
     actor.local.start.return_value = None
@@ -140,16 +150,6 @@ def test_local_rank_reports_machine_identity_and_ray_granted_cards(monkeypatch):
     monkeypatch.setattr(jobs, "node_ip", lambda: "127.0.0.1")
     spec = JobSpec(id="job", batch="p", policy=Batch(image="i"), command=["true"],
                    gpus=1, cpus=1, out="/tmp/job/out")
-    info = jobs._Rank(spec).info()
+    info = jobs._Rank(spec, "/tmp/job", CLUSTER).info()
     assert info.machine and info.node_ip == "127.0.0.1"
-    assert info.gpus == ["1"] and info.container == "fleet-job-job"
-
-
-@pytest.mark.parametrize("image", ["--privileged", "--volume=/var/run/docker.sock:/socket"])
-def test_batch_image_cannot_become_a_docker_option(image):
-    spec = JobSpec(id="job", batch="test", namespace="namespace", policy=Batch(image=image),
-                   command=["alpine", "true"], gpus=0, cpus=1, out="/tmp/job/out")
-    command = jobs.docker_command(spec, [])
-    boundary = command.index("--")
-    assert command[boundary + 1:] == [image, "alpine", "true"]
-    assert image not in command[:boundary]
+    assert info.gpus == ["1"] and info.container == ""

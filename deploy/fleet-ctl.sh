@@ -12,7 +12,7 @@
 #   node upgrade [TAG]            install a release's fleet-node, bridge, fleet-proof-app and launch scripts
 #   node upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_DIR]   the same from local files
 #   node rollback                 restore what the last node upgrade replaced
-#   app cleanup APP-0             remove the placement group and container a failed app start left
+#   app cleanup APP-0             remove the placement group a failed app start left
 #
 # -n prints what would change and changes nothing. Settings come from the environment or
 # ${FLEET_CTL_ENV:-~/.config/zkm-fleet/ctl.env}: FLEET_PREFIX (install dir), FLEET_NODE_SSH
@@ -596,7 +596,7 @@ PY
 
 app_cleanup() {
   "$PREFIX/venv/bin/python" - "${1:?usage: app cleanup APP-0, e.g. ethproofs-v6-gpu-0}" "$DRY" <<'PY'
-import subprocess, sys, ray
+import sys, ray
 from ray._raylet import PlacementGroupID
 from ray.util import placement_group_table
 from ray.util.placement_group import PlacementGroup, remove_placement_group
@@ -614,12 +614,6 @@ for pg_id, v in placement_group_table().items():
         print(verb, v["name"]); found = True
         if not dry:
             remove_placement_group(PlacementGroup(PlacementGroupID.from_hex(pg_id)))
-container = f"fleet-gpu-{name}"
-state = subprocess.run(["docker", "inspect", "-f", "{{.State.Status}}", container], capture_output=True, text=True).stdout.strip()
-if state == "exited":
-    print(verb, "container", container); found = True
-    if not dry:
-        subprocess.run(["docker", "rm", container], check=True)
 if not found:
     print(f"nothing to clean for {name}")
 PY

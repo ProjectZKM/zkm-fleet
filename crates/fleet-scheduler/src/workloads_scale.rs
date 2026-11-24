@@ -486,9 +486,6 @@ impl WorkloadController {
             EntryMut(&mut target).set_resources(&req, Some(replicas as u32));
             let t = Entry(&target);
             let (g, cpu) = (t.gpus().unwrap_or(1.0), t.cpus());
-            if t.integrated_worker() && replicas != 1 {
-                return Err(fail(400, "integrated app workers require one machine-pinned replica"));
-            }
             if !g.is_finite() || g < 0.0 {
                 return Err(fail(400, REPLICA_RANGE));
             }
@@ -499,7 +496,7 @@ impl WorkloadController {
             }
             // Container replicas reserve the whole app. Proof quota is charged per assigned
             // proof; extra replicas can remain idle while that quota is occupied.
-            if t.holds_allocation() {
+            if t.is_container() {
                 (quota_g, quota_cpu) = (quota_g + g * replicas as f64, quota_cpu + cpu * replicas as f64);
             } else {
                 (quota_g, quota_cpu) = (f64::max(quota_g, g), f64::max(quota_cpu, cpu));
@@ -717,8 +714,8 @@ impl WorkloadController {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect::<Vec<_>>();
         for (key, intent) in intents {
-            // One deployment's conflict (an old owner of an integrated worker, say) must not
-            // stall the rest of the fleet: defer it to the next pass and keep dispatching.
+            // One deployment's conflict must not stall the rest of the fleet: defer it to the
+            // next pass and keep dispatching.
             let name = key.clone();
             if let Err(error) = self.advance_scale(key, intent).await {
                 tracing::warn!(deployment = %name, error = %error, "scale deferred to the next pass");
@@ -916,6 +913,9 @@ impl WorkloadController {
             "priority": request.priority.unwrap_or(0), "replicas": 1, "gpus": 1.0, "cpus": 1});
         if let Some(tag) = &tag {
             entry["tag"] = json!(tag);
+        }
+        for (key, value) in fleet_proto::model::v1::RegisterAppRequest::defaults(request.kind()) {
+            entry[key.as_str()] = value;
         }
         for (key, value) in spec.into_iter().filter(|(_, v)| !v.is_null()) {
             entry[key.as_str()] = value;

@@ -112,8 +112,8 @@ else
     || die "--proof-storage-roots requires the optional fleet-ziren-node storage handler"
   install -m 755 "$BIN/fleet-node" "$PREFIX/bin/fleet-node.new"
   mv "$PREFIX/bin/fleet-node.new" "$PREFIX/bin/fleet-node"
-  # Only SDK proof actors and their storage handler need the native prover.
-  # Ordinary apps, batches and integrated workers carry their own application code.
+  # Only the proof storage handler needs the native prover. Apps and batches carry
+  # their own application code.
   for b in fleet-ziren-node fleet-proof-app; do
     if [ -x "$BIN/$b" ]; then install -m 755 "$BIN/$b" "$PREFIX/bin/"; fi
   done
@@ -231,7 +231,6 @@ else
   [ -f "$ETC/apps.yaml" ] || cat > "$ETC/apps.yaml" <<EOF
 scheduler: $SCHEDULER
 cluster_token_file: $ETC/cluster.token
-node_binary: $PREFIX/bin/fleet-ziren-node
 log_dir: $WORKDIR/logs
 apps: [] # configured proof servers and persistent apps for this machine
 EOF

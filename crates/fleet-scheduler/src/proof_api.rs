@@ -153,9 +153,6 @@ async fn submit(fleet: &Scheduler, req: SubmitProofRequest, caller: &Token, app:
         if fleet.queued_for(&namespace, &registered.name) >= registered.max_queued as usize {
             return Err((StageStatus::InternalError, format!("app {} has {} jobs queued or running, its most", registered.name, registered.max_queued)));
         }
-        if fleet.app_worker_owned(&namespace, &registered.name) {
-            return Err((StageStatus::InvalidParameter, "this app owns its input stream; SDK proof submission is unavailable".into()));
-        }
         if registered.disabled {
             return Err((StageStatus::InvalidParameter, format!("app {} is disabled: it takes no new jobs", registered.name)));
         }

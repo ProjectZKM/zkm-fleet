@@ -5,21 +5,28 @@ from unittest.mock import Mock
 import pytest
 import yaml
 
-from fleet_bridge import actors, node, reconcile, jobs
+from fleet_bridge import node, reconcile, jobs, shim
 from fleet_bridge.model import Batch, JobSpec, JobState, JobStatus
+
+DOCKER = {"executor": "shim", "driver": "docker"}
+
+
+def packaged(**entry):
+    """A packaged prover's entry."""
+    return {"kind": "ziren-gpu", "runtime": dict(DOCKER), "image": "ziren-gpu:1", "port_base": 0, "container_port": 8080, **entry}
 
 
 @pytest.fixture
 def executor(tmp_path, monkeypatch):
     (tmp_path / "batches.yaml").write_text("batches: {}\n")
-    (tmp_path / "apps.yaml").write_text(yaml.safe_dump({"apps": [{
-        "name": "proof", "kind": "ziren-gpu", "namespace": "a"*32,
-        "app": "eth", "elf_id": "b"*64, "disabled": True, "replicas": 2,
-    }]}))
+    (tmp_path / "apps.yaml").write_text(yaml.safe_dump({
+        "shim_binary": "/opt/trusted-shim-runtime", "shim_state_dir": str(tmp_path / "shim"), "apps": [packaged(
+        name="proof", namespace="a"*32, app="eth", elf_id="b"*64, disabled=True, replicas=2)]}))
     e=node.NodeExecutor(str(tmp_path/"apps.yaml"),str(tmp_path/"batches.yaml"),str(tmp_path/"jobs"))
     e.pool.shutdown()
     e.pool=Mock()
     monkeypatch.setattr(node.ray,"nodes",lambda:[{"Alive":True}])
+    monkeypatch.setattr(shim,"capabilities",lambda _:["shim-docker-v1","shim-prover-v1","shim-runtime-v2","shim-automatic-port-v1",shim.BATCH_CAPABILITY])
     return e
 
 
@@ -52,9 +59,8 @@ def test_cancel_fences_launch_even_if_commands_execute_out_of_order(executor):
 
 def test_cancel_before_local_record_confirms_absence_without_launch(executor,monkeypatch):
     monkeypatch.setattr(jobs,"_going",lambda _:False)
-    monkeypatch.setattr(node,"container_gone",lambda _:True)
     assert executor.stop(command()["parameters"],False)["cleaned"]
-    monkeypatch.setattr(node,"container_gone",lambda _:False)
+    monkeypatch.setattr(node,"job_gone",lambda *_:False)
     with pytest.raises(ValueError,match="without a local record"):
         executor.stop(command()["parameters"],False)
 
@@ -62,23 +68,19 @@ def test_cancel_before_local_record_confirms_absence_without_launch(executor,mon
 def test_stop_removes_every_replica_and_writes_nothing(executor,monkeypatch):
     cfg=yaml.safe_load(executor.apps_file.read_text())
     before=executor.apps_file.read_bytes()
-    stop=Mock();clean=Mock();monkeypatch.setattr(reconcile,"stop",stop)
+    stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
     monkeypatch.setattr(reconcile,"running",lambda:{"proof-2":"left over","other-0":"another app"})
-    monkeypatch.setattr(actors,"clean_after",clean);monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:True)
     result=executor.set_app({"app":cfg["apps"][0],"disabled":True})
     assert result["cleaned"]
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1","proof-2"]
-    assert clean.remote.call_count==3
     assert executor.apps_file.read_bytes()==before
 
 
 def test_stop_failure_does_not_confirm_cleanup(executor,monkeypatch):
     app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
-    monkeypatch.setattr(reconcile,"stop",lambda _:None);monkeypatch.setattr(reconcile,"running",lambda:{})
-    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:False)
-    with pytest.raises(ValueError,match="uncertain"):
+    monkeypatch.setattr(reconcile,"stop",Mock(side_effect=RuntimeError("shim cleanup is not confirmed")))
+    monkeypatch.setattr(reconcile,"running",lambda:{})
+    with pytest.raises(RuntimeError,match="not confirmed"):
         executor.set_app({"app":app,"disabled":True})
     assert yaml.safe_load(executor.apps_file.read_text())["apps"][0]["disabled"]
 
@@ -88,9 +90,9 @@ def test_start_uses_local_executor_and_no_admin_token(executor,monkeypatch):
     monkeypatch.setattr(reconcile,"running",lambda:{})
     start=Mock();monkeypatch.setattr(reconcile,"start",start)
     with pytest.raises(ValueError,match="disabled in apps.yaml"):
-        executor.set_app({"app":app,"disabled":False})
+        executor.set_app({"app":app,"disabled":False},"start")
     node.set_fields(executor.apps_file,"apps","proof",{"disabled":False})
-    assert executor.set_app({"app":app,"disabled":False})["ready"]
+    assert executor.set_app({"app":app,"disabled":False},"start")["ready"]
     assert start.call_count==2
     assert all(not c.kwargs for c in start.call_args_list)
 
@@ -143,7 +145,6 @@ def test_finished_job_reports_log_completion_without_archiving_outputs(executor,
     monkeypatch.setattr(node.ray, "cluster_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(node.ray, "available_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(reconcile, "running", lambda: {})
-    monkeypatch.setattr(node, "container_gone", lambda _: True)
     monkeypatch.setattr(jobs, "_going", lambda _: False)
     monkeypatch.setattr(jobs, "discard_placement", lambda _: None)
     report = executor.report()["jobs"][0]
@@ -169,7 +170,6 @@ def test_a_settled_job_directory_is_read_again_only_once_it_changes(executor, mo
     monkeypatch.setattr(node.ray, "cluster_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(node.ray, "available_resources", lambda: {"CPU": 1})
     monkeypatch.setattr(reconcile, "running", lambda: {})
-    monkeypatch.setattr(node, "container_gone", lambda _: True)
     monkeypatch.setattr(jobs, "_going", lambda _: True)
     read = []
     directory_of = jobs.JobDirectory
@@ -206,7 +206,7 @@ def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkey
     executor.apps_file.write_text(yaml.safe_dump(cfg))
     specs=reconcile.replica_specs(reconcile.load_apps(cfg))
     monkeypatch.setattr(reconcile,'running',lambda:{name:name for name in specs})
-    monkeypatch.setattr(reconcile,'health_of',lambda name, **kwargs:ReplicaHealth(name=name,spec=actors.spec_hash(specs[name]),gpu_ready=True))
+    monkeypatch.setattr(reconcile,'health_of',lambda name, **kwargs:ReplicaHealth(name=name,spec=shim.spec_hash(specs[name]),ready=True))
     start,stop=Mock(),Mock()
     monkeypatch.setattr(reconcile,'start',start);monkeypatch.setattr(reconcile,'stop',stop)
     monkeypatch.setattr(node.ray,'cluster_resources',lambda:{'GPU':8,'CPU':48})
@@ -214,9 +214,9 @@ def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkey
     assert executor.report()['apps'][0]['ready'] is True
     assert executor.set_app({'app':cfg['apps'][0],'disabled':False})['ready']
     start.assert_not_called();stop.assert_not_called()
-    assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=False).is_ready
-    assert not ReplicaHealth(name='gpu',spec='hash',gpu_ready=True,stopping=True).is_ready
-    assert ReplicaHealth(name='cpu',spec='hash').is_ready
+    assert not ReplicaHealth(name='gpu',spec='hash',ready=False).is_ready
+    assert not ReplicaHealth(name='gpu',ready=True).is_ready
+    assert ReplicaHealth(name='gpu',spec='hash',ready=True).is_ready
 
 
 def test_a_start_in_progress_holds_neither_other_app_changes_nor_the_report(executor, monkeypatch):
@@ -255,26 +255,23 @@ def test_a_start_in_progress_holds_neither_other_app_changes_nor_the_report(exec
     assert node.read_json(executor.journal/'start.json')['error'] is None
     assert sorted(actors_up)==names and not executor.starting
     from fleet_bridge.model import ReplicaHealth
-    monkeypatch.setattr(reconcile,'health_of',lambda name,**kwargs:ReplicaHealth(name=name,spec='hash',gpu_ready=True))
+    monkeypatch.setattr(reconcile,'health_of',lambda name,**kwargs:ReplicaHealth(name=name,spec='hash',ready=True))
     app=executor.report()['apps'][0]
     assert (app['ready'],app['started'])==(True,True)
 
 
-def test_prover_executor_switch_retains_old_actor_until_explicit_cleanup(executor, monkeypatch):
+def test_a_changed_prover_retains_its_actor_until_explicit_cleanup(executor, monkeypatch):
     from fleet_bridge.model import ReplicaHealth
     cfg = yaml.safe_load(executor.apps_file.read_text())
     app = cfg['apps'][0]
-    app.update(disabled=False, runtime={'executor':'shim','driver':'docker'},
-        image='packaged:2', port_base=0, container_port=8080)
-    cfg.update(shim_binary='/shim', shim_state_dir='/state')
+    app.update(disabled=False, image='packaged:2')
     executor.apps_file.write_text(yaml.safe_dump(cfg))
     monkeypatch.setattr(reconcile, 'running', lambda: {'proof-0':'old-actor'})
-    monkeypatch.setattr(reconcile, 'health_of', lambda _: ReplicaHealth(name='proof-0', gpu_ready=True))
-    monkeypatch.setattr(node.shim, 'capabilities', lambda _: ['shim-prover-v1'])
+    monkeypatch.setattr(reconcile, 'health_of', lambda _: ReplicaHealth(name='proof-0', spec='another', ready=True))
     start, stop = Mock(), Mock()
     monkeypatch.setattr(reconcile, 'start', start)
     monkeypatch.setattr(reconcile, 'stop', stop)
-    with pytest.raises(ValueError, match='explicit drain and confirmed cleanup'):
+    with pytest.raises(ValueError, match='retained until explicit cleanup'):
         executor.set_app({'app':app, 'disabled':False}, 'upgrade')
     start.assert_not_called()
     stop.assert_not_called()
@@ -286,7 +283,7 @@ def test_actor_health_timeout_keeps_machine_heartbeat_and_command_results(execut
     monkeypatch.setattr(node.ray, 'available_resources', lambda: {'GPU': 4, 'CPU': 16})
     monkeypatch.setattr(reconcile, 'running', lambda: {'proof-0': 'starting', 'proof-1': 'healthy'})
     health = Mock(side_effect=[node.ray.exceptions.GetTimeoutError('starting'),
-                             ReplicaHealth(name='proof-1', spec='hash', gpu_ready=True)])
+                             ReplicaHealth(name='proof-1', spec='hash', ready=True)])
     monkeypatch.setattr(reconcile, 'health_of', health)
     node.write_json(executor.journal / 'cleanup.json', {'command': {'id': 'cleanup'},
                                                      'done': True, 'result': {'cleaned': True}, 'error': None})
@@ -302,10 +299,8 @@ def test_start_takes_resources_from_apps_yaml_and_stops_extra_replicas(executor,
     node.set_fields(executor.apps_file,"apps","proof",{"disabled":False,"gpus":2,"cpus":8,"replicas":1})
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
     monkeypatch.setattr(reconcile,"running",lambda:{"proof-1":"outside the new count"})
-    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:True)
     start=Mock();monkeypatch.setattr(reconcile,"start",start)
-    assert executor.set_app({"app":app,"disabled":False,"scale_id":"resize"})["ready"]
+    assert executor.set_app({"app":app,"disabled":False,"scale_id":"resize"},"resize")["ready"]
     assert [c.args[0] for c in stop.call_args_list]==["proof-1"]
     replica=start.call_args.args[0]
     assert (start.call_count,replica.name,replica.app.gpus,replica.app.cpus)==(1,"proof-0",2,8)
@@ -412,11 +407,9 @@ def app_message(executor, ident, change, app=None, batch=None, ns="a"*32, ns_nam
 
 def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
     stop=Mock();monkeypatch.setattr(reconcile,"stop",stop)
-    monkeypatch.setattr(actors,"clean_after",Mock());monkeypatch.setattr(node.ray,"get",lambda *a,**k:None)
-    monkeypatch.setattr(node,"container_gone",lambda _:True)
     apps=yaml.safe_load(executor.apps_file.read_text())
-    apps["apps"]+=[{"name":"other-ns","kind":"ziren-gpu","namespace":"zkm","app":"eth","elf_id":"b"*64},
-                           {"name":"web","kind":"app","namespace":"zkm"}]
+    apps["apps"]+=[packaged(name="other-ns",namespace="zkm",app="eth",elf_id="b"*64),
+                           {"name":"web","kind":"app","runtime":dict(DOCKER),"namespace":"zkm"}]
     executor.apps_file.write_text(yaml.safe_dump(apps))
     assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["proof"]},None)
     assert [c.args[0] for c in stop.call_args_list]==["proof-0","proof-1"]
@@ -430,8 +423,7 @@ def test_app_removal_cleans_up_and_drops_the_entry(executor,monkeypatch):
 
 def removable(monkeypatch):
     """Replicas that stop at once and leave no container."""
-    monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
-    monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:True)
+    monkeypatch.setattr(reconcile,"stop",Mock())
 
 
 def files(root, *paths):
@@ -447,72 +439,73 @@ def configure(executor, *entries, log_dir=None):
     executor.apps_file.write_text(yaml.safe_dump(apps))
 
 
-def worker(name, app, data, **more):
-    """An entry with an integrated worker, which works in data/<app>/run and keeps proofs in data/<app>/store."""
-    return {"name":name,"kind":"ziren-gpu","namespace":"a"*32,"app":app,"elf_id":"b"*64,"image":"ziren-gpu:1",
-        "machine":"m1","worker_command":["/opt/worker"],"worker_workdir":str(data/app/"run"),
-        "proof_storage_root":str(data/app/"store"),**more}
+def prover(name, app, data, **more):
+    """A prover's entry, which keeps proofs in data/<app>/store."""
+    return packaged(name=name,namespace="a"*32,app=app,elf_id="b"*64,
+        proof_storage_root=str(data/app/"store"),**more)
 
 
 def test_removing_an_app_from_one_node_keeps_its_data(executor,monkeypatch,tmp_path_factory):
     """A scale that leaves a node no replicas has it remove the app's entries; the app runs on elsewhere."""
     removable(monkeypatch)
     data=tmp_path_factory.mktemp("data")
-    files(data,"eth/run/checkpoint","eth/store/outputs/job-1/lease/proof.json","logs/eth-worker-0.node.log")
-    configure(executor,worker("eth-worker","eth",data),log_dir=data/"logs")
+    files(data,"eth/store/outputs/job-1/lease/proof.json","logs/eth-worker-0.node.log")
+    configure(executor,prover("eth-worker","eth",data),log_dir=data/"logs")
     assert app_message(executor,"remove-1",{"remove":True},app="eth")==({"removed":["eth-worker"]},None)
-    assert len([f for f in data.rglob("*") if f.is_file()])==3
+    assert len([f for f in data.rglob("*") if f.is_file()])==2
 
 
 def test_deleting_an_app_deletes_what_its_entries_held(executor,monkeypatch,tmp_path_factory):
-    """A deleted app's node deletes its replicas' logs, its worker's directory and the files of its proof
-    jobs in its proof storage. Its storage root, volumes and env file stay, and so does what isn't its own."""
+    """A deleted app's node deletes its replicas' logs and the files of its proof jobs in its proof
+    storage. Its storage root and volumes stay, and so does what isn't its own."""
     removable(monkeypatch)
     data=tmp_path_factory.mktemp("data")
-    files(data,"eth/run/checkpoint","eth/store/outputs/job-1/lease/proof.json","eth/store/outputs/job-2/lease/proof.json",
-          "eth/store/inputs/i1","eth/store/elf/e1","models/weights","worker.env","elsewhere/proof.json",
+    files(data,"eth/store/outputs/job-1/lease/proof.json","eth/store/outputs/job-2/lease/proof.json",
+          "eth/store/inputs/i1","eth/store/elf/e1","models/weights","elsewhere/proof.json",
           "logs/eth-worker-0.node.log","logs/eth-worker-0.node.log.cursor","logs/eth-worker-11.node.log",
           "logs/eth-worker-db-0.node.log","logs/eth-worker-db-0.node.log.cursor","logs/node.log")
-    configure(executor,worker("eth-worker","eth",data,worker_env_file=str(data/"worker.env"),volumes=[f"{data/'models'}:ro"]),
+    configure(executor,prover("eth-worker","eth",data,volumes=[f"{data/'models'}:ro"]),
               log_dir=data/"logs")
     listed=[str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1","eth/store/inputs/gone",
                                     "eth/store","elsewhere/proof.json")]
     result,error=app_message(executor,"remove-1",{"remove":True,"delete":{"keep":[],"files":listed}},app="eth")
     assert error is None and result["removed"]==["eth-worker"]
     assert sorted(result["deleted"])==sorted(str(data/p) for p in ("eth/store/outputs/job-1","eth/store/inputs/i1","eth/store/elf/e1",
-        "logs/eth-worker-0.node.log","logs/eth-worker-0.node.log.cursor","logs/eth-worker-11.node.log","eth/run"))
+        "logs/eth-worker-0.node.log","logs/eth-worker-0.node.log.cursor","logs/eth-worker-11.node.log"))
     assert result["kept"]==[{"path":str(data/p),"reason":"not in the app's proof storage on this node"} for p in ("eth/store","elsewhere/proof.json")]
     left=sorted(str(f.relative_to(data)) for f in data.rglob("*") if f.is_file())
     assert left==["elsewhere/proof.json","eth/store/outputs/job-2/lease/proof.json","logs/eth-worker-db-0.node.log",
                   "logs/eth-worker-db-0.node.log.cursor","logs/node.log",
-                  "models/weights","worker.env"]
+                  "models/weights"]
 
 
 def test_deleting_an_app_keeps_what_another_app_or_batch_uses(executor,monkeypatch,tmp_path_factory):
-    """Its worker's directory stays when it holds or lies in a path that another app or batch uses: on this
-    node, as its configuration says, or on another, as the scheduler says. So does one that is too close to
-    the root or holds fleet's own files."""
+    """A proof job's files stay when they hold a path that another app or batch uses: on this node, as
+    its configuration says, or on another, as the scheduler says. So does what is too close to the root
+    or holds fleet's own files."""
     removable(monkeypatch)
     data=tmp_path_factory.mktemp("data")
-    files(data,"web/run/state","shared/run/state")
+    files(data,"web/store/outputs/job-1/shared/state")
+    job,shared=str(data/"web/store/outputs/job-1"),str(data/"web/store/outputs/job-1/shared")
     cases=[
-        ({}, [worker("web-db","db",data,volumes=[str(data/"web")])], "batches: {}\n", f"another app or batch uses {data/'web'}"),
-        ({"keep":[str(data/"web/run/state")]}, [], "batches: {}\n", f"another app or batch uses {data/'web/run/state'}"),
-        ({}, [], f"batches:\n  render: {{image: a, allow: [{data}]}}\n", f"another app or batch uses {data}"),
+        ({}, [prover("web-db","db",data,volumes=[shared])], "batches: {}\n"),
+        ({"keep":[shared]}, [], "batches: {}\n"),
+        ({}, [], f"batches:\n  render: {{image: a, allow: [{shared}]}}\n"),
     ]
-    for n,(change,others,batches,reason) in enumerate(cases):
-        configure(executor,worker("web-gpu","web",data),*others)
+    for n,(change,others,batches) in enumerate(cases):
+        configure(executor,prover("web-gpu","web",data),*others)
         (executor.apps_file.parent/"batches.yaml").write_text(batches)
-        result,error=app_message(executor,f"remove-{n}",{"remove":True,"delete":change},app="web")
-        assert error is None and result["kept"]==[{"path":str(data/"web/run"),"reason":reason}], result
-        assert (data/"web/run/state").exists()
+        result,error=app_message(executor,f"remove-{n}",{"remove":True,"delete":{**change,"files":[job]}},app="web")
+        assert error is None and result["kept"]==[{"path":job,"reason":f"another app or batch uses {shared}"}], result
+        assert (data/"web/store/outputs/job-1/shared/state").exists()
     (executor.apps_file.parent/"batches.yaml").write_text("batches: {}\n")
-    for n,(workdir,reason) in enumerate([("/opt","too close to the root of the filesystem"),
-                                         (str(executor.jobs_dir.parent),f"holds or lies in fleet's own {executor.jobs_dir}")]):
-        configure(executor,{**worker("web-gpu","web",data),"worker_workdir":workdir})
-        executor.jobs_dir.mkdir(exist_ok=True)
-        result,error=app_message(executor,f"root-{n}",{"remove":True,"delete":{}},app="web")
-        assert result["kept"]==[{"path":workdir,"reason":reason}], result
+    executor.jobs_dir.mkdir(exist_ok=True)
+    own=str(executor.jobs_dir.parent)
+    for n,(root,path,reason) in enumerate([("/","/opt","too close to the root of the filesystem"),
+                                           (os.path.dirname(own),own,f"holds or lies in fleet's own {executor.jobs_dir}")]):
+        configure(executor,{**prover("web-gpu","web",data),"proof_storage_root":root})
+        result,error=app_message(executor,f"root-{n}",{"remove":True,"delete":{"files":[path]}},app="web")
+        assert result["kept"]==[{"path":path,"reason":reason}], result
     assert os.path.isdir("/opt") and executor.apps_file.exists()
 
 
@@ -537,7 +530,7 @@ def test_deleting_a_batch_deletes_its_jobs_directories(executor,monkeypatch):
     done=job_directory(executor,"job-done","render")
     unsure=job_directory(executor,"job-unsure","render",cleaned=False)
     other=job_directory(executor,"job-other","train")
-    monkeypatch.setattr(jobs,"_going",lambda _:False);monkeypatch.setattr(node,"container_gone",lambda _:False)
+    monkeypatch.setattr(jobs,"_going",lambda _:False);monkeypatch.setattr(node,"job_gone",lambda *_:False)
     result,error=app_message(executor,"remove-1",{"remove":True,"delete":{"jobs":["job-done","job-unsure","job-other","job-gone","../etc"]}},batch="render")
     assert error is None
     assert result=={"removed":["render"],"jobs_deleted":1,"kept":[
@@ -547,25 +540,27 @@ def test_deleting_a_batch_deletes_its_jobs_directories(executor,monkeypatch):
 
 
 def test_an_app_whose_cleanup_is_uncertain_stays_configured(executor,monkeypatch):
-    monkeypatch.setattr(reconcile,"stop",Mock());monkeypatch.setattr(actors,"clean_after",Mock())
-    monkeypatch.setattr(node.ray,"get",lambda *a,**k:None);monkeypatch.setattr(node,"container_gone",lambda _:False)
+    monkeypatch.setattr(reconcile,"stop",Mock(side_effect=RuntimeError("shim cleanup is not confirmed")))
     result,error=app_message(executor,"remove-1",{"remove":True},app="eth")
-    assert "uncertain" in error
+    assert "not confirmed" in error
     assert [s["name"] for s in yaml.safe_load(executor.apps_file.read_text())["apps"]]==["proof"]
 
 
 SETTINGS = """# machine config
+shim_binary: /opt/trusted-shim-runtime
+shim_state_dir: /var/lib/trusted-shim
 apps:
 # the web app
 - name: web # owner label
   kind: app
+  runtime: {executor: shim, driver: docker}
   namespace: zkm
   image: web:1
   env:
     A: "1"
     B: "2"
   replicas: 1
-- {name: other, kind: app, namespace: zkm, image: other:1}
+- {name: other, kind: app, runtime: {executor: shim, driver: docker}, namespace: zkm, image: other:1}
 """
 
 
@@ -576,7 +571,7 @@ def test_app_settings_are_written_without_touching_other_lines(executor):
     text=executor.apps_file.read_text()
     web,other=yaml.safe_load(text)["apps"]
     assert (web["image"],web["env"],web["shm_gb"],web["replicas"])==("web:2",{"A":"3"},8,1)
-    assert other=={"name":"other","kind":"app","namespace":"zkm","image":"other:1"}
+    assert other=={"name":"other","kind":"app","runtime":DOCKER,"namespace":"zkm","image":"other:1"}
     assert "# machine config" in text and "# the web app" in text and "owner label" in text
     assert app_message(executor,"set-2",{"set":{"image":"x:1"}},app="missing",ns="zkm")==({"updated":[]},None)
 
@@ -695,7 +690,7 @@ def test_appended_entries_stay_in_the_list_before_the_keys_after_it(tmp_path, te
 
 
 def test_create_adds_a_disabled_app_and_refuses_a_taken_name(executor):
-    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
+    entry={"name":"web","kind":"app","runtime":DOCKER,"namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100,"gpus":1}
     assert app_message(executor,"create-1",{"create":entry},app="web",ns="a"*32)==({"created":["web"]},None)
     assert yaml.safe_load(executor.apps_file.read_text())["apps"][-1]==entry
     result,error=app_message(executor,"create-2",{"create":entry},app="web",ns="a"*32)
@@ -706,7 +701,7 @@ def test_a_report_carries_a_create_done_only_with_its_entry(executor,monkeypatch
     """A create that finishes while a report is read is reported with its entry, in the next one."""
     monkeypatch.setattr(node.ray,"cluster_resources",lambda:{"GPU":8,"CPU":48})
     monkeypatch.setattr(node.ray,"available_resources",lambda:{"GPU":8,"CPU":48})
-    entry={"name":"web","kind":"app","namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100}
+    entry={"name":"web","kind":"app","runtime":DOCKER,"namespace":"a"*32,"disabled":True,"image":"web:1","port_base":50100}
     def running():
         # The create runs after this report read the configuration.
         if not (executor.journal/"create-1.json").exists():
@@ -721,8 +716,8 @@ def test_a_report_carries_a_create_done_only_with_its_entry(executor,monkeypatch
 
 
 def test_create_adds_a_prover_and_refuses_an_invalid_entry(executor):
-    prover={"name":"proofs","kind":"ziren-gpu","namespace":"a"*32,"disabled":True,"image":"ziren-gpu:1","elf_id":"b"*64}
-    assert app_message(executor,"create-1",{"create":prover},app="proofs",ns="a"*32)==({"created":["proofs"]},None)
+    entry=packaged(name="proofs",namespace="a"*32,disabled=True,elf_id="b"*64)
+    assert app_message(executor,"create-1",{"create":entry},app="proofs",ns="a"*32)==({"created":["proofs"]},None)
     before=executor.apps_file.read_text()
-    result,error=app_message(executor,"create-2",{"create":{**prover,"name":"other","elf_id":""}},app="other",ns="a"*32)
+    result,error=app_message(executor,"create-2",{"create":{**entry,"name":"other","elf_id":""}},app="other",ns="a"*32)
     assert error and "elf_id" in str(error) and executor.apps_file.read_text()==before

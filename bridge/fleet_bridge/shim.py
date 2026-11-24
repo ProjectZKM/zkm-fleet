@@ -1,7 +1,8 @@
-"""Local stdio adapter to trusted-shim. No scheduling, proof or Docker implementation.
+"""Local stdio adapter to trusted-shim, which runs every app replica and batch job.
+No scheduling, proof or Docker implementation.
 
-Only explicit shim selections enter this module. Persisted allocations
-choose their cleanup executable independently of the current apps.yaml.
+Persisted allocations choose their cleanup executable independently of the
+current apps.yaml.
 """
 from __future__ import annotations
 
@@ -20,20 +21,20 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Iterator
 
 import ray
 
-from . import actors
 from .model import AppReplicaSpec, AppRuntime, ControlPlaneConfig, ExecutorKind, Record, ReplicaHealth, RuntimeIdentity, ServiceProtocol, to_dict
 
 CAPABILITY = "shim-docker-v1"
 
-# How a launch request is formed. Revision 2 runs a Docker container the way the
-# legacy executor runs an app: `cpus` and `memory_gb` are Ray reservations, not
-# container limits, and a GPU app gets every NVIDIA driver capability. Revision 1
+# How a launch request is formed. Revision 2 runs a Docker container with `cpus`
+# and `memory_gb` as Ray reservations, not container limits, and gives a GPU app
+# every NVIDIA driver capability. Revision 1
 # sets them as hard limits and adds nothing to the environment. The shim replays
 # a launch only when the request is identical, so an allocation keeps the
 # revision it was launched with.
@@ -58,12 +59,29 @@ BATCH_FEATURES = ("runtime-run-to-completion-v1", "runtime-exit-status-v1", "run
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
-    # The full digest: persisted allocations compare against this exact value.
-    return actors.config_digest(spec)
+    """The full digest of the replica's own mapping from the apps file, which persisted
+    allocations compare against: a bridge upgrade never replaces a running app by
+    itself. Priority is scheduling metadata and does not require restarting a container."""
+    return hashlib.sha256(json.dumps({k: v for k, v in spec.config.items() if k != "priority"}, sort_keys=True).encode()).hexdigest()
 
 
-def selected(spec: AppReplicaSpec) -> bool:
-    return bool(spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM)
+def spec_hash(spec: AppReplicaSpec) -> str:
+    return binding_hash(spec)[:16]
+
+
+def _granted_gpus() -> list[str]:
+    gpus = [str(int(g)) for g in ray.get_gpu_ids()]
+    if not gpus:
+        raise RuntimeError("actor was granted no GPU")
+    return gpus
+
+
+def _http_ok(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return bool(r.status == 200)
+    except Exception:
+        return False
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
@@ -73,7 +91,7 @@ def required_capability(spec: AppReplicaSpec) -> str:
         if spec.app.service_protocol is ServiceProtocol.TCP:
             return "shim-openshell-tcp-services-v1"
         return "shim-openshell-services-v1" if spec.app.services else "shim-openshell-provisioning-v1"
-    if spec.app.runtime and spec.app.runtime.driver in ("tee", "tee-simulation"):
+    if spec.app.runtime.driver in ("tee", "tee-simulation"):
         return "shim-" + spec.app.runtime.driver + "-v1"
     if spec.app.service_protocol is ServiceProtocol.TCP:
         return "shim-tcp-v1"
@@ -98,14 +116,14 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
         required.add("shim-openshell-attachments-v1")
     if app.native_access and (app.ingress or "control" in app.services):
         required.add("shim-openshell-ingress-v1")
-    if app.runtime and app.runtime.driver == "docker":
+    if app.runtime.driver == "docker":
         required.add(CAPABILITY)
     if app.access_policy_sha256 is not None:
         required.add("shim-openshell-access-v1")
         if app.runtime.driver in ("tee", "tee-simulation"):
             required.add("shim-" + app.runtime.driver + "-v1")
         return required
-    if app.runtime and app.runtime.driver in ("docker", "tee", "tee-simulation"):
+    if app.runtime.driver in ("docker", "tee", "tee-simulation"):
         required.update(name for name, needed in (
             ("shim-network-v1", bool(app.services)),
             ("shim-runtime-v2", app.container_port is not None or app.entrypoint is not None),
@@ -244,9 +262,9 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
     except TimeoutError:
         if sent:
             raise ShimPending("shim daemon did not answer in time; the operation continues there") from None
-        raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
+        raise RuntimeError("shim daemon unavailable or rejected operation") from None
     except (OSError, ValueError, TypeError):
-        raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback") from None
+        raise RuntimeError("shim daemon unavailable or rejected operation") from None
 
 
 # A health probe's connector recovery must finish within the probe's own budget.
@@ -278,7 +296,7 @@ def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *
             input=json.dumps(to_dict(command)), capture_output=True, text=True, timeout=max(150, timeout or 0), check=True)
         return json.loads(result.stdout)
     except (OSError, ValueError, subprocess.SubprocessError):
-        raise RuntimeError("shim operation failed; no legacy fallback") from None
+        raise RuntimeError("shim operation failed") from None
 
 
 @dataclass(kw_only=True)
@@ -331,10 +349,6 @@ class RuntimeBook:
 
     def bind(self, spec: AppReplicaSpec, command_id: str | None) -> AppReplicaSpec:
         previous = self.read(spec.name)
-        if not selected(spec):
-            if previous and not previous.cleaned:
-                raise ValueError("previous shim allocation requires confirmed cleanup before switching executors")
-            return spec
         if not command_id:
             raise ValueError("shim launch requires a durable command id")
         if previous and not previous.cleaned:
@@ -405,7 +419,7 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     revision = spec.launch_revision
     # Explicit manifest substitution, shared by all containers. No credential
     # contents or worker-specific environment is injected into workloads.
-    # Revision 2 counts at least one CPU, as the legacy executor sets RAYON_NUM_THREADS.
+    # Revision 2 counts at least one CPU.
     fill = {**{k: v for k, v in to_dict(app).items() if isinstance(v, (str, int, float))},
         "port": app.container_port or port, "index": spec.index, "name": spec.name,
         "machine": socket.gethostname(), "gpu_count": len(gpus),
@@ -427,7 +441,7 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         trust.update(attestation={"mode": "required", "profile": tee.platform}, attestation_proof="required")
     environment = {k: v.format(**fill) for k, v in app.env.items()}
     if driver == "docker" and revision >= 2 and gpus and spec.kind is AppRuntime.APP:
-        # As the legacy executor runs a GPU app; the app's own value wins.
+        # The app's own value wins.
         environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
     return {"execution": spec.execution, "driver": driver, "image": app.image,
         **({"access_policy_sha256": app.access_policy_sha256} if app.access_policy_sha256 is not None else {}),
@@ -574,8 +588,7 @@ DOCKER_SOCKET = "/var/run/docker.sock"
 DOCKER = ("docker", f"--host=unix://{DOCKER_SOCKET}")
 # How long `docker image inspect` may take before the image counts as missing.
 IMAGE_CHECK_TIMEOUT_S = 30
-# A pull's own budget. As for a legacy app, whose `docker run` pulls before its
-# readiness clock starts, it is separate from the app's ready_timeout_s.
+# A pull's own budget, separate from the app's ready_timeout_s.
 PULL_TIMEOUT_S = 3600
 # The shim's Docker driver names each container after its allocation's slot.
 CONTAINER_NAME = re.compile(r"trusted-shim-[0-9a-f]{64}")
@@ -647,7 +660,7 @@ class _DockerConnection(http.client.HTTPConnection):
 
 class LogFollower:
     """Appends a container's stdout and stderr to the replica's node log, the file
-    `fleetctl app logs` reads, as a legacy app's node log holds its process output.
+    `fleetctl app logs` reads.
 
     A thread of this actor streams the container's log from the Docker daemon
     the shim uses, while the container runs, and stops with the actor. A cursor
@@ -778,7 +791,7 @@ class _ShimApp:
         # behind a fresh attestation admission.
         self.resumable = spec.cluster.shim_daemon and (docker and "shim-resume-v1" in supported
             or spec.app.runtime.driver in TEE_DRIVERS and "shim-resume-tee-v1" in supported)
-        self.gpus = actors._granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
+        self.gpus = _granted_gpus() if spec.app.gpus and spec.kind.takes_gpus else []
         request = launch_request(spec, self.gpus)
         status = self.launch(request, pull=docker)
         resumed = status.get("state") == "stopped" and self.resumable
@@ -904,14 +917,14 @@ class _ShimApp:
         ready = status.get("state") == "ready" and self.application_ready()
         if ready and self.resumes and time.monotonic() - self.resumed_at >= RESUME_STABLE_S:
             self.resumes, self.resume_at = 0, 0.0
-        return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
+        return ReplicaHealth(name=self.spec.name, spec=spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution,
             gpus=self.gpus, port=self.port, machine=socket.gethostname(),
             management_ready=status.get("state") == "ready", ready=ready).dump()
 
     def application_ready(self) -> bool:
         if self.spec.app.service_protocol is ServiceProtocol.HTTP1:
-            return actors._http_ok(self.health_url)
+            return _http_ok(self.health_url)
         try:
             with socket.create_connection(("127.0.0.1", self.port), timeout=3):
                 return True
@@ -927,7 +940,7 @@ class _ProvisionedApp:
     def __init__(self, spec: AppReplicaSpec) -> None:
         self.spec = spec
         # Reported to Fleet, which requires the native launch to attach exactly these.
-        self.gpus = actors._granted_gpus() if spec.app.gpus else []
+        self.gpus = _granted_gpus() if spec.app.gpus else []
         status = self.call("allocate")
         if status.get("phase") not in ("reserved", "authorizing", "dispatched", "created"):
             raise RuntimeError("native allocation requires explicit cleanup")
@@ -947,7 +960,7 @@ class _ProvisionedApp:
         # A local health verdict is independent of connector registration.
         # Fleet joins it with authenticated gateway policy readiness.
         ready = bool(self.spec.app.services and status.get("platform_ready") and status.get("application_ready"))
-        return ReplicaHealth(name=self.spec.name, spec=actors.spec_hash(self.spec), executor=ExecutorKind.SHIM,
+        return ReplicaHealth(name=self.spec.name, spec=spec_hash(self.spec), executor=ExecutorKind.SHIM,
             execution=self.spec.execution, machine=socket.gethostname(), ready=ready, gpus=self.gpus,
             native_observation_base64=status.get("native_observation_base64"),
             allocation_reserved=status.get("phase") in ("reserved", "authorizing", "dispatched", "created")).dump()

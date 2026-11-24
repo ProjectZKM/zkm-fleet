@@ -1999,31 +1999,3 @@ async fn an_agent_that_ends_its_session_hands_its_worker_to_the_next_at_once() {
     assert_eq!(agent.heartbeat(heartbeat("old")).await.unwrap_err().code(), tonic::Code::FailedPrecondition,
         "the ended session doesn't come back while the new one is active");
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn integrated_app_worker_rejects_sdk_jobs_in_its_own_namespace() {
-    use fleet_proto::fleet::v1::{worker_service_client::WorkerServiceClient, WorkerHeartbeatRequest,
-    };
-    let h = start().await;
-    create_namespace(&h, "alice", Some(serde_json::json!({"gpus":2,"cpus":8})));
-    let elf = artifacts::hash(b"elf");
-    let app = app_in("alice", &elf);
-    let (key, _, token) = namespace_token(&h, "alice", 94, &elf);
-    let channel = Channel::from_shared(format!("http://127.0.0.1:{}", h.control_port)).unwrap().connect().await.unwrap();
-    let mut agent = WorkerServiceClient::with_interceptor(channel, fleet_scheduler::token::BearerTokenInterceptor::new(TOKEN).unwrap(),
-    );
-    let report = serde_json::json!({"version":3,"machine":"test","ready":true,
-        "total_gpus":2,"total_cpus":8,"free_gpus":1,"free_cpus":6,"batches":{},
-        "apps":[{"name":"ethproofs","kind":"ziren-gpu","namespace":"alice",
-            "app":app,"elf_id":elf,"worker_command":["/opt/eth-proofs"],
-            "machine":"test","replicas":1,"gpus":1,"cpus":2,"ready":true,"disabled":false}]});
-    agent.heartbeat(WorkerHeartbeatRequest {worker_id:"integrated-worker".into(),session:"session".into(),
-            report: Some(serde_json::from_value(report).unwrap()),runtime_delivery_ready:false,proof_fetch_ready:false,
-        }).await.unwrap();
-    let (status, error) = submit(&h, &token, &app, &signed_request(&h, "owned-stream", b"elf", &key)).await;
-    assert_eq!(status, S::InvalidParameter as i32);
-    assert!(error.contains("owns its input stream"), "{error}");
-    assert_refused(&wait_done(&h, &token, &app, "owned-stream").await);
-    let (_, access) = user_http(&h, &token, "GET", "/access");
-    assert_eq!(serde_json::from_str::<serde_json::Value>(&access).unwrap()["usage"]["gpus"], 1.0);
-}

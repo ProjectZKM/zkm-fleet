@@ -3,12 +3,8 @@ scheduler: https://scheduler.example.com:8905
 # With a private CA, install.sh node --scheduler-ca copies it here and sets this.
 scheduler_ca_file: /etc/zkm-fleet/scheduler-ca.pem
 cluster_token_file: /etc/zkm-fleet/cluster.token
-# Legacy native provers (cpu-wrap below) run this binary. Release packages don't ship
-# it: build it with `cargo build --locked --release -p fleet-ziren-node`.
-node_binary: /opt/zkm-fleet/bin/fleet-ziren-node
 log_dir: /var/log/zkm-fleet
-gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
-# The persistent shim that runs packaged provers; install.sh node --with-shim sets these.
+# The persistent shim that runs every app and batch job; install.sh node --with-shim sets these.
 shim_binary: /opt/zkm-fleet/libexec/trusted-shim/SHA256/trusted-shim-runtime
 shim_state_dir: /opt/zkm-fleet/work/shim
 shim_daemon: true
@@ -16,8 +12,7 @@ shim_daemon: true
 apps:
   # Resources not reserved by enabled apps remain available to batch jobs.
   # A packaged SDK prover: the worker and its Ziren GPU server in one image built by
-  # deploy/build-proof-image.sh, run by the shim. deploy/migrate-proof-runtime.py
-  # writes these settings for an existing entry.
+  # deploy/build-proof-image.sh, run by the shim.
   - name: ethproofs-gpu
     kind: ziren-gpu
     namespace: ethproofs-user
@@ -78,12 +73,6 @@ apps:
     runtime: {executor: shim, driver: docker}
     port_base: 51000
     command: [agent, --port, "{port}", --threads, "{cpu_count}"]   # {cpu_count} is 1 here
-  # A legacy native CPU prover: it runs node_binary, so that binary must be installed.
-  - name: cpu-wrap
-    kind: ziren-cpu
-    replicas: 1
-    cpus: 16
-    memory_gb: 64
   # A GPU app on its own port: ComfyUI from a tree on the host. Replica i serves on
   # port_base + i; volumes are mounted at the same path inside, so the tree's venv,
   # model links and database URLs work unchanged (`:ro`, `:rslave` for NFS).
@@ -96,6 +85,7 @@ apps:
     gpus: 1
     cpus: 8
     image: zkm-fleet-comfyui:22.04
+    runtime: {executor: shim, driver: docker}
     user: "1000:1000"
     port_base: 50000
     health_path: /system_stats

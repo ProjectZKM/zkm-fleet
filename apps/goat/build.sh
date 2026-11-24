@@ -2,8 +2,8 @@
 # Packages the GOAT proof builder worker from the pinned third_party/bitvm-node source.
 #
 # The package holds proof-builder-rpc, programs.json (guest ELF digests, program IDs,
-# verifying-key hashes and the Fleet app id), fleet-app-id, source-revision and
-# SHA256SUMS. The build fails unless programs.json equals the supplied baseline.
+# verifying-key hashes and the Fleet app id), fleet-app-id, gpu-worker (the container's
+# entrypoint), source-revision and SHA256SUMS. The build fails unless programs.json equals the supplied baseline.
 # --new-baseline instead creates the baseline from this build, with the operator
 # verifying-key hash beside it as <baseline>.operator-vk-hash.
 set -euo pipefail
@@ -229,10 +229,11 @@ mv -- "$package_dir/programs.json.built" "$package_dir/programs.json"
 python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_id"])' \
   "$package_dir/programs.json" > "$package_dir/fleet-app-id"
 install -m 755 "$binary" "$package_dir/proof-builder-rpc"
+install -m 755 "$fleet_root/apps/gpu-worker.sh" "$package_dir/gpu-worker"
 git -C "$source_dir" rev-parse HEAD > "$package_dir/source-revision"
 if command -v sha256sum > /dev/null; then
-  (cd -- "$package_dir" && sha256sum proof-builder-rpc programs.json fleet-app-id > SHA256SUMS)
+  (cd -- "$package_dir" && sha256sum proof-builder-rpc programs.json fleet-app-id gpu-worker > SHA256SUMS)
 else
-  (cd -- "$package_dir" && shasum -a 256 proof-builder-rpc programs.json fleet-app-id > SHA256SUMS)
+  (cd -- "$package_dir" && shasum -a 256 proof-builder-rpc programs.json fleet-app-id gpu-worker > SHA256SUMS)
 fi
 echo "Packaged GOAT proof builder goat/$(cat "$package_dir/fleet-app-id") in $package_dir"

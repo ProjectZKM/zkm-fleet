@@ -56,7 +56,7 @@ async fn setup() -> (tempfile::TempDir, Arc<WorkloadController>, String) {
     (dir, control, namespace)
 }
 fn inventory(namespace: &str) -> NodeReport {
-    serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
+    serde_json::from_value(json!({"version":3,"machine":"machine","ready":true,"total_gpus":2,"total_cpus":8,"free_gpus":2,"free_cpus":8,"runtime_capabilities":["shim-docker-v1","shim-batch-v1"],"batches":{"training":{"image":"test","namespace":namespace,"priority":20,"max_gpus":2,"min_runtime_s":0}}})).unwrap()
 }
 
 #[tokio::test]
@@ -1740,48 +1740,15 @@ async fn obsolete_routes_and_nonlocal_log_ranks_are_refused() {
 }
 
 #[tokio::test]
-async fn integrated_workers_reserve_resources_reject_scaling_and_restore_admission_guard() {
+async fn a_setting_its_node_entry_drops_leaves_the_record() {
     let (_dir, c, ns) = setup().await;
-    let mut report = scale_inventory(&ns, true, false);
-    report.apps[0]["worker_command"] = json!(["/opt/eth-proofs"]);
+    let mut report = scale_inventory(&ns, false, false);
     report.apps[0]["machine"] = json!("machine");
-    report.apps[0]["replicas"] = json!(1);
-    c.report("gpu", "session", report).await.unwrap();
-    assert!(c.fleet.app_worker_owned(&ns, PROOF));
-    assert!(!c.fleet.app_worker_owned(&ns, "other"));
-    assert_eq!(c.fleet.usage(&ns).gpus, 1.0);
-    assert_eq!(c.fleet.usage(&ns).cpus, 2.0);
-    assert!(c.request_scale(&ns, PROOF, request_resources(json!({"replicas":2}))).await.is_err());
-    c.fleet.set_worker_owned_apps(HashSet::new());
-    let _restarted = WorkloadController::new(c.fleet.clone(), "cluster".into()).unwrap();
-    assert!(c.fleet.app_worker_owned(&ns, PROOF));
-}
-
-#[tokio::test]
-async fn integrated_worker_owner_must_be_cleaned_before_moving() {
-    let (_dir, c, ns) = setup().await;
-    let mut report = scale_inventory(&ns, true, false);
-    report.apps[0]["worker_command"] = json!(["/opt/eth-proofs"]);
-    report.apps[0]["replicas"] = json!(1);
-    let mut invalid = report.clone();
-    invalid.apps[0]["replicas"] = json!(2);
-    assert!(c.report("gpu", "session", invalid).await.is_err());
-    let mut duplicate = report.clone();
-    let mut another = duplicate.apps[0].clone();
-    another["name"] = json!("second");
-    duplicate.apps.push(another);
-    assert!(c.report("gpu", "session", duplicate).await.is_err());
     c.report("gpu", "session", report.clone()).await.unwrap();
-    assert!(c.report("other", "session", report.clone()).await.is_err());
-    let entry = report.apps[0].clone();
-    assert!(c.command("other", NodeOperation::SetApp,
-        json!({"app":entry,"disabled":false})).is_err());
-    c.inner.lock().deployments.get_mut("gpu-model").unwrap().disabled = true;
-    assert!(c.command("other", NodeOperation::SetApp,
-        json!({"app":entry,"disabled":false})).is_err());
-    c.fleet.release_job(&ns, "deployment:gpu-model").await.unwrap();
-    assert!(c.command("other", NodeOperation::SetApp,
-        json!({"app":entry,"disabled":false})).is_ok());
+    assert_eq!(c.inner.lock().deployments["gpu-model"].spec["machine"], "machine");
+    report.apps[0].as_object_mut().unwrap().remove("machine");
+    c.report("gpu", "session", report).await.unwrap();
+    assert!(c.inner.lock().deployments["gpu-model"].spec.get("machine").is_none(), "absent, not null");
 }
 
 #[tokio::test]
@@ -1868,7 +1835,7 @@ async fn a_starting_app_says_why_it_is_not_running() {
 }
 
 #[tokio::test]
-async fn enabling_an_integrated_worker_without_a_registered_app_keeps_heartbeats_accepted() {
+async fn enabling_a_prover_without_a_registered_app_keeps_heartbeats_accepted() {
     let (_dir,c,ns)=setup().await;
     let report=scale_inventory(&ns,true,true);
     assert!(!c.fleet.app_known(&ns, PROOF));
@@ -1927,51 +1894,6 @@ async fn a_scale_waiting_for_capacity_to_start_can_be_resized() {
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"cpus":2})).await.status(),StatusCode::CONFLICT,"a start already sent to the node must finish first");
 }
 
-/// One integrated worker (a dedicated proof server running the app's own worker).
-fn integrated_inventory(ns: &str) -> NodeReport {
-    let mut report=scale_inventory(ns,true,false);
-    report.apps[0]["worker_command"]=json!(["/opt/eth-proofs"]);
-    report.apps[0]["replicas"]=json!(1);
-    report.apps[0]["machine"]=json!("machine");
-    report
-}
-
-#[tokio::test]
-async fn one_conflicting_scale_defers_without_stalling_the_dispatch() {
-    let (_dir,c,ns)=setup().await;
-    // "gpu" keeps an integrated worker of `model` running: it owns the app.
-    c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
-    // "cpu" reports the same app disabled and cleaned, plus an unrelated plain app.
-    let mut report=integrated_inventory(&ns);
-    report.free_gpus=2.0;report.free_cpus=8.0;
-    report.apps[0]["disabled"]=json!(true);
-    report.apps[0]["cleaned"]=json!(true);
-    let mut other=report.apps[0].clone();
-    other["name"]=json!("other");
-    other["app"]=json!("other");
-    other["kind"]=json!("app");
-    other["worker_command"]=json!(null);
-    other["replicas"]=json!(1);
-    report.apps.push(other);
-    c.report("cpu","session",report).await.unwrap();
-    // Both deployments hold a start: `model` on cpu conflicts with the owner on gpu, `other` does not.
-    for key in ["cpu-model","cpu-other"] {
-        let mut i=c.inner.lock();
-        let intent=i.deployments.get_mut(key).unwrap();
-        let mut scale=scaling::new_scale(intent.spec.clone(),false);
-        scale.phase=fleet_proto::model::v1::ScalePhase::Starting as i32;
-        intent.scale=Some(scale);
-    }
-    // The conflict defers instead of stalling: the pass and the whole dispatch succeed, the
-    // conflicting start is still uncreated, and the other app's start was created.
-    c.advance_scales().await.unwrap();
-    c.dispatch().await.unwrap();
-    let i=c.inner.lock();
-    let stuck=i.deployments["cpu-model"].scale.as_ref().unwrap();
-    assert!(stuck.pending() && stuck.start.is_none());
-    assert!(i.deployments["cpu-other"].scale.as_ref().unwrap().start.is_some());
-}
-
 #[tokio::test]
 async fn a_start_whose_deployment_went_away_is_retired_before_it_places_the_app() {
     let (_dir,c,ns)=setup().await;
@@ -2007,7 +1929,7 @@ async fn a_start_whose_deployment_went_away_is_retired_before_it_places_the_app(
 async fn a_disabled_app_its_node_stopped_reporting_is_forgotten() {
     let (_dir,c,ns)=setup().await;
     let record=c.dir.join("deployments").join("gpu-model.json");
-    c.report("gpu","session",integrated_inventory(&ns)).await.unwrap();
+    c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
     c.report("gpu","session",inventory(&ns)).await.unwrap();
     assert!(c.inner.lock().deployments.contains_key("gpu-model") && record.exists(),"an enabled app may only be missing for now");
     c.inner.lock().deployments.get_mut("gpu-model").unwrap().disabled=true;
@@ -2282,7 +2204,8 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
 #[tokio::test]
 async fn shim_capability_does_not_migrate_existing_apps() {
     let (_dir,c,ns)=setup().await;
-    let report=scale_inventory(&ns,false,false);
+    let mut report=scale_inventory(&ns,false,false);
+    report.runtime_capabilities.clear();
     c.report("gpu","session",report.clone()).await.unwrap();
     let before=c.inner.lock().deployments["gpu-model"].clone();
     let commands=c.inner.lock().commands.len();
@@ -2311,7 +2234,9 @@ async fn shim_capability_does_not_migrate_existing_apps() {
 #[tokio::test]
 async fn shim_placement_and_pending_commands_require_explicit_node_capability() {
     let (_dir,c,ns)=setup().await;
-    c.report("old","old-session",inventory(&ns)).await.unwrap();
+    let mut old=inventory(&ns);
+    old.runtime_capabilities.clear();
+    c.report("old","old-session",old).await.unwrap();
     let entry=json!({"name":"web","app":"web","namespace":ns,"kind":"app","gpus":0,"cpus":1,"replicas":1,
         "runtime":{"executor":"shim","driver":"docker"}});
     assert!(c.place_app(Entry(&entry),&[]).is_err());
@@ -2324,7 +2249,7 @@ async fn shim_placement_and_pending_commands_require_explicit_node_capability() 
         let mut i=c.inner.lock();let mut command=i.commands[&id].clone();command.admitted=true;i.commands.insert(id.clone(),command);
         assert_eq!(heartbeat_commands(&i,"new").len(),1);
         i.workers.get_mut("new").unwrap().report.runtime_capabilities.clear();
-        assert!(heartbeat_commands(&i,"new").is_empty(), "downgrade cannot execute a queued shim command as legacy");
+        assert!(heartbeat_commands(&i,"new").is_empty(), "a node that lost the capability gets no queued shim command");
         assert!(!i.commands[&id].done, "retain the original command and allocation");
         let mut command=i.commands[&id].clone(); command.done=true; i.commands.insert(id.clone(),command);
     }
@@ -2411,31 +2336,32 @@ async fn a_batch_update_is_checked_kept_by_the_scheduler_and_sent_to_its_nodes()
 }
 
 #[tokio::test]
-async fn a_batch_on_the_shim_places_its_jobs_only_where_the_shim_runs_batch_jobs() {
+async fn a_batch_places_its_jobs_only_where_the_shim_runs_batch_jobs() {
     let (_dir,c,ns)=setup().await;
     let mut batch=json!({"image":"t:1","namespace":ns,"priority":0,"user":null,"max_gpus":2,
         "default_gpu_mem_gb":0,"shm_gb":16,"allow":[],"env":{},"disabled":false,"preemptible":true,
         "min_runtime_s":0,"stop_timeout_s":30});
     let mut report=inventory(&ns);
+    report.runtime_capabilities.clear();
     report.batches.insert("trainer".into(),batch.clone().into());
     c.report("gpu","session",report.clone()).await.unwrap();
     let path=format!("/batches/trainer/settings?namespace={ns}");
     let on_shim=json!({"executor":"shim","driver":"docker"});
-    for bad in [json!("shim"),json!({"executor":"shim"}),json!({"executor":"shim","driver":"tee"}),json!({"executor":"legacy","driver":"docker"})] {
+    for bad in [json!("shim"),json!({"executor":"shim"}),json!({"executor":"shim","driver":"tee"}),json!({"executor":"legacy"})] {
         assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":bad})).await.status(),StatusCode::BAD_REQUEST,"{bad}");
     }
     let owner=user_token(&c,&ns,0x7a,"scope=default",Some(vec!["trainer".into()]),true).await;
     assert_eq!(scale_call(c.clone(),&owner,"PUT",&path,json!({"runtime":on_shim})).await.status(),StatusCode::FORBIDDEN);
     let request=json!({"command":["true"],"gpus":0,"cpus":1});
     let id=|job: Value| text(&job,"id").to_string();
-    let legacy=id(c.submit("trainer",request.clone(),None,&BTreeMap::new()).await.unwrap());
+    let unset=id(c.submit("trainer",request.clone(),None,&BTreeMap::new()).await.unwrap());
     assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":on_shim})).await.status(),StatusCode::OK);
     let shim=id(c.submit("trainer",request.clone(),None,&BTreeMap::new()).await.unwrap());
     let job=|id: &str| c.job(id,None,&BTreeMap::new()).unwrap();
-    assert!(job(&legacy).policy["runtime"].is_null() && job(&shim).policy["runtime"]==on_shim,"a job keeps the runtime it was submitted with");
-    // The node's shim does not run batch jobs yet: only the job on the legacy executor goes there.
+    assert!(job(&unset).policy["runtime"].is_null() && job(&shim).policy["runtime"]==on_shim,"a job keeps the settings it was submitted with");
+    // The node's shim does not run batch jobs yet: neither job goes there, with or without the setting.
     c.dispatch().await.unwrap();
-    assert_eq!((job(&legacy).worker.as_deref(),job(&shim).worker.as_deref()),(Some("gpu"),None));
+    assert_eq!((job(&unset).worker.as_deref(),job(&shim).worker.as_deref()),(None,None));
     assert_eq!(job(&shim).status["detail"],"waiting for a node whose shim runs batch jobs");
     let written=fs::metadata(c.dir.join("jobs").join(format!("{shim}.json"))).unwrap().modified().unwrap();
     c.dispatch().await.unwrap();
@@ -2445,12 +2371,8 @@ async fn a_batch_on_the_shim_places_its_jobs_only_where_the_shim_runs_batch_jobs
     report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-batch-v1".into()];
     c.report("gpu","session",report).await.unwrap();
     c.dispatch().await.unwrap();
-    assert_eq!(job(&shim).worker.as_deref(),Some("gpu"));
-    let launch=command_where(&c,|cmd|cmd.operation==NodeOperation::LaunchJob as i32&&cmd.parameters["id"]==shim.as_str()).unwrap();
-    assert_eq!(launch.parameters["policy"]["runtime"],on_shim,"the node learns the runtime from the job's policy");
-    for back in [json!({"executor":"legacy"}),Value::Null] {
-        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":back})).await.status(),StatusCode::OK);
-    }
+    assert!(job(&unset).worker.as_deref()==Some("gpu") && job(&shim).worker.as_deref()==Some("gpu"));
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":null})).await.status(),StatusCode::OK);
     assert!(c.inner.lock().apps["trainer"].spec["runtime"].is_null());
     // A new batch takes it too, from an administrator.
     let create=format!("/batches?namespace={ns}");
@@ -2707,8 +2629,8 @@ async fn an_app_on_no_node_takes_and_checks_settings_in_its_template() {
     // What a placed app's settings refuse, these refuse too.
     assert_eq!(settings("&dry_run=true", json!({"image":""})).await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(settings("&dry_run=true", json!({"gpus":2})).await.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(settings("&dry_run=true", json!({"runtime":{"executor":"shim","driver":"docker"}})).await.status(), StatusCode::CONFLICT,
-        "no node runs the shim");
+    assert_eq!(settings("&dry_run=true", json!({"runtime":{"executor":"shim","driver":"tee"}})).await.status(), StatusCode::CONFLICT,
+        "no node runs that driver");
     assert_eq!(settings("&node=gpu", json!({"image":"serve:2"})).await.status(), StatusCode::NOT_FOUND, "it is on no node");
     // The settings wait in the app; no node is told until it is enabled.
     assert_eq!(settings("", json!({"image":"serve:2","env":{"MODE":"restore"}})).await.status(), StatusCode::ACCEPTED);
@@ -2737,8 +2659,8 @@ async fn an_app_is_created_on_no_node_and_placed_when_enabled() {
         StatusCode::BAD_REQUEST, "the scheduler picks the node");
     let (node, entry) = deployed(&c, &ns, "model").await.unwrap();
     assert_eq!((node.as_str(), entry), ("gpu", json!({"name":"model","kind":"app","namespace":ns,"disabled":true,"priority":0,
-        "replicas":1,"gpus":1,"cpus":2,"image":"serve:1","port_base":50100,"health_path":"/health",
-        "command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}})));
+        "replicas":1,"gpus":1,"cpus":2,"runtime":{"executor":"shim","driver":"docker"},"image":"serve:1","port_base":50100,
+        "health_path":"/health","command":["serve","--port","{port}"],"env":{"HF_HUB_OFFLINE":"1"}})), "on the shim's Docker driver unless its spec selects another");
     assert_eq!(c.inner.lock().apps["model"].workers, ["gpu"]);
     assert!(c.inner.lock().deployments.contains_key("gpu-model"), "enabling it starts that deployment");
     c.deploy(&ns, "model").await.unwrap();
@@ -2752,7 +2674,9 @@ async fn an_app_is_created_on_no_node_and_placed_when_enabled() {
 #[tokio::test]
 async fn a_proof_app_is_an_app_whose_container_proves_its_program() {
     let (_dir, c, ns) = setup().await;
-    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let mut node = inventory(&ns);
+    node.runtime_capabilities.extend(["shim-prover-v1", "shim-runtime-v2", "shim-automatic-port-v1"].map(String::from));
+    c.report("gpu", "session", node).await.unwrap();
     let body = json!({"name":"eth","namespace":ns,"priority":5,"spec":{"image":"ziren-gpu:1","gpus":1,"proof_storage_root":"/proofs"},
         "proof":{"elf_id":"AB".repeat(32),"class":"latency"}});
     assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
@@ -3241,8 +3165,7 @@ async fn an_unreserved_app_places_by_memory_on_a_node_that_caps_it_and_counts_no
         (json!({"memory_limit_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
         (json!({"gpus":1}), "only for a kind: app without GPUs"),
         (json!({"gpus":null}), "only for a kind: app without GPUs"),
-        (json!({"runtime":null}), "the legacy executor doesn't enforce them"),
-        (json!({"runtime":{"executor":"legacy"}}), "the legacy executor doesn't enforce them"),
+        (json!({"runtime":{"executor":"legacy"}}), "runtime must select shim"),
         (json!({"cpus":3}), "cpu_limit (2) must be at least cpus (3)"),
         (json!({"memory_gb":4}), "memory_limit_gb (2) must be at least memory_gb (4)"),
         (json!({"memory_limit_gb":0.005}), "at least 6 MiB"),
@@ -3345,7 +3268,7 @@ async fn a_scale_sets_hard_limits_only_where_the_node_enforces_them() {
     c.report("gpu", "session", report.clone()).await.unwrap();
     let refused = c.request_scale(&ns, "model", request_resources(json!({"cpu_limit":3}))).await.unwrap_err();
     assert_eq!(status_of(&refused), 400);
-    assert!(refused.to_string().contains("legacy executor doesn't enforce them"), "{refused}");
+    assert!(refused.to_string().contains("need runtime {executor: shim}"), "{refused}");
     let (_dir, c, ns) = setup().await;
     report.apps[0]["namespace"] = json!(ns);
     report.apps[0]["runtime"] = json!({"executor":"shim","driver":"docker"});

@@ -143,7 +143,6 @@ pub struct Scheduler {
     /// The registered proof apps, (namespace, name) -> record, mirrored from the store. A job
     /// executes only for one of them.
     apps: Mutex<HashMap<(String, String), App>>,
-    worker_owned_apps: Mutex<HashSet<(String, String)>>,
     wake: Notify,
     started: Instant,
     stopping: AtomicBool,
@@ -205,7 +204,6 @@ impl Scheduler {
             durable_hold: tokio::sync::RwLock::new(()),
             quota_ops: tokio::sync::Mutex::new(()),
             apps: Mutex::new(HashMap::new()),
-            worker_owned_apps: Mutex::new(HashSet::new()),
             wake: Notify::new(),
             started: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -238,14 +236,6 @@ impl Scheduler {
     /// Whether the app refuses new jobs.
     pub fn app_disabled(&self, namespace: &str, name: &str) -> bool {
         self.app(namespace, name).is_some_and(|a| a.disabled)
-    }
-
-    pub(crate) fn set_worker_owned_apps(&self, apps: HashSet<(String, String)>) {
-        *self.worker_owned_apps.lock() = apps;
-    }
-
-    pub(crate) fn app_worker_owned(&self, namespace: &str, name: &str) -> bool {
-        self.worker_owned_apps.lock().contains(&(namespace.into(), name.into()))
     }
 
     pub fn app_priority(&self, namespace: &str, name: &str) -> i32 {
@@ -847,10 +837,6 @@ impl Scheduler {
             .iter()
             .find(|a| a.namespace == namespace && a.name == name)
             .ok_or_else(|| refuse(404, format!("no app {name}")))?;
-        // Its dedicated worker would keep the node's GPUs with no app left to serve.
-        if self.app_worker_owned(namespace, name) {
-            return Err(refuse(409, format!("app {name} still has a dedicated worker; disable it first: fleetctl app disable {name}")));
-        }
         let live = self
             .inner
             .lock()

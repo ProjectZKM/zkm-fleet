@@ -521,9 +521,8 @@ impl RegisterAppRequest {
                 && spec.contains_key("container_port")
                 && spec.get("services").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
                 && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
-                && spec.get("service_protocol").is_none_or(|v| v == "http1")
-                && spec.get("worker_command").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
-                "packaged provers require shim Docker, a private HTTP health port and an image-owned worker");
+                && spec.get("service_protocol").is_none_or(|v| v == "http1"),
+                "packaged provers require shim Docker and a private HTTP health port");
         }
         if let Some(hash) = spec.get("access_policy_sha256") {
             anyhow::ensure!(hash.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -630,7 +629,7 @@ impl RegisterAppRequest {
             anyhow::ensure!(!entry.native_access(),
                 "cpu_limit and memory_limit_gb don't apply to a native OpenShell app: its cpus and memory_gb are its limits");
             anyhow::ensure!(shim,
-                "cpu_limit and memory_limit_gb need runtime {{executor: shim}} with driver docker, tee or tee-simulation: the legacy executor doesn't enforce them");
+                "cpu_limit and memory_limit_gb need runtime {{executor: shim}} with driver docker, tee or tee-simulation");
         }
         let cpus = entry.cpus();
         anyhow::ensure!(cpus.is_finite() && (0.0..=Self::MAX_CPUS).contains(&cpus), "cpus must be a number from 0 to {}", Self::MAX_CPUS);
@@ -659,10 +658,9 @@ impl RegisterAppRequest {
     }
 
     pub fn validate_runtime(runtime: &Value) -> anyhow::Result<()> {
-        anyhow::ensure!(runtime == &serde_json::json!({"executor":"legacy"})
-            || Self::local_container_runtime(Some(runtime))
+        anyhow::ensure!(Self::local_container_runtime(Some(runtime))
             || runtime == &serde_json::json!({"executor":"shim", "driver":"openshell"}),
-            "runtime must select legacy or shim with driver docker, openshell, tee or tee-simulation; trust parameters are node-owned");
+            "runtime must select shim with driver docker, openshell, tee or tee-simulation; trust parameters are node-owned");
         Ok(())
     }
 
@@ -671,6 +669,16 @@ impl RegisterAppRequest {
     pub fn kind(&self) -> &str {
         self.spec.get("kind").and_then(Value::as_str)
             .unwrap_or(if self.proof.is_some() { "ziren-gpu" } else { "app" })
+    }
+
+    /// What a spec of this kind leaves unset: the shim's Docker driver, and for a prover its
+    /// packaged worker's health port on a host port the shim picks.
+    pub fn defaults(kind: &str) -> serde_json::Map<String, Value> {
+        let mut defaults = serde_json::json!({"runtime":{"executor":"shim","driver":"docker"}});
+        if kind != "app" {
+            (defaults["port_base"], defaults["container_port"]) = (0.into(), 8080.into());
+        }
+        defaults.as_object().cloned().unwrap_or_default()
     }
 
     /// That the spec is an object of known, well-typed settings for its kind, and that a
@@ -685,14 +693,13 @@ impl RegisterAppRequest {
         );
         let spec = self.spec.as_object().ok_or_else(|| anyhow::anyhow!("spec must be a JSON object of settings"))?;
         let kind = self.kind();
-        let packaged = kind != "app" && spec.get("runtime") == Some(&serde_json::json!({"executor":"shim","driver":"docker"}));
-        let own: &[&str] = match kind {
-            "app" => &Self::CONTAINER_SETTINGS,
-            "ziren-gpu" | "ziren-cpu" => &Self::PROVER_SETTINGS,
+        // A prover is a container too, with its storage and proving settings.
+        let own = match kind {
+            "app" => Self::CONTAINER_SETTINGS.to_vec(),
+            "ziren-gpu" | "ziren-cpu" => [&Self::PROVER_SETTINGS[..], &Self::CONTAINER_SETTINGS[..]].concat(),
             _ => anyhow::bail!("kind must be app, ziren-gpu or ziren-cpu"),
         };
-        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str()) && !own.contains(&k.as_str())
-            && !(packaged && Self::CONTAINER_SETTINGS.contains(&k.as_str()))) {
+        if let Some(key) = spec.keys().find(|k| !Self::SPEC_SETTINGS.contains(&k.as_str()) && !own.contains(&k.as_str())) {
             anyhow::bail!("unknown setting {key} for a {kind} app; it takes {}, {}", Self::SPEC_SETTINGS.join(", "), own.join(", "));
         }
         anyhow::ensure!(
@@ -707,14 +714,13 @@ impl RegisterAppRequest {
             set("image").and_then(Value::as_str).is_some_and(|i| !i.is_empty() && !i.starts_with('-')),
             "image is required"
         );
-        if (kind == "app" || packaged) && !crate::workload::Entry(&self.spec).native_access() {
+        if kind == "app" && !crate::workload::Entry(&self.spec).native_access() {
             anyhow::ensure!(set("port_base").is_some(), "port_base is required: replica i serves on port_base + i");
         }
-        if let Some(runtime) = spec.get("runtime") {
-            Self::validate_runtime(runtime)?;
-        }
-        let mut execution = spec.clone();
+        let mut execution = Self::defaults(kind);
+        execution.extend(spec.clone());
         execution.insert("kind".into(), Value::String(kind.into()));
+        Self::validate_runtime(&execution["runtime"])?;
         Self::validate_transport(&execution)?;
         let strings = |v: &Value| v.as_array().is_none_or(|a| a.iter().any(|v| !v.is_string()));
         let positive = |v: &Value| v.as_f64().is_none_or(|v| v <= 0.0 || !v.is_finite());
@@ -750,7 +756,7 @@ mod tests {
         request.validate().unwrap();
         let entry = crate::workload::Entry(&request.spec);
         assert!(entry.is_prover());
-        assert!(!entry.holds_allocation(), "SDK proof jobs retain their existing per-job quota accounting");
+        assert!(!entry.is_container(), "SDK proof jobs retain their existing per-job quota accounting");
         assert_eq!(entry.runtime_capability(), Some("shim-prover-v1"));
         let mut report = NodeReport::default();
         report.runtime_capabilities = vec!["shim-docker-v1".into(),"shim-runtime-v2".into(),"shim-automatic-port-v1".into()];
@@ -759,7 +765,7 @@ mod tests {
         assert!(report.supports_runtime(entry));
         for key in ["port_base", "container_port"] {
             let mut bad = source.clone();
-            bad["spec"].as_object_mut().unwrap().remove(key);
+            bad["spec"][key] = Value::Null;
             assert!(serde_json::from_value::<RegisterAppRequest>(bad).unwrap().validate().is_err());
         }
         for explicit_kind in [true, false] {
@@ -855,7 +861,7 @@ mod tests {
         let good = json!({"runtime":{"executor":"shim","driver":"docker"},"services":["ssh","control"],"service_protocol":"tcp"});
         RegisterAppRequest::validate_transport(good.as_object().unwrap()).unwrap();
         assert_eq!(crate::workload::Entry(&good).runtime_capability(), Some("shim-tcp-v1"));
-        for (field,value) in [("service_protocol",json!("udp")),("runtime",json!({"executor":"legacy"})),
+        for (field,value) in [("service_protocol",json!("udp")),("runtime",Value::Null),
             ("services",json!(["control"])),("ingress",json!({"ssh":{}}))] {
             let mut bad=good.clone(); bad[field]=value;
             assert!(RegisterAppRequest::validate_transport(bad.as_object().unwrap()).is_err());
@@ -1087,17 +1093,17 @@ mod tests {
 
     #[test]
     fn runtime_selection_is_explicit_and_rejects_unsupported_trust_options() {
-        for runtime in [json!({"executor":"legacy"}),json!({"executor":"shim","driver":"docker"}),json!({"executor":"shim","driver":"openshell"})] {
+        for runtime in [json!({"executor":"shim","driver":"docker"}),json!({"executor":"shim","driver":"openshell"})] {
             RegisterAppRequest::validate_runtime(&runtime).unwrap();
         }
-        for runtime in [Value::Null,json!("shim"),json!({"executor":"shim","driver":"unknown"}),
+        for runtime in [Value::Null,json!("shim"),json!({"executor":"legacy"}),json!({"executor":"shim","driver":"unknown"}),
             json!({"executor":"shim","driver":"docker","policy_proof":"required"})] {
             assert!(RegisterAppRequest::validate_runtime(&runtime).is_err());
         }
-        let legacy: NodeReport=serde_json::from_value(json!({"version":3,"machine":"m","ready":true,
+        let bare: NodeReport=serde_json::from_value(json!({"version":3,"machine":"m","ready":true,
             "total_gpus":0,"total_cpus":1,"free_gpus":0,"free_cpus":1})).unwrap();
-        assert!(legacy.supports_runtime(crate::workload::Entry(&json!({}))));
-        assert!(!legacy.supports_runtime(crate::workload::Entry(&json!({"runtime":{"executor":"shim","driver":"docker"}}))));
+        assert!(bare.supports_runtime(crate::workload::Entry(&json!({}))));
+        assert!(!bare.supports_runtime(crate::workload::Entry(&json!({"runtime":{"executor":"shim","driver":"docker"}}))));
     }
 
     #[test]
@@ -1105,11 +1111,12 @@ mod tests {
         let app = |body: Value| -> anyhow::Result<()> {
             serde_json::from_value::<RegisterAppRequest>(body)?.validate()
         };
-        let container = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"}});
+        let runtime = json!({"executor":"shim","driver":"docker"});
+        let container = json!({"image":"serve:1","port_base":50100,"gpus":2,"replicas":1,"command":["serve","{port}"],"env":{"A":"1"},"runtime":runtime});
         app(json!({"name":"model","spec":container})).unwrap();
         for (key, value) in [("gpus", json!("2")), ("replicas", json!(0)), ("port_base", json!(-1)), ("port_base", Value::Null),
             ("image", Value::Null), ("workdir", json!(1)), ("env", json!({"A":1})), ("kind", json!("vm")),
-            ("proof_storage_root", json!("/proofs")), ("name", json!("x"))] {
+            ("proof_storage_root", json!("/proofs")), ("name", json!("x")), ("runtime", json!({"executor":"legacy"}))] {
             let mut spec = container.clone();
             spec[key] = value;
             assert!(app(json!({"name":"model","spec":spec})).is_err(), "{key}");
@@ -1119,9 +1126,14 @@ mod tests {
         app(json!({"name":"eth","spec":prover,"proof":proof})).unwrap();
         app(json!({"name":"eth","spec":{"kind":"ziren-cpu","image":"ziren-cpu:1","gpus":0},"proof":proof})).unwrap();
         assert!(app(json!({"name":"eth","spec":prover})).is_err(), "a prover proves a program");
-        assert!(app(json!({"name":"model","spec":container,"proof":proof})).is_err(), "a container app proves none");
-        assert!(app(json!({"name":"eth","spec":{"image":"ziren-gpu:1","port_base":1},"proof":proof})).is_err(),
-            "a prover takes no container settings");
+        let mut plain = container.clone();
+        plain["kind"] = json!("app");
+        assert!(app(json!({"name":"model","spec":plain,"proof":proof})).is_err(), "a container app proves none");
+        for (key, value) in [("services", json!(["http"])), ("runtime", json!({"executor":"shim","driver":"tee"})), ("container_port", Value::Null)] {
+            let mut spec = prover.clone();
+            spec[key] = value;
+            assert!(app(json!({"name":"eth","spec":spec,"proof":proof})).is_err(), "a prover has only its health port, on shim Docker: {key}");
+        }
         assert!(app(json!({"name":"eth","elf_id":"ab".repeat(32)})).is_err(), "an app is created from its spec");
         assert!(app(json!({"name":"model","node":"gpu","spec":container})).is_err(), "the scheduler picks the node");
     }
@@ -1175,7 +1187,7 @@ mod tests {
             validate(spec).unwrap();
         }
         // Without one, nothing changes: a whole reservation, no limit.
-        validate(json!({"image":"web:1","port_base":50100,"cpus":2})).unwrap();
+        validate(json!({"image":"web:1","port_base":50100,"cpus":2,"runtime":{"executor":"shim","driver":"docker"}})).unwrap();
         validate(json!({"image":"web:1","port_base":50100,"cpus":2,"cpu_limit":2.5,"runtime":{"executor":"shim","driver":"docker"}})).unwrap();
         let refused = |change: Value| {
             let mut spec = capped.clone();
@@ -1185,7 +1197,6 @@ mod tests {
             validate(spec).unwrap_err().to_string()
         };
         for (change, message) in [
-            (json!({"runtime":null}), "the legacy executor doesn't enforce them"),
             (json!({"runtime":{"executor":"shim","driver":"openshell"},"cpus":1,"port_base":null}), "don't apply to a native OpenShell app"),
             (json!({"cpu_limit":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
             (json!({"memory_gb":null}), "also set cpu_limit, memory_gb and memory_limit_gb"),
@@ -1209,9 +1220,10 @@ mod tests {
         prover.insert("kind".into(), json!("ziren-cpu"));
         let error = RegisterAppRequest::validate_resources(&prover).unwrap_err().to_string();
         assert!(error.contains("only for a kind: app without GPUs"), "{error}");
-        // A legacy or GPU app keeps whole CPUs.
-        assert!(validate(json!({"image":"web:1","port_base":50100,"cpus":0.5})).is_err());
-        assert!(validate(json!({"image":"web:1","port_base":50100,"cpus":0})).is_err());
+        // An app without the limits keeps whole CPUs.
+        for cpus in [0.5, 0.0] {
+            assert!(validate(json!({"image":"web:1","port_base":50100,"cpus":cpus,"runtime":{"executor":"shim","driver":"docker"}})).is_err());
+        }
         // The smallest hard limits shim accepts are accepted.
         let mut spec = capped.clone(); (spec["cpu_limit"], spec["memory_gb"], spec["memory_limit_gb"]) = (json!(0.01), json!(0.005859375), json!(0.005859375));
         validate(spec).unwrap();

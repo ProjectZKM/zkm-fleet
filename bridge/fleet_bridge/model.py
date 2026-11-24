@@ -158,19 +158,6 @@ def merge(obj: D, **changes: Any) -> D:
     return dataclasses.replace(obj, **coerced)
 
 
-def to_env(obj: Any) -> dict[str, str]:
-    """Environment variables from a record whose fields carry `metadata={"env": NAME}`;
-    None is left out."""
-    out: dict[str, str] = {}
-    for f in fields(obj):
-        name = f.metadata.get("env")
-        value = getattr(obj, f.name)
-        if not name or value is None:
-            continue
-        out[name] = json.dumps(value) if isinstance(value, bool) else str(to_dict(value))  # true/false, as a parser expects
-    return out
-
-
 # ── records ──────────────────────────────────────────────────────────────────
 
 @dataclass(kw_only=True)
@@ -278,19 +265,14 @@ class Batch(Record):
     min_runtime_s: int = 300
     # SIGTERM, then SIGKILL this much later: on cancel and on preemption (time to checkpoint).
     stop_timeout_s: int = 30
-    # What runs the batch's jobs: the bridge's own `docker run` (None or legacy), or the
-    # shim's Docker driver, as a run to completion.
+    # A batch's jobs run through the shim's Docker driver, each as a run to completion.
     runtime: RuntimeSelection | None = None
 
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
-        if self.on_shim and self.runtime.driver != "docker":
-            raise ModelError("a batch runs on the legacy executor or on shim docker")
-
-    @property
-    def on_shim(self) -> bool:
-        return self.runtime is not None and self.runtime.executor is ExecutorKind.SHIM
+        if self.runtime is not None and self.runtime.driver != "docker":
+            raise ModelError("a batch's jobs run through the shim's Docker driver")
 
 
 @dataclass(kw_only=True)
@@ -336,9 +318,6 @@ class JobSpec(Record):
     @property
     def log_path(self) -> str:
         return self.log or os.path.join(os.path.dirname(self.out), "log")
-
-    def rank_log_path(self, rank: int) -> str:
-        return self.log_path if rank == 0 else f"{self.log_path}.rank{rank}"
 
 
 @dataclass(kw_only=True)
@@ -431,13 +410,6 @@ class JobStatus(Record):
     # filled in by `status` for the reader, never stored
     metrics: dict[str, Any] | None = None
     out: str | None = None
-
-    def places(self) -> list[TaskPlacement]:
-        """Every rank's place (rank 0's from the top-level fields for a single-node job)."""
-        if self.ranks:
-            return self.ranks
-        return [TaskPlacement(rank=0, machine=self.machine or "", node_ip=self.node_ip or "", gpus=self.gpus,
-                         container=self.container or "")]
 
 
 # ── apps ─────────────────────────────────────────────────────────────────────
@@ -534,9 +506,7 @@ class ControlPlaneConfig(Record):
     scheduler: str | None = None
     scheduler_ca_file: str | None = None
     cluster_token_file: str | None = None
-    node_binary: str | None = None
     log_dir: str = "/tmp/zkm-fleet"
-    gpu_port_range: tuple[int, int] = (30100, 30199)
     shim_binary: str | None = None
     shim_state_dir: str | None = None
     shim_daemon: bool = False
@@ -609,7 +579,6 @@ class ServiceProtocol(str, enum.Enum):
 
 
 class ExecutorKind(str, enum.Enum):
-    LEGACY = "legacy"
     SHIM = "shim"
 
 
@@ -620,9 +589,8 @@ class RuntimeSelection(Record):
     driver: str | None = None
 
     def __post_init__(self) -> None:
-        if (self.executor is ExecutorKind.LEGACY and self.driver is not None
-                or self.executor is ExecutorKind.SHIM and self.driver not in ("docker", "openshell", "tee", "tee-simulation")):
-            raise ModelError("runtime must select legacy or shim with driver docker, openshell, tee or tee-simulation")
+        if self.driver not in ("docker", "openshell", "tee", "tee-simulation"):
+            raise ModelError("runtime must select shim with driver docker, openshell, tee or tee-simulation")
 
 
 @dataclass(kw_only=True)
@@ -663,8 +631,6 @@ class DurableMount(Record):
 
 # At most this many GPUs or durable mounts per native replica, as in shim.
 MAX_NATIVE_ATTACHMENTS = 16
-# The drivers whose containers take hard limits from an entry.
-LIMITED_DRIVERS = ("docker", "tee", "tee-simulation")
 # The smallest hard CPU limit Docker accepts, and the most CPUs shim counts in 32-bit millicores.
 MIN_CPU_LIMIT = 0.01
 MAX_CPUS = 2**32 / 1000
@@ -714,11 +680,6 @@ class AppSpec(Record):
     mounts: list[DurableMount] = field(default_factory=list)
     shm_gb: int | None = None
     ready_timeout_s: float = 600
-    # Integrated app worker sharing the replica's dedicated GPU server.
-    worker_command: list[str] = field(default_factory=list)
-    worker_env_file: str | None = None
-    worker_workdir: str | None = None
-    worker_stop_timeout_s: int = 120
     # apps
     port_base: int | None = None
     command: list[str] = field(default_factory=list)
@@ -732,12 +693,13 @@ class AppSpec(Record):
     rust_log: str = "info"
     @property
     def native_access(self) -> bool:
-        return self.access_policy_sha256 is not None or bool(self.runtime and self.runtime.driver == "openshell")
+        return self.access_policy_sha256 is not None or self.runtime.driver == "openshell"
 
     def __post_init__(self) -> None:
+        if self.runtime is None:
+            raise ModelError(f"{self.name}: an app entry selects its runtime, e.g. runtime: {{executor: shim, driver: docker}}")
         if self.access_policy_sha256 is not None:
-            if (not re.fullmatch(r"[0-9a-f]{64}", self.access_policy_sha256)
-                    or not self.runtime or self.runtime.executor is not ExecutorKind.SHIM):
+            if not re.fullmatch(r"[0-9a-f]{64}", self.access_policy_sha256):
                 raise ModelError("access policy requires a SHA256 commitment and shim runtime")
             # The scheduler admits user rules only on these drivers; legacy
             # `openshell` records are never placed with one.
@@ -747,11 +709,8 @@ class AppSpec(Record):
             raise ModelError("TCP banner health requires native OpenShell TCP services")
         if self.mounts and not self.native_access:
             raise ModelError("durable mounts require native OpenShell")
-        if self.cpu_limit is not None or self.memory_limit_gb is not None:
-            if self.native_access:
-                raise ModelError("cpu_limit and memory_limit_gb don't apply to a native OpenShell app: its cpus and memory_gb are its limits")
-            if not self.runtime or self.runtime.executor is not ExecutorKind.SHIM or self.runtime.driver not in LIMITED_DRIVERS:
-                raise ModelError("cpu_limit and memory_limit_gb need runtime {executor: shim} with driver docker, tee or tee-simulation")
+        if (self.cpu_limit is not None or self.memory_limit_gb is not None) and self.native_access:
+            raise ModelError("cpu_limit and memory_limit_gb don't apply to a native OpenShell app: its cpus and memory_gb are its limits")
         if self.cpu_limit is not None and not (MIN_CPU_LIMIT <= self.cpu_limit <= MAX_CPUS and self.cpu_limit >= self.cpus):
             raise ModelError(f"cpu_limit must be at least {MIN_CPU_LIMIT} CPUs and at least cpus, which Ray reserves")
         if self.memory_limit_gb is not None and not (MIN_MEMORY_LIMIT_BYTES <= self.memory_limit_gb * 2**30 < 2**63
@@ -783,12 +742,8 @@ class AppSpec(Record):
                     or not self.services and self.health_path != "/"):
                 raise ModelError("native OpenShell requires CPU/memory limits, private HTTP services (ingress without bearer_env, control beside an application service) or TCP services with banner health")
         if self.service_protocol is ServiceProtocol.TCP:
-            if (self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM
-                    or not any(s != "control" for s in self.services) or self.ingress):
+            if not any(s != "control" for s in self.services) or self.ingress:
                 raise ModelError("TCP requires a shim application service without HTTP ingress")
-        if self.services or self.ingress or self.container_port is not None or self.entrypoint is not None:
-            if self.runtime is None or self.runtime.executor is not ExecutorKind.SHIM:
-                raise ModelError("services, container_port and entrypoint require explicit shim execution")
         if (len(self.services) != len(set(self.services)) or len(self.services) > 8
                 or any(not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", s) for s in self.services)):
             raise ModelError("invalid runtime services")
@@ -798,10 +753,10 @@ class AppSpec(Record):
             raise ModelError("ingress bearer environment is missing")
         if self.container_port is not None and not 1 <= self.container_port <= 65535:
             raise ModelError("invalid container_port")
-        if self.port_base == 0 and self.runtime and self.runtime.executor is ExecutorKind.SHIM and self.container_port is None:
+        if self.port_base == 0 and self.container_port is None:
             raise ModelError("automatic host ports require shim and container_port")
-        if self.runtime is not None and self.kind is not AppRuntime.APP:
-            if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker") or self.worker_command:
+        if self.kind is not AppRuntime.APP:
+            if self.runtime.driver != "docker":
                 raise ModelError("packaged provers require shim Docker and an image-owned worker")
             if self.port_base is None or not self.container_port or not self.image:
                 raise ModelError("packaged provers require an image and health port")
@@ -813,14 +768,6 @@ class AppSpec(Record):
             raise ModelError("network is a setting of a prover on shim Docker")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
-        if self.worker_command:
-            if (self.kind is not AppRuntime.ZIREN_GPU or self.replicas != 1
-                    or not self.machine or not self.proof_storage_root):
-                raise ModelError("integrated worker requires a machine-pinned ziren-gpu app with one replica and persistent proof_storage_root")
-            if not os.path.isabs(self.worker_command[0]) or self.worker_stop_timeout_s <= 0:
-                raise ModelError("worker executable must be absolute and stop timeout positive")
-        elif self.worker_env_file or self.worker_workdir:
-            raise ModelError("worker environment and workdir require worker_command")
         self.app = self.app or self.name
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", self.app):
             raise ModelError(f"{self.name}: app must be a name: letters, digits, _ . -, at most 63")
@@ -860,17 +807,16 @@ class AppsConfig(Record):
 
     def validate_launch(self, app: AppSpec) -> None:
         cluster = self.cluster
-        if app.runtime and app.runtime.executor is ExecutorKind.SHIM:
-            if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
-                raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
+        if not all(p and os.path.isabs(p) and "\x00" not in p for p in (cluster.shim_binary, cluster.shim_state_dir)):
+            raise ModelError("shim requires absolute shim_binary and shim_state_dir in existing apps.yaml")
         if app.services and cluster.shim_network is None:
             raise ModelError("runtime services require node-owned shim_network settings in existing apps.yaml")
-        if app.runtime and app.runtime.driver in ("tee", "tee-simulation"):
+        if app.runtime.driver in ("tee", "tee-simulation"):
             if not cluster.shim_daemon or not cluster.shim_tee or cluster.shim_tee.driver != app.runtime.driver:
                 raise ModelError("TEE apps require a matching node TEE mode and persistent shim")
         if app.native_access and (not cluster.shim_daemon or cluster.shim_openshell is None):
             raise ModelError("OpenShell requires the configured persistent companion")
-        if app.cpus == 0 and app.runtime and app.runtime.executor is ExecutorKind.SHIM:
+        if app.cpus == 0:
             # A replica that reserves no CPU is always capped.
             if (app.native_access or app.kind is not AppRuntime.APP or app.gpus or app.cpu_limit is None
                     or not app.memory_gb or app.memory_limit_gb is None):
@@ -916,7 +862,7 @@ class AppReplicaSpec(Record):
     app: AppSpec
     cluster: ControlPlaneConfig
     config: dict[str, Any] = field(default_factory=dict)
-    # Pinned machine allocation, supplied before entering Ray; absent for legacy.
+    # Pinned machine allocation, supplied before entering Ray.
     execution: RuntimeIdentity | None = None
     # How the shim launch request for `execution` is formed (shim.LAUNCH_REVISION),
     # supplied with it; specs pickled for a running actor carry none and mean 1.
@@ -951,56 +897,24 @@ class ResourceRequest(Record):
 
 
 @dataclass(kw_only=True)
-class NodeEnvironment(Record):
-    """What fleet-ziren-node reads from its environment."""
-
-    name: str = field(metadata={"env": "FLEET_NODE_NAME"})
-    backend: str = field(metadata={"env": "FLEET_BACKEND"})
-    scheduler: str = field(metadata={"env": "FLEET_SCHEDULER"})
-    scheduler_ca_file: str | None = field(default=None, metadata={"env": "FLEET_SCHEDULER_CA_FILE"})
-    cluster_token_file: str = field(metadata={"env": "FLEET_CLUSTER_TOKEN_FILE"})
-    machine: str = field(metadata={"env": "FLEET_MACHINE"})
-    app_namespace: str | None = field(default=None, metadata={"env": "FLEET_APP_NAMESPACE"})
-    app: str | None = field(default=None, metadata={"env": "FLEET_APP"})
-    app_elf_id: str | None = field(default=None, metadata={"env": "FLEET_APP_ELF_ID"})
-    rust_log: str = field(metadata={"env": "RUST_LOG"})
-    exit_with_parent: bool = field(default=True, metadata={"env": "FLEET_EXIT_WITH_PARENT"})
-    app_storage_root: str | None = field(default=None, metadata={"env": "FLEET_APP_STORAGE_ROOT"})
-    cpus: int = field(default=0, metadata={"env": "FLEET_CPUS"})
-    gpus: int | None = field(default=None, metadata={"env": "FLEET_GPUS"})
-    gpu_endpoint: str | None = field(default=None, metadata={"env": "FLEET_GPU_ENDPOINT"})
-    image: str | None = field(default=None, metadata={"env": "FLEET_IMAGE"})
-    rayon_threads: int | None = field(default=None, metadata={"env": "RAYON_NUM_THREADS"})
-
-
-@dataclass(kw_only=True)
 class ReplicaHealth(Record):
     """What an actor answers to `health()`."""
 
     name: str
-    executor: ExecutorKind = ExecutorKind.LEGACY
+    executor: ExecutorKind = ExecutorKind.SHIM
     execution: RuntimeIdentity | None = None
     spec: str | None = None  # the replica's spec hash
     machine: str | None = None
     gpus: list[str] = field(default_factory=list)
-    gpu_port: int | None = None
-    gpu_ready: bool | None = None
     port: int | None = None
-    ready: bool | None = None
+    ready: bool = False
     # Shim's authenticated local management listener can be available while the
     # application is unhealthy (for example during state restore).
     management_ready: bool = False
     # Durable native ownership may precede compute creation and route readiness.
     allocation_reserved: bool = False
     native_observation_base64: str | None = None
-    stopping: bool = False
 
     @property
     def is_ready(self) -> bool:
-        if self.stopping or self.spec is None:
-            return False
-        if self.ready is not None:
-            return self.ready
-        if self.gpu_ready is not None:
-            return self.gpu_ready
-        return True  # CPU prover health already checks its local process.
+        return self.spec is not None and self.ready
