@@ -22,6 +22,7 @@ export CARGO_TARGET_DIR="$fleet_root/target/ethproofs-app"
 cargo build --locked --release --manifest-path "$ethproofs_source/Cargo.toml" -p eth-proofs
 install -m 755 "$CARGO_TARGET_DIR/release/eth-proofs" "$package_dir/eth-proofs"
 install -m 644 "$guest_elf" "$package_dir/program.elf"
+install -m 755 "$fleet_root/apps/gpu-worker.sh" "$package_dir/gpu-worker"
 git -C "$ethproofs_source" rev-parse HEAD > "$package_dir/source-revision"
-(cd -- "$package_dir" && sha256sum eth-proofs program.elf > SHA256SUMS)
+(cd -- "$package_dir" && sha256sum eth-proofs program.elf gpu-worker > SHA256SUMS)
 echo "Packaged EthProofs worker in $package_dir"

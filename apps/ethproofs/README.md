@@ -1,10 +1,10 @@
 # EthProofs app worker
 
-The EthProofs worker runs as a container app on the shim. One image holds the worker
-and the Ziren GPU server it proves against; the image's entrypoint
-([`deploy/images/gpu-worker`](../../deploy/images/gpu-worker)) starts the server,
-starts the worker once the server answers ready, and ends the container when either
-process ends.
+The EthProofs worker runs as a container app on the shim, in the GPU image's own
+container: the worker package is mounted in, and its `gpu-worker` script
+([`apps/gpu-worker.sh`](../gpu-worker.sh)) is the container's entrypoint. It starts
+the GPU server, starts the worker once the server answers ready, and ends the
+container when either process ends.
 
 Fleet pins the worker in the `third_party/reth-processor` Git submodule
 ([pinned source](https://github.com/ProjectZKM/reth-processor/tree/a75cb337305eac262a31346b4b3086146fed8297)).
@@ -69,33 +69,22 @@ the host and guest, then pin its resolved digest in the app's `apps.yaml` entry.
 validated image is `sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655`.
 Its Ziren revision label matches the locked host and guest revision.
 
-Build the image on the GPU node from the package and the validated GPU image. The
-package keeps its installed path inside the image, so the worker's command and
-`ETH_PROOFS_ELF_FILE` name the same paths:
-
-```bash
-docker build -t ethproofs-worker:TAG -f deploy/images/gpu-worker/Dockerfile \
-  --build-arg GPU_IMAGE=ghcr.io/projectzkm/ziren-gpu@sha256:DIGEST \
-  --build-arg PACKAGE_PATH=/opt/zkm-fleet/apps/ethproofs \
-  --build-context package=/opt/zkm-fleet/apps/ethproofs deploy/images/gpu-worker
-```
-
-Adapt [`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`, using the
-node's machine, the namespace, the guest's ELF digest, the image and the state
+Install the package at `/opt/zkm-fleet/apps/ethproofs`; it holds `gpu-worker`. Adapt
+[`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`, using the node's
+machine, the namespace, the guest's ELF digest, the validated GPU image and the state
 directory. The example starts disabled and sets `machine`, which keeps the app on the
-node that holds its state. Its `env` has two parts:
+node that holds its state. It mounts the package read-only and the state directory,
+and its `env` has two parts:
 
 - **The GPU server's**: the container's environment, as the entry lists it.
-- **The worker's**: the entrypoint gives the worker `PATH`, `HOME`, the lines of the
-  private file `WORKER_ENV_FILE`, every `FLEET_*` value, `FLEET_GPU_ENDPOINT` and
-  `RAYON_NUM_THREADS` (from `WORKER_THREADS`), and nothing else of the container's
-  environment. The file cannot replace a `FLEET_*` value.
+- **The worker's**: the entrypoint gives the worker only `PATH`, `HOME`, every
+  `FLEET_*` value, `FLEET_GPU_ENDPOINT` and `RAYON_NUM_THREADS` (from
+  `WORKER_THREADS`).
 
-Put API credentials and RPC URLs in the private file described by
-[`worker.env.example`](worker.env.example), readable only by the account in the
-entry's `user`, and mount it read-only. Each line is `KEY=VALUE` with one plain word
-or one quoted string; nothing is expanded, and any other line ends the container
-naming its line number. The worker's log level is `RUST_LOG` in that file.
+Put API credentials and RPC URLs in `.env` in the state directory, as
+[`worker.env.example`](worker.env.example) describes, readable only by the account in
+the entry's `user`. The worker reads it at startup; a value the entrypoint gives the
+worker wins over the file's. The worker's log level is `RUST_LOG` in that file.
 
 The worker reads its app name from `FLEET_APP`. Its checkpoint identity names the
 app; a version-1 checkpoint naming a tenant is upgraded in place when the rest of its
