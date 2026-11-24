@@ -538,6 +538,26 @@ def test_direct_executor_change_cannot_stop_a_legacy_actor(tmp_path,monkeypatch)
     stop.assert_not_called()
 
 
+def test_a_start_of_a_started_shim_replica_that_is_not_ready_changes_nothing(tmp_path,monkeypatch):
+    e=executor(tmp_path)
+    app=config(tmp_path)["apps"][0];app.update(namespace="0"*32,app="web",elf_id="")
+    admitted=actors.spec_hash(spec(tmp_path))
+    monkeypatch.setattr(node,"alive_nodes",lambda:[{}])
+    monkeypatch.setattr(shim,"capabilities",lambda _:[shim.CAPABILITY])
+    monkeypatch.setattr(reconcile,"running",lambda:{"web-0":object()})
+    start,stop=Mock(),Mock();monkeypatch.setattr(reconcile,"start",start);monkeypatch.setattr(reconcile,"stop",stop)
+    unready=lambda digest:ReplicaHealth(name="web-0",spec=digest,executor=shim.ExecutorKind.SHIM,management_ready=True,ready=False)
+    # Its runtime makes it ready: the start has nothing to do, and is no error.
+    monkeypatch.setattr(reconcile,"health_of",lambda _:unready(admitted))
+    assert e.set_app({"app":app,"disabled":False},"start")=={"disabled":False,"ready":True}
+    # One that runs something else stays until it is stopped.
+    monkeypatch.setattr(reconcile,"health_of",lambda _:unready("another"))
+    with pytest.raises(ValueError,match="differs from the admitted one; retained until explicit cleanup"):
+        e.set_app({"app":app,"disabled":False},"start")
+    start.assert_not_called();stop.assert_not_called()
+    assert e.runtimes.read("web-0") is None
+
+
 def test_failed_shim_does_not_call_legacy_executor(tmp_path,monkeypatch):
     e=executor(tmp_path)
     app=config(tmp_path)["apps"][0];app.update(namespace="0"*32,app="web",elf_id="")
