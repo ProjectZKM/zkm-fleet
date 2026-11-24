@@ -19,7 +19,7 @@ to report the node READY with a heartbeat newer than the restart, and the matchi
 export FLEET_PREFIX=/path/to/control/install FLEET_NODE_SSH=gpu-1   # or ~/.config/zkm-fleet/ctl.env
 export FLEET_NODE_PREFIX=/path/to/node/install                      # default ~/app/fleet
 deploy/fleet-ctl.sh status                       # control services, health, nodes and apps
-deploy/fleet-ctl.sh -n scheduler upgrade v0.2.5  # -n prints every step and changes nothing
+deploy/fleet-ctl.sh -n scheduler upgrade v0.2.6  # -n prints every step and changes nothing
 ```
 
 ### Control host
@@ -49,7 +49,7 @@ The scheduler and MCP run in Docker Compose from the release's GHCR image
 (`ghcr.io/projectzkm/zkm-fleet-scheduler:VERSION`); only `fleetctl` is a host binary.
 
 ```bash
-deploy/fleet-ctl.sh scheduler upgrade v0.2.5
+deploy/fleet-ctl.sh scheduler upgrade v0.2.6
 ```
 
 It downloads the release package and checks its SHA-256, pulls the image (a missing
@@ -100,7 +100,7 @@ stop existing workloads automatically.
 ### Execution node
 
 ```bash
-deploy/fleet-ctl.sh node upgrade v0.2.5
+deploy/fleet-ctl.sh node upgrade v0.2.6
 # or from a local build of the same revision:
 deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
   target/release/fleet-proof-app deploy
@@ -275,7 +275,7 @@ Build from the release's revision and name the release, so the agent reports it 
 `fleetctl node`'s VERSION column (`-` otherwise):
 
 ```bash
-FLEET_VERSION=0.2.5 cargo build --locked --release \
+FLEET_VERSION=0.2.6 cargo build --locked --release \
   -p fleet-scheduler -p fleetctl -p fleet-mcp -p fleet-node -p fleet-proof-app
 ```
 
