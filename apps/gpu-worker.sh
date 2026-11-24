@@ -24,9 +24,13 @@ trap stop TERM INT
 
 (cd / && exec zkm-gpu-server) &
 server=$!
-ready() {
-  [ "$(curl -fsS -m 3 -X POST -H 'content-type: application/protobuf' --data-binary '' \
-    "${endpoint}api.ProverService/Ready" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 0801 ]
+ready() {  # the GPU image has perl, and no curl
+  perl -MIO::Socket::INET -e '
+    my $server = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$ARGV[0]", Timeout => 3) or exit 1;
+    print $server "POST /twirp/api.ProverService/Ready HTTP/1.0\r\nHost: 127.0.0.1\r\n",
+      "Content-Type: application/protobuf\r\nContent-Length: 0\r\n\r\n";
+    local $/;
+    exit(<$server> =~ m{^HTTP/1\.\d 200 .*\r\n\r\n\x08\x01\z}s ? 0 : 1)' "$ZIREN_SERVER_PORT"
 }
 until ready; do
   kill -0 "$server" 2>/dev/null || { echo "gpu-worker: the GPU server ended before it was ready" >&2; exit 1; }
