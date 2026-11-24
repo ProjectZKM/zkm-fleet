@@ -310,18 +310,35 @@ can also advertise batches in their `batches.yaml`.
 **Settings.** A new batch takes `name`, `namespace`, `image` (required) and `user`,
 plus these settings, shown with their defaults: `max_gpus` 8, `default_gpu_mem_gb` 0,
 `shm_gb` 16, `priority` 0, `allow` `[]`, `env` `{}`, `disabled` false, `preemptible`
-true, `min_runtime_s` 300 and `stop_timeout_s` 30. Other fields are refused.
+true, `min_runtime_s` 300, `stop_timeout_s` 30 and `runtime` null. Other fields are
+refused.
 `fleetctl batch update NAME --image ...` (`PUT /batches/NAME/settings`) changes them,
 except `priority` and `disabled`, which have their own commands;
 accepted jobs keep the settings they were submitted with. Only administrators set
-`allow` (the host paths jobs may mount) and `user`, so an owner's batch starts with no
-host mounts and the image's default user.
+`allow` (the host paths jobs may mount), `user` and `runtime`, so an owner's batch
+starts with no host mounts, the image's default user and the legacy executor.
+
+**Runtime.** `runtime` says what runs a batch's jobs. With null or
+`{"executor":"legacy"}` the node's bridge runs each attempt with `docker run`. With
+`{"executor":"shim","driver":"docker"}` (`fleetctl batch add|update NAME --runtime
+shim`) the bridge launches each attempt through the node's trusted-shim, as a run to
+completion on its Docker driver: the same image, command, environment, mounts, cards,
+user, `shm_gb` and `stop_timeout_s`, and no network for a namespace's job. The bridge
+keeps the VRAM wait, the retries and their budgets, and writes the container's output
+to the job's log, so `fleetctl batch logs`, cancel, preempt and requeue work the same.
+Each attempt is a new generation of the job's allocation, launched once the shim has
+removed the one before it. The scheduler places such a job only on a node that reports
+`shim-batch-v1`, which a node does when its shim's Docker driver runs a container to
+completion, reports its exit status and output, starts it without a network and stops
+it with a long grace; until one does, the job waits with the detail `waiting for a node
+whose shim runs batch jobs`. A node refuses the launch of a job whose runtime its shim
+does not run.
 
 **Records.** A batch record (`type: batch`) has an app record's envelope. Its `state`
 is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and
 its policy is under `batch`: `image`, `user`, `max_gpus`, `default_gpu_mem_gb`,
-`shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s` and
-`workers`.
+`shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `runtime`
+and `workers`.
 
 In the API, `POST /batches?namespace=alice` takes the batch JSON, or the namespace as
 its `namespace` field; a name or an ID is accepted, and the ID is stored. A batch or

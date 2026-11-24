@@ -1791,11 +1791,19 @@ impl WorkloadController {
                         let app_ok =
                             app.is_none_or(|a| a.workers.is_empty() || a.workers.contains(*id));
                         app_ok && pin.is_none_or(|p| p == id.as_str() || p == w.report.machine)
+                            && w.report.runs_batch(r.policy())
                     })
                     .map(|(id, _)| id.clone())
                     .collect::<Vec<_>>()
             };
             if allowed.is_empty() {
+                // Say why a job of a batch on the shim waits where no node's shim runs batch jobs.
+                let waiting = "waiting for a node whose shim runs batch jobs";
+                if r.policy().runtime_capability().is_some() && r.status["detail"] != waiting {
+                    r.set_detail(waiting);
+                    self.save("jobs", &r.id, &r)?;
+                    self.inner.lock().jobs.insert(r.id.clone(), r.clone());
+                }
                 continue;
             }
             let worker = allowed
@@ -2093,6 +2101,11 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
     {
         return Err(fail(400, "invalid batch settings"));
     }
+    // Its jobs run under the node's own `docker run` (no runtime, or legacy) or through the shim.
+    let runtime = &spec["runtime"];
+    if !runtime.is_null() && runtime != &json!({"executor":"legacy"}) && runtime != &json!({"executor":"shim","driver":"docker"}) {
+        return Err(fail(400, r#"runtime: {"executor":"shim","driver":"docker"}, {"executor":"legacy"} or null"#));
+    }
     Ok(())
 }
 
@@ -2100,7 +2113,7 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
 const BATCH_IDENTITY: [&str; 4] = ["name", "namespace", "image", "user"];
 
 /// A new batch's settings that have a default, with it.
-fn batch_defaults() -> [(&'static str, Value); 10] {
+fn batch_defaults() -> [(&'static str, Value); 11] {
     [
         ("max_gpus", json!(8)),
         ("default_gpu_mem_gb", json!(0)),
@@ -2112,14 +2125,15 @@ fn batch_defaults() -> [(&'static str, Value); 10] {
         ("preemptible", json!(true)),
         ("min_runtime_s", json!(300)),
         ("stop_timeout_s", json!(30)),
+        ("runtime", Value::Null),
     ]
 }
 
 /// Settings an update may change on a batch (its name, namespace, priority and enabled state
 /// have their own operations).
-const BATCH_SETTINGS: [&str; 10] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
-    "preemptible", "min_runtime_s", "stop_timeout_s"];
-const BATCH_ADMIN_SETTINGS: [&str; 2] = ["user", "allow"];
+const BATCH_SETTINGS: [&str; 11] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
+    "preemptible", "min_runtime_s", "stop_timeout_s", "runtime"];
+const BATCH_ADMIN_SETTINGS: [&str; 3] = ["user", "allow", "runtime"];
 
 /// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
@@ -2270,8 +2284,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
         }
         check_batch_spec(&body)?;
-        if c.is_some() && (!Batch(&body).allow().is_empty() || Batch(&body).user().is_some()) {
-            return Err(fail(403, "batch host mount roots and runtime user require administrator credentials"));
+        if c.is_some() && (!Batch(&body).allow().is_empty() || Batch(&body).user().is_some() || !body["runtime"].is_null()) {
+            return Err(fail(403, "batch host mount roots, runtime user and runtime require administrator credentials"));
         }
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");

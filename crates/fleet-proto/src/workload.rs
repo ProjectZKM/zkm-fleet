@@ -268,6 +268,9 @@ pub const CPU_SHARES_CAPABILITY: &str = "shim-cpu-shares-v1";
 /// A TEE node whose machine configuration allows tenants that reserve no CPU
 /// (`shim_tee.allow_cpu_overcommit`).
 pub const TEE_CPU_OVERCOMMIT_CAPABILITY: &str = "shim-tee-cpu-overcommit-v1";
+/// A node whose shim runs a batch job to completion, without a network, and reports how
+/// it ended and what it wrote.
+pub const BATCH_CAPABILITY: &str = "shim-batch-v1";
 
 impl NodeReport {
     /// Native provisioning holds resources before there is an application route.
@@ -326,6 +329,10 @@ impl NodeReport {
     pub fn fits_cpu_limit(&self, entry: Entry<'_>) -> bool {
         !matches!(entry.0["runtime"]["driver"].as_str(), Some("tee" | "tee-simulation"))
             || entry.cpu_limit().is_none_or(|limit| limit <= self.total_cpus + 1e-9)
+    }
+    /// Whether the node runs a batch's jobs.
+    pub fn runs_batch(&self, batch: Batch<'_>) -> bool {
+        batch.runtime_capability().is_none_or(|needed| self.runtime_capabilities.iter().any(|c| c == needed))
     }
     pub fn supports_cleanup(&self, entry: Entry<'_>) -> bool {
         entry.runtime_capability().is_none() || self.supports_runtime(entry)
@@ -395,6 +402,11 @@ impl<'a> Batch<'a> {
     /// How long a job runs before it may be preempted.
     pub fn min_runtime_s(self) -> u64 {
         self.0["min_runtime_s"].as_u64().unwrap_or(300)
+    }
+    /// What a node must report to run its jobs: a batch on the shim runs only where the
+    /// shim runs batch jobs; any node runs one on the legacy executor.
+    pub fn runtime_capability(self) -> Option<&'static str> {
+        (self.0["runtime"]["executor"] == "shim").then_some(BATCH_CAPABILITY)
     }
 }
 

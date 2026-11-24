@@ -437,6 +437,17 @@ struct AddBatch {
     #[arg(long)]
     #[serde(skip)]
     env: Vec<String>,
+    /// What runs its jobs: `shim` (the node's trusted-shim, on nodes whose shim runs batch
+    /// jobs) or `legacy` (the node's own docker run, the default); requires administrator
+    /// credentials.
+    #[arg(long, value_parser = ["shim", "legacy"])]
+    #[serde(skip)]
+    runtime: Option<String>,
+}
+
+/// A batch's `runtime` setting for `--runtime shim|legacy`.
+fn batch_runtime(name: &str) -> Value {
+    if name == "shim" { json!({"executor":"shim","driver":"docker"}) } else { json!({"executor":"legacy"}) }
 }
 
 /// What can be done to a batch job (a proof job is the scheduler's and its client's).
@@ -560,6 +571,10 @@ enum BatchCmd {
         #[arg(long)] allow: Vec<String>,
         /// K=V every batch job gets; repeat. Replaces the batch's environment.
         #[arg(long)] env: Vec<String>,
+        /// What runs its jobs: `shim` (the node's trusted-shim, on nodes whose shim runs
+        /// batch jobs) or `legacy` (the node's own docker run); requires administrator
+        /// credentials.
+        #[arg(long, value_parser = ["shim", "legacy"])] runtime: Option<String>,
     },
     /// Delete a batch and everything of it, like app delete: its configuration on its nodes,
     /// and its jobs' records, logs and outputs on the control host and its nodes. Its mounts
@@ -1212,6 +1227,9 @@ fn add_batch(add: &AddBatch, conn: &ConnectionOptions, out: &OutputWriter) -> an
     if !env.is_empty() {
         body["env"] = Value::Object(env);
     }
+    if let Some(runtime) = &add.runtime {
+        body["runtime"] = batch_runtime(runtime);
+    }
     let a = FleetClient::new(conn)?;
     let v = a.send(a.req(reqwest::Method::POST, "/batches").json(&body))?;
     let gpus = v["batch"]["max_gpus"].as_u64().unwrap_or(0);
@@ -1373,7 +1391,7 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
         Some(BatchCmd::List) => return batches(&p.conn, out),
-        Some(BatchCmd::Update { name, image, user, max_gpus, gpu_mem, shm_gb, allow, env }) => {
+        Some(BatchCmd::Update { name, image, user, max_gpus, gpu_mem, shm_gb, allow, env, runtime }) => {
             let mut set = json!({});
             if let Some(v) = image { set["image"] = json!(v); }
             if let Some(v) = user { set["user"] = json!(v); }
@@ -1382,6 +1400,7 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
             if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }
             if !allow.is_empty() { set["allow"] = json!(allow); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
+            if let Some(v) = runtime { set["runtime"] = batch_runtime(v); }
             if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
             let a = FleetClient::new(&p.conn)?;
             batch_named(&a, name)?;

@@ -5,6 +5,7 @@ choose their cleanup executable independently of the current apps.yaml.
 """
 from __future__ import annotations
 
+import base64
 import calendar
 import hashlib
 import http.client
@@ -21,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 
 import ray
 
@@ -47,6 +48,11 @@ LIMITS_CAPABILITY = "shim-limits-v1"
 CPU_SHARES_CAPABILITY = "shim-cpu-shares-v1"
 # A TEE node whose operator lets tenants that reserve no CPU share its VM.
 TEE_CPU_OVERCOMMIT_CAPABILITY = "shim-tee-cpu-overcommit-v1"
+# A node whose shim runs a batch job: a container without a network that ends with its
+# process, reports how it ended, keeps its output, and gets a batch's grace to stop.
+BATCH_CAPABILITY = "shim-batch-v1"
+BATCH_FEATURES = ("runtime-run-to-completion-v1", "runtime-exit-status-v1", "runtime-logs-v1",
+                  "runtime-network-v1", "runtime-long-stop-v1")
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
@@ -195,6 +201,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-management-v1", managed_network),
             (LIMITS_CAPABILITY, True),
             (CPU_SHARES_CAPABILITY, "runtime-cpu-shares-v1" in features),
+            (BATCH_CAPABILITY, "docker" in value.get("drivers", []) and all(f in features for f in BATCH_FEATURES)),
         ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
@@ -435,6 +442,126 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
             "gpus": gpus, "volumes": volumes,
             "user": app.user, "workdir": app.workdir, "stop_timeout_s": app.stop_timeout_s,
             "shm_bytes": (app.shm_gb if app.shm_gb is not None else 16) * 2**30}}
+
+
+# How long a running job's shim may leave its questions unanswered before the attempt counts as lost.
+JOB_UNANSWERED_S = 300
+
+
+class JobRun:
+    """A batch job's container, run to completion through the shim's Docker driver.
+
+    Its record, in the job's directory, is written before each launch and names the
+    shim and the execution, so stopping, removing or checking the container needs
+    nothing else, and a job that never ran here has none. A run's container is
+    never started again: every launch is a new generation of the job's allocation,
+    made once the one before it is confirmed removed."""
+
+    NAME = "run"
+
+    def __init__(self, job_dir: str) -> None:
+        self.book = RuntimeBook(Path(job_dir) / ".shim")
+
+    def record(self) -> Allocation | None:
+        return self.book.read(self.NAME)
+
+    def call(self, record: Allocation, operation: str, timeout: float | None = None) -> dict[str, Any]:
+        return invoke(record.binary, record.state_dir, socket.gethostname(),
+            {"operation": operation, "execution": record.execution}, daemon=record.daemon, timeout=timeout)
+
+    def launch(self, cluster: ControlPlaneConfig, namespace: str, workload: str, allocation_id: str, *, image: str,
+               command: list[str], environment: dict[str, str], limits: dict[str, int | None],
+               options: dict[str, Any]) -> dict[str, Any]:
+        """Starts the job's next run and returns its status."""
+        if not cluster.shim_binary or not cluster.shim_state_dir:
+            raise ValueError("shim is not configured")
+        previous = self.record()
+        if not self.remove():
+            raise RuntimeError("the job's previous container is not confirmed removed")
+        generation = previous.execution.generation + 1 if previous else 1
+        record = Allocation(executor=ExecutorKind.SHIM, spec=allocation_id, binary=cluster.shim_binary,
+            state_dir=cluster.shim_state_dir, daemon=cluster.shim_daemon, launch_revision=LAUNCH_REVISION,
+            execution=RuntimeIdentity(namespace=namespace, workload=workload, allocation_id=allocation_id,
+                lease_id=f"run-{generation}", generation=generation, node_id=socket.gethostname()))
+        self.book.write(self.NAME, record)
+        return invoke(record.binary, record.state_dir, socket.gethostname(), {"operation": "launch", "request": {
+            "execution": record.execution, "driver": "docker", "image": image, "command": command,
+            "environment": environment, "limits": limits,
+            "policy": {"issuer": "fleet", "policy_id": "unproved-container-lifecycle", "version": 0, "sha256": ""},
+            "trust": {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"},
+            "services": [], "driver_options": {**options, "run_to_completion": True}}}, daemon=record.daemon)
+
+    def wait(self, log: BinaryIO, poll_s: float = 2.0) -> dict[str, Any]:
+        """Copies the run's output to `log` until its process ends, and returns how it
+        ended: the shim's exit status, or {} for a container that is gone."""
+        record = self.record()
+        if record is None:
+            raise RuntimeError("the job has no shim run")
+        since: str | None = None
+        unanswered = 0.0
+        while True:
+            try:
+                status = self.call(record, "inspect")
+                if status.get("state") == "failed":
+                    return {}
+                # Read after the state: once the process has ended, its output is complete.
+                since = self._copy(record, log, since)
+                if status.get("state") == "stopped":
+                    return status.get("exit") or {}
+                unanswered = 0.0
+            except RuntimeError:
+                unanswered += poll_s
+                if unanswered > JOB_UNANSWERED_S:
+                    raise
+            time.sleep(poll_s)
+
+    def _copy(self, record: Allocation, log: BinaryIO, since: str | None) -> str | None:
+        """Appends the output written since `since`; returns where the next read starts."""
+        while True:
+            window = invoke(record.binary, record.state_dir, socket.gethostname(),
+                {"operation": "logs", "execution": record.execution, **({"since": since} if since else {})},
+                daemon=record.daemon)
+            for line in base64.b64decode(window.get("output") or "").splitlines(keepends=True):
+                log.write(line.partition(b" ")[2])  # after the line's timestamp
+            log.flush()
+            since = window.get("next_since") or since
+            if not window.get("more"):
+                return since
+
+    def stop(self, grace_s: int) -> None:
+        """SIGTERM, then SIGKILL after the grace the run was launched with."""
+        record = self.record()
+        if record is not None and not record.cleaned:
+            try:
+                self.call(record, "stop", timeout=grace_s + 60)
+            except RuntimeError:
+                pass  # `gone` says whether it stopped
+
+    def remove(self, timeout: float | None = None) -> bool:
+        """Removes the run's container, stopping it with its grace first; whether
+        the shim confirmed it. A run that never reached the shim is fenced there."""
+        record = self.record()
+        if record is None or record.cleaned:
+            return True
+        try:
+            if self.call(record, "delete", timeout=timeout).get("cleaned") is not True:
+                return False
+        except RuntimeError:
+            return False
+        record.cleaned = True
+        self.book.write(self.NAME, record)
+        return True
+
+    def gone(self) -> bool:
+        """Whether no container of the job runs: none was launched, it was removed,
+        or its process has ended. An unanswered question counts as still running."""
+        record = self.record()
+        if record is None or record.cleaned:
+            return True
+        try:
+            return self.call(record, "inspect").get("state") == "stopped"
+        except RuntimeError:
+            return False
 
 
 # The Docker daemon the shim's driver uses; the environment cannot select another.
