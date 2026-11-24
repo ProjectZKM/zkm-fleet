@@ -57,7 +57,7 @@ def test_cutover_preserves_configuration_identity_and_all_storage(tmp_path):
     # No credential file needs to exist, let alone be read, during preparation.
 
 
-@pytest.mark.parametrize('update', [dict(disabled=False), dict(worker_command=['/app/worker']),
+@pytest.mark.parametrize('update', [dict(disabled=False), dict(kind='app'),
     dict(elf_id=''), dict(proof_storage_root='relative')])
 def test_unsafe_cutover_is_refused_without_mutation(tmp_path, update):
     cfg = configuration(tmp_path)
@@ -177,3 +177,220 @@ def test_image_supervisor_stops_both_processes_on_failure_or_signal(tmp_path, fa
                 os.kill(int(path.read_text()), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def integrated(tmp_path, **update):
+    """A node's configuration whose entry runs the app's own worker on the legacy executor."""
+    cfg = dict(shim_binary='/opt/shim', shim_state_dir='/var/lib/shim', shim_daemon=True,
+        apps=[dict(name='stream-gpu', app='stream', namespace='alice', kind='ziren-gpu', disabled=True,
+            machine='gpu-1', elf_id='c' * 64, replicas=1, cpus=36, gpus=4, shm_gb=64, rust_log='debug',
+            proof_storage_root='/srv/stream/state', image='gpu-server@sha256:' + 'd' * 64,
+            env={'RUST_LOG': 'warn', 'TMPDIR': '/dev/shm', 'JSON': '{"a":1}'},
+            worker_command=['/opt/stream/worker', '--block-interval', '1'],
+            worker_env_file='/etc/stream/worker.env', worker_workdir='/srv/stream/state/run',
+            worker_stop_timeout_s=600)])
+    cfg['apps'][0].update(update)
+    return cfg
+
+
+def test_an_integrated_worker_moves_with_its_command_and_private_file_and_keeps_the_servers_environment(tmp_path):
+    cfg = integrated(tmp_path)
+    before = json.loads(json.dumps(cfg['apps'][0]))
+    result, updates = migration.convert(cfg, ['stream-gpu'], IMAGE)
+    entry = result['apps'][0]
+    # What the worker is stays in the entry as it was: the image runs it.
+    for key in ('name', 'app', 'namespace', 'machine', 'elf_id', 'cpus', 'gpus', 'proof_storage_root', 'disabled',
+                'worker_command', 'worker_env_file', 'worker_workdir', 'worker_stop_timeout_s', 'rust_log'):
+        assert entry[key] == before[key], key
+    assert (entry['image'], entry['runtime'], entry['command']) == (IMAGE, {'executor': 'shim', 'driver': 'docker'}, [])
+    # The GPU server's port, on the node's loopback at a port the shim picks.
+    assert (entry['port_base'], entry['container_port']) == (0, 3000)
+    # The server keeps its environment, braces and all; Fleet's identity and the worker's settings ride beside it.
+    assert entry['env'] == {'RUST_LOG': 'warn', 'TMPDIR': '/dev/shm', 'JSON': '{{"a":1}}',
+        'FLEET_NODE_NAME': '{name}', 'FLEET_APP_NAMESPACE': '{namespace}', 'FLEET_APP': '{app}',
+        'FLEET_APP_ELF_ID': '{elf_id}', 'FLEET_APP_STORAGE_ROOT': '{proof_storage_root}', 'FLEET_CPUS': '{cpu_count}',
+        'FLEET_WORKER_RUST_LOG': 'debug', 'FLEET_WORKER_READY_TIMEOUT_S': '{ready_timeout_s}',
+        'FLEET_WORKER_ENV_FILE': '{worker_env_file}', 'ZIREN_SERVER_PORT': '3000',
+        'CUDA_VISIBLE_DEVICES': '{gpus}', 'ZKM_GPU_DEVICES': '{gpus}'}
+    assert entry['env']['JSON'].format() == '{"a":1}'
+    # Its state is writable, its private file read-only; the working directory lies in the state.
+    assert entry['volumes'] == ['/srv/stream/state', '{worker_env_file}:ro']
+    assert updates == [dict(entry='stream-gpu', app='stream', namespace='alice', cpus=36,
+        set={k: entry[k] for k in ('image', 'runtime', 'env', 'volumes', 'port_base', 'command', 'container_port', 'shm_gb')})]
+    # It needs neither the scheduler nor the node's credential.
+    assert not any('token' in v or 'scheduler' in v.lower() for v in [*entry['volumes'], *entry['env']])
+    assert cfg == integrated(tmp_path), 'the source configuration is untouched'
+
+
+@pytest.mark.parametrize('update, problem', [
+    (dict(proof_storage_root='/opt/stream'), 'would hide'),
+    (dict(volumes=['/opt:ro']), 'would hide'),
+    (dict(worker_stop_timeout_s=3601), '3600'),
+    (dict(kind='ziren-cpu'), 'integrated worker'),
+    (dict(disabled=False), 'disable and drain'),
+])
+def test_an_integrated_worker_the_image_could_not_run_is_refused(tmp_path, update, problem):
+    with pytest.raises(ValueError, match=problem):
+        migration.convert(integrated(tmp_path, **update), ['stream-gpu'], IMAGE)
+
+
+def test_a_working_directory_outside_the_state_is_mounted_too(tmp_path):
+    result, _ = migration.convert(integrated(tmp_path, worker_workdir='/srv/stream/run', worker_env_file=None),
+        ['stream-gpu'], IMAGE)
+    assert result['apps'][0]['volumes'] == ['/srv/stream/state', '/srv/stream/run']
+    assert 'FLEET_WORKER_ENV_FILE' not in result['apps'][0]['env']
+
+
+SERVER = """#!/usr/bin/env python3
+import os, signal, sys, time
+from pathlib import Path
+state = Path(os.environ['TEST_STATE'])
+def stop(*_):
+    (state / 'server.stopped').write_text('after the worker' if (state / 'worker.stopped').exists() else 'first')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(state / 'server.pid').write_text(str(os.getpid()))
+while True:
+    if os.environ.get('TEST_SERVER_EXIT') and (state / 'worker.pid').exists():
+        sys.exit(int(os.environ['TEST_SERVER_EXIT']))
+    time.sleep(.02)
+"""
+WORKER = """#!/usr/bin/env python3
+import json, os, signal, sys, time
+from pathlib import Path
+state = Path(sys.argv[1])
+def stop(*_):
+    (state / 'worker.stopped').write_text('server alive' if not (state / 'server.stopped').exists() else 'server gone')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(state / 'worker.env').write_text(json.dumps(dict(os.environ)))
+(state / 'worker.pid').write_text(str(os.getpid()))
+if len(sys.argv) > 2:
+    sys.exit(int(sys.argv[2]))
+while True:
+    time.sleep(.02)
+"""
+# The GPU server's readiness answer, once the test says it is ready.
+CURL = """#!/bin/bash
+[ -e "$TEST_STATE/ready" ] && printf '\\010\\001' || exit 7
+"""
+
+
+class WorkerImage:
+    """The worker image's entrypoint over a fake GPU server and worker."""
+
+    def __init__(self, tmp_path, *, ready=True, env_file=None, **env):
+        self.state = tmp_path / 'state'
+        self.state.mkdir()
+        bin_dir = tmp_path / 'bin'
+        bin_dir.mkdir()
+        for name, text in (('zkm-gpu-server', SERVER), ('curl', CURL), ('worker', WORKER)):
+            (bin_dir / name).write_text(text)
+            (bin_dir / name).chmod(0o755)
+        self.worker = str(bin_dir / 'worker')
+        if ready:
+            (self.state / 'ready').touch()
+        self.env = {'PATH': f"{bin_dir}:{os.environ['PATH']}", 'HOME': str(tmp_path), 'TEST_STATE': str(self.state),
+            'SHARD_SIZE': '16777216', 'CUDA_VISIBLE_DEVICES': '0,1', 'FLEET_NODE_NAME': 'stream-gpu-0',
+            'FLEET_APP': 'stream', 'FLEET_CPUS': '36', 'FLEET_WORKER_RUST_LOG': 'debug', **env}
+        if env_file is not None:
+            (tmp_path / 'worker.env').write_text(env_file)
+            self.env['FLEET_WORKER_ENV_FILE'] = str(tmp_path / 'worker.env')
+        self.process = None
+
+    def start(self, *arguments, command=None):
+        self.process = subprocess.Popen(['bash', str(ROOT / 'deploy/images/worker/entrypoint.sh'),
+            *(command if command is not None else [self.worker, str(self.state), *arguments])],
+            env=self.env, stderr=subprocess.PIPE, text=True)
+        return self
+
+    def wait_for(self, name, timeout=8):
+        deadline = time.monotonic() + timeout
+        while not (self.state / name).exists():
+            assert time.monotonic() < deadline and self.process.poll() is None, name
+            time.sleep(.02)
+
+    def close(self):
+        if self.process and self.process.poll() is None:
+            self.process.kill()
+        if self.process:
+            self.process.wait()
+            self.process.stderr.close()
+        for path in self.state.glob('*.pid'):
+            try:
+                os.kill(int(path.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.fixture
+def worker_image(tmp_path):
+    images = []
+    def make(**settings):
+        root = tmp_path / f'image-{len(images)}'
+        root.mkdir()
+        images.append(WorkerImage(root, **settings))
+        return images[-1]
+    yield make
+    for image in images:
+        image.close()
+
+
+def test_the_worker_starts_once_its_server_is_ready_with_its_own_environment_and_drains_first(worker_image):
+    image = worker_image(ready=False, env_file=(
+        "# the worker's private settings\n"
+        "API_TOKEN=secret-1\n"
+        'export RPC_URL="http://rpc.example/?a=1&b=2"  # quoted\n'
+        "NOTE='two words # kept'\n"
+        "EMPTY=\n"
+        "FLEET_APP=another\n"
+        "FLEET_APP_TENANT=legacy-label\n")).start()
+    image.wait_for('server.pid')
+    time.sleep(.5)
+    assert not (image.state / 'worker.pid').exists(), 'the worker waits for its GPU server'
+    (image.state / 'ready').touch()
+    image.wait_for('worker.pid')
+    env = json.loads((image.state / 'worker.env').read_text())
+    # Its private file, Fleet's identity over it, and what the legacy executor gives a worker.
+    assert {k: env[k] for k in ('API_TOKEN', 'RPC_URL', 'NOTE', 'EMPTY', 'FLEET_APP_TENANT')} == {
+        'API_TOKEN': 'secret-1', 'RPC_URL': 'http://rpc.example/?a=1&b=2', 'NOTE': 'two words # kept', 'EMPTY': '',
+        'FLEET_APP_TENANT': 'legacy-label'}
+    assert {k: v for k, v in env.items() if k.startswith(('FLEET_', 'RUST_', 'RAYON_'))} == {
+        'FLEET_NODE_NAME': 'stream-gpu-0', 'FLEET_APP': 'stream', 'FLEET_CPUS': '36', 'FLEET_APP_TENANT': 'legacy-label',
+        'FLEET_WORKER_ROLE': 'app', 'FLEET_EXIT_WITH_PARENT': 'true',
+        'FLEET_GPU_ENDPOINT': 'http://127.0.0.1:3000/twirp/', 'RUST_LOG': 'debug', 'RAYON_NUM_THREADS': '36'}
+    # Nothing of the GPU server's settings.
+    assert not {'SHARD_SIZE', 'CUDA_VISIBLE_DEVICES', 'TEST_STATE'} & set(env)
+    image.process.send_signal(signal.SIGTERM)
+    assert image.process.wait(timeout=8) == 143
+    assert (image.state / 'worker.stopped').read_text() == 'server alive'
+    assert (image.state / 'server.stopped').read_text() == 'after the worker'
+
+
+@pytest.mark.parametrize('worker_exit, server_exit, code', [('5', None, 5), ('0', None, 1), (None, '7', 7)])
+def test_either_process_ending_ends_the_container_and_the_other(worker_image, worker_exit, server_exit, code):
+    image = worker_image(**({'TEST_SERVER_EXIT': server_exit} if server_exit else {}))
+    image.start(*([worker_exit] if worker_exit else []))
+    assert image.process.wait(timeout=8) == code
+    assert (image.state / ('worker.stopped' if server_exit else 'server.stopped')).exists()
+    for path in image.state.glob('*.pid'):
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(path.read_text()), 0)
+
+
+@pytest.mark.parametrize('line', ['API TOKEN=x', 'TOKEN=two words', 'TOKEN="a\\"b"', "TOKEN='open", 'TOKEN=$(id)x y', 'just-a-word'])
+def test_a_private_file_the_entrypoint_cannot_read_exactly_starts_nothing_and_shows_no_value(worker_image, line):
+    image = worker_image(env_file=f'GOOD=1\n{line}\n').start()
+    assert image.process.wait(timeout=8) == 64
+    message = image.process.stderr.read()
+    assert 'line 2' in message and 'two words' not in message and '$(id)' not in message
+    assert not list(image.state.glob('*.pid'))
+
+
+def test_a_server_that_is_never_ready_or_a_command_that_is_not_the_workers_ends_the_container(worker_image):
+    image = worker_image(ready=False, FLEET_WORKER_READY_TIMEOUT_S='1.0').start()
+    assert image.process.wait(timeout=10) == 1 and 'did not become ready' in image.process.stderr.read()
+    assert not (image.state / 'worker.pid').exists() and (image.state / 'server.stopped').exists()
+    for command in ([], ['worker'], ['/no/such/worker']):
+        refused = worker_image().start(command=command)
+        assert refused.process.wait(timeout=8) == 64

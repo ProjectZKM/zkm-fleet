@@ -527,9 +527,8 @@ impl RegisterAppRequest {
                 && spec.contains_key("container_port")
                 && spec.get("services").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
                 && spec.get("ingress").is_none_or(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
-                && spec.get("service_protocol").is_none_or(|v| v == "http1")
-                && spec.get("worker_command").is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
-                "packaged provers require shim Docker, a private HTTP health port and an image-owned worker");
+                && spec.get("service_protocol").is_none_or(|v| v == "http1"),
+                "packaged provers require shim Docker and a private HTTP health port");
         }
         if let Some(hash) = spec.get("access_policy_sha256") {
             anyhow::ensure!(hash.as_str().is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
@@ -745,6 +744,16 @@ mod tests {
     use super::*;
     use prost::Message;
     use serde_json::json;
+
+    #[test]
+    fn a_packaged_integrated_worker_is_a_valid_entry_that_holds_its_allocation() {
+        let entry = json!({"kind":"ziren-gpu", "runtime":{"executor":"shim","driver":"docker"}, "port_base":0,
+            "container_port":3000, "worker_command":["/opt/app/worker"]});
+        RegisterAppRequest::validate_transport(entry.as_object().unwrap()).unwrap();
+        let entry = crate::workload::Entry(&entry);
+        assert!(entry.integrated_worker() && entry.holds_allocation());
+        assert_eq!(entry.runtime_capability(), Some("shim-prover-v1"));
+    }
 
     #[test]
     fn packaged_provers_reuse_container_transport_but_require_new_adapter_capability() {

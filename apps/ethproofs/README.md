@@ -95,6 +95,20 @@ the previous worker before starting the replacement. Bootstrap a new state
 directory with `--start-block N`; a checkpoint takes precedence on subsequent
 restarts. Run only one worker for the stream and preserve GOAT's entry.
 
+To run the worker on trusted-shim, put the package and its validated GPU image in
+one image and convert the disabled entry
+([integrated workers](../../docs/reference.md#sdk-protocol),
+[cut-over](../../docs/maintenance.md#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)):
+
+```bash
+deploy/build-worker-image.sh REGISTRY/ethproofs-worker:VERSION \
+  ghcr.io/projectzkm/ziren-gpu@sha256:DIGEST /opt/zkm-fleet/apps/ethproofs
+```
+
+The package keeps its path in the image, so `worker_command` and the worker file's
+`ETH_PROOFS_ELF_FILE` stay as they are. The worker's state, cursor and outbox stay in
+`proof_storage_root`, which the container mounts at the same path.
+
 ## Production deployment
 
 The worker runs on one GPU node as one replica of app `ethproofs-z4`. Inspect its current GPU/CPU

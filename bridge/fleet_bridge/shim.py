@@ -48,6 +48,9 @@ LIMITS_CAPABILITY = "shim-limits-v1"
 CPU_SHARES_CAPABILITY = "shim-cpu-shares-v1"
 # A TEE node whose operator lets tenants that reserve no CPU share its VM.
 TEE_CPU_OVERCOMMIT_CAPABILITY = "shim-tee-cpu-overcommit-v1"
+# A node whose shim gives a container more than SHORT_STOP_S between SIGTERM and SIGKILL.
+LONG_STOP_CAPABILITY = "shim-long-stop-v1"
+SHORT_STOP_S = 90
 # A node whose shim runs a batch job: a container without a network that ends with its
 # process, reports how it ended, keeps its output, and gets a batch's grace to stop.
 BATCH_CAPABILITY = "shim-batch-v1"
@@ -62,6 +65,12 @@ def binding_hash(spec: AppReplicaSpec) -> str:
 
 def selected(spec: AppReplicaSpec) -> bool:
     return bool(spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM)
+
+
+def stop_grace_s(app: AppSpec) -> int:
+    """How long the app's container gets to stop: an integrated worker's own grace,
+    in which it finishes its proof against its GPU server."""
+    return app.worker_stop_timeout_s if app.worker_command else app.stop_timeout_s
 
 
 def required_capability(spec: AppReplicaSpec) -> str:
@@ -113,6 +122,7 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
             ("shim-management-v1", app.runtime.driver != "docker" and (bool(app.ingress) or "control" in app.services)),
             ("shim-single-use-ingress-v1", app.runtime.driver != "docker" and any(r.single_use for r in app.ingress.values())),
             (LIMITS_CAPABILITY, app.cpu_limit is not None or app.memory_limit_gb is not None),
+            (LONG_STOP_CAPABILITY, app.runtime.driver == "docker" and stop_grace_s(app) > SHORT_STOP_S),
             (CPU_SHARES_CAPABILITY, app.cpus == 0),
             (TEE_CPU_OVERCOMMIT_CAPABILITY, app.cpus == 0 and app.runtime.driver in TEE_DRIVERS),
         ) if needed)
@@ -201,6 +211,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-management-v1", managed_network),
             (LIMITS_CAPABILITY, True),
             (CPU_SHARES_CAPABILITY, "runtime-cpu-shares-v1" in features),
+            (LONG_STOP_CAPABILITY, "runtime-long-stop-v1" in features),
             (BATCH_CAPABILITY, "docker" in value.get("drivers", []) and all(f in features for f in BATCH_FEATURES)),
         ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
@@ -426,7 +437,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
     return {"execution": spec.execution, "driver": driver, "image": app.image,
         **({"access_policy_sha256": app.access_policy_sha256} if app.access_policy_sha256 is not None else {}),
-        "command": [v.format(**fill) for v in app.command],
+        # An integrated worker's image runs its worker_command, as given.
+        "command": list(app.worker_command) or [v.format(**fill) for v in app.command],
         "environment": environment,
         "limits": launch_limits(spec),
         # Application policy admission is separate from the synchronous TEE RA gate.
@@ -440,7 +452,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
             **({"entrypoint": app.entrypoint} if app.entrypoint is not None else {}),
             **({"ingress": {name:{k:v for k,v in to_dict(rule).items() if k!="single_use" or v} for name,rule in app.ingress.items()}} if app.ingress else {}),
             "gpus": gpus, "volumes": volumes,
-            "user": app.user, "workdir": app.workdir, "stop_timeout_s": app.stop_timeout_s,
+            "user": app.user, "workdir": app.worker_workdir if app.worker_command else app.workdir,
+            "stop_timeout_s": stop_grace_s(app),
             "shm_bytes": (app.shm_gb if app.shm_gb is not None else 16) * 2**30}}
 
 
@@ -905,6 +918,11 @@ class _ShimApp:
             management_ready=status.get("state") == "ready", ready=ready).dump()
 
     def application_ready(self) -> bool:
+        if self.spec.app.worker_command:
+            # An integrated worker's container is its health boundary, as its processes are on
+            # the legacy executor: its image ends the container when the worker or its GPU
+            # server exits, and a probe during a proof would call a busy worker unready.
+            return True
         if self.spec.app.service_protocol is ServiceProtocol.HTTP1:
             return actors._http_ok(self.health_url)
         try:

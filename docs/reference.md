@@ -457,10 +457,47 @@ select `runtime: {executor: shim, driver: docker}` in their existing `apps.yaml`
 entry. They retain `kind: ziren-gpu` or `ziren-cpu`, their app/ELF identity and the
 existing proof submission, queue, quota and completion protocol. Execution uses the
 same durable shim Docker lifecycle as other containers. The bridge advertises
-`shim-prover-v1`; older adapters cannot receive these launches. OpenShell and
-host-side `worker_command` are not supported for this packaged SDK worker path.
+`shim-prover-v1`; older adapters cannot receive these launches. OpenShell is not
+supported for a packaged prover.
 It exposes only its private HTTP health port; SDK ingress and artifact retrieval
 continue through the existing proof-app endpoint and storage protocol.
+
+**Integrated workers.** An entry with `worker_command` runs the app's own worker against
+its replica's GPU server. On the legacy executor the worker is a host process beside the
+server's container. With `runtime: {executor: shim, driver: docker}` the app's image
+holds both, and the `worker_*` settings keep their meaning for the container:
+`worker_command` is its command (an absolute path in the image, passed as written),
+`worker_workdir` its working directory and `worker_stop_timeout_s`, up to 3600, its
+grace between SIGTERM and SIGKILL. A grace above 90 s needs a node that reports
+`shim-long-stop-v1`, as an app's `stop_timeout_s` above 90 does. The entry takes no
+`command`. Its container is its health: the image ends it when the worker or the GPU
+server exits, the bridge starts an exited container again, and nothing probes a worker
+while it proves. The scheduler treats the entry as it treats one on the legacy
+executor: one machine-pinned replica that holds its allocation and owns its app's input
+stream.
+
+`deploy/build-worker-image.sh OUTPUT_IMAGE GPU_IMAGE@sha256:DIGEST PACKAGE_DIRECTORY
+[PATH_IN_IMAGE]` builds such an image: the app's worker package (as `apps/*/build.sh`
+makes one) on the operator-validated GPU base, with Fleet's worker entrypoint. The
+package keeps its own path in the image unless another is given, so `worker_command`
+and the paths in the worker's settings stay valid; give another path for a package
+under one of the entry's volumes, which would hide the image's copy. The build record
+holds the base image digest, the path and each package file's SHA-256. The script does
+not start a prover or publish an image.
+
+The entrypoint starts the GPU server with the container's environment, which is the
+entry's `env`, and waits until it answers ready, at most `ready_timeout_s`. It then
+starts the worker with an environment of its own: Fleet's identity (`FLEET_NODE_NAME`,
+`FLEET_APP_NAMESPACE`, `FLEET_APP`, `FLEET_APP_ELF_ID`, `FLEET_APP_STORAGE_ROOT`,
+`FLEET_GPU_ENDPOINT`, `FLEET_WORKER_ROLE=app`), `RUST_LOG` from the entry's `rust_log`,
+`RAYON_NUM_THREADS` from its `cpus`, and the values of `worker_env_file`, which is
+mounted read-only and whose contents are no part of the launch. The file cannot
+replace Fleet's identity. Each of its lines is `KEY=VALUE` with one bare word or one
+single- or double-quoted string, without backslashes inside double quotes; nothing is
+expanded, and any other line ends the container naming its line number. On a stop
+the worker gets SIGTERM first and the GPU server once the worker has exited. The
+container is on Docker's bridge network: the worker reaches what a container there
+reaches, and a service it used on the node's loopback needs another address.
 
 `deploy/build-proof-image.sh OUTPUT_IMAGE GPU_IMAGE@sha256:DIGEST` builds the locked
 SDK worker and puts it with the operator-validated GPU base in one image. The build

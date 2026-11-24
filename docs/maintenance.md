@@ -552,8 +552,14 @@ This is a coordinated maintenance operation. Build and verify the new image befo
 the downtime. The SDK worker and its matching Ziren 2.0 GPU server share one image;
 Fleet retains proof scheduling, and shim owns the container. Existing application,
 namespace and ELF identities, queued jobs, proof history and storage paths stay in
-place. Integrated `worker_command` applications own their input streams and need
-their own complete worker image; the SDK converter refuses to guess their packaging.
+place. An integrated `worker_command` application owns its input stream and moves
+with its own worker image ([integrated workers](reference.md#sdk-protocol)): build it in
+step 3 with `deploy/build-worker-image.sh REGISTRY/APP-WORKER:VERSION
+GPU_IMAGE@sha256:DIGEST PACKAGE_DIRECTORY` instead, and give the migrator that image.
+The migrator keeps the entry's `worker_*` settings, mounts its state and its private
+environment file, and refuses a worker whose path a volume would hide. Before the
+downtime, check that the worker needs nothing on the node's loopback and that every
+line of its environment file is a plain `KEY=VALUE`.
 
 1. Pause producers and disable each affected proof app with
    `fleetctl --namespace NS app disable APP`. Wait for running proofs to finish,

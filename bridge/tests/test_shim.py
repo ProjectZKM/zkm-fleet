@@ -140,6 +140,62 @@ def spec(tmp_path):
     return reconcile.replica_specs(reconcile.load_apps(config(tmp_path)))["web-0"]
 
 
+def integrated(tmp_path, **update):
+    """A node's configuration with an app's own worker, packaged with its GPU server."""
+    raw = config(tmp_path)
+    raw["apps"][0].update(kind="ziren-gpu", elf_id="a" * 64, gpus=2, cpus=4, machine=socket.gethostname(),
+        proof_storage_root="/srv/stream/state", port_base=0, container_port=3000, command=[], stop_timeout_s=30,
+        env={"TMPDIR": "/dev/shm", "FLEET_NODE_NAME": "{name}", "FLEET_WORKER_ENV_FILE": "{worker_env_file}",
+             "FLEET_WORKER_READY_TIMEOUT_S": "{ready_timeout_s}", "CUDA_VISIBLE_DEVICES": "{gpus}"},
+        volumes=["{proof_storage_root}", "{worker_env_file}:ro"],
+        worker_command=["/opt/stream/worker", "--note", "{kept}"], worker_env_file="/etc/stream/worker.env",
+        worker_workdir="/srv/stream/state/run", worker_stop_timeout_s=600)
+    raw["apps"][0].update(update)
+    return raw
+
+
+def test_a_packaged_integrated_worker_is_launched_with_its_command_workdir_and_grace(tmp_path, monkeypatch):
+    bound = shim.RuntimeBook(tmp_path / "book").bind(reconcile.replica_specs(reconcile.load_apps(integrated(tmp_path)))["web-0"], "launch")
+    request = shim.launch_request(bound, ["4", "6"])
+    # The image runs the worker's command as written; nothing in it is filled in.
+    assert request["command"] == ["/opt/stream/worker", "--note", "{kept}"]
+    options = request["driver_options"]
+    assert (options["workdir"], options["stop_timeout_s"], options["container_port"], options["gpus"]) == (
+        "/srv/stream/state/run", 600, 3000, ["4", "6"])
+    assert options["volumes"] == ["/srv/stream/state:/srv/stream/state", "/etc/stream/worker.env:/etc/stream/worker.env:ro"]
+    # The private file is mounted and named; its contents are no part of the launch.
+    assert request["environment"] == {"TMPDIR": "/dev/shm", "FLEET_NODE_NAME": "web-0",
+        "FLEET_WORKER_ENV_FILE": "/etc/stream/worker.env", "FLEET_WORKER_READY_TIMEOUT_S": "600", "CUDA_VISIBLE_DEVICES": "0,1"}
+    # A grace above the shim's short stop needs a shim that gives it.
+    assert shim.required_capabilities(bound) >= {"shim-prover-v1", "shim-docker-v1", shim.LONG_STOP_CAPABILITY}
+    short = reconcile.replica_specs(reconcile.load_apps(integrated(tmp_path, worker_stop_timeout_s=90)))["web-0"]
+    assert shim.LONG_STOP_CAPABILITY not in shim.required_capabilities(short)
+    # Its container is its health: no probe reaches a worker that is busy proving.
+    actor = object.__new__(shim._ShimApp)
+    actor.spec = bound
+    monkeypatch.setattr(actors, "_http_ok", lambda _: pytest.fail("an integrated worker is not probed"))
+    monkeypatch.setattr(shim.socket, "create_connection", lambda *a, **k: pytest.fail("an integrated worker is not probed"))
+    assert actor.application_ready()
+
+
+@pytest.mark.parametrize("update", [{"command": ["serve"]}, {"worker_stop_timeout_s": 3601}, {"worker_command": ["worker"]},
+    {"replicas": 2}, {"machine": None}, {"proof_storage_root": None}, {"runtime": {"executor": "shim", "driver": "tee"}}])
+def test_a_packaged_integrated_worker_the_shim_could_not_run_is_refused(tmp_path, update):
+    with pytest.raises(ValueError):
+        reconcile.load_apps(integrated(tmp_path, **update))
+
+
+def test_a_long_stop_is_advertised_by_a_shim_that_gives_one(tmp_path, monkeypatch):
+    cluster = replace(spec(tmp_path).cluster, shim_daemon=True)
+    for features, expected in ((["data-plane-v1", "runtime-long-stop-v1"], True), (["data-plane-v1"], False)):
+        monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: {"protocol": 1, "drivers": ["docker"], "features": features})
+        assert (shim.LONG_STOP_CAPABILITY in shim.capabilities(cluster)) is expected
+    # An app's own long grace needs it as well.
+    slow = spec(tmp_path)
+    assert shim.LONG_STOP_CAPABILITY in shim.required_capabilities(replace(slow, app=replace(slow.app, stop_timeout_s=91)))
+    assert shim.LONG_STOP_CAPABILITY not in shim.required_capabilities(slow)
+
+
 @pytest.mark.parametrize("value", [[], None, {"protocol":True,"drivers":["docker"]},
     {"protocol":1,"drivers":None}, {"protocol":1,"drivers":"docker"},
     {"protocol":1,"drivers":["docker"],"features":None},

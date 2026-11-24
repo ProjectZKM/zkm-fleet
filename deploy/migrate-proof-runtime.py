@@ -42,16 +42,10 @@ def convert(config, names, image):
         raise ValueError("entry names must be unique")
     if not result.get('shim_binary') or not result.get('shim_state_dir') or not result.get('shim_daemon'):
         raise ValueError("configure the persistent shim service before migration")
-    if not result.get('scheduler', '').startswith('https://'):
-        raise ValueError("containers need an HTTPS scheduler reachable from the node")
-    if not Path(result.get('cluster_token_file', '')).is_absolute():
-        raise ValueError("configure an absolute node credential path")
-    if result.get('scheduler_ca_file') and not Path(result['scheduler_ca_file']).is_absolute():
-        raise ValueError("configure an absolute scheduler CA path")
     updates = []
     for entry in selected.values():
-        if entry.get('kind') not in ('ziren-gpu', 'ziren-cpu') or entry.get('worker_command'):
-            raise ValueError("select native SDK proof entries; integrated applications must supply their own worker image")
+        if entry.get('kind') not in ('ziren-gpu', 'ziren-cpu'):
+            raise ValueError("select proof entries")
         if entry.get('disabled') is not True:
             raise ValueError("disable and drain the proof app, then confirm cleanup before preparing its migration")
         root = entry.get('proof_storage_root', '')
@@ -61,20 +55,11 @@ def convert(config, names, image):
         if type(cpus) is not int or cpus < 1:
             raise ValueError(f"{entry['name']}: cpus must be a whole number of CPUs, at least 1, as the "
                 f"scheduler requires; it is {cpus!r}")
-        env = dict(entry.get('env') or {})
-        env.update(FLEET_NODE_NAME='{name}', FLEET_MACHINE='{machine}',
-            FLEET_SCHEDULER='{scheduler}', FLEET_CLUSTER_TOKEN_FILE='{cluster_token_file}',
-            FLEET_APP_NAMESPACE='{namespace}', FLEET_APP='{app}', FLEET_APP_ELF_ID='{elf_id}',
-            FLEET_APP_STORAGE_ROOT='{proof_storage_root}', FLEET_GPUS='{gpu_count}',
-            FLEET_CPUS='{cpu_count}', FLEET_IMAGE='{image}',
-            FLEET_BACKEND='cuda' if entry['kind'] == 'ziren-gpu' else entry.get('backend', 'cpu'),
-            FLEET_EXIT_WITH_PARENT='false', FLEET_HEALTH_ADDR='0.0.0.0:8080',
-            FLEET_GPU_ENDPOINT='http://127.0.0.1:3000/twirp/', ZIREN_SERVER_PORT='3000',
-            CUDA_VISIBLE_DEVICES='{gpus}', ZKM_GPU_DEVICES='{gpus}',
-            RAYON_NUM_THREADS='{cpu_count}', RUST_LOG=entry.get('rust_log', 'info'))
+        # The shim fills {name} templates in an entry's environment; its own values stay as written.
+        env = {k: str(v).replace('{', '{{').replace('}', '}}') for k, v in (entry.get('env') or {}).items()}
         volumes = [shim_volume(entry['name'], v) for v in entry.get('volumes') or []]
         # Storage paths stay identical: persisted file:// references and completed
-        # lease markers remain valid. Only the credential FILE is mounted read-only.
+        # lease markers remain valid. Only a credential FILE is mounted, read-only.
         def mount(path, template, readonly):
             existing = [v for v in volumes if v.partition(':')[0] in (path, template)]
             if existing:
@@ -84,15 +69,9 @@ def convert(config, names, image):
             else:
                 volumes.append(template + (':ro' if readonly else ''))
         mount(root, root, False)
-        mount(result['cluster_token_file'], '{cluster_token_file}', True)
-        if result.get('scheduler_ca_file'):
-            env['FLEET_SCHEDULER_CA_FILE'] = '{scheduler_ca_file}'
-            mount(result['scheduler_ca_file'], '{scheduler_ca_file}', True)
-        else:
-            env.pop('FLEET_SCHEDULER_CA_FILE', None)
-        settings = dict(image=image, runtime={'executor': 'shim', 'driver': 'docker'},
-            env=env, volumes=volumes, port_base=0, container_port=8080,
-            health_path='/healthz', command=[], stop_timeout_s=min(entry.get('stop_timeout_s', 30), 90))
+        convert_worker = integrated_worker if entry.get('worker_command') else sdk_worker
+        settings = dict(image=image, runtime={'executor': 'shim', 'driver': 'docker'}, env=env, volumes=volumes,
+            port_base=0, command=[], **convert_worker(result, entry, env, volumes, mount))
         if entry['kind'] == 'ziren-gpu':
             settings['shm_gb'] = entry.get('shm_gb') or 64
         entry.update(settings)
@@ -101,6 +80,63 @@ def convert(config, names, image):
         updates.append(dict(entry=entry['name'], app=entry.get('app', entry['name']),
             namespace=entry['namespace'], cpus=cpus, set=settings))
     return result, updates
+
+
+def sdk_worker(config, entry, env, volumes, mount):
+    """Fleet's SDK worker, which takes its proofs from the scheduler."""
+    if not config.get('scheduler', '').startswith('https://'):
+        raise ValueError("containers need an HTTPS scheduler reachable from the node")
+    if not Path(config.get('cluster_token_file', '')).is_absolute():
+        raise ValueError("configure an absolute node credential path")
+    if config.get('scheduler_ca_file') and not Path(config['scheduler_ca_file']).is_absolute():
+        raise ValueError("configure an absolute scheduler CA path")
+    env.update(FLEET_NODE_NAME='{name}', FLEET_MACHINE='{machine}',
+        FLEET_SCHEDULER='{scheduler}', FLEET_CLUSTER_TOKEN_FILE='{cluster_token_file}',
+        FLEET_APP_NAMESPACE='{namespace}', FLEET_APP='{app}', FLEET_APP_ELF_ID='{elf_id}',
+        FLEET_APP_STORAGE_ROOT='{proof_storage_root}', FLEET_GPUS='{gpu_count}',
+        FLEET_CPUS='{cpu_count}', FLEET_IMAGE='{image}',
+        FLEET_BACKEND='cuda' if entry['kind'] == 'ziren-gpu' else entry.get('backend', 'cpu'),
+        FLEET_EXIT_WITH_PARENT='false', FLEET_HEALTH_ADDR='0.0.0.0:8080',
+        FLEET_GPU_ENDPOINT='http://127.0.0.1:3000/twirp/', ZIREN_SERVER_PORT='3000',
+        CUDA_VISIBLE_DEVICES='{gpus}', ZKM_GPU_DEVICES='{gpus}',
+        RAYON_NUM_THREADS='{cpu_count}', RUST_LOG=entry.get('rust_log', 'info'))
+    mount(config['cluster_token_file'], '{cluster_token_file}', True)
+    if config.get('scheduler_ca_file'):
+        env['FLEET_SCHEDULER_CA_FILE'] = '{scheduler_ca_file}'
+        mount(config['scheduler_ca_file'], '{scheduler_ca_file}', True)
+    else:
+        env.pop('FLEET_SCHEDULER_CA_FILE', None)
+    return dict(container_port=8080, health_path='/healthz', stop_timeout_s=min(entry.get('stop_timeout_s', 30), 90))
+
+
+def integrated_worker(config, entry, env, volumes, mount):
+    """An app's own worker (`worker_command`), which the app's image runs beside its GPU
+    server. The entry's environment stays the server's; the image's entrypoint gives the
+    worker Fleet's identity and the entry's worker_env_file. The command, working
+    directory, environment file and stop grace stay in the entry as they are."""
+    if entry['kind'] != 'ziren-gpu' or not 0 < entry.get('worker_stop_timeout_s', 120) <= 3600:
+        raise ValueError(f"{entry['name']}: an integrated worker is a ziren-gpu entry that stops within 3600 s")
+    env.update(FLEET_NODE_NAME='{name}', FLEET_APP_NAMESPACE='{namespace}', FLEET_APP='{app}',
+        FLEET_APP_ELF_ID='{elf_id}', FLEET_APP_STORAGE_ROOT='{proof_storage_root}', FLEET_CPUS='{cpu_count}',
+        FLEET_WORKER_RUST_LOG=entry.get('rust_log', 'info'), FLEET_WORKER_READY_TIMEOUT_S='{ready_timeout_s}',
+        ZIREN_SERVER_PORT='3000', CUDA_VISIBLE_DEVICES='{gpus}', ZKM_GPU_DEVICES='{gpus}')
+    workdir = entry.get('worker_workdir')
+    if workdir and not any(under(workdir, v.partition(':')[0]) for v in volumes):
+        mount(workdir, workdir, False)
+    if entry.get('worker_env_file'):
+        env['FLEET_WORKER_ENV_FILE'] = '{worker_env_file}'
+        mount(entry['worker_env_file'], '{worker_env_file}', True)
+    worker = entry['worker_command'][0]
+    hidden = [v.partition(':')[0] for v in volumes if under(worker, v.partition(':')[0])]
+    if hidden:
+        raise ValueError(f"{entry['name']}: {worker} lies under the volume {hidden[0]}, which would hide the image's "
+            "worker; build the image with the package at another path and name that path in worker_command")
+    # The GPU server's port, published on the node's loopback as the legacy executor publishes it.
+    return dict(container_port=3000)
+
+
+def under(path, directory):
+    return Path(path) == Path(directory) or Path(directory) in Path(path).parents
 
 
 def main():

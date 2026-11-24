@@ -675,6 +675,8 @@ LIMITED_DRIVERS = ("docker", "tee", "tee-simulation")
 # The smallest hard CPU limit Docker accepts, and the most CPUs shim counts in 32-bit millicores.
 MIN_CPU_LIMIT = 0.01
 MAX_CPUS = 2**32 / 1000
+# The longest grace the shim gives a container between SIGTERM and SIGKILL.
+MAX_STOP_TIMEOUT_S = 3600
 # The smallest hard memory limit shim accepts.
 MIN_MEMORY_LIMIT_BYTES = 6 * 1024**2
 
@@ -719,7 +721,9 @@ class AppSpec(Record):
     mounts: list[DurableMount] = field(default_factory=list)
     shm_gb: int | None = None
     ready_timeout_s: float = 600
-    # Integrated app worker sharing the replica's dedicated GPU server.
+    # Integrated app worker sharing the replica's dedicated GPU server: a host process on the
+    # legacy executor, the command of the app's own image on the shim. The environment file,
+    # working directory and stop grace are the worker's on both.
     worker_command: list[str] = field(default_factory=list)
     worker_env_file: str | None = None
     worker_workdir: str | None = None
@@ -806,8 +810,11 @@ class AppSpec(Record):
         if self.port_base == 0 and self.runtime and self.runtime.executor is ExecutorKind.SHIM and self.container_port is None:
             raise ModelError("automatic host ports require shim and container_port")
         if self.runtime is not None and self.kind is not AppRuntime.APP:
-            if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker") or self.worker_command:
+            if self.runtime != RuntimeSelection(executor=ExecutorKind.SHIM, driver="docker"):
                 raise ModelError("packaged provers require shim Docker and an image-owned worker")
+            # The image runs an integrated worker's worker_command; its container has no other command.
+            if self.worker_command and (self.command or self.worker_stop_timeout_s > MAX_STOP_TIMEOUT_S):
+                raise ModelError(f"a packaged integrated worker takes no command and at most {MAX_STOP_TIMEOUT_S} s to stop")
             if self.port_base is None or not self.container_port or not self.image:
                 raise ModelError("packaged provers require an image and health port")
             if self.services or self.ingress or self.service_protocol is not ServiceProtocol.HTTP1:

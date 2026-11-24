@@ -109,6 +109,17 @@ The script:
 - writes `proof-builder-rpc`, `programs.json`, `fleet-app-id`, `source-revision` and
   `SHA256SUMS`.
 
+To run the worker on trusted-shim, put the package and its validated GPU image in one
+image with `deploy/build-worker-image.sh` and convert the disabled entry
+([integrated workers](../../docs/reference.md#sdk-protocol),
+[cut-over](../../docs/maintenance.md#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)).
+A package inside `proof_storage_root` needs another path in the image, named in
+`worker_command`. The container publishes one port on the node's loopback, the GPU
+server's by default: set the entry's `container_port` to the worker's `--rpc-addr` port,
+with the worker listening on `0.0.0.0`, for clients on the node. `DATABASE_URL` and
+every other address in the worker's file must be reachable from a container on Docker's
+bridge network.
+
 ## Install and configure
 
 1. Install the package at `/opt/zkm-fleet/apps/goat`.
