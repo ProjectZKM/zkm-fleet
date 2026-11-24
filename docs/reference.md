@@ -238,7 +238,16 @@ priority alone doesn't restart replicas. `fleetctl app update NAME ... --check`
 (`PUT /apps/NAME/settings?dry_run=true`) answers what the update would, including a
 refusal because the app's node lacks a capability the settings need, and changes
 nothing: a way to check a move to another runtime before the app is drained for
-it. What only the node checks when it starts a replica isn't covered.
+it. What only the node checks when it starts a replica isn't covered. An app on
+no node yet takes an update, or a check, in the app itself: the settings are
+checked against the nodes there are, no node is told, and its first enable places
+it with them.
+
+A change tells the node only what it has to do. Disabling stops the replicas and
+writes the configuration; enabling writes it and starts them; settings for a
+disabled app are one configuration write; settings for a running app stop it,
+write and start it again. Each step's result is answered with the next step, so a
+change takes about as long as its stop and its start do.
 
 **Deleting.** `fleetctl app delete NAME --yes` and `fleetctl batch delete NAME --yes`
 work the same way. Without `--yes` they only say what would go. A delete is refused

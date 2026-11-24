@@ -727,8 +727,12 @@ impl WorkloadController {
     fn require_deployment_scope(&self, c: Option<&Token>, namespace: &str, app: &str, node: Option<&str>,
     ) -> anyhow::Result<()> {
         if let Some(c) = c {
-            let (_, deployment) = self.app_deployment(namespace, app, node)?;
-            if deployment.entry().tag().is_some_and(|tag| c.tag.as_deref() != Some(tag)) {
+            // An app on no node yet is its template.
+            let tag = match self.unplaced(namespace, app).filter(|_| node.is_none()) {
+                Some(template) => template.entry().tag().map(str::to_owned),
+                None => self.app_deployment(namespace, app, node)?.1.entry().tag().map(str::to_owned),
+            };
+            if tag.is_some_and(|tag| c.tag.as_deref() != Some(tag.as_str())) {
                 return Err(fail(403, "another tag cannot be selected"));
             }
         }
@@ -1206,8 +1210,10 @@ impl WorkloadController {
                     repaired.scale = Some(scaling::new_scale(self.with_priority(intent.spec.clone()), intent.disabled));
                     self.save("deployments", &key, &repaired)?;
                     self.inner.lock().deployments.insert(key.clone(), repaired);
-                } else {
-                    // Configured as desired but not running as desired: start or stop it.
+                } else if intent.disabled || !(observed.started() && observed.0["runtime"]["executor"] == "shim") {
+                    // Configured as desired but not running as desired: start or stop it. A
+                    // shim app whose replicas are started is its runtime's to make ready: its
+                    // node keeps what runs until it is stopped, and would refuse a start.
                     self.command(worker_id, NodeOperation::SetApp,
                         message::set_app(&self.with_priority(intent.spec.clone()), intent.disabled))?;
                 }
@@ -1555,7 +1561,31 @@ impl WorkloadController {
         Ok(true)
     }
     async fn dispatch(&self) -> anyhow::Result<()> {
-        let ops = self.ops.lock().await;
+        self.advance_apps().await?;
+        let waiting_job = |r: &Job| {
+            r.worker.is_none() && matches!(r.state(), "waiting_quota" | "waiting_dependency") && r.stop.is_none()
+        };
+        let mut jobs = {
+            self.inner
+                .lock()
+                .jobs
+                .open()
+                .filter(|r| waiting_job(r))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        jobs.sort_by(|a, b| {
+            b.policy().priority().cmp(&a.policy().priority())
+                .then(a.submitted_at().unwrap_or(0.0).total_cmp(&b.submitted_at().unwrap_or(0.0)))
+                .then(a.id.cmp(&b.id))
+        });
+        self.place_jobs(jobs, waiting_job).await
+    }
+    /// The next step of every app change, and the stops of jobs: what a pass does before it
+    /// places jobs. A node's heartbeat that reports a command done runs it too, so the step
+    /// that follows goes out in that heartbeat's answer.
+    async fn advance_apps(&self) -> anyhow::Result<()> {
+        let _ops = self.ops.lock().await;
         self.advance_scales().await?;
         let held = {
             self.inner
@@ -1725,24 +1755,10 @@ impl WorkloadController {
             self.save("commands", &c.id, &c)?;
             self.inner.lock().commands.insert(c.id.clone(), c);
         }
-        let waiting_job = |r: &Job| {
-            r.worker.is_none() && matches!(r.state(), "waiting_quota" | "waiting_dependency") && r.stop.is_none()
-        };
-        let mut jobs = {
-            self.inner
-                .lock()
-                .jobs
-                .open()
-                .filter(|r| waiting_job(r))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        drop(ops);
-        jobs.sort_by(|a, b| {
-            b.policy().priority().cmp(&a.policy().priority())
-                .then(a.submitted_at().unwrap_or(0.0).total_cmp(&b.submitted_at().unwrap_or(0.0)))
-                .then(a.id.cmp(&b.id))
-        });
+        Ok(())
+    }
+    /// Places waiting `jobs`, in their order, and sends each assigned job's launch.
+    async fn place_jobs(&self, jobs: Vec<Job>, waiting_job: impl Fn(&Job) -> bool) -> anyhow::Result<()> {
         for id in jobs.into_iter().map(|r| r.id) {
             // Each job is placed under its own hold of the operation lock: a node's report
             // or a request waiting for it goes between two jobs, not after the whole queue.
@@ -1962,6 +1978,11 @@ impl WorkerService for NodeControlService {
             .await
             .map_err(|e| tonic::Status::failed_precondition(e.to_string()))?;
         let r_worker = r.worker_id.clone();
+        if !ack.is_empty() {
+            if let Err(e) = self.0.advance_apps().await {
+                tracing::error!(error=%e, "app changes retained for the next dispatch pass");
+            }
+        }
         let commands = heartbeat_commands(&self.0.inner.lock(), &r.worker_id);
         Ok(tonic::Response::new(WorkerHeartbeatResponse {
             runtime_deliveries: if r.runtime_delivery_ready {
@@ -1970,7 +1991,8 @@ impl WorkerService for NodeControlService {
             proof_fetches: self.0.fleet.proof_fetch.heartbeat(&machine, &r.worker_id, &r.session, r.proof_fetch_ready,
             ),
             log_requests: self.0.fleet.log_relay.heartbeat(&r.worker_id, &r.session),
-            heartbeat_secs: 2,
+            // A node with a command to run is heard again sooner, for its result.
+            heartbeat_secs: if commands.is_empty() { 2 } else { 1 },
             commands,
             acknowledged_results: ack,
             acknowledged_jobs: reported

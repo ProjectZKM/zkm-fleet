@@ -253,6 +253,8 @@ class NodeExecutor:
         self.settled: dict[str, int] = {}
         # Set when a command finishes, so its result is reported without waiting.
         self.finished = threading.Event()
+        # Replicas being started: not ready, and busy until they are.
+        self.starting: set[str] = set()
 
     def resource_lock(self, key: str) -> threading.Lock:
         with self.lock:
@@ -297,7 +299,9 @@ class NodeExecutor:
                     result = self.stop(params, preempt=operation == 3)
                 elif operation == 4:
                     with self.apps_lock:
-                        result = self.set_app(params, command["id"])
+                        result, start = self.admit_app(params, command["id"])
+                    # A start waits until its replicas are ready; other apps' changes needn't.
+                    start()
                 elif operation == 7:
                     with self.apps_lock:
                         result, then = self.app(params)
@@ -428,6 +432,14 @@ class NodeExecutor:
         writes that configuration (enabled state, resources, settings) with NODE_OPERATION_APP
         first. A stop removes every replica of the app, also one beyond its configured
         count, and confirms its containers are gone."""
+        result, start = self.admit_app(p, command_id)
+        start()
+        return result
+
+    def admit_app(self, p: dict[str, Any], command_id: str | None = None) -> tuple[dict[str, Any], Any]:
+        """`set_app` in two parts: what is checked and changed against the node's
+        configuration and its running replicas, and a function that starts the replicas
+        admitted here and returns once they are ready. A stop is done by the first part."""
         if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         app = p["app"]
@@ -448,7 +460,7 @@ class NodeExecutor:
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
         if p["disabled"]:
             self._remove_replicas(sorted(set(running) | {f"{configured.name}-{i}" for i in range(configured.replicas)}))
-            return {"cleaned": True, "disabled": True}
+            return {"cleaned": True, "disabled": True}, lambda: None
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
         cfg.validate_launch(configured)
@@ -461,6 +473,7 @@ class NodeExecutor:
         self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
         existing = reconcile.running()
         capabilities = None
+        admitted = []
         for spec in replicas:
             if spec.name in existing:
                 health = reconcile.health_of(existing[spec.name])
@@ -485,9 +498,19 @@ class NodeExecutor:
                     raise ValueError(f"node does not support the selected shim runtime: it lacks {', '.join(sorted(missing))}")
             if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
                 raise ValueError("legacy containers require confirmed cleanup before shim launch")
-            spec = self.runtimes.bind(spec, command_id)
-            reconcile.start(spec)
-        return {"disabled": False, "ready": not configured.native_access}
+            admitted.append(self.runtimes.bind(spec, command_id))
+
+        def start() -> None:
+            names = {spec.name for spec in admitted}
+            with self.lock:
+                self.starting |= names
+            try:
+                for spec in admitted:
+                    reconcile.start(spec)
+            finally:
+                with self.lock:
+                    self.starting -= names
+        return {"disabled": False, "ready": not configured.native_access}, start
 
     def _remove_replicas(self, names: list[str]) -> None:
         for name in names:
@@ -701,6 +724,8 @@ class NodeExecutor:
         cfg = reconcile.load_apps(yaml.safe_load(self.apps_file.read_text()), validate_launch=False)
         apps = cfg.raw.get("apps", [])
         running = reconcile.running()
+        with self.lock:
+            starting = set(self.starting)
         runtime_instances = []
         for app in apps:
             names = [f"{app['name']}-{i}" for i in range(app.get("replicas", 1))]
@@ -710,11 +735,15 @@ class NodeExecutor:
             app.setdefault("cpus", 1)
             app["gpus"] = 0 if app["kind"] == "ziren-cpu" else app.get("gpus", 1)
             app["ready"] = True
+            # Started, ready or not: the scheduler starts what is not.
+            app["started"] = all(name in running or name in starting for name in names)
             # Where `fleetctl app logs` reads from: one node log per replica.
             app["logs"] = [os.path.join(cfg.cluster.log_dir, f"{name}.node.log") for name in names]
             for name in names:
                 try:
-                    health = reconcile.health_of(running[name], timeout_s=5) if name in running else None
+                    # A replica being started answers once it is ready: asking it would
+                    # hold this report, and every result in it, for the whole timeout.
+                    health = reconcile.health_of(running[name], timeout_s=5) if name in running and name not in starting else None
                     owned_executor = health is not None and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
                     healthy = owned_executor and health.is_ready
                     if owned_executor and health.execution is not None and (healthy or health.management_ready or health.allocation_reserved):

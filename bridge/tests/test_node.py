@@ -219,6 +219,47 @@ def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkey
     assert ReplicaHealth(name='cpu',spec='hash').is_ready
 
 
+def test_a_start_in_progress_holds_neither_other_app_changes_nor_the_report(executor, monkeypatch):
+    import threading
+    cfg=yaml.safe_load(executor.apps_file.read_text())
+    cfg['apps'][0]['disabled']=False
+    executor.apps_file.write_text(yaml.safe_dump(cfg))
+    names=list(reconcile.replica_specs(reconcile.load_apps(cfg)))
+    actors_up={}
+    monkeypatch.setattr(reconcile,'running',lambda:dict(actors_up))
+    asked=Mock(side_effect=AssertionError('a starting replica answers only once it is ready'))
+    monkeypatch.setattr(reconcile,'health_of',asked)
+    monkeypatch.setattr(node.ray,'cluster_resources',lambda:{'GPU':8,'CPU':48})
+    monkeypatch.setattr(node.ray,'available_resources',lambda:{'GPU':4,'CPU':16})
+    begun,ready=threading.Event(),threading.Event()
+    def start(spec):
+        actors_up[spec.name]=spec.name
+        begun.set()
+        assert ready.wait(10)
+    monkeypatch.setattr(reconcile,'start',start)
+    command={'id':'start','operation':4,'parameters':{'app':cfg['apps'][0],'disabled':False}}
+    node.write_json(executor.journal/'start.json',{'command':command,'done':False})
+    starting=threading.Thread(target=executor.execute,args=(command,))
+    starting.start()
+    try:
+        assert begun.wait(10)
+        # Another app's change takes the configuration at once.
+        assert executor.apps_lock.acquire(timeout=1)
+        executor.apps_lock.release()
+        app=executor.report()['apps'][0]
+        assert (app['ready'],app['started'])==(False,True),'being started counts as started: the scheduler sends no second start'
+        asked.assert_not_called()
+    finally:
+        ready.set()
+        starting.join(10)
+    assert node.read_json(executor.journal/'start.json')['error'] is None
+    assert sorted(actors_up)==names and not executor.starting
+    from fleet_bridge.model import ReplicaHealth
+    monkeypatch.setattr(reconcile,'health_of',lambda name,**kwargs:ReplicaHealth(name=name,spec='hash',gpu_ready=True))
+    app=executor.report()['apps'][0]
+    assert (app['ready'],app['started'])==(True,True)
+
+
 def test_prover_executor_switch_retains_old_actor_until_explicit_cleanup(executor, monkeypatch):
     from fleet_bridge.model import ReplicaHealth
     cfg = yaml.safe_load(executor.apps_file.read_text())

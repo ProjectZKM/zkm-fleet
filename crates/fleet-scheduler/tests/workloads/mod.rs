@@ -1629,16 +1629,20 @@ async fn proof_scale_drains_running_execution_before_delivery_and_keeps_disabled
     finish_app_command(&c,&ns,true,&normal,true,Some(stopped)).await;
     c.request_scale(&ns,PROOF,request_resources(json!({"gpus":2,"replicas":1})),
     ).await.unwrap();
-    c.dispatch().await.unwrap();
-    let stop=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
-    finish_app_command(&c,&ns,true,&stop,true,None).await;c.dispatch().await.unwrap();
+    // An app that is down has nothing to stop or start: the node writes its configuration,
+    // and its report of it completes the change.
+    let sent=c.inner.lock().commands.len();
     node_writes_config(&c,scale_inventory(&ns,true,true)).await;
-    let apply=c.inner.lock().commands.values().find(|v|!v.done).unwrap().clone();
-    assert_eq!(apply.parameters["disabled"],true);
-    let mut observed=apply.parameters["app"].clone();observed["disabled"]=json!(true);observed["cleaned"]=json!(true);observed["ready"]=json!(false);
-    finish_app_command(&c,&ns,true,&apply,true,Some(observed)).await;c.dispatch().await.unwrap();
+    assert_eq!(c.scale_status(&ns,PROOF,None).unwrap()["state"],"starting","until the node reports the new resources");
+    let mut written=scale_inventory(&ns,true,true);
+    written.apps[0]=c.inner.lock().deployments["gpu-model"].scale.as_ref().unwrap().target.clone();
+    for (key,value) in [("disabled",true),("cleaned",true),("ready",false)] { written.apps[0][key]=json!(value); }
+    c.report("gpu","session",written).await.unwrap();c.dispatch().await.unwrap();
+    assert_eq!(c.inner.lock().commands.len(),sent+1,"one command: the configuration");
     assert!(c.fleet.app_disabled(&ns, PROOF));
     assert_eq!(c.scale_status(&ns,PROOF,None).unwrap()["state"],"complete");
+    let down=c.inner.lock().deployments["gpu-model"].clone();
+    assert_eq!((down.disabled,&down.spec["gpus"]),(true,&json!(2.0)),"the deployment is the stopped target");
 }
 
 #[tokio::test]
@@ -2469,11 +2473,6 @@ async fn a_registered_app_update_changes_its_server() {
     assert_eq!((scale.set.as_ref().map(|s|s.0.clone()),scale.target["image"].as_str()),(Some(json!({"image":"prover:2"})),Some("prover:2")));
 }
 
-async fn answer(c: &WorkloadController, mut report: NodeReport, command: &CommandRecord, result: Value) {
-    report.results=vec![CommandResult{id:command.id.clone(),result:result.into(),error:None}];
-    c.report("gpu","session",report).await.unwrap();
-    c.dispatch().await.unwrap();
-}
 async fn change_pending(c: &WorkloadController, disabled: bool) {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while !c.inner.lock().deployments.values().any(|s| s.scale.as_ref().is_some_and(|s| s.pending() && s.disabled == disabled)) {
@@ -2493,6 +2492,66 @@ async fn disabling_an_app_whose_node_is_offline_is_kept_until_it_returns() {
 }
 
 #[tokio::test]
+async fn a_started_shim_app_that_is_not_ready_is_not_started_again() {
+    let (_dir,c,ns)=setup().await;
+    let node=|ready: bool, started: bool| {
+        let mut report=shim_node(&ns,&[]);
+        report.apps=vec![json!({"name":"agent","kind":"app","namespace":ns,"app":"agent","gpus":0,"cpus":1,"replicas":1,"image":"agent:1",
+            "runtime":{"executor":"shim","driver":"docker"},"disabled":false,"ready":ready,"started":started,"cleaned":false}).into()];
+        report
+    };
+    c.report("gpu","session",node(true,true)).await.unwrap();
+    c.report("gpu","session",node(false,true)).await.unwrap();
+    assert_eq!(c.inner.lock().commands.len(),0,"its runtime makes it ready; its node would refuse a start");
+    // One with a replica that is not started (its node restarted, say) is.
+    c.report("gpu","session",node(false,false)).await.unwrap();
+    assert!(command_where(&c,|v|v.is(NodeOperation::SetApp)).unwrap().starts());
+}
+
+#[tokio::test]
+async fn a_nodes_result_is_answered_with_the_next_step_of_its_change() {
+    let (_dir,c,ns)=setup().await;
+    c.report("gpu","session",scale_inventory(&ns,false,false)).await.unwrap();
+    let node=NodeControlService(c.clone());
+    let beat=|report: NodeReport, results: Vec<(&str,Value)>| {
+        let node=&node;
+        let mut report=report;
+        report.results=results.into_iter().map(|(id,result)|CommandResult{id:id.into(),result:result.into(),error:None}).collect();
+        async move {
+            node.heartbeat(tonic::Request::new(WorkerHeartbeatRequest{worker_id:"gpu".into(),session:"session".into(),
+                report:Some(report),..Default::default()})).await.unwrap().into_inner()
+        }
+    };
+    assert_eq!(beat(scale_inventory(&ns,false,false),vec![]).await.heartbeat_secs,2);
+    c.begin_toggle(&["gpu-model".into()],true).unwrap();
+    c.dispatch().await.unwrap();
+    let answer=beat(scale_inventory(&ns,false,false),vec![]).await;
+    assert_eq!((answer.commands.len(),answer.heartbeat_secs),(1,1),"a node with a command to run is heard again sooner");
+    let stop=answer.commands[0].id.clone();
+    // No dispatch pass runs between these heartbeats: each result's answer carries what follows it.
+    let answer=beat(scale_inventory(&ns,false,true),vec![(&stop,json!({"cleaned":true}))]).await;
+    assert_eq!(answer.commands.iter().map(|c|c.operation).collect::<Vec<_>>(),vec![NodeOperation::App as i32]);
+    let write=answer.commands[0].id.clone();
+    let answer=beat(scale_inventory(&ns,false,true),vec![(&write,json!({"updated":["model"]}))]).await;
+    assert_eq!((answer.commands.len(),answer.heartbeat_secs),(0,2));
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
+    assert_eq!(c.inner.lock().commands.len(),2,"a disable is a stop and a configuration write");
+    // Enabling it again stops nothing: the write, then the start.
+    c.begin_toggle(&["gpu-model".into()],false).unwrap();
+    c.dispatch().await.unwrap();
+    let answer=beat(scale_inventory(&ns,false,true),vec![]).await;
+    assert_eq!(answer.commands.iter().map(|c|c.operation).collect::<Vec<_>>(),vec![NodeOperation::App as i32]);
+    let write=answer.commands[0].id.clone();
+    let answer=beat(scale_inventory(&ns,false,true),vec![(&write,json!({"updated":["model"]}))]).await;
+    assert_eq!(answer.commands.len(),1);
+    let start=command_where(&c,|v|v.id==answer.commands[0].id).unwrap();
+    assert!(start.starts()&&start.parameters["scale_phase"]=="apply");
+    beat(scale_inventory(&ns,false,false),vec![(&start.id,json!({"ready":true}))]).await;
+    assert_eq!(c.scale_status(&ns,"model",None).unwrap()["state"],"complete");
+    assert_eq!(c.inner.lock().commands.len(),4);
+}
+
+#[tokio::test]
 async fn an_enable_waiting_for_capacity_can_be_cancelled() {
     let (_dir,c,ns)=setup().await;
     let mut occupied=scale_inventory(&ns,false,true);occupied.free_gpus=0.0;occupied.free_cpus=0.0;
@@ -2500,10 +2559,8 @@ async fn an_enable_waiting_for_capacity_can_be_cancelled() {
     let path=format!("/apps/model/disabled?namespace={ns}");
     let enable=tokio::spawn({let (c,path)=(c.clone(),path.clone());async move{scale_call(c,"admin","DELETE",&path,Value::Null).await}});
     change_pending(&c,false).await;
-    c.dispatch().await.unwrap();
-    let stop=command_where(&c,|v|!v.done&&v.parameters["scale_phase"]=="stop").unwrap();
-    answer(&c,occupied.clone(),&stop,json!({"cleaned":true,"disabled":true})).await;
     node_writes_config(&c,occupied).await;
+    assert!(command_where(&c,|v|v.parameters["scale_phase"]=="stop").is_none(),"an app that is down is not stopped first");
     let start=command_where(&c,|v|!v.done&&v.parameters["scale_phase"]=="apply").unwrap();
     assert!(!start.admitted,"no capacity");
     let disable=tokio::spawn({let (c,path)=(c.clone(),path.clone());async move{scale_call(c,"admin","PUT",&path,Value::Null).await}});
@@ -2628,6 +2685,36 @@ async fn deployed(c: &Arc<WorkloadController>, ns: &str, name: &str) -> anyhow::
     c.report(&create.worker, &session, report).await.unwrap();
     task.await.unwrap()?;
     Ok((create.worker, entry))
+}
+
+#[tokio::test]
+async fn an_app_on_no_node_takes_and_checks_settings_in_its_template() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", inventory(&ns)).await.unwrap();
+    let body = json!({"name":"model","namespace":ns,"spec":{"image":"serve:1","gpus":1,"cpus":2,"port_base":50100,"health_path":"/health"}});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", "/apps", body).await.status(), StatusCode::CREATED);
+    let settings = |query: &str, set: Value| {
+        let (c, path) = (c.clone(), format!("/apps/model/settings?namespace={ns}{query}"));
+        async move { scale_call(c, "admin", "PUT", &path, set).await }
+    };
+    let json_of = |response: Response| async { serde_json::from_slice::<Value>(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap() };
+    // A check changes nothing.
+    let checked = settings("&dry_run=true", json!({"image":"serve:2"})).await;
+    assert_eq!(checked.status(), StatusCode::OK);
+    let checked = json_of(checked).await;
+    assert_eq!((&checked["dry_run"], &checked["node"], &checked["state"]), (&json!(true), &Value::Null, &json!("configured")));
+    assert_eq!(c.inner.lock().apps["model"].spec["image"], "serve:1");
+    // What a placed app's settings refuse, these refuse too.
+    assert_eq!(settings("&dry_run=true", json!({"image":""})).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(settings("&dry_run=true", json!({"gpus":2})).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(settings("&dry_run=true", json!({"runtime":{"executor":"shim","driver":"docker"}})).await.status(), StatusCode::CONFLICT,
+        "no node runs the shim");
+    assert_eq!(settings("&node=gpu", json!({"image":"serve:2"})).await.status(), StatusCode::NOT_FOUND, "it is on no node");
+    // The settings wait in the app; no node is told until it is enabled.
+    assert_eq!(settings("", json!({"image":"serve:2","env":{"MODE":"restore"}})).await.status(), StatusCode::ACCEPTED);
+    assert!(c.inner.lock().commands.len() == 0 && c.inner.lock().deployments.is_empty());
+    let (_, entry) = deployed(&c, &ns, "model").await.unwrap();
+    assert_eq!((&entry["image"], &entry["env"]), (&json!("serve:2"), &json!({"MODE":"restore"})), "its first placement carries them");
 }
 
 #[tokio::test]
@@ -3130,7 +3217,13 @@ async fn an_unreserved_app_places_by_memory_on_a_node_that_caps_it_and_counts_no
     assert_eq!(Entry(&entry).total(0.0), (0.0, 0.0), "it counts nothing toward free_cpus");
     c.begin_toggle(&["full-agent".into()], false).unwrap();
     c.dispatch().await.unwrap();
+    let write = command_where(&c, |v| v.worker == "full" && !v.done && v.operation == NodeOperation::App as i32).unwrap();
+    let mut report = c.inner.lock().workers["full"].report.clone();
+    report.results = vec![CommandResult { id: write.id, result: json!({"updated":["agent"]}).into(), error: None }];
+    c.report("full", "session", report).await.unwrap();
+    c.dispatch().await.unwrap();
     let start = command_where(&c, |v| v.worker == "full" && v.operation == NodeOperation::SetApp as i32).unwrap();
+    assert!(start.starts());
     assert!(start.admitted, "admitted on a node with 0 free CPUs");
     assert_eq!(c.capacity("full").unwrap(), before);
     let listed = c.app_resources(&ns, "agent", None)["resources"].clone();

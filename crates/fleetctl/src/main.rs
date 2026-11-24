@@ -1143,12 +1143,15 @@ fn update_app(name: &str, set: Value, node: Option<&str>, check: bool, conn: &Co
     if let Some(node) = node { request = request.query(&[("node", node)]); }
     if check { request = request.query(&[("dry_run", "true")]); }
     let v = a.send(request.json(&set))?;
-    if check {
-        out.done(&format!("{name}: {} takes these settings; nothing changed", v["node"].as_str().unwrap_or("?")), v);
-        return Ok(());
-    }
-    out.done(&format!("{name}: {} — it drains and restarts with the new settings on {}",
-        v["state"].as_str().unwrap_or("requested"), v["node"].as_str().unwrap_or("?")), v);
+    // An app on no node yet names none: its settings wait in the app for its first enable.
+    let node = v["node"].as_str().map(str::to_owned);
+    out.done(&match (check, node) {
+        (true, Some(node)) => format!("{name}: {node} takes these settings; nothing changed"),
+        (true, None) => format!("{name}: a node takes these settings; it is on no node yet, and nothing changed"),
+        (false, Some(node)) => format!("{name}: {} — it drains and restarts with the new settings on {node}",
+            v["state"].as_str().unwrap_or("requested")),
+        (false, None) => format!("{name}: it is on no node yet; enabling it places it with the new settings"),
+    }, v);
     Ok(())
 }
 

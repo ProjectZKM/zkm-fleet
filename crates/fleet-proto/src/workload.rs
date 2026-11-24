@@ -101,6 +101,10 @@ impl<'a> Entry<'a> {
     pub fn ready(self) -> bool {
         self.0["ready"].as_bool() == Some(true)
     }
+    /// In a report: every replica has been started, ready or not.
+    pub fn started(self) -> bool {
+        self.0["started"].as_bool() == Some(true)
+    }
     /// In a report: nothing of the app is left running on the node.
     pub fn cleaned(self) -> bool {
         self.0["cleaned"].as_bool() == Some(true)
