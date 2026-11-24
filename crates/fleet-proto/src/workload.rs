@@ -21,10 +21,9 @@ impl<'a> Entry<'a> {
     /// The hard limits among them: an entry without one has none, so its container has no
     /// such limit on the Docker driver.
     pub const LIMITS: [&'static str; 2] = ["cpu_limit", "memory_limit_gb"];
-    /// The node's own configuration of an entry: the app it runs, its program and how its
-    /// worker launches. No change the scheduler sends replaces them.
-    pub const NODE_OWNED: [&'static str; 8] = ["app", "elf_id", "worker_command", "worker_env_file",
-        "worker_workdir", "worker_stop_timeout_s", "machine", "proof_storage_root"];
+    /// The node's own configuration of an entry: the app it runs, its program, its machine
+    /// and its storage. No change the scheduler sends replaces them.
+    pub const NODE_OWNED: [&'static str; 4] = ["app", "elf_id", "machine", "proof_storage_root"];
     /// What a report says about an entry beside its configuration, and the namespace reference
     /// the scheduler keeps from it.
     pub const REPORTED: [&'static str; 4] = ["ready", "logs", "cleaned", "namespace_ref"];
@@ -33,7 +32,7 @@ impl<'a> Entry<'a> {
         self.0["access_policy_sha256"].is_string() || self.0["runtime"]["driver"] == "openshell"
     }
 
-    /// Missing selection is permanently the legacy path, including old records.
+    /// What a node must report to run the entry. A record without a selection needs nothing.
     pub fn runtime_capability(self) -> Option<&'static str> {
         if self.native_access() {
             if self.0["service_protocol"] == "tcp" {
@@ -46,7 +45,6 @@ impl<'a> Entry<'a> {
         }
         match self.0.get("runtime") {
             None => None,
-            Some(v) if v == &json!({"executor":"legacy"}) => None,
             Some(v) if v == &json!({"executor":"shim", "driver":"tee"}) => Some("shim-tee-v1"),
             Some(v) if v == &json!({"executor":"shim", "driver":"tee-simulation"}) => Some("shim-tee-simulation-v1"),
             Some(v) if v == &json!({"executor":"shim", "driver":"docker"}) => Some(
@@ -177,15 +175,6 @@ impl<'a> Entry<'a> {
     }
     pub fn is_prover(self) -> bool {
         self.kind().starts_with("ziren-")
-    }
-    /// A GPU prover whose node also runs the app's own worker against it, on one replica.
-    pub fn integrated_worker(self) -> bool {
-        self.kind() == "ziren-gpu" && self.0["worker_command"].as_array().is_some_and(|command| !command.is_empty())
-    }
-    /// Whether the deployment holds its namespace's quota for all its replicas: a container,
-    /// or an integrated worker. A plain prover is charged per proof instead.
-    pub fn holds_allocation(self) -> bool {
-        self.is_container() || self.integrated_worker()
     }
 }
 
@@ -335,8 +324,8 @@ impl NodeReport {
             || entry.cpu_limit().is_none_or(|limit| limit <= self.total_cpus + 1e-9)
     }
     /// Whether the node runs a batch's jobs.
-    pub fn runs_batch(&self, batch: Batch<'_>) -> bool {
-        batch.runtime_capability().is_none_or(|needed| self.runtime_capabilities.iter().any(|c| c == needed))
+    pub fn runs_batch(&self) -> bool {
+        self.runtime_capabilities.iter().any(|c| c == BATCH_CAPABILITY)
     }
     pub fn supports_cleanup(&self, entry: Entry<'_>) -> bool {
         entry.runtime_capability().is_none() || self.supports_runtime(entry)
@@ -406,11 +395,6 @@ impl<'a> Batch<'a> {
     /// How long a job runs before it may be preempted.
     pub fn min_runtime_s(self) -> u64 {
         self.0["min_runtime_s"].as_u64().unwrap_or(300)
-    }
-    /// What a node must report to run its jobs: a batch on the shim runs only where the
-    /// shim runs batch jobs; any node runs one on the legacy executor.
-    pub fn runtime_capability(self) -> Option<&'static str> {
-        (self.0["runtime"]["executor"] == "shim").then_some(BATCH_CAPABILITY)
     }
 }
 
@@ -758,14 +742,6 @@ mod tests {
         assert!(Entry(&entry).same_resources(Entry(&entry.clone())));
         assert!(Entry(&json!({"cpus": 0})).unreserved() && !Entry(&json!({})).unreserved());
         assert_eq!(Entry(&json!({"cpus": 0})).total(0.0), (0.0, 0.0));
-    }
-
-    #[test]
-    fn integrated_workers_and_containers_hold_their_allocation() {
-        let worker = json!({"kind": "ziren-gpu", "worker_command": ["run"]});
-        assert!(Entry(&worker).integrated_worker() && Entry(&worker).holds_allocation());
-        assert!(!Entry(&json!({"kind": "ziren-gpu", "worker_command": []})).holds_allocation());
-        assert!(Entry(&json!({"kind": "app"})).holds_allocation());
     }
 
     #[test]

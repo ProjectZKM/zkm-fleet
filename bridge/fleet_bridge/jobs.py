@@ -1,8 +1,9 @@
 """Local batch execution, container cleanup and replay-safe Ray actors.
 
 The Rust control plane admits jobs, resolves dependencies and owns resource policy.
-This module executes commands already authorized by fleet-node. Inputs and outputs
-belong to the workload owner's storage; no submission or file-upload CLI lives here.
+This module executes commands already authorized by fleet-node: each job's container
+runs to completion through the shim's Docker driver. Inputs and outputs belong to the
+workload owner's storage; no submission or file-upload CLI lives here.
 """
 
 from __future__ import annotations
@@ -166,10 +167,6 @@ def is_job_actor(name: str) -> bool:
     return name.startswith(JOB_ACTOR_PREFIX)
 
 
-def container_name(job_id: str, rank: int = 0) -> str:
-    return f"fleet-job-{job_id}" + (f"-r{rank}" if rank else "")
-
-
 def actor_name(job_id: str, rank: int = 0) -> str:
     return f"{JOB_ACTOR_PREFIX}{job_id}" + (f"-r{rank}" if rank else "")
 
@@ -191,31 +188,6 @@ def job_environment(spec: JobSpec, attempt: int) -> dict[str, str]:
     return {k: spec.expand(v) for k, v in env.items()}
 
 
-def docker_command(spec: JobSpec, gpus: list[str], attempt: int = 1, rank: int = 0) -> list[str]:
-    """The `docker run` for a job (or one rank of it) on the given host cards."""
-    p = spec.policy
-    cmd = ["docker", "run", "-d", "--name", container_name(spec.id, rank), "--network", job_network(spec),
-           f"--shm-size={p.shm_gb}g", "--label", "zkm-fleet=job", "--label", f"zkm-fleet.job={spec.id}"]
-    if gpus:
-        cmd += ["--runtime=nvidia", "--gpus", f'"device={",".join(gpus)}"', "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
-    if spec.cpus:
-        cmd += [f"--cpus={spec.cpus}", "-e", f"OMP_NUM_THREADS={spec.cpus}"]
-    if p.user:
-        cmd += ["--user", p.user]
-    if spec.workdir:
-        cmd += ["-w", spec.expand(spec.workdir)]
-    for m in spec.mounts:
-        cmd += ["-v", m.docker()]
-    cmd += ["-v", f"{spec.out}:{spec.out}"]
-    for k, v in job_environment(spec, attempt).items():
-        cmd += ["-e", f"{k}={v}"]
-    # Image names are user supplied. End option parsing before the positional
-    # image so a value such as --privileged cannot become a Docker option.
-    cmd += ["--", p.image]
-    cmd += [spec.expand(a) for a in spec.command]
-    return cmd
-
-
 def missing_mounts(spec: JobSpec) -> list[str]:
     """Mounts that do not exist where the job landed; the job fails instead of docker
     creating them, owned by root, in someone's tree."""
@@ -225,19 +197,20 @@ def missing_mounts(spec: JobSpec) -> list[str]:
 # ── the actors ───────────────────────────────────────────────────────────────
 
 class _Rank:
-    """The cards Ray granted to one local batch container."""
+    """The cards Ray granted to one local batch container, which runs to completion
+    through the shim: its command, environment, mounts, cards and grace."""
 
-    def __init__(self, spec: JobSpec, rank: int = 0) -> None:
-        self.spec, self.rank = spec, rank
+    def __init__(self, spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig) -> None:
+        self.spec = spec
         self.gpus: list[str] = [str(int(g)) for g in ray.get_gpu_ids()]
-        self.name = container_name(spec.id, rank)
-        self.log_path = spec.rank_log_path(rank)
-        self.follower: subprocess.Popen[bytes] | None = None
+        self.name = ""  # the container, as the shim names it once launched
+        self.log_path = spec.log_path
         self.log: io.BufferedWriter | None = None
         self.offset = 0
+        self.run, self.cluster = shim.JobRun(job_dir), cluster
 
     def info(self) -> TaskPlacement:
-        return TaskPlacement(rank=self.rank, machine=socket.gethostname(), node_ip=node_ip(),
+        return TaskPlacement(rank=0, machine=socket.gethostname(), node_ip=node_ip(),
                         gpus=self.gpus, container=self.name)
 
     def check(self, need: int | None) -> str | None:
@@ -254,6 +227,12 @@ class _Rank:
 
     def start(self, attempt: int) -> str | None:
         """Starts the container; returns why it did not start, or None."""
+        # The shim never pulls. Fetch a missing image before the job's lock is taken.
+        try:
+            if not shim.image_present(self.spec.policy.image):
+                shim.pull_image(self.spec.id, self.spec.policy.image)
+        except RuntimeError as error:
+            return str(error)[:500]
         with open(os.path.join(os.path.dirname(self.spec.out), ".lock"), "a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             st = JobStatus.read(os.path.join(os.path.dirname(self.spec.out), STATUS_FILE))
@@ -264,31 +243,38 @@ class _Rank:
                 return error
         self.offset = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
         self.log = open(self.log_path, "ab")
-        self.follow()
         return None
 
     def create(self, attempt: int) -> str | None:
-        """Creates and starts the attempt's container; returns the error, or None."""
-        _sh(["docker", "rm", "-f", self.name])
-        out = _sh(docker_command(self.spec, self.gpus, attempt, self.rank))
-        return out.stderr.strip()[:500] if out.returncode != 0 else None
-
-    def follow(self) -> None:
-        """Has the container's output appended to the job's log while it runs."""
-        self.follower = subprocess.Popen(["docker", "logs", "-f", self.name], stdout=self.log, stderr=subprocess.STDOUT)
+        """Launches the attempt's container; returns the error, or None."""
+        spec, p = self.spec, self.spec.policy
+        environment = job_environment(spec, attempt)
+        if self.gpus:
+            environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
+        if spec.cpus:
+            environment.setdefault("OMP_NUM_THREADS", str(spec.cpus))
+        try:
+            status = self.run.launch(self.cluster, spec.namespace or p.namespace, spec.batch, spec.id, image=p.image,
+                command=[spec.expand(a) for a in spec.command], environment=environment,
+                limits={"cpu_millicores": spec.cpus * 1000 if spec.cpus else None, "memory_bytes": None},
+                options={"network": job_network(spec), "gpus": self.gpus,
+                    "volumes": [m.docker() for m in spec.mounts] + [f"{spec.out}:{spec.out}"], "user": p.user,
+                    "workdir": spec.expand(spec.workdir) if spec.workdir else None,
+                    "stop_timeout_s": p.stop_timeout_s, "shm_bytes": p.shm_gb * 2**30})
+        except (RuntimeError, ValueError) as error:
+            return str(error)[:500]
+        self.name = str(status.get("runtime_id") or self.name)
+        return None
 
     def wait(self) -> JobAttempt:
-        """Waits for the container to end and says how it ended."""
-        waited = _sh(["docker", "wait", self.name])
-        time.sleep(1)  # let the follower drain the last lines
-        if self.follower and self.log:
-            self.follower.terminate()
+        """Copies the container's output to the job's log until it ends and says how it ended."""
+        try:
+            exit_status = self.run.wait(self.log)
+        finally:
             self.log.close()
-        text = waited.stdout.strip()
-        code = int(text) if text.lstrip("-").isdigit() else None
-        result = self.ended(code, code != 0 and _sh(
-            ["docker", "inspect", "-f", "{{.State.OOMKilled}}", self.name]).stdout.strip() == "true")
-        _sh(["docker", "rm", "-f", self.name])
+        code = exit_status.get("code")
+        result = self.ended(code if type(code) is int else None, exit_status.get("oom_killed") is True)
+        self.kill()
         return result
 
     def ended(self, code: int | None, host_oom: bool) -> JobAttempt:
@@ -309,77 +295,17 @@ class _Rank:
         return result
 
     def kill(self) -> None:
-        _sh(["docker", "rm", "-f", self.name])
-
-
-class _ShimRank(_Rank):
-    """One local batch container run to completion through the shim, which `_Rank`
-    runs with Docker itself: the same command, environment, mounts, cards and grace."""
-
-    def __init__(self, spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig) -> None:
-        super().__init__(spec)
-        self.run, self.cluster = shim.JobRun(job_dir), cluster
-
-    def start(self, attempt: int) -> str | None:
-        # The shim never pulls. Fetch a missing image before the job's lock is taken.
-        try:
-            if not shim.image_present(self.spec.policy.image):
-                shim.pull_image(self.spec.id, self.spec.policy.image)
-        except RuntimeError as error:
-            return str(error)[:500]
-        return super().start(attempt)
-
-    def create(self, attempt: int) -> str | None:
-        spec, p = self.spec, self.spec.policy
-        environment = job_environment(spec, attempt)
-        if self.gpus:
-            environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
-        if spec.cpus:
-            environment.setdefault("OMP_NUM_THREADS", str(spec.cpus))
-        try:
-            status = self.run.launch(self.cluster, spec.namespace or p.namespace, spec.batch, spec.id, image=p.image,
-                command=[spec.expand(a) for a in spec.command], environment=environment,
-                limits={"cpu_millicores": spec.cpus * 1000 if spec.cpus else None, "memory_bytes": None},
-                options={"network": job_network(spec), "gpus": self.gpus,
-                    "volumes": [m.docker() for m in spec.mounts] + [f"{spec.out}:{spec.out}"], "user": p.user,
-                    "workdir": spec.expand(spec.workdir) if spec.workdir else None,
-                    "stop_timeout_s": p.stop_timeout_s, "shm_bytes": p.shm_gb * 2**30})
-        except (RuntimeError, ValueError) as error:
-            return str(error)[:500]
-        self.name = str(status.get("runtime_id") or self.name)
-        return None
-
-    def follow(self) -> None:
-        pass  # `wait` copies the output
-
-    def wait(self) -> JobAttempt:
-        try:
-            exit_status = self.run.wait(self.log)
-        finally:
-            self.log.close()
-        code = exit_status.get("code")
-        result = self.ended(code if type(code) is int else None, exit_status.get("oom_killed") is True)
-        self.kill()
-        return result
-
-    def kill(self) -> None:
         self.run.remove(self.spec.policy.stop_timeout_s + 60)
-
-
-def stop_command(job_id: str, rank: int, grace_s: int) -> list[str]:
-    """SIGTERM to the job, SIGKILL grace_s later (docker stop): a cancel or a preemption
-    gives it the time to checkpoint into out/ (FLEET_ATTEMPT tells the next attempt)."""
-    return ["docker", "stop", "-t", str(grace_s), container_name(job_id, rank)]
 
 
 class _JobActor:
     """Execute one finite job on this machine, including its retry budgets."""
 
-    def __init__(self, spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig | None = None) -> None:
+    def __init__(self, spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig) -> None:
         self.spec = spec
         self.dir = JobDirectory(os.path.dirname(job_dir), os.path.basename(job_dir))
-        # A batch on the shim comes with this node's shim settings.
-        self.local = _ShimRank(spec, job_dir, cluster) if cluster is not None else _Rank(spec)
+        # `cluster` carries this node's shim settings.
+        self.local = _Rank(spec, job_dir, cluster)
         self.gpus = self.local.gpus
         info = self.local.info()
         self.dir.update(machine=info.machine, node_ip=info.node_ip, launch_pending=False)
@@ -478,40 +404,6 @@ def budgets(spec: JobSpec, attempts: list[JobAttempt]) -> tuple[int, int]:
     return retries, oom_restarts
 
 
-@ray.remote(num_cpus=0, max_retries=0)
-def _on_node(argv: list[str]) -> str:
-    return _sh(argv).stdout
-
-
-def _on_job_node(place: TaskPlacement, argv: list[str], timeout_s: float = 60) -> str | None:
-    """Runs argv on the machine a rank landed on (its container is there) and returns
-    its stdout; None when that machine has left the cluster."""
-    if not place.node_ip:  # never landed (or a record from before node_ip): only this machine can have it
-        return _sh(argv).stdout
-    if not any(n.get("NodeManagerAddress") == place.node_ip for n in alive_nodes()):
-        return None
-    try:
-        return str(ray.get(_on_node.options(resources={f"node:{place.node_ip}": 0.001}).remote(argv), timeout=timeout_s))
-    except Exception:
-        return None
-
-
-def _stop(job: JobDirectory, st: JobStatus, grace_s: int) -> None:
-    """Stops the job's container with grace, whichever executor runs it."""
-    shim.JobRun(job.path).stop(grace_s)
-    _stop_ranks(st, job.id, grace_s)
-
-
-def _stop_ranks(st: JobStatus, job_id: str, grace_s: int) -> None:
-    """Every rank's container stopped with grace, all at once (a gang's ranks end together)."""
-    threads = [threading.Thread(target=_on_job_node, args=(r, stop_command(job_id, r.rank, grace_s), grace_s + 60))
-               for r in st.places()]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-
 def bundle(spec: JobSpec) -> ResourceRequest:
     """CPU/GPU units already assigned to this execution machine."""
     return ResourceRequest(cpu=float(max(spec.cpus, 1)), gpu=float(spec.gpus))
@@ -545,9 +437,9 @@ def prepare_launch(spec: JobSpec) -> bool:
     return False
 
 
-def launch(spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig | None = None) -> None:
-    """Starts the job's actor; with `cluster`, this node's shim settings, its container
-    runs through the shim."""
+def launch(spec: JobSpec, job_dir: str, cluster: ControlPlaneConfig) -> None:
+    """Starts the job's actor; its container runs through the shim that `cluster`,
+    this node's shim settings, names."""
     b = bundle(spec)
     pg = job_placement(spec)
     JobActor.options(
@@ -598,34 +490,13 @@ def _going(job_id: str) -> bool:
     return _alive(actor_name(job_id))
 
 
-@ray.remote(num_cpus=0, max_retries=0)
-def _container_stopped(job_id: str, rank: int) -> bool:
-    out = _sh(["docker", "inspect", "-f", "{{.State.Running}}", container_name(job_id, rank)])
-    return (out.returncode == 0 and out.stdout.strip() == "false"
-            or out.returncode != 0 and ("No such object" in out.stderr or "No such container" in out.stderr))
-
-
 def execution_stopped(job: JobDirectory) -> bool:
-    """Actor disappearance alone is not proof that detached Docker work stopped."""
+    """Actor disappearance alone is not proof that the job's container stopped: the shim says."""
     st = job.status()
     if _going(job.id) or any(_alive(actor_name(job.id, i)) for i in range(1, st.nodes)):
         return False
     if not shim.JobRun(job.path).gone():
         return False
-    live = {n["NodeManagerAddress"] for n in alive_nodes()} if any(p.node_ip for p in st.places()) else set()
-    for place in st.places():
-        if not place.node_ip:
-            if place.machine or place.container or st.started_at is not None:
-                return False
-            continue  # actors publish location before starting Docker
-        if place.node_ip not in live:
-            return False
-        try:
-            task = _container_stopped.options(resources={f"node:{place.node_ip}": 0.001})
-            if not ray.get(task.remote(job.id, place.rank), timeout=5):
-                return False
-        except Exception:
-            return False
     try:
         discard_placement(job.id)
     except Exception:
@@ -637,9 +508,6 @@ def confirm_cleanup(job: JobDirectory) -> bool:
     st = job.status()
     if not _going(job.id) and not st.launch_pending and st.state in (JobState.CANCELLED,JobState.PREEMPTED,JobState.WAITING_QUOTA):
         shim.JobRun(job.path).remove(5)
-        for p in st.places():
-            if p.node_ip:
-                _on_job_node(p,["docker","rm","-f",container_name(job.id,p.rank)],5)
     return execution_stopped(job)
 
 
@@ -658,13 +526,9 @@ def cancel(jobs_dir: str, job_id: str) -> JobStatus:
     if st.state is not JobState.CANCELLED:
         raise Conflict(f"{job_id} already {st.state.value}: nothing to cancel")
     if st.node_ip or st.container or st.ranks:  # location is written before container creation
-        _stop(job, st, job.spec().policy.stop_timeout_s)
+        shim.JobRun(job.path).stop(job.spec().policy.stop_timeout_s)
     _end_actors(job_id, st.nodes)
     shim.JobRun(job.path).remove()
-    gone = [r.machine for r in st.places()
-            if _on_job_node(r, ["docker", "rm", "-f", container_name(job_id, r.rank)]) is None]
-    if gone:
-        st = job.update(container=f"not removed: {', '.join(gone)} left the cluster")
     try:
         remove_placement_group(ray.util.get_placement_group(pg_name(job_id)))
     except Exception:
@@ -712,7 +576,7 @@ def preempt(jobs_dir: str, job_id: str, reason: str) -> JobStatus:
     if st.state is not JobState.PREEMPTED:
         raise Conflict(f"{job_id} is {st.state.value}: nothing to preempt")
     if before.state is JobState.RUNNING:
-        _stop(job, st, spec.policy.stop_timeout_s)
+        shim.JobRun(job.path).stop(spec.policy.stop_timeout_s)
     _end_actors(job_id, st.nodes)
     if not confirm_cleanup(job):
         return job.update(force=True, detail=f"preempted ({reason}): waiting for confirmed container cleanup")

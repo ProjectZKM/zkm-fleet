@@ -100,9 +100,8 @@ ones join a node that runs it, and a node left with none stops them and
 removes the app from its `apps.yaml`, which frees its room; the app's data stays on
 that node. A node that comes back with a copy of an app whose replicas all run
 elsewhere removes it too, unless its entry is anchored to the machine (`machine`).
-Integrated EthProofs runs exactly one replica; other apps may run more, with
-resources per replica. The app's current allocation counts toward the room for its
-new one. Scaling never adds node capacity.
+Resources are per replica, and the app's current allocation counts toward the room
+for its new one. Scaling never adds node capacity.
 
 A node's pool is `RAY_NUM_CPUS` and `CUDA_VISIBLE_DEVICES` in its `etc/watchdog.env`;
 empty means detect CPUs automatically, and no GPUs. Changing it restarts Ray, so
@@ -148,7 +147,7 @@ Disabling drains the replicas and releases their resources after cleanup; the ap
 durable data stays. An interrupted EthProofs block is retried from its saved cursor,
 and its [shutdown rules](../apps/ethproofs/README.md#operate-and-recover) say how to
 finish an in-flight proof first. `node drain` stops new proof and batch placements,
-but not an integrated app's own block stream.
+but not an app's own work, such as EthProofs' block stream.
 
 ### Batches
 
@@ -159,8 +158,6 @@ fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
   --image nvidia/cuda:12.8.0-base-ubuntu22.04 --priority 10
 # An administrator approves host storage and a runtime user before jobs mount it:
 fleetctl --namespace pi batch update gpu-test --allow /data/models --user 1000:1000
-# An administrator moves its jobs to the node's trusted-shim (new jobs; `legacy` moves back):
-fleetctl --namespace pi batch update gpu-test --runtime shim
 fleetctl --token-file pi-owner.token batch submit gpu-test --gpus 1 --cpus 2 \
   --mount /data/models:ro -- nvidia-smi
 fleetctl --token-file pi-owner.token batch gpu-test             # the batch and its newest jobs

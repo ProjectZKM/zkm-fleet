@@ -201,14 +201,6 @@ impl std::ops::Deref for WorkloadRead<'_> {
     }
 }
 
-/// The proof apps an enabled integrated worker feeds: (namespace, app).
-fn worker_owned(inner: &WorkloadState) -> HashSet<(String, String)> {
-    inner.deployments.values()
-        .filter(|s| s.entry().integrated_worker() && !s.disabled)
-        .map(|s| (s.entry().namespace().to_owned(), s.entry().app().to_owned()))
-        .collect()
-}
-
 impl WorkloadController {
     pub fn new(fleet: Arc<Scheduler>, cluster: String) -> anyhow::Result<Self> {
         let dir = fleet.cfg.data_dir.join("workloads");
@@ -235,7 +227,6 @@ impl WorkloadController {
             anyhow::ensure!(inner.policy_preparations.insert(policy::preparation_key(&v)?, v).is_none(),
                 "duplicate durable policy preparation");
         }
-        fleet.set_worker_owned_apps(worker_owned(&inner));
         let policy = crate::policy_gateway::PolicyGateway::open(&fleet.cfg)?;
         let controller = Self {
             deliveries: crate::runtime_delivery::DeliveryQueue::open(&dir.join("runtime-deliveries"))?,
@@ -252,12 +243,6 @@ impl WorkloadController {
     }
     pub(crate) fn fleet(&self) -> &Arc<Scheduler> {
         &self.fleet
-    }
-    fn refresh_worker_owned_apps(&self) {
-        self.update_worker_owned_apps(&self.inner.read());
-    }
-    fn update_worker_owned_apps(&self, inner: &WorkloadState) {
-        self.fleet.set_worker_owned_apps(worker_owned(inner));
     }
 
     /// Mirrors a prover's state onto its proof app. A prover whose app is not registered has
@@ -363,7 +348,7 @@ impl WorkloadController {
         let mut paths = std::collections::BTreeSet::new();
         for w in i.workers.values() {
             for e in w.report.entries().filter(|e| e.app() != name) {
-                for key in ["workdir", "worker_workdir", "proof_storage_root", "worker_env_file"] {
+                for key in ["workdir", "proof_storage_root"] {
                     paths.extend(e.0[key].as_str().map(str::to_owned));
                 }
                 for volume in e.0["volumes"].as_array().into_iter().flatten().filter_map(Value::as_str) {
@@ -494,26 +479,6 @@ impl WorkloadController {
         Ok(())
     }
 
-    fn check_worker_owner(&self, inner: &WorkloadState, worker: &str, entry: Entry<'_>,
-    ) -> anyhow::Result<()> {
-        if !entry.integrated_worker() { return Ok(()); }
-        let namespace = entry.namespace();
-        let allocations = self.fleet.allocations(namespace);
-        let key = format!("{}-{}", worker, entry.name());
-        let owner = inner.deployments.iter().find(|(other_key, intent)| {
-            let other = intent.entry();
-            *other_key != &key && other.integrated_worker()
-                && other.namespace() == namespace
-                && other.app() == entry.app()
-                && (!intent.disabled || allocations.iter().any(|a| a.id == format!("deployment:{other_key}")))
-        });
-        if owner.is_some() {
-            return Err(fail(409, "this app already has an integrated worker; clean up its owner before moving it",
-            ));
-        }
-        Ok(())
-    }
-
     fn save(&self, kind: &str, id: &str, value: &impl Serialize) -> anyhow::Result<()> {
         atomic(
             &self.dir.join(kind).join(format!("{id}.json")),
@@ -560,9 +525,6 @@ impl WorkloadController {
         }
         if c.is(NodeOperation::SetApp) {
             let entry = c.entry();
-            if c.starts() {
-                self.check_worker_owner(&inner, worker, entry)?;
-            }
             let key = format!("{}-{}", worker, entry.name());
             if inner.deployments.get(&key)
                 .and_then(|s| s.scale.as_ref()).is_some_and(|s| s.pending() && c.scale_id() != Some(s.id())) {
@@ -594,7 +556,6 @@ impl WorkloadController {
             };
             self.save("deployments", &key, &intent)?;
             inner.deployments.insert(key, intent);
-            self.update_worker_owned_apps(&inner);
         }
         self.save("commands", &c.id, &c)?;
         let id = c.id.clone();
@@ -1028,16 +989,6 @@ impl WorkloadController {
                 fleet_proto::models::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
             }
         }
-        let mut worker_streams = HashSet::new();
-        for entry in report.entries().filter(|e| e.integrated_worker()) {
-            if entry.replicas() != 1 {
-                return Err(fail(409, "integrated workers require exactly one replica"));
-            }
-            if !entry.disabled() && !worker_streams.insert((entry.namespace(), entry.app())) {
-                return Err(fail(409, "duplicate integrated worker stream in node report",
-                ));
-            }
-        }
         let _ops = self.ops.lock().await;
         {
             let mut i = self.inner.lock();
@@ -1046,9 +997,6 @@ impl WorkloadController {
                 .is_some_and(|w| w.session != session && !w.ended && now() - w.seen < 30.0)
             {
                 return Err(fail(409, "another agent session is active for this worker"));
-            }
-            for entry in report.entries().filter(|e| !e.disabled() && !e.cleaned()) {
-                self.check_worker_owner(&i, worker_id, entry)?;
             }
             let draining = i.workers.get(worker_id).is_some_and(|w| w.draining);
             i.workers.insert(
@@ -1129,8 +1077,10 @@ impl WorkloadController {
                 // The app an entry runs, its program and its launch settings are the node's own
                 // configuration, not resource-scale overrides.
                 for field in Entry::NODE_OWNED {
-                    if observed.0.get(field).is_some() || intent.spec.get(field).is_some() {
-                        intent.spec[field] = observed.0[field].clone();
+                    match observed.0.get(field) {
+                        Some(value) => intent.spec[field] = value.clone(),
+                        // One the entry does not set is not null in the record: it is absent.
+                        None => { intent.spec.as_object_mut().map(|spec| spec.remove(field)); }
                     }
                 }
                 self.save("deployments", &key, &intent)?;
@@ -1154,7 +1104,7 @@ impl WorkloadController {
             };
             // An older/downgraded bridge cannot attest cleanup of a shim allocation.
             let supported = if intent.disabled { report.supports_cleanup(intent.entry()) } else { report.supports_runtime(intent.entry()) };
-            if observed.holds_allocation() {
+            if observed.is_container() {
                 let id = format!("deployment:{key}");
                 if observed.cleaned() && intent.disabled {
                     if supported {
@@ -1220,7 +1170,6 @@ impl WorkloadController {
             }
         }
         self.forget_unreported_deployments(worker_id, &report.entries().map(|e| e.name().to_owned()).collect::<Vec<_>>())?;
-        self.refresh_worker_owned_apps();
         for incoming in &report.jobs {
             if !is_safe_id(&incoming.id) || !incoming.status.is_object() {
                 continue;
@@ -1374,7 +1323,7 @@ impl WorkloadController {
                 }
                 if c.is(NodeOperation::SetApp) && c.error.is_none() {
                     let entry = c.entry();
-                    if entry.holds_allocation() && c.stops() && c.cleaned() {
+                    if entry.is_container() && c.stops() && c.cleaned() {
                         self.fleet
                             .release_job(
                                 entry.namespace(),
@@ -1396,7 +1345,7 @@ impl WorkloadController {
                             c.removed()
                                 .map(|name| format!("{worker_id}-{name}"))
                                 .filter(|key| i.deployments.get(key).is_some_and(|d| d.worker == worker_id
-                                    && d.entry().app() == app && d.entry().holds_allocation()))
+                                    && d.entry().app() == app && d.entry().is_container()))
                                 .collect()
                         };
                         for key in keys {
@@ -1734,7 +1683,7 @@ impl WorkloadController {
                     .await?;
                     continue;
                 }
-                if s.holds_allocation()
+                if s.is_container()
                     && self
                         .fleet
                         .reserve_job(
@@ -1807,15 +1756,15 @@ impl WorkloadController {
                         let app_ok =
                             app.is_none_or(|a| a.workers.is_empty() || a.workers.contains(*id));
                         app_ok && pin.is_none_or(|p| p == id.as_str() || p == w.report.machine)
-                            && w.report.runs_batch(r.policy())
+                            && w.report.runs_batch()
                     })
                     .map(|(id, _)| id.clone())
                     .collect::<Vec<_>>()
             };
             if allowed.is_empty() {
-                // Say why a job of a batch on the shim waits where no node's shim runs batch jobs.
+                // Say why a job waits where no node's shim runs batch jobs.
                 let waiting = "waiting for a node whose shim runs batch jobs";
-                if r.policy().runtime_capability().is_some() && r.status["detail"] != waiting {
+                if r.status["detail"] != waiting {
                     r.set_detail(waiting);
                     self.save("jobs", &r.id, &r)?;
                     self.inner.lock().jobs.insert(r.id.clone(), r.clone());
@@ -2123,10 +2072,10 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
     {
         return Err(fail(400, "invalid batch settings"));
     }
-    // Its jobs run under the node's own `docker run` (no runtime, or legacy) or through the shim.
+    // Its jobs run through the shim's Docker driver, with or without the setting.
     let runtime = &spec["runtime"];
-    if !runtime.is_null() && runtime != &json!({"executor":"legacy"}) && runtime != &json!({"executor":"shim","driver":"docker"}) {
-        return Err(fail(400, r#"runtime: {"executor":"shim","driver":"docker"}, {"executor":"legacy"} or null"#));
+    if !runtime.is_null() && runtime != &json!({"executor":"shim","driver":"docker"}) {
+        return Err(fail(400, r#"runtime: {"executor":"shim","driver":"docker"} or null"#));
     }
     Ok(())
 }

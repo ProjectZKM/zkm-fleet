@@ -100,7 +100,7 @@ The installer preserves existing YAML text and mode, validates the pinned binary
 hash and publishes it atomically. The Ray service runs its watchdog every 30 seconds,
 including temp-link repair, while the node waits for shim readiness before connecting.
 
-Legacy apps keep their executor. An existing stdio shim allocation also keeps its
+An existing stdio shim allocation keeps its
 transport and executable: the installer refuses to silently convert it to daemon
 mode. Introduce daemon mode on a new node, or explicitly drain and clean up those
 shim allocations first. Existing Ray processes are left running; moving Ray itself
@@ -208,7 +208,7 @@ enforcement and never fall back to that default. The gateway and scheduler use t
 same UID and a private compute socket; only the node's shim/driver creates workloads.
 The gateway has no Docker socket or Fleet administrator credentials. It can start
 only once the scheduler serves that socket, which needs the `policy_gateway.openshell`
-settings below. This does not change existing workload executors.
+settings below.
 
 The release workflow publishes `ghcr.io/projectzkm/zkm-fleet-openshell` once for the
 OpenShell revision pinned in `Cargo.lock`. `fleet-ctl.sh openshell up` records its

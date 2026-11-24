@@ -25,7 +25,7 @@ it, is anchored to that node with `machine` in its entry in the node's `apps.yam
 Administrators manage namespaces, quotas, access, host storage for batches and apps'
 execution settings.
 
-Two integrated app workers prove on their node's own GPU server:
+Two app workers prove on the GPU server in their own container:
 
 - **EthProofs** prepares witnesses, proves and reports every block in sequence,
   resuming from its saved cursor.

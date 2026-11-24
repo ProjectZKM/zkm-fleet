@@ -47,7 +47,6 @@ def test_preempted_execution_waits_for_control_plane_admission(tmp_path, monkeyp
     spec(namespace="n", id=job.id, out=job.out).write(job.spec_path)
     JobStatus(id=job.id, state=JobState.RUNNING, submitted_at=1, started_at=1, gpus_requested=1, cpus=1).write(job.status_path)
     monkeypatch.setattr(jobs, "_alive", lambda _: True)
-    monkeypatch.setattr(jobs, "_stop_ranks", lambda *args: None)
     monkeypatch.setattr(jobs, "_end_actors", lambda *args: None)
     monkeypatch.setattr(jobs, "confirm_cleanup", lambda _: True)
     launch = Mock()

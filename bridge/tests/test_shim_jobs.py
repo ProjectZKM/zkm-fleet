@@ -1,4 +1,4 @@
-"""A batch job runs to completion through the shim as it does under `docker run`."""
+"""A batch job runs to completion through the shim."""
 import base64
 import os
 from unittest.mock import Mock
@@ -26,7 +26,7 @@ class FakeShim:
         operation = command["operation"]
         self.calls.append(operation)
         if self.down:
-            raise RuntimeError("shim daemon unavailable or rejected operation; no legacy fallback")
+            raise RuntimeError("shim daemon unavailable or rejected operation")
         execution = command["request"]["execution"] if operation == "launch" else command["execution"]
         key = execution.generation
         if operation == "launch":
@@ -70,7 +70,7 @@ def cluster(tmp_path):
 
 
 def queued(tmp_path, **settings):
-    """A queued job of a batch on the shim, with its directory."""
+    """A queued job of a batch, with its directory."""
     job = jobs.JobDirectory(str(tmp_path), "job-1", must_exist=False)
     os.makedirs(job.out)
     spec = JobSpec(**{**dict(id="job-1", namespace="a" * 32, owner="owner", batch="training",
@@ -82,11 +82,11 @@ def queued(tmp_path, **settings):
     return job, spec
 
 
-def test_a_job_on_the_shim_gets_what_docker_run_gives_it_and_ends_with_its_process(tmp_path, monkeypatch):
+def test_a_job_gets_its_command_environment_mounts_and_cards_and_ends_with_its_process(tmp_path, monkeypatch):
     fake = FakeShim(monkeypatch)
     fake.output = [b"epoch 1\n", b"epoch 2\n"]
     job, spec = queued(tmp_path)
-    rank = jobs._ShimRank(spec, job.path, cluster(tmp_path))
+    rank = jobs._Rank(spec, job.path, cluster(tmp_path))
     assert rank.start(1) is None and rank.name == "trusted-shim-" + "a" * 64
     request = fake.runs[1]["request"]
     execution = request["execution"]
@@ -96,10 +96,9 @@ def test_a_job_on_the_shim_gets_what_docker_run_gives_it_and_ends_with_its_proce
     assert request["driver_options"] == {"run_to_completion": True, "network": "none", "gpus": ["3"],
         "volumes": ["/data/models:/data/models:ro", f"{job.out}:{job.out}"], "user": "1000:1000", "workdir": job.out,
         "stop_timeout_s": 120, "shm_bytes": 16 * 2**30}
-    # The same environment as `docker run -e`, the job's values over the batch's.
-    docker = jobs.docker_command(spec, ["3"], 1)
-    assert request["environment"] == dict(docker[i + 1].split("=", 1) for i, arg in enumerate(docker) if arg == "-e")
-    assert (request["environment"]["B"], request["environment"]["FLEET_ATTEMPT"]) == ("job", "1")
+    # The job's values over the batch's, with what a container on cards and CPUs gets.
+    assert request["environment"] == {**jobs.job_environment(spec, 1), "NVIDIA_DRIVER_CAPABILITIES": "all", "OMP_NUM_THREADS": "2"}
+    assert (request["environment"]["A"], request["environment"]["B"], request["environment"]["FLEET_ATTEMPT"]) == ("batch", "job", "1")
     result = rank.wait()
     assert result.ok and result.cause is None
     # Its output is in the job's log, each line once and without the shim's timestamps.
@@ -119,7 +118,7 @@ def test_an_attempt_reports_how_it_ended_and_the_next_one_is_a_new_run(tmp_path,
     fake = FakeShim(monkeypatch)
     monkeypatch.setattr(jobs, "_holders", lambda gpus: "none")
     job, spec = queued(tmp_path)
-    rank = jobs._ShimRank(spec, job.path, cluster(tmp_path))
+    rank = jobs._Rank(spec, job.path, cluster(tmp_path))
     fake.exit, fake.output = exit_status, output
     assert rank.start(1) is None
     result = rank.wait()
@@ -133,7 +132,7 @@ def test_an_attempt_reports_how_it_ended_and_the_next_one_is_a_new_run(tmp_path,
 def test_a_missing_image_is_pulled_first_and_a_stopped_job_starts_nothing(tmp_path, monkeypatch):
     fake = FakeShim(monkeypatch)
     job, spec = queued(tmp_path)
-    rank = jobs._ShimRank(spec, job.path, cluster(tmp_path))
+    rank = jobs._Rank(spec, job.path, cluster(tmp_path))
     pulls = []
     monkeypatch.setattr(shim, "image_present", lambda image: False)
     monkeypatch.setattr(shim, "pull_image", lambda name, image: pulls.append(image))
@@ -150,7 +149,7 @@ def test_a_missing_image_is_pulled_first_and_a_stopped_job_starts_nothing(tmp_pa
 def test_a_shim_that_refuses_the_launch_fails_the_attempt_and_leaves_nothing_behind(tmp_path, monkeypatch):
     fake = FakeShim(monkeypatch)
     job, spec = queued(tmp_path)
-    rank = jobs._ShimRank(spec, job.path, cluster(tmp_path))
+    rank = jobs._Rank(spec, job.path, cluster(tmp_path))
     fake.down = True
     assert "shim daemon unavailable" in rank.start(1)
     run = shim.JobRun(job.path)
@@ -160,13 +159,13 @@ def test_a_shim_that_refuses_the_launch_fails_the_attempt_and_leaves_nothing_beh
     rank.kill()
     assert run.record().cleaned and run.gone()
     assert rank.start(2) is None and sorted(fake.runs) == [2], "a later run never reuses a generation"
-    assert jobs._ShimRank(spec, job.path, ControlPlaneConfig()).start(3) == "shim is not configured"
+    assert jobs._Rank(spec, job.path, ControlPlaneConfig()).start(3) == "shim is not configured"
 
 
 def test_a_run_whose_shim_stops_answering_is_lost_and_one_whose_container_is_gone_has_failed(tmp_path, monkeypatch):
     fake = FakeShim(monkeypatch)
     job, spec = queued(tmp_path)
-    rank = jobs._ShimRank(spec, job.path, cluster(tmp_path))
+    rank = jobs._Rank(spec, job.path, cluster(tmp_path))
     assert rank.start(1) is None
     fake.down = True
     with pytest.raises(RuntimeError):
@@ -182,15 +181,12 @@ def test_a_run_whose_shim_stops_answering_is_lost_and_one_whose_container_is_gon
 def test_a_cancel_stops_the_shim_run_with_its_grace_and_removes_it(tmp_path, monkeypatch):
     fake = FakeShim(monkeypatch)
     job, spec = queued(tmp_path)
-    assert jobs._ShimRank(spec, job.path, cluster(tmp_path)).start(1) is None
+    assert jobs._Rank(spec, job.path, cluster(tmp_path)).start(1) is None
     job.update(state=JobState.RUNNING, node_ip="10.0.0.1", started_at=2)
     monkeypatch.setattr(jobs, "_alive", lambda _: False)
-    monkeypatch.setattr(jobs, "_stop_ranks", lambda *a: None)
     monkeypatch.setattr(jobs, "_end_actors", lambda *a: None)
-    monkeypatch.setattr(jobs, "_on_job_node", lambda *a: "")
     monkeypatch.setattr(jobs, "remove_placement_group", lambda pg: None)
     monkeypatch.setattr(jobs.ray.util, "get_placement_group", lambda name: name)
-    monkeypatch.setattr(jobs, "alive_nodes", lambda: [{"NodeManagerAddress": "10.0.0.1"}])
     assert not jobs.execution_stopped(job), "its container still runs"
     fake.calls.clear()
     assert jobs.cancel(str(tmp_path), "job-1").state is JobState.CANCELLED
@@ -209,12 +205,14 @@ def test_only_a_shim_with_every_batch_feature_takes_batch_jobs(tmp_path, monkeyp
     for features, expected in [(ALL_FEATURES, True), *[([f for f in ALL_FEATURES if f != missing], False) for missing in shim.BATCH_FEATURES]]:
         monkeypatch.setattr(shim, "daemon_call", lambda *a, **k: {"protocol": 1, "drivers": ["docker"], "features": features})
         assert (shim.BATCH_CAPABILITY in shim.capabilities(config)) is expected, features
-    with pytest.raises(ModelError):
-        Batch.load({"image": "trainer:1", "runtime": {"executor": "shim", "driver": "tee"}})
-    assert not Batch(image="trainer:1").on_shim and not Batch.load({"image": "trainer:1", "runtime": {"executor": "legacy"}}).on_shim
+    for runtime in ({"executor": "shim", "driver": "tee"}, {"executor": "legacy"}, {"executor": "shim"}):
+        with pytest.raises(ModelError):
+            Batch.load({"image": "trainer:1", "runtime": runtime})
+    assert Batch.load({"image": "trainer:1"}).runtime is None
+    assert Batch.load({"image": "trainer:1", "runtime": ON_SHIM}).runtime.driver == "docker"
 
 
-def test_a_node_launches_a_shim_batch_only_when_its_shim_runs_batch_jobs(tmp_path, monkeypatch):
+def test_a_node_launches_a_job_only_when_its_shim_runs_batch_jobs(tmp_path, monkeypatch):
     (tmp_path / "batches.yaml").write_text("batches: {}\n")
     (tmp_path / "apps.yaml").write_text(f"shim_binary: /opt/trusted-shim-runtime\nshim_state_dir: {tmp_path}/shim\nshim_daemon: true\napps: []\n")
     executor = node.NodeExecutor(str(tmp_path / "apps.yaml"), str(tmp_path / "batches.yaml"), str(tmp_path / "jobs"))
@@ -227,14 +225,14 @@ def test_a_node_launches_a_shim_batch_only_when_its_shim_runs_batch_jobs(tmp_pat
         "batch": "training", "submitted_at": 1, "request": {"command": ["true"], "gpus": 0, "cpus": 1},
         "policy": {"image": "trainer:1", "namespace": "a" * 32, **({"runtime": runtime} if runtime else {})}}
     monkeypatch.setattr(shim, "capabilities", lambda config: ["shim-docker-v1"])
-    with pytest.raises(ValueError, match="does not run batch jobs"):
-        executor.launch(parameters("job-1234abcd", ON_SHIM))
-    launch.assert_not_called()
-    monkeypatch.setattr(shim, "capabilities", lambda config: ["shim-docker-v1", shim.BATCH_CAPABILITY])
-    executor.launch(parameters("job-1234abcd", ON_SHIM))
-    spec, _, config = launch.call_args.args
-    assert spec.policy.on_shim and (config.shim_binary, config.shim_daemon) == ("/opt/trusted-shim-runtime", True)
-    # A batch on the legacy executor needs nothing of the shim.
-    monkeypatch.setattr(shim, "capabilities", lambda config: pytest.fail("not asked"))
-    executor.launch(parameters("job-5678abcd", None))
-    assert launch.call_args.args[2] is None
+    # A batch's stored policy names the shim's Docker driver or no runtime: either way its jobs run there.
+    for ident, runtime in (("job-1234abcd", ON_SHIM), ("job-5678abcd", None)):
+        monkeypatch.setattr(shim, "capabilities", lambda config: ["shim-docker-v1"])
+        with pytest.raises(ValueError, match="does not run batch jobs"):
+            executor.launch(parameters(ident, runtime))
+        launch.assert_not_called()
+        monkeypatch.setattr(shim, "capabilities", lambda config: ["shim-docker-v1", shim.BATCH_CAPABILITY])
+        executor.launch(parameters(ident, runtime))
+        _, _, config = launch.call_args.args
+        assert (config.shim_binary, config.shim_daemon) == ("/opt/trusted-shim-runtime", True)
+        launch.reset_mock()

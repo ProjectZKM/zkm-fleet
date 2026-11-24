@@ -11,7 +11,6 @@ import os
 import re
 import shutil
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -21,8 +20,8 @@ from typing import Any
 import ray
 import yaml
 
-from . import actors, reconcile, jobs, shim
-from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, ExecutorKind, RuntimeSelection, RuntimeInstance
+from . import reconcile, jobs, shim
+from .model import AppSpec, Batch, JobSpec, JobState, JobStatus, Mount, RuntimeInstance
 from .rayapi import alive_nodes, resources
 
 log = logging.getLogger(__name__)
@@ -71,15 +70,9 @@ def read_json(path: Path, default: Any = None) -> Any:
         return default
 
 
-def container_gone(name: str) -> bool:
-    result = subprocess.run(["docker", "inspect", "--format", "{{.State.Running}}", name], capture_output=True, text=True)
-    return (result.returncode == 0 and result.stdout.strip() == "false"
-            or result.returncode != 0 and ("no such object" in result.stderr.lower() or "no such container" in result.stderr.lower()))
-
-
 def job_gone(jobs_dir: Path, ident: str) -> bool:
-    """Whether no container of a job runs, whichever executor ran it."""
-    return shim.JobRun(str(jobs_dir / ident)).gone() and container_gone(jobs.container_name(ident))
+    """Whether no container of a job runs."""
+    return shim.JobRun(str(jobs_dir / ident)).gone()
 
 
 def _entry(root: Any, section: str, name: str) -> Any:
@@ -260,8 +253,7 @@ class NodeExecutor:
             return self.resource_locks.setdefault(key, threading.Lock())
 
     def cleanup(self, job: jobs.JobDirectory) -> bool:
-        # There is only one execution machine. A persisted old Ray IP must not
-        # make local Docker cleanup depend on a vanished Ray node identity.
+        # There is only one execution machine: this node's shim holds the job's run.
         if jobs._going(job.id) or not job_gone(self.jobs_dir, job.id):
             return False
         jobs.discard_placement(job.id)
@@ -351,11 +343,9 @@ class NodeExecutor:
         if "code" in request:
             raise ValueError("job inputs must be prepared by the app owner in storage")
         policy = Batch.load(p["policy"])
-        cluster = None
-        if policy.on_shim:
-            cluster = shim.daemon_config(self.apps_file)
-            if shim.BATCH_CAPABILITY not in shim.capabilities(cluster):
-                raise ValueError("this node's shim does not run batch jobs")
+        cluster = shim.daemon_config(self.apps_file)
+        if shim.BATCH_CAPABILITY not in shim.capabilities(cluster):
+            raise ValueError("this node's shim does not run batch jobs")
         if policy.namespace != p["namespace"] or request.get("nodes", 1) != 1:
             raise ValueError("invalid local execution scope")
         directory.mkdir(parents=True, exist_ok=True)
@@ -423,7 +413,6 @@ class NodeExecutor:
         if not self.cleanup(job) and state.terminal:
             jobs._end_actors(job.id, job.status().nodes)
             shim.JobRun(job.path).stop(job.spec().policy.stop_timeout_s)
-            subprocess.run(["docker", "stop", "--time", str(job.spec().policy.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().policy.stop_timeout_s + 30)
         return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 
     def set_app(self, p: dict[str, Any], command_id: str | None = None) -> dict[str, Any]:
@@ -451,9 +440,7 @@ class NodeExecutor:
             raise ValueError("app scope differs from configured scope")
         if app.get("kind") != configured.kind.value or app.get("tag") != configured.tag:
             raise ValueError("app kind or tag differs from configured scope")
-        selected = configured.runtime or RuntimeSelection(executor=ExecutorKind.LEGACY)
-        requested = RuntimeSelection.load(app["runtime"], strict=True) if "runtime" in app else RuntimeSelection(executor=ExecutorKind.LEGACY)
-        if not p["disabled"] and selected != requested:
+        if not p["disabled"] and app.get("runtime") != configured.runtime.dump():
             raise ValueError("runtime selection differs from the admitted command")
         running = [n for n in reconcile.running()
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
@@ -463,7 +450,7 @@ class NodeExecutor:
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
         cfg.validate_launch(configured)
-        if configured.cpu_limit is not None and configured.runtime and configured.runtime.driver in shim.TEE_DRIVERS:
+        if configured.cpu_limit is not None and configured.runtime.driver in shim.TEE_DRIVERS:
             # A TEE node's CPUs are its confidential VM's vCPUs, fixed when it boots.
             total = resources()[0].get("CPU", 0)
             if configured.cpu_limit > total + 1e-9:
@@ -475,32 +462,15 @@ class NodeExecutor:
         admitted = []
         for spec in replicas:
             if spec.name in existing:
-                health = reconcile.health_of(existing[spec.name])
-                wanted = ExecutorKind.SHIM if shim.selected(spec) else ExecutorKind.LEGACY
-                if health.executor is not wanted:
-                    raise ValueError("executor change requires explicit drain and confirmed cleanup")
-                if reconcile.matches(spec, health):
+                if reconcile.health_of(existing[spec.name]).spec == shim.spec_hash(spec):
+                    # The admitted replica is started. Making it ready is its runtime's
+                    # work, and what it runs stays until it is stopped.
                     continue
-                if shim.selected(spec):
-                    if health.spec == actors.spec_hash(spec):
-                        # The admitted replica is started. Making it ready is its runtime's
-                        # work, and what it runs stays until it is stopped.
-                        continue
-                    raise ValueError("shim execution differs from the admitted one; retained until explicit cleanup")
-                if spec.app.kind in ("ziren-cpu", "ziren-gpu") and not spec.app.worker_command:
-                    # A changed configuration does not establish that a native
-                    # actor is idle. Keep its process
-                    # and GPU allocation until an explicit drained stop confirms
-                    # cleanup; ordinary reconciliation must not abort a proof.
-                    raise ValueError("native prover differs from configuration; explicit drain and cleanup required")
-                reconcile.stop(spec.name)
-            if shim.selected(spec):
-                if capabilities is None:
-                    capabilities = shim.capabilities(cfg.cluster)
-                if missing := shim.required_capabilities(spec) - set(capabilities):
-                    raise ValueError(f"node does not support the selected shim runtime: it lacks {', '.join(sorted(missing))}")
-            if shim.selected(spec) and (not container_gone(actors.app_container(spec.name)) or not container_gone(actors.gpu_container(spec.name))):
-                raise ValueError("legacy containers require confirmed cleanup before shim launch")
+                raise ValueError("shim execution differs from the admitted one; retained until explicit cleanup")
+            if capabilities is None:
+                capabilities = shim.capabilities(cfg.cluster)
+            if missing := shim.required_capabilities(spec) - set(capabilities):
+                raise ValueError(f"node does not support the selected shim runtime: it lacks {', '.join(sorted(missing))}")
             admitted.append(self.runtimes.bind(spec, command_id))
 
         def start() -> None:
@@ -517,14 +487,8 @@ class NodeExecutor:
 
     def _remove_replicas(self, names: list[str]) -> None:
         for name in names:
-            allocation = self.runtimes.read(name)
-            if allocation and not allocation.cleaned:
-                reconcile.stop(name, cleanup=lambda: self.runtimes.cleanup(name))
-                continue
-            reconcile.stop(name)
-            ray.get(actors.clean_after.remote(name), timeout=120)
-            if not container_gone(actors.gpu_container(name)) or not container_gone(actors.app_container(name)):
-                raise ValueError(f"{name}: app container cleanup is uncertain")
+            # Cleaning an allocation that is cleaned, or one that was never made, does nothing.
+            reconcile.stop(name, cleanup=lambda: self.runtimes.cleanup(name))
 
     def app(self, p: dict[str, Any]) -> tuple[dict[str, Any], Any]:
         """An app-level change from the scheduler, for an app (`p["app"]`: the entries that
@@ -537,9 +501,9 @@ class NodeExecutor:
         A removed entry has what is left of its replicas cleaned up the way disabling does.
         Removing an app from this node alone (a scale left it no replicas here) keeps its
         data. Deleting it (`p["delete"]`) removes what this node holds of it too: its
-        replicas' logs, its worker's directory and the files of its proof jobs
-        (`delete["files"]`) in its proof storage. A deleted batch's jobs (`delete["jobs"]`)
-        lose their directories: record, logs and outputs. Volumes, mounts, env files,
+        replicas' logs and the files of its proof jobs (`delete["files"]`) in its proof
+        storage. A deleted batch's jobs (`delete["jobs"]`)
+        lose their directories: record, logs and outputs. Volumes, mounts,
         storage roots and images stay, and so does whatever holds or lies in a path another
         app or batch uses, here or (by `delete["keep"]`) on another node. Returns the
         result, and what deletes the files, for after the configuration lock."""
@@ -612,15 +576,15 @@ class NodeExecutor:
     def _paths_in_use(self, keep: list[str], removed: list[AppSpec]) -> list[str]:
         """The host paths that a deletion keeps, with what holds or lies in one: those of
         the apps and batches this node still configures, `keep` (the ones on other nodes),
-        and the volumes and env files of the `removed` entries."""
+        and the volumes of the `removed` entries."""
         paths = list(keep)
         for e in (yaml.safe_load(self.apps_file.read_text()) or {}).get("apps") or []:
-            paths += [e.get(k) for k in ("workdir", "worker_workdir", "proof_storage_root", "worker_env_file")]
+            paths += [e.get(k) for k in ("workdir", "proof_storage_root")]
             paths += [str(v).split(":")[0] for v in e.get("volumes") or []]
         for b in ((yaml.safe_load(Path(self.batches).read_text()) or {}).get("batches") or {}).values():
             paths += list((b or {}).get("allow") or [])
         for a in removed:
-            paths += [v.split(":")[0] for v in a.volumes] + [a.worker_env_file]
+            paths += [v.split(":")[0] for v in a.volumes]
         return [os.path.realpath(p) for p in paths if isinstance(p, str) and os.path.isabs(p)]
 
     def _refusal(self, path: str, in_use: list[str], log_dir: str, *, inside_ok: bool = False) -> str | None:
@@ -658,7 +622,7 @@ class NodeExecutor:
 
     def _delete_app_files(self, removed: list[AppSpec], log_dir: str, in_use: list[str], files: list[str]) -> dict[str, Any]:
         """Deletes what the `removed` entries of a deleted app held: the files of its proof
-        jobs in their proof storage, their replicas' logs and their workers' directories."""
+        jobs in their proof storage and their replicas' logs."""
         deleted: list[str] = []
         kept: list[dict[str, str]] = []
         roots = [os.path.realpath(a.proof_storage_root) for a in removed if a.proof_storage_root]
@@ -676,8 +640,6 @@ class NodeExecutor:
             pattern = re.compile(rf"{re.escape(a.name)}-\d+\.node\.log(?:\.cursor)?")
             for name in filter(pattern.fullmatch, logs):
                 self._delete(os.path.join(log_dir, name), None, deleted, kept)
-            if a.worker_workdir and os.path.lexists(a.worker_workdir):
-                self._delete(a.worker_workdir, self._refusal(a.worker_workdir, in_use, log_dir), deleted, kept)
         if deleted or kept:
             log.info("deleted app's files: %d deleted, kept %s", len(deleted), kept)
         return {"deleted": deleted, "kept": kept}
@@ -747,9 +709,8 @@ class NodeExecutor:
                     # A replica being started answers once it is ready: asking it would
                     # hold this report, and every result in it, for the whole timeout.
                     health = reconcile.health_of(running[name], timeout_s=5) if name in running and name not in starting else None
-                    owned_executor = health is not None and health.executor.value == app.get("runtime", {}).get("executor", "legacy")
-                    healthy = owned_executor and health.is_ready
-                    if owned_executor and health.execution is not None and (healthy or health.management_ready or health.allocation_reserved):
+                    healthy = health is not None and health.is_ready
+                    if health is not None and health.execution is not None and (healthy or health.management_ready or health.allocation_reserved):
                         record = self.runtimes.read(name)
                         if record is not None and not record.cleaned and record.execution == health.execution:
                             services = list(app.get("services", [])) if healthy else [s for s in app.get("services", []) if s == "control"]
@@ -766,7 +727,7 @@ class NodeExecutor:
                     log.warning("app health unavailable for %s: %s", name, type(error).__name__)
                     healthy = False
                 app["ready"] &= healthy
-            app["cleaned"] = not any(name in running for name in names) and all((not (record := self.runtimes.read(name)) or record.cleaned) for name in names) and all(container_gone(actors.gpu_container(name)) and container_gone(actors.app_container(name)) for name in names)
+            app["cleaned"] = not any(name in running for name in names) and all((not (record := self.runtimes.read(name)) or record.cleaned) for name in names)
         job_reports = []
         # A node keeps every job's directory, so only those that may still change are read.
         settled, self.settled = self.settled, {}

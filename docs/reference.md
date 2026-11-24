@@ -133,15 +133,14 @@ the app's `apps.yaml` entry; unknown or mistyped settings are refused.
 | `image` (required), `replicas`, `gpus`, `cpus`, `shm_gb`, `memory_gb`, `env`, `volumes`, `ready_timeout_s`, `stop_timeout_s` | Every app |
 | `command`, `port_base` (required; replica i serves on `port_base` + i), `health_path`, `workdir`, `user` | A `kind: app` container |
 | `proof_storage_root`, `backend`, `rust_log` | A prover |
-| `cpu_limit`, `memory_limit_gb` | A shim app: `runtime: {executor: shim}` with driver `docker`, `tee` or `tee-simulation` |
+| `cpu_limit`, `memory_limit_gb` | An app on driver `docker`, `tee` or `tee-simulation` |
 
 **Reservations and hard limits.** `gpus`, `cpus` and `memory_gb` are what Ray
 reserves for each replica: the scheduler places and admits an app by them, and on
-the Docker driver nothing caps a container to them. A shim app may also set hard
+the Docker driver nothing caps a container to them. An app may also set hard
 limits for each replica's container: `cpu_limit` in CPUs (fractions allowed, at
 least 0.01 and at least `cpus`) and `memory_limit_gb` in GiB (at least 6 MiB and at
-least `memory_gb`). A limit the app doesn't set isn't applied. Both are refused for a
-legacy-executor app, which doesn't enforce them, and for a native OpenShell app,
+least `memory_gb`). A limit the app doesn't set isn't applied. Both are refused for a native OpenShell app,
 whose `cpus` and `memory_gb` are its limits. Quotas count reservations, not limits.
 
 `cpus` is a positive whole number, except that a shim `kind: app` without GPUs may
@@ -193,8 +192,8 @@ disabled. Once the node reports it, within 120 seconds, the scheduler enables it
 admits it against the namespace quota. A failed create clears the placement, so the
 next enable places the app again. If the node hasn't reported the entry in time,
 enabling answers 503, and enabling again waits for the same create. An app that a
-node's `apps.yaml` already runs, such as an integrated worker's prover bound with
-`app: NAME`, isn't placed again.
+node's `apps.yaml` already runs, such as a prover entry bound with `app: NAME`,
+isn't placed again.
 
 **Moves.** Each start of an app the scheduler placed is placed again when it leaves
 the queue: on its own node when that has room, else on the node that fits it best
@@ -203,8 +202,7 @@ entry, the old node removes its own (its configuration and leftover containers a
 processes, never the app's data), which frees the room there, and the app starts on
 the new node. A node whose create fails isn't picked again for that app. With no room
 anywhere, the start preempts lower-priority work on its own node and keeps the room
-that frees. A start whose entry is anchored with `machine` never moves; every
-integrated worker's entry is. It waits for room on its node, preempting
+that frees. A start whose entry is anchored with `machine` never moves. It waits for room on its node, preempting
 lower-priority batch jobs of its namespace when it can. Fleet copies nothing an app
 keeps on a node's disks: the app looks after its own storage. Anchor an app that keeps
 data there, or runs from it, by setting `machine` in its entry in that node's
@@ -262,11 +260,9 @@ The app or batch then goes with everything Fleet holds of it:
 - On the control host: its job records with their logs, and the commands about them.
   A proof app's job records and anchor go from Postgres.
 - On each node: its configuration, with what the node holds of it. A batch's jobs lose
-  their directories: record, logs and `out/`. An app's replicas' logs and its workers'
-  directories (`worker_workdir`) go, and so do its proof jobs' files in its proof
+  their directories: record, logs and `out/`. An app's replicas' logs go, and so do its proof jobs' files in its proof
   storage: each job's output directory, and the inputs and ELF that no other job or
-  app uses. An EthProofs worker's directory is its proof storage root, so its
-  checkpoints and proofs go with it.
+  app uses.
 
 Volumes, batch mounts, env files, storage roots and images stay. So does whatever
 holds or lies in a path that another app or batch on any node uses, and anything at
@@ -325,18 +321,17 @@ refused.
 except `priority` and `disabled`, which have their own commands;
 accepted jobs keep the settings they were submitted with. Only administrators set
 `allow` (the host paths jobs may mount), `user` and `runtime`, so an owner's batch
-starts with no host mounts, the image's default user and the legacy executor.
+starts with no host mounts and the image's default user.
 
-**Runtime.** `runtime` says what runs a batch's jobs. With null or
-`{"executor":"legacy"}` the node's bridge runs each attempt with `docker run`. With
-`{"executor":"shim","driver":"docker"}` (`fleetctl batch add|update NAME --runtime
-shim`) the bridge launches each attempt through the node's trusted-shim, as a run to
-completion on its Docker driver: the same image, command, environment, mounts, cards,
+**Runtime.** A batch's jobs run through the shim's Docker driver: `runtime` is null
+or `{"executor":"shim","driver":"docker"}`, which mean the same. The node's bridge
+launches each attempt through the node's trusted-shim, as a run to completion on
+that driver: the same image, command, environment, mounts, cards,
 user, `shm_gb` and `stop_timeout_s`, and no network for a namespace's job. The bridge
 keeps the VRAM wait, the retries and their budgets, and writes the container's output
 to the job's log, so `fleetctl batch logs`, cancel, preempt and requeue work the same.
 Each attempt is a new generation of the job's allocation, launched once the shim has
-removed the one before it. The scheduler places such a job only on a node that reports
+removed the one before it. The scheduler places a job only on a node that reports
 `shim-batch-v1`, which a node does when its shim's Docker driver runs a container to
 completion, reports its exit status and output, starts it without a network and stops
 it with a long grace; until one does, the job waits with the detail `waiting for a node
@@ -462,13 +457,13 @@ the client binary with the image; do not mix their proof representations. CI
 compiles the full SDK/CUDA adapter as well as testing storage without the runtime.
 Use locked builds. Dependency updates must revalidate this tuple; regenerating
 the lockfile is an intentional upgrade, including its Plonky3 dependencies.
-SDK proof apps can package the worker and GPU server into one immutable image and
-select `runtime: {executor: shim, driver: docker}` in their existing `apps.yaml`
+SDK proof apps package the worker and GPU server into one immutable image and
+select `runtime: {executor: shim, driver: docker}` in their `apps.yaml`
 entry. They retain `kind: ziren-gpu` or `ziren-cpu`, their app/ELF identity and the
 existing proof submission, queue, quota and completion protocol. Execution uses the
 same durable shim Docker lifecycle as other containers. The bridge advertises
-`shim-prover-v1`; older adapters cannot receive these launches. OpenShell and
-host-side `worker_command` are not supported for this packaged SDK worker path.
+`shim-prover-v1`; older adapters cannot receive these launches. OpenShell is
+not supported for this packaged SDK worker path.
 It exposes only its private HTTP health port; SDK ingress and artifact retrieval
 continue through the existing proof-app endpoint and storage protocol.
 A prover's node entry can set `network: host`: its one replica then runs on the
@@ -493,41 +488,35 @@ can reference app scalar fields and `{name}`, `{machine}`, `{index}`, `{port}`,
 `{cluster_token_file}` and `{scheduler_ca_file}`. Credential contents are never
 injected by Fleet; an administrator must approve the individual read-only mounts.
 Keep proof storage mounted at the same absolute path so persisted `file://`
-references and completed lease records remain usable. The existing host storage
-fetch handler remains available for fetching historical outputs.
+references and completed lease records remain usable. The host storage
+fetch handler fetches historical outputs.
 
-Existing native entries using the shared `node_binary` remain readable for an
-explicit cutover; a packaged worker does not use that binary. See the
-[maintenance procedure](maintenance.md#cut-over-sdk-proof-apps-to-packaged-shim-runtimes)
-for an upgrade that retains queued jobs and all stored data.
 Guest/verifier compatibility still needs validation for the pinned image tuple;
 an immutable image alone does not attest to hardware or prove compatibility.
 Check `fleet_bridge.__file__` from the adapter's Python interpreter and working
 directory when deploying: a source tree in that directory takes precedence over
 an installed wheel, so updating the wheel alone may leave the running code old.
 
-Ordinary container apps can opt in to trusted-shim without migrating existing
-workloads. Add `shim_binary` (the absolute `trusted-shim-runtime` executable path)
-and `shim_state_dir` (an absolute private persistent directory) to the existing
-node-owned `apps.yaml`. These shared settings do not enter legacy deployment
-hashes. Upgrade the scheduler and `fleet-node` before the Python bridge: node report
+Every app replica and batch job runs through trusted-shim. The node-owned
+`apps.yaml` sets `shim_binary` (the absolute `trusted-shim-runtime` executable path)
+and `shim_state_dir` (an absolute private persistent directory). Upgrade the scheduler and `fleet-node` before the Python bridge: node report
 v3 gains the optional `runtime_capabilities` field, with no database migration.
 An older node advertises none and cannot receive a shim launch or acknowledge its
 cleanup. A supported node advertises `shim-docker-v1` after probing the binary.
 
-Keep old app entries unchanged. Only an administrator explicitly selecting
-`runtime: {executor: shim, driver: docker}` on an ordinary app activates shim.
-Use the existing app settings API to switch an app; its normal drain, stop,
-confirmed cleanup and apply sequence runs first. Selection changes require
-administrator credentials. `{executor: legacy}` selects the existing executor.
-Batch jobs and Ziren prover apps retain their existing execution paths and durable
-leases. No existing configuration, image or data migration is needed.
+Every `apps.yaml` entry selects its runtime, `runtime: {executor: shim, driver: DRIVER}`
+with driver `docker`, `openshell`, `tee` or `tee-simulation`; the bridge refuses a file
+with an entry that selects none. An entry the scheduler creates runs on the Docker
+driver unless its spec selects another, and a prover's serves its health check on
+`container_port: 8080` behind a loopback port the shim picks (`port_base: 0`). Use the app settings API to change an app's
+driver; its normal drain, stop, confirmed cleanup and apply sequence runs first.
+Selection changes require administrator credentials.
 
 The machine adapter persists the selected binary, request binding, node, allocation,
 lease and generation under its existing jobs state before dispatching to Ray.
-Recovery keeps that identity; cleanup follows the persisted executor even if
-configuration changes. Healthy unchanged legacy replicas are preserved. Directly
-editing a live app's executor cannot replace its actor. An uncertain shim launch or
+Recovery keeps that identity; cleanup follows the persisted record even if
+configuration changes. Directly
+editing a live app's runtime cannot replace its actor. An uncertain shim launch or
 cleanup retains its reservation and never falls back to Docker directly. A stopped
 or lost shim execution needs explicit cleanup and a new generation to run again.
 With the persistent shim (`runtime-resume-v1`), a Docker runtime whose container
@@ -540,8 +529,8 @@ waiting. Its retries back off from 5 min, doubling up to an hour.
 Keep the allocation and shim journals across upgrades and restarts.
 
 Shim delegates lifecycle to upstream Docker and checks a container's effective
-CPU/memory limits against the launch request before start. A Docker runtime runs
-the way a legacy app does: Ray reserves its `cpus` and `memory_gb`, and the
+CPU/memory limits against the launch request before start. For a Docker runtime
+Ray reserves its `cpus` and `memory_gb`, and the
 request sets no container limit; TEE runtimes set both as hard limits. On either
 driver, an entry's `cpu_limit` and `memory_limit_gb` are the container's hard
 limits in place of those, and a replica with `cpus: 0` also gets
@@ -550,16 +539,16 @@ has. Each
 allocation records its launch request revision, and one recorded without a
 revision keeps the hard limits and environment it was launched with until it is
 cleaned up and launched as a new generation; from revision 2, `{cpu_count}` is
-`max(1, int(cpus))`, as legacy sets `RAYON_NUM_THREADS`: 1 for a replica that
+`max(1, int(cpus))`: 1 for a replica that
 reserves 0 or a fraction of a CPU, whatever its `cpu_limit`, since a cap isn't a
 reservation. The shim creates
 containers with `--pull=never`. When a first Docker launch fails and the node lacks
 the image, the bridge pulls it, within an hour, and makes the same launch again;
 a failed pull fails the launch naming the image. A launch that finds its container,
 as after a Ray restart or a reboot, needs no image check or registry. The app's
-`ready_timeout_s` starts after the launch, as it does after a legacy `docker run`.
+`ready_timeout_s` starts after the launch.
 A Docker `kind: app` entry with GPUs gets `NVIDIA_DRIVER_CAPABILITIES=all` unless
-its `env` sets it, as a legacy app does. The container's stdout and stderr go
+its `env` sets it. The container's stdout and stderr go
 to `<log_dir>/<replica>.node.log`, which `fleetctl app logs` reads: a thread of the
 replica's actor streams them from Docker's API. `<replica>.node.log.cursor` beside
 the log holds the time of the last line written, so a resumed container or a
@@ -936,13 +925,13 @@ PYTHONPATH=bridge TRUSTED_SHIM_TEST_BINARY=/absolute/path/trusted-shim-runtime \
   python -m pytest -q -s bridge/tests/test_shim_cluster.py
 ```
 
-The test starts an isolated local Ray cluster, runs legacy and shim apps together,
+The test starts an isolated local Ray cluster, runs a shim app,
 checks container ids/start times across adapter recovery, verifies that the
 container has no Docker CPU/memory limit and only loopback publication, and
 confirms cleanup. No live Fleet node or
 proof network is contacted. Without the explicit binary path this test is skipped.
 
-Integrated EthProofs owns its whole pipeline (head polling, witness preparation,
+EthProofs owns its whole pipeline (head polling, witness preparation,
 loopback GPU proving, durable outputs and reporting) and needs no separate EthProofs
 client or SDK endpoint. Its
 cursor advances one block at a time, once the block's output and report are
@@ -1530,7 +1519,7 @@ Proofs are submitted through the Ziren network SDK; MCP lists and inspects them.
 | Registered apps, proof jobs, tokens | Postgres: `fleet_apps` (each namespace's programs and placement policy, with when each was disabled), `fleet_jobs` (state, kind and a failed job's stage status by name, with CHECK constraints), `fleet_tokens`, `fleet_namespaces` (namespace and tag quotas), `fleet_namespace_allocations`, `fleet_schema` (the schema version) |
 | SDK proof ELFs and inputs | The app's `proof_storage_root`: `elf/<hash>` and `inputs/<hash>`; Fleet keeps references, hashes and parameters |
 | SDK proof outputs | The app's `outputs/<job id>/<execution lease>/`: proof, public values and a committed manifest |
-| Integrated EthProofs data | Its storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`, in the app's own format |
+| EthProofs data | Its storage root: `checkpoint.json`, `inputs/`, `outputs/<block>/`, `outbox/` and `reported/`, in the app's own format |
 | Apps, deployments, batches, jobs and commands | `data_dir/workloads/{apps,deployments,jobs,commands}` on the control host: durable JSON records, including lease and cleanup fences |
 | Batch inputs, outputs and checkpoints | The owner's shared or object storage |
 | Batch logs | `data_dir/workloads/artifacts/<job-id>/<lease>/logs` on the control host; nodes keep execution files in `FLEET_JOBS_DIR/<job-id>/`, normally `work/jobs/` |
@@ -1581,7 +1570,7 @@ an authenticated HTTPS gateway from outside.
 Ordinary shim apps can declare `services: [http]` in the existing app spec. These
 names map to the app's loopback listener; `container_port` optionally differs from
 `port_base + replica index`, and `entrypoint` optionally overrides the image's
-entrypoint. All three are administrator-owned settings and require explicit
+entrypoint. All three are administrator-owned settings and require
 `runtime: {executor: shim, driver: docker}`. Changes use the existing drain,
 confirmed cleanup and replacement sequence.
 
@@ -1617,13 +1606,12 @@ node may report only the declared `control` service as ready. This lets an
 administrator repair or restart the exact allocation without advertising its
 unhealthy application services. Disabled, stale, ended and retiring allocations
 remain hidden. Upgrade the scheduler's report validation before the bridge to
-accept this restricted service subset. No legacy task changes executor.
+accept this restricted service subset.
 
 Upgrade scheduler/fleet-node before the bridge (older JSON readers reject unknown
 fields). The bridge advertises `shim-network-v1` only when the binary and node
 network settings support it. New container-port/entrypoint options require
-`shim-runtime-v2`. Existing Docker-only shim and legacy tasks remain supported;
-installing network settings leaves legacy deployment hashes unchanged. New shim
+`shim-runtime-v2`. Shim
 actors use a separate Ray worker environment so updated adapter code loads
 without restarting Ray or existing detached apps. Stop/delete requires the shim
 to drain live streams before releasing the port and Ray reservation.
@@ -1637,7 +1625,7 @@ The explicit Docker shim executor can declare the reserved `control` service for
 Ingress `bearer_env` values remain node-local. Reports and app views contain `@fleet-local-env:NAME` references; node configuration updates resolve those against the existing local value. A move to a node without that credential fails before writing configuration. Nodes must advertise `shim-private-env-v1` for these workloads.
  Runtime management/ingress requires `shim-management-v1`; automatic ports require `shim-automatic-port-v1`. Older nodes are ineligible. The bridge supervises a failed connector process without replacing the runtime. These capabilities require trusted-shim #5 and trusted-data-router #4.
 
-Installing this support does not select it for legacy apps. Proof-required policy/TEE execution and the OpenShell driver are still not accepted by this Docker lifecycle path; requesting unsupported trust modes fails validation.
+Proof-required policy/TEE execution and the OpenShell driver are still not accepted by this Docker lifecycle path; requesting unsupported trust modes fails validation.
 
 Shim HTTP ingress rules accept `single_use: true` to require an exact HTTP request
 capability from the application's central gateway. Scheduler placement then
@@ -1681,7 +1669,7 @@ not completed enforcement or a cryptographic proof.
 
 Upgrade Fleet, relay and shim before issuing identity-bound grants; old shim
 parsers reject them. Enable all needed service policies before switching a shared
-router's clients. Unconfigured routers and legacy tasks retain their behavior.
+router's clients. Unconfigured routers retain their behavior.
 The authorization snapshot caps policies plus permanent revocations at 1024
 records, and live expiring delegate denials separately at 4096; it returns 507 at
 capacity. Compaction only removes denials covered

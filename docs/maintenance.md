@@ -273,8 +273,7 @@ FLEET_VERSION=0.2.9 cargo build --locked --release \
 Install it with the local form of `node upgrade` on systemd nodes, and the manual
 procedure on cron nodes.
 
-`fleet-ziren-node`, which legacy native provers (`node_binary`) and
-`--proof-storage-roots` need, isn't in the release package: build it the same way with
+`fleet-ziren-node`, which `--proof-storage-roots` needs, isn't in the release package: build it the same way with
 `-p fleet-ziren-node` and install it as the node's `bin/fleet-ziren-node`.
 
 ## Changing a node's capacity
@@ -290,7 +289,7 @@ fleetctl --token-file owner.token --namespace NAMESPACE app disable APP
 ```
 
 Wait for active proofs and batch jobs to finish and for app cleanup to complete.
-Draining alone doesn't stop integrated workers, which run their own input streams.
+Draining alone doesn't stop an app's replicas, such as a worker that runs its own input stream.
 Disabling EthProofs keeps its finished outputs and retries any unfinished block on
 resume; its [guide](../apps/ethproofs/README.md#operate-and-recover) describes
 finishing the current proof first. Note the enabled apps, their allocations and each
@@ -395,9 +394,7 @@ stale starts are retired.
 
 A start whose node has no room moves to a node that has, unless its entry anchors it
 with `machine`; an anchored start waits on its node, preempting lower-priority batch
-jobs of its namespace when it can. Every integrated worker (an app whose node runs
-its prover as a Fleet worker, such as goat's proof builder) is anchored, since the
-bridge requires `machine` for one.
+jobs of its namespace when it can.
 
 ### Who changed what
 
@@ -465,80 +462,3 @@ The 0.2 runtime release also migrates schema 16 through 19 automatically to 20.
 For an unsupported schema, stop and prepare a tested migration; never reset
 production metadata. Preserve job history, namespace/token identities and application
 storage. After migration, rollback requires a schema-20-compatible scheduler.
-
-## Cut over SDK proof apps to packaged shim runtimes
-
-This is a coordinated maintenance operation. Build and verify the new image before
-the downtime. The SDK worker and its matching Ziren 2.0 GPU server share one image;
-Fleet retains proof scheduling, and shim owns the container. Existing application,
-namespace and ELF identities, queued jobs, proof history and storage paths stay in
-place. Integrated `worker_command` applications own their input streams and need
-their own complete worker image; the SDK converter refuses to guess their packaging.
-
-1. Pause producers and disable each affected proof app with
-   `fleetctl --namespace NS app disable APP`. Wait for running proofs to finish,
-   their output references to be recorded, and replica cleanup to be confirmed.
-   Queued proofs remain queued. For other batch/application jobs, wait for completion
-   or use the application's own checkpoint procedure. Fleet cannot checkpoint an
-   arbitrary process's memory. Do not cancel or kill work to simulate a lossless pause.
-2. With application writes quiesced, back up PostgreSQL, the scheduler data directory,
-   each node's existing `apps.yaml`/`batches.yaml` and job journals, shim state, and all
-   application storage/checkpoints. Check backup readability and record job IDs,
-   states, output hashes and queued counts. Keep credentials private. Do not reset
-   metadata, delete apps/jobs, prune volumes, or remove shim ledgers. If the existing
-   database schema is unsupported, stop and prepare a tested schema migration.
-3. Build with `deploy/build-proof-image.sh REGISTRY/PROOF:VERSION GPU_IMAGE@sha256:DIGEST` on the build host
-   (Rust toolchain, Docker and Python 3.11+). Publish through the normal release process
-   and record the resulting registry digest. This build does not start a prover.
-   Upgrade the control host and CLI, then each affected node to the same release with
-   the persistent shim service: `install.sh node --with-shim`
-   ([installation](installation.md#nodes-with-persistent-shim-services)) on a node
-   without it, `fleet-ctl.sh node upgrade` on one with it.
-4. Prepare the existing configuration while every selected entry is disabled. Run the
-   release package's migrator (`PACKAGE` as in the [cron procedure](#cron-supervised-nodes))
-   with the node's venv Python, which has PyYAML:
-
-   ```bash
-   "$FLEET_PREFIX/venv/bin/python" "$PACKAGE/deploy/migrate-proof-runtime.py" \
-     --apps "$FLEET_PREFIX/etc/apps.yaml" --name policy-prover \
-     --image REGISTRY/PROOF@sha256:DIGEST \
-     --output-dir /private/upgrade-review
-   ```
-
-   Repeat `--name` for more entries. The directory must be new; it
-   contains a private `apps.yaml` preview, an update index and one settings JSON per
-   entry. The tool leaves the source configuration, database and every storage file
-   untouched and never reads token contents. Shim volumes are `PATH[:ro|rw|rslave]`,
-   mounted at the same path inside the container: the tool rewrites a `PATH:PATH[:OPTS]`
-   volume to that form and refuses one whose container path differs. Each entry keeps
-   its `cpus` (1 when it sets none), a whole number of at least 1, which Ray reserves
-   for the GPU server and the worker together; their container has no CPU limit.
-   Review mounts and identities.
-5. Stop only the control agent while installing the reviewed `apps.yaml` through an
-   atomic replacement, retaining its original permissions and a backup, then start it
-   again. Confirm the node advertises `shim-prover-v1`. Keep each app disabled and
-   apply its settings to the existing scheduler record, selecting `--node NODE` when
-   needed:
-
-   ```bash
-   fleetctl --namespace NS app update APP \
-     --settings /private/upgrade-review/policy-prover.settings.json
-   ```
-
-   Wait for the settings operation to complete. Do not use `app delete`/`app add`:
-   those operations would discard identity/history that an in-place update retains.
-   Before enabling it, give the record the entry's CPUs (`cpus` in `updates.json`)
-   with `fleetctl --namespace NS app scale APP --cpus N`: settings don't carry CPUs,
-   and the scheduler otherwise restores its own count.
-6. Compare the backed-up job inventory and stored hashes, verify historical outputs
-   remain fetchable, then enable one app and submit its approved guest through the
-   proof network. Verify the returned proof with the matching verifier before
-   enabling the rest and resuming producers. Nodes still require only outbound
-   control/data connections; the health port is published on loopback.
-
-For rollback, drain the new runtime, confirm its cleanup, restore the previous image
-and application settings, and preserve the current database and artifact directories.
-Never overwrite newly generated proofs with an older backup. An older scheduler must
-support the current database schema; a schema-incompatible binary is not a valid
-rollback. Retain the host storage-fetch handler until all historical output retrieval
-paths have been verified after migration.
