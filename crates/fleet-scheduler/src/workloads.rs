@@ -626,6 +626,8 @@ impl WorkloadController {
                 "reserved_cpus":reserved,"cpu_limits":cpu_limits,"memory_limits_gb":memory_limits,
                 "gpus":w.report.total_gpus,"cpus":w.report.total_cpus,"machine":w.report.machine,
                 "agent_version":w.report.agent_version,"hardware":w.report.hardware,
+                // What decides which runtimes and settings the node can run.
+                "runtime_capabilities":w.report.runtime_capabilities.iter().collect::<std::collections::BTreeSet<_>>(),
                 "free_gpus":w.report.free_gpus,"free_cpus":w.report.free_cpus,
                 "ready":w.report.ready && now()-w.seen<30.0 && !w.draining,"draining":w.draining,
                 "busy":(!busy.is_empty()).then(||busy.join(", ")),"apps":apps,
@@ -2524,6 +2526,9 @@ impl WorkloadController {
             let set: Value = serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)?;
             if let Some(settings) = set.as_object() {
                 Self::require_admin_settings(c, settings, &Self::ADMIN_APP_SETTINGS)?;
+            }
+            if q.get("dry_run").is_some_and(|v| v == "true") {
+                return Ok(Json(self.check_update(namespace, app, node, set).await?).into_response());
             }
             return Ok((StatusCode::ACCEPTED, Json(self.request_update(namespace, app, node, set).await?)).into_response());
         }

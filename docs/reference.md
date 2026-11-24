@@ -234,7 +234,11 @@ environment, command, user, workdir, volumes, shm and memory sizes, health path 
 timeouts. The image, environment, command, user, workdir and volumes need an
 administrator, since an app can reach host networking, storage and prover
 credentials; an update mixing them with other fields is refused whole. Changing
-priority alone doesn't restart replicas.
+priority alone doesn't restart replicas. `fleetctl app update NAME ... --check`
+(`PUT /apps/NAME/settings?dry_run=true`) answers what the update would, including a
+refusal because the app's node lacks a capability the settings need, and changes
+nothing: a way to check a move to another runtime before the app is drained for
+it. What only the node checks when it starts a replica isn't covered.
 
 **Deleting.** `fleetctl app delete NAME --yes` and `fleetctl batch delete NAME --yes`
 work the same way. Without `--yes` they only say what would go. A delete is refused

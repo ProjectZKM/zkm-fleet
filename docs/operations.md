@@ -65,7 +65,9 @@ CPU units are logical CPUs, and Ray's pool can be smaller than the hardware.
 `fleetctl node` shows total and free GPUs and CPUs, and apart from them the CPUs its
 enabled apps reserve (`RESERVED CPUS`) and the sum of their hard limits
 (`CPU LIMITS`, `MEMORY LIMITS GB`): limits beyond the node's CPUs mean its CPUs are
-overcommitted. App listings show configured allocations, disabled apps included,
+overcommitted. `fleetctl node NAME` also lists the node's `runtime_capabilities`:
+what its shim and bridge support, which decides the runtimes and settings an app
+can use there. App listings show configured allocations, disabled apps included,
 not live use. Namespace and tag quotas cap reservations further; hard limits don't
 count toward them.
 

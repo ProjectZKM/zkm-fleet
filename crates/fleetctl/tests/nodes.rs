@@ -19,7 +19,8 @@ fn node_views_show_total_and_free_cpu_gpu_resources_and_the_hard_limits_apart() 
                 "gpus": 8, "cpus": 48, "free_gpus": 2, "free_cpus": 0,
                 "reserved_cpus": 40, "cpu_limits": 6.5, "memory_limits_gb": 12,
                 "machine": "gpu-machine", "ready": true, "draining": false,
-                "busy": null, "agent_version": "v0.1.6", "heartbeat_age_ms": 1000
+                "busy": null, "agent_version": "v0.1.6", "heartbeat_age_ms": 1000,
+                "runtime_capabilities": ["shim-docker-v1", "shim-limits-v1"]
             });
             let body = serde_json::json!({"nodes": [node.clone()]}).to_string();
             let server = std::thread::spawn(move || {
@@ -99,6 +100,7 @@ fn node_views_show_total_and_free_cpu_gpu_resources_and_the_hard_limits_apart() 
                         "cpu_limits 6.5",
                         "memory_limits_gb 12",
                         "agent_version v0.1.6",
+                        "runtime_capabilities shim-docker-v1,shim-limits-v1",
                     ] {
                         assert!(
                             text.lines().any(|line| line

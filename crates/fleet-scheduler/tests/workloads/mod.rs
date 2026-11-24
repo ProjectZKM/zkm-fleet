@@ -2248,8 +2248,14 @@ async fn an_app_update_drains_has_the_node_write_the_settings_then_restarts() {
         assert_eq!(refused.downcast_ref::<crate::fleet::RequestRejection>().unwrap().status,400,"{bad}");
     }
     let set=json!({"image":"web:2","env":{"A":"1"}});
+    // A check refuses what the update would, and otherwise answers without starting it.
+    assert_eq!(status_of(&c.check_update(&ns,"model",None,json!({"image":""})).await.unwrap_err()),400);
+    let checked=c.check_update(&ns,"model",None,set.clone()).await.unwrap();
+    assert_eq!((&checked["dry_run"],&checked["node"],&checked["operation"]),(&json!(true),&json!("gpu"),&Value::Null));
+    assert!(command_where(&c,|_|true).is_none() && c.scale_status(&ns,"model",None).unwrap()["state"]=="configured");
     assert_eq!(c.request_update(&ns,"model",None,set.clone()).await.unwrap()["state"],"draining");
     assert!(c.request_update(&ns,"model",None,json!({"image":"web:3"})).await.is_err(),"one operation at a time");
+    assert_eq!(status_of(&c.check_update(&ns,"model",None,json!({"image":"web:3"})).await.unwrap_err()),409);
     c.dispatch().await.unwrap();
     let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
     finish_app_command(&c,&ns,false,&stop,true,None).await;
@@ -2278,6 +2284,7 @@ async fn shim_capability_does_not_migrate_existing_apps() {
     let commands=c.inner.lock().commands.len();
     let set=json!({"runtime":{"executor":"shim","driver":"docker"}});
     assert!(c.request_update(&ns,"model",None,set.clone()).await.is_err(), "old nodes cannot select shim");
+    assert_eq!(status_of(&c.check_update(&ns,"model",None,set.clone()).await.unwrap_err()),409,"and a check says so without draining");
     let mut upgraded=report;
     upgraded.runtime_capabilities=vec!["shim-docker-v1".into()];
     c.report("gpu","session",upgraded.clone()).await.unwrap();
@@ -2288,6 +2295,8 @@ async fn shim_capability_does_not_migrate_existing_apps() {
     assert_eq!(restarted.inner.lock().deployments["gpu-model"].spec,before.spec);
     let owner=user_token(&c,&ns,0x79,"scope=default",Some(vec!["model".into()]),true).await;
     assert_eq!(scale_call(c.clone(),&owner,"PUT",&format!("/apps/model/settings?namespace={ns}"),set.clone()).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(),&owner,"PUT",&format!("/apps/model/settings?namespace={ns}&dry_run=true"),set.clone()).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(c.check_update(&ns,"model",None,set.clone()).await.unwrap()["dry_run"],true);
     assert_eq!(c.request_update(&ns,"model",None,set).await.unwrap()["state"],"draining");
     c.dispatch().await.unwrap();
     let stop=command_where(&c,|cmd|cmd.parameters["scale_phase"]=="stop").unwrap();
@@ -3180,6 +3189,7 @@ async fn a_node_shows_what_its_apps_reserve_beside_their_hard_limits() {
     ];
     c.report("gpu", "session", report).await.unwrap();
     let node = &c.worker_status()[0];
+    assert_eq!(node["runtime_capabilities"], json!(["shim-cleanup-v1", "shim-cpu-shares-v1", "shim-docker-v1", "shim-limits-v1"]));
     assert_eq!((&node["cpus"], &node["free_cpus"]), (&json!(8.0), &json!(0.0)));
     assert_eq!((&node["reserved_cpus"], &node["cpu_limits"], &node["memory_limits_gb"]), (&json!(2.0), &json!(3.0), &json!(4.0)),
         "a disabled app counts in neither");
