@@ -1,5 +1,6 @@
 """Local execution fences are independent of user authentication and admission."""
 import os
+import shutil
 from unittest.mock import Mock
 import pytest
 import yaml
@@ -150,6 +151,52 @@ def test_finished_job_reports_log_completion_without_archiving_outputs(executor,
     assert not list(directory.glob("*.tar.gz"))
     (directory / ".fleet-logs-lease-1").touch()
     assert executor.report()["jobs"][0]["logs_ready"]
+
+
+def test_a_settled_job_directory_is_read_again_only_once_it_changes(executor, monkeypatch):
+    def job(ident, state):
+        directory = executor.jobs_dir / ident
+        (directory / "out").mkdir(parents=True)
+        JobSpec(id=ident, batch="training", policy=Batch(image="training:latest"),
+                command=["true"], gpus=0, cpus=1, out=str(directory / "out")).write(str(directory / "spec.json"))
+        JobStatus(id=ident, state=state, submitted_at=1, gpus_requested=0, cpus=1).write(str(directory / "status.json"))
+        node.write_json(directory / ".fleet-lease.json", {"lease": "lease-1"})
+        (directory / ".fleet-cleaned-lease-1").touch()
+        return directory
+    done, lost, live = job("job-done", JobState.SUCCEEDED), job("job-lost", JobState.LOST), job("job-live", JobState.RUNNING)
+    for directory in (done, lost):
+        (directory / ".fleet-reported-lease-1").touch()
+    monkeypatch.setattr(node.ray, "cluster_resources", lambda: {"CPU": 1})
+    monkeypatch.setattr(node.ray, "available_resources", lambda: {"CPU": 1})
+    monkeypatch.setattr(reconcile, "running", lambda: {})
+    monkeypatch.setattr(node, "container_gone", lambda _: True)
+    monkeypatch.setattr(jobs, "_going", lambda _: True)
+    read = []
+    directory_of = jobs.JobDirectory
+    monkeypatch.setattr(jobs, "JobDirectory", lambda root, ident, **kw: read.append(ident) or directory_of(root, ident, **kw))
+    def report():
+        read.clear()
+        return [j["id"] for j in executor.report()["jobs"]], sorted(read)
+    assert report() == (["job-live"], ["job-done", "job-live", "job-lost"])
+    # A lost job may still be launched again under its lease, so it is never settled.
+    assert report() == (["job-live"], ["job-live", "job-lost"])
+    # A new lease, as any change in the directory, has it read again.
+    node.write_json(done / ".fleet-lease.json", {"lease": "lease-2"})
+    os.utime(done, ns=(1, 1))
+    assert report() == (["job-done", "job-live"], ["job-done", "job-live", "job-lost"])
+    # A deleted job leaves nothing behind for a later one of its name.
+    shutil.rmtree(done)
+    assert report() == (["job-live"], ["job-live", "job-lost"]) and "job-done" not in executor.settled
+    job("job-done", JobState.RUNNING)
+    assert report()[0] == ["job-done", "job-live"]
+
+
+def test_a_finished_command_is_reported_without_waiting(executor):
+    command = {"id": "c1", "operation": 99, "parameters": {}}
+    node.write_json(executor.journal / "c1.json", {"command": command, "done": False})
+    executor.execute(command)
+    assert executor.finished.is_set()
+    assert node.read_json(executor.journal / "c1.json")["error"] == "unsupported node operation"
 
 
 def test_healthy_proof_app_is_ready_and_enable_preserves_actors(executor, monkeypatch):
