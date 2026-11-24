@@ -8,6 +8,10 @@
 //! `HTTPS_PROXY`, so the proxy keeps no state and a job cannot widen its list.
 
 use anyhow::{Context, Result};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use clap::Parser;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -138,7 +142,7 @@ impl Proxy {
             .filter_map(|l| l.split_once(':'))
             .find(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"))
             .and_then(|(_, value)| value.trim().strip_prefix("Basic "))
-            .and_then(|basic| decode(basic.trim()))
+            .and_then(|basic| STANDARD.decode(basic.trim()).ok())
             .and_then(|pair| String::from_utf8(pair).ok())
             .and_then(|pair| pair.split_once(':').map(|(_, password)| password.to_owned()))
             .ok_or(Refusal(407, "the job's proxy credentials are required"))?;
@@ -167,35 +171,12 @@ impl Proxy {
     /// The host list a token carries, if this node's key signed it.
     fn hosts(&self, token: &str) -> Option<Vec<String>> {
         let (list, signature) = token.split_once('.')?;
-        let (list, signature) = (decode(list)?, decode(signature)?);
+        let (list, signature) = (URL_SAFE_NO_PAD.decode(list).ok()?, URL_SAFE_NO_PAD.decode(signature).ok()?);
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).ok()?;
         mac.update(&list);
         mac.verify_slice(&signature).ok()?;
         Some(String::from_utf8(list).ok()?.strip_prefix("v1\n")?.split(',').map(str::to_owned).collect())
     }
-}
-
-/// Base64, standard or URL-safe, padded or not.
-fn decode(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
-    let (mut bits, mut count) = (0u32, 0);
-    for byte in text.trim_end_matches('=').bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        };
-        bits = bits << 6 | u32::from(value);
-        count += 6;
-        if count >= 8 {
-            count -= 8;
-            out.push((bits >> count) as u8);
-        }
-    }
-    Some(out)
 }
 
 /// An address on the internet: not the node's own, a private network's or a reserved one.
@@ -259,29 +240,17 @@ mod tests {
 
     const KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
 
-    fn encode(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let n = chunk.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - chunk.len()));
-            for i in 0..=chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
-            }
-        }
-        out
-    }
-
     /// The token the bridge gives a job: `fleet_bridge.egress.token`.
     fn token(key: &[u8], hosts: &str) -> String {
         let list = format!("v1\n{hosts}");
         let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
         mac.update(list.as_bytes());
-        format!("{}.{}", encode(list.as_bytes()), encode(&mac.finalize().into_bytes()))
+        format!("{}.{}", URL_SAFE_NO_PAD.encode(list), URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
     }
 
     fn request(target: &str, token: Option<&str>) -> String {
         let auth = token
-            .map(|t| format!("Proxy-Authorization: Basic {}\r\n", encode(format!("fleet:{t}").as_bytes())))
+            .map(|t| format!("Proxy-Authorization: Basic {}\r\n", STANDARD.encode(format!("fleet:{t}"))))
             .unwrap_or_default();
         format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n{auth}\r\n")
     }
@@ -342,7 +311,7 @@ mod tests {
             // No credentials, another node's key, and a list edited after it was signed.
             ("anonymous", request(&format!("localhost:{port}"), None), 407),
             ("foreign", request(&format!("localhost:{port}"), Some(&token(b"another node's 32-byte egress key", "localhost"))), 407),
-            ("edited", request(&format!("localhost:{port}"), Some(&listed.replacen(&encode(b"v1\npypi.org,localhost"), &encode(b"v1\nexample.com"), 1))), 407),
+            ("edited", request(&format!("localhost:{port}"), Some(&listed.replacen(&URL_SAFE_NO_PAD.encode("v1\npypi.org,localhost"), &URL_SAFE_NO_PAD.encode("v1\nexample.com"), 1))), 407),
             // Plain HTTP through the proxy is no tunnel.
             ("plain", format!("GET http://localhost:{port}/ HTTP/1.1\r\nHost: localhost\r\n\r\n"), 405),
         ] {

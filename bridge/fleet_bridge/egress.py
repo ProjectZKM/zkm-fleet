@@ -1,7 +1,7 @@
 """A batch job's way out: an internal Docker network whose only other member is the
 node's egress proxy, which tunnels to the hosts of the job's batch and to no other.
 
-`serve` is `zkm-fleet-egress.service`: it makes the network and the node's key, starts
+`serve` is `zkm-fleet-egress.service` (`python -m fleet_bridge.egress serve`): it makes the network and the node's key, starts
 the proxy, shows that the network reaches the proxy and nothing of the node, and then
 stays with the proxy. `environment` is what the bridge gives a job on that network.
 """
@@ -21,6 +21,8 @@ from pathlib import Path
 from .model import BatchEgressConfig, ModelError, from_dict
 
 DOCKER = ("docker", "--host=unix:///var/run/docker.sock")
+# The network a job joins, and the proxy's container: its name on that network and its port.
+NETWORK, PROXY, PORT = "fleet-egress", "fleet-egress-proxy", 3128
 # The bridge of the network has no address on the node: a job has no route to the node
 # or beyond it, and nothing of the node listens where a job could reach it.
 NETWORK_OPTIONS = ("--internal", "--opt", "com.docker.network.bridge.inhibit_ipv4=true")
@@ -51,7 +53,7 @@ def environment(settings: BatchEgressConfig, hosts: list[str]) -> dict[str, str]
     key = Path(settings.key_file).read_bytes()
     if len(key) < 32:
         raise ValueError("the node's egress key is shorter than 32 bytes")
-    proxy = f"http://fleet:{token(key, hosts)}@{settings.proxy}:{settings.port}"
+    proxy = f"http://fleet:{token(key, hosts)}@{PROXY}:{PORT}"
     return {name: proxy for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")} | {"NO_PROXY": "", "no_proxy": ""}
 
 
@@ -63,13 +65,13 @@ def _docker(*args: str, check: bool = True, timeout: float = 120) -> subprocess.
     return result
 
 
-def _network(name: str) -> dict:
+def _network() -> dict:
     """The network's description, made first where the node lacks it."""
-    if _docker("network", "inspect", name, check=False).returncode != 0:
-        _docker("network", "create", *NETWORK_OPTIONS, name)
-    network = json.loads(_docker("network", "inspect", name).stdout)[0]
+    if _docker("network", "inspect", NETWORK, check=False).returncode != 0:
+        _docker("network", "create", *NETWORK_OPTIONS, NETWORK)
+    network = json.loads(_docker("network", "inspect", NETWORK).stdout)[0]
     if network.get("Internal") is not True or network.get("Driver") != "bridge":
-        raise RuntimeError(f"the Docker network {name} is not an internal bridge network; remove it and start again")
+        raise RuntimeError(f"the Docker network {NETWORK} is not an internal bridge network; remove it and start again")
     return network
 
 
@@ -95,23 +97,23 @@ def start(settings: BatchEgressConfig) -> None:
             out.write(secrets.token_bytes(32))
     if key.stat().st_mode & 0o077 or key.stat().st_size < 32:
         raise RuntimeError(f"the egress key {key} must hold at least 32 bytes that only its owner reads")
-    network = _network(settings.network)
+    network = _network()
     user = f"{os.getuid()}:{os.getgid()}"
     confined = ("--user", user, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pull=missing")
-    _docker("rm", "--force", settings.proxy, check=False)
+    _docker("rm", "--force", PROXY, check=False)
     # The proxy leaves through Docker's default network and listens on the batches' one.
     # `--init`: the proxy is not the container's first process, so a stop signal ends it.
-    _docker("create", "--name", settings.proxy, "--restart=no", "--init", *confined, "--env", "RUST_LOG=info",
+    _docker("create", "--name", PROXY, "--restart=no", "--init", *confined, "--env", "RUST_LOG=info",
             "--volume", f"{key}:{KEY_PATH}:ro", "--network", "bridge", settings.image,
-            "egress-proxy", "--listen", f"0.0.0.0:{settings.port}", "--key-file", KEY_PATH, timeout=900)
+            "egress-proxy", "--listen", f"0.0.0.0:{PORT}", "--key-file", KEY_PATH, timeout=900)
     try:
-        _docker("network", "connect", settings.network, settings.proxy)
-        _docker("start", settings.proxy)
+        _docker("network", "connect", NETWORK, PROXY)
+        _docker("start", PROXY)
         # A job's view of the network: the proxy answers, and nothing of the node does.
-        _docker("run", "--rm", *confined, "--network", settings.network, settings.image, "egress-check",
-                "--proxy", f"{settings.proxy}:{settings.port}", *_node_addresses(network))
+        _docker("run", "--rm", *confined, "--network", NETWORK, settings.image, "egress-check",
+                "--proxy", f"{PROXY}:{PORT}", *_node_addresses(network))
     except BaseException:
-        _docker("rm", "--force", settings.proxy, check=False)
+        _docker("rm", "--force", PROXY, check=False)
         raise
 
 
@@ -121,7 +123,7 @@ def serve(apps: Path) -> None:
         raise SystemExit("apps.yaml has no batch_egress settings")
     start(settings)
     # Stay with the proxy: its output is this service's, and a stop of the service stops it.
-    os.execvp(DOCKER[0], [*DOCKER, "attach", "--no-stdin", settings.proxy])
+    os.execvp(DOCKER[0], [*DOCKER, "attach", "--no-stdin", PROXY])
 
 
 def main() -> None:

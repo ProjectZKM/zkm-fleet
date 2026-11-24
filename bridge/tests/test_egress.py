@@ -117,11 +117,12 @@ def test_a_node_reports_egress_only_with_its_settings_and_a_shim_that_names_netw
     assert launch.call_args.args[2].batch_egress == settings(tmp_path)
 
 
-@pytest.mark.parametrize("changes", [{"network": "bridge"}, {"network": "host"}, {"network": "Fleet"}, {"proxy": "a b"},
-    {"proxy": "fleet-egress"}, {"key_file": "egress.key"}, {"image": ""}, {"image": "--privileged"}, {"port": 0}, {"port": "3128"}])
-def test_the_nodes_egress_settings_name_a_network_of_their_own(tmp_path, changes):
+@pytest.mark.parametrize("changes", [{"key_file": "egress.key"}, {"image": ""}, {"image": "--privileged"}, {"image": "a b"}])
+def test_the_nodes_egress_settings_are_an_image_and_an_absolute_key_file(tmp_path, changes):
     with pytest.raises(ModelError):
         settings(tmp_path, **changes)
+    with pytest.raises(ModelError):
+        ControlPlaneConfig.load({"batch_egress": {"image": IMAGE, "key_file": str(tmp_path / "egress.key"), "network": "bridge"}}, strict=True)
 
 
 class FakeDocker:

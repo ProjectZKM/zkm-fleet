@@ -214,7 +214,7 @@ EOF
   esac
 else
   cp "$SRC"/deploy/{fleet-watchdog.sh,ray-start.sh,node-start.sh} "$PREFIX/deploy/"
-  cp "$SRC"/deploy/{shim-start.sh,ray-watch.sh,egress-start.sh,install-node-services.sh} "$PREFIX/deploy/"
+  cp "$SRC"/deploy/{shim-start.sh,ray-watch.sh,install-node-services.sh} "$PREFIX/deploy/"
   # The node holds the cluster token, never the administrator or user tokens.
   [ "$(readlink -f "$TOKEN")" = "$(readlink -m "$ETC/cluster.token")" ] || install -m 600 "$TOKEN" "$ETC/cluster.token"
   if [ -n "$CA" ]; then

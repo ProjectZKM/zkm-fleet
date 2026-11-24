@@ -149,7 +149,7 @@ jobs:
           install -m 755 target/shim/bin/trusted-router-tunnel "$DIST/bin/"
           cp -a deploy/docker-compose.yml deploy/gateway.yaml.in \
             deploy/install.sh deploy/setup.sh deploy/fleet-watchdog.sh deploy/ray-start.sh deploy/node-start.sh deploy/fleet-ctl.sh \
-            deploy/shim-start.sh deploy/ray-watch.sh deploy/egress-start.sh deploy/install-node-services.sh \
+            deploy/shim-start.sh deploy/ray-watch.sh deploy/install-node-services.sh \
             deploy/migrate-proof-runtime.py "$DIST/deploy/"
           cp -a deploy/trustee "$DIST/deploy/"
           cp -a bridge/pyproject.toml bridge/fleet_bridge "$DIST/bridge/"

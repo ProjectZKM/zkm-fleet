@@ -585,20 +585,11 @@ class BatchEgressConfig(Record):
     image: str
     # The node's egress key; the bridge signs each job's host list with it.
     key_file: str
-    network: str = "fleet-egress"
-    # The proxy's container, and its name on the network.
-    proxy: str = "fleet-egress-proxy"
-    port: int = 3128
 
     def __post_init__(self) -> None:
-        name = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
-        if (not all(isinstance(v, str) and name.fullmatch(v) for v in (self.network, self.proxy))
-                or self.network in ("none", "host", "bridge", "default") or self.network == self.proxy):
-            raise ModelError("batch egress needs a network and a proxy name: lowercase letters, digits and -")
         if (not isinstance(self.image, str) or not self.image or self.image.startswith("-") or any(c.isspace() for c in self.image)
-                or not isinstance(self.key_file, str) or not os.path.isabs(self.key_file) or "\x00" in self.key_file
-                or type(self.port) is not int or not 1 <= self.port <= 65535):
-            raise ModelError("batch egress needs an image, an absolute key_file and a port")
+                or not isinstance(self.key_file, str) or not os.path.isabs(self.key_file) or "\x00" in self.key_file):
+            raise ModelError("batch egress needs an image and an absolute key_file")
 
 
 @dataclass(kw_only=True)

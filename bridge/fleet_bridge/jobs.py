@@ -343,7 +343,7 @@ class _ShimRank(_Rank):
                 if self.cluster.batch_egress is None:
                     raise ValueError("this node gives batch jobs no egress")
                 environment.update(egress.environment(self.cluster.batch_egress, p.egress))
-                network = {"named": self.cluster.batch_egress.network}
+                network = {"named": egress.NETWORK}
             status = self.run.launch(self.cluster, spec.namespace or p.namespace, spec.batch, spec.id, image=p.image,
                 command=[spec.expand(a) for a in spec.command], environment=environment,
                 limits={"cpu_millicores": spec.cpus * 1000 if spec.cpus else None, "memory_bytes": None},

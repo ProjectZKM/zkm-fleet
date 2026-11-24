@@ -2655,6 +2655,7 @@ version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum 0.7.9",
+ "base64 0.22.1",
  "clap",
  "fleet-proto",
  "hex",

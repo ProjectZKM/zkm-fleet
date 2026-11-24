@@ -108,7 +108,7 @@ deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
 
 It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scripts
 (`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`, `shim-start.sh`,
-`ray-watch.sh`, `egress-start.sh`, `install-node-services.sh`) around a short stop and start
+`ray-watch.sh`, `install-node-services.sh`) around a short stop and start
 of the agent's unit, after checking that the new bridge imports in the node's venv
 and parses the node's `apps.yaml`, and waits until the scheduler reports the node
 READY with a heartbeat newer than the restart (a drained node never reports READY, so
@@ -366,12 +366,9 @@ release:
 batch_egress:
   image: ghcr.io/projectzkm/zkm-fleet-node:VERSION   # holds the proxy
   key_file: /opt/zkm-fleet/etc/egress.key            # made at the first start, mode 600
-  # network: fleet-egress        # the internal Docker network jobs join
-  # proxy: fleet-egress-proxy    # the proxy's container, and its name on the network
-  # port: 3128
 ```
 
-and run `deploy/egress-start.sh` as a service of the node's user:
+and run the bridge's egress module as a service of the node's user:
 
 ```ini
 # /etc/systemd/system/zkm-fleet-egress.service
@@ -383,8 +380,8 @@ Requires=docker.service
 [Service]
 Type=simple
 User=ubuntu
-Environment=FLEET_ENV=/etc/zkm-fleet/watchdog.env
-ExecStart=/bin/bash /opt/zkm-fleet/deploy/egress-start.sh
+WorkingDirectory=/opt/zkm-fleet/bridge
+ExecStart=/opt/zkm-fleet/venv/bin/python -m fleet_bridge.egress serve --apps /etc/zkm-fleet/apps.yaml
 ExecStopPost=/usr/bin/docker rm --force fleet-egress-proxy
 Restart=on-failure
 RestartSec=10
