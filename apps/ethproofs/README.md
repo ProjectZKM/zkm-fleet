@@ -1,7 +1,10 @@
 # EthProofs app worker
 
-Fleet 0.2 does not automatically convert this integrated worker; preserve its
-cursor, state and image during the control-plane upgrade.
+The EthProofs worker runs as a container app on the shim. One image holds the worker
+and the Ziren GPU server it proves against; the image's entrypoint
+([`deploy/images/gpu-worker`](../../deploy/images/gpu-worker)) starts the server,
+starts the worker once the server answers ready, and ends the container when either
+process ends.
 
 Fleet pins the worker in the `third_party/reth-processor` Git submodule
 ([pinned source](https://github.com/ProjectZKM/reth-processor/tree/a75cb337305eac262a31346b4b3086146fed8297)).
@@ -24,8 +27,8 @@ Host and guest Ziren are locked to
 `git submodule update --init --recursive`.
 GOAT retains its existing SDK and gateway architecture.
 
-The integrated worker selects Ethereum mainnet blocks using HTTP head polling,
-prepares witnesses, and proves directly against its loopback Ziren GPU server.
+The worker selects Ethereum mainnet blocks using HTTP head polling,
+prepares witnesses, and proves directly against the GPU server in its container.
 Proofs, public values and the block cursor stay in the app's persistent directory.
 Fleet manages lifecycle and resource allocation without interpreting the checkpoint.
 EthProofs API reporting runs from a durable outbox with retry and backpressure.
@@ -41,9 +44,8 @@ restart. The deployment does not enable `--latest-block` or a nonzero `--max-lag
 Completed outputs and pending reports survive restarts. Earlier skips made while
 latest-head mode was enabled remain historical gaps; this policy applies from the
 saved cursor onward.
-Fleet rejects SDK submissions to an enabled
-worker-owned stream, reserves the whole worker allocation, and refuses a second
-owner until the previous owner has been cleaned up. A filesystem lock also
+The app holds its GPUs and CPUs for as long as it is enabled; Fleet sets no hard CPU
+or memory limit on the container unless the app has one. A filesystem lock
 prevents two processes from sharing one state directory. Cross-machine failover
 requires explicit cleanup and transfer of this directory.
 
@@ -67,27 +69,42 @@ the host and guest, then pin its resolved digest in the app's `apps.yaml` entry.
 validated image is `sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655`.
 Its Ziren revision label matches the locked host and guest revision.
 
-Install the package at `/opt/zkm-fleet/apps/ethproofs`. Adapt
-[`apps.example.yaml`](apps.example.yaml) to the existing node config,
-using the node's Ray hostname/IP, namespace, actual ELF digest, validated GPU
-image, and durable storage path. The example starts disabled. Put API credentials
-and RPC URLs in the private file described by
-[`worker.env.example`](worker.env.example), readable only by the worker account.
-Fleet supplies the scoped identity, state root, and loopback GPU endpoint. The
-worker reads its app name from `FLEET_APP`. Its checkpoint identity names the app;
-a version-1 checkpoint naming a tenant is upgraded in place when the rest of its
-identity matches.
+Build the image on the GPU node from the package and the validated GPU image. The
+package keeps its installed path inside the image, so the worker's command and
+`ETH_PROOFS_ELF_FILE` name the same paths:
 
-A new guest has a new app identity. Create it under a new NAME with
-`fleetctl --token-file zkm-owner.token --namespace zkm app add NAME --spec prover.json --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda`,
-where `prover.json` holds the validated image (`{"image": "ghcr.io/projectzkm/ziren-gpu@sha256:..."}`).
-Then stage its `apps.yaml` entry disabled with `app: NAME` and the guest's `elf_id`,
-and wait for the node heartbeat to advertise it before enabling the app: enabling an
-app no node reports yet places a plain prover, without the worker, on a node the
-scheduler picks.
-Use a new entry name and state directory. Keep a temporary rollback package
-until proving and reporting are verified, then remove retired deployment records
-according to the app's retention policy. Keep GOAT's entry and image unchanged.
+```bash
+docker build -t ethproofs-worker:TAG -f deploy/images/gpu-worker/Dockerfile \
+  --build-arg GPU_IMAGE=ghcr.io/projectzkm/ziren-gpu@sha256:DIGEST \
+  --build-arg PACKAGE_PATH=/opt/zkm-fleet/apps/ethproofs \
+  --build-context package=/opt/zkm-fleet/apps/ethproofs deploy/images/gpu-worker
+```
+
+Adapt [`apps.example.yaml`](apps.example.yaml) to the node's `apps.yaml`, using the
+node's machine, the namespace, the guest's ELF digest, the image and the state
+directory. The example starts disabled and sets `machine`, which keeps the app on the
+node that holds its state. Its `env` has two parts:
+
+- **The GPU server's**: the container's environment, as the entry lists it.
+- **The worker's**: the entrypoint gives the worker `PATH`, `HOME`, the lines of the
+  private file `WORKER_ENV_FILE`, every `FLEET_*` value, `FLEET_GPU_ENDPOINT` and
+  `RAYON_NUM_THREADS` (from `WORKER_THREADS`), and nothing else of the container's
+  environment. The file cannot replace a `FLEET_*` value.
+
+Put API credentials and RPC URLs in the private file described by
+[`worker.env.example`](worker.env.example), readable only by the account in the
+entry's `user`, and mount it read-only. Each line is `KEY=VALUE` with one plain word
+or one quoted string; nothing is expanded, and any other line ends the container
+naming its line number. The worker's log level is `RUST_LOG` in that file.
+
+The worker reads its app name from `FLEET_APP`. Its checkpoint identity names the
+app; a version-1 checkpoint naming a tenant is upgraded in place when the rest of its
+identity matches. To continue an existing stream under a new app name, set `FLEET_APP`
+in the entry to the name the checkpoint holds.
+
+A new guest has a new identity: use a new app name and state directory. Keep the
+previous image and package until proving and reporting are verified. Keep GOAT's
+entry and image unchanged.
 
 Before enabling a new worker, validate proving on a dedicated Fleet staging
 worker and API reporting with test credentials. For an existing stream, preserve its next unproved block and stop
@@ -118,9 +135,9 @@ fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4 --g
 fleetctl --token-file zkm-owner.token --namespace zkm app scale ethproofs-z4
 ```
 
-Inspect `~/app/fleet/work/apps/ethproofs/v5-worker/checkpoint.json` for the saved
-next block. Verify proofs and reporting acknowledgments in
-`~/app/fleet/work/logs/ethproofs-v5-gpu-0.node.log`. Do not edit the checkpoint
+Inspect `checkpoint.json` in the state directory for the saved next block. Verify
+proofs and reporting acknowledgments with `fleetctl app logs NAME`, which shows the
+worker's and the GPU server's output. Do not edit the checkpoint
 to bypass a failed block.
 
 ## Operate and recover
@@ -131,14 +148,12 @@ and acknowledged `reported/`. Output and report records are synced before the
 cursor advances. Restart recovers committed outputs. Sequential mode also reuses prepared inputs;
 the optional latest-head mode can skip an old unproved input. Production runs
 sequential mode. A failed
-proof leaves its input and cursor intact for the actor's restart. Signaling the
-worker with SIGTERM drains its current proof while its GPU server stays alive.
-Fleet app disable kills the actor first; an unfinished block is retried after
-resume. To finish the current proof before disabling, pause the node agent, ask
-the Ray actor to shut down gracefully, remove it, then queue an app-disable
-request and restart the agent so it can acknowledge that request. Keep the GPU server alive until the worker exits; signaling the worker
-alone lets Ray restart its actor. Do not stop Ray or the GPU container first. Forced stops recover completed
-outputs from durable state. Sequential mode retries the unfinished block.
+proof leaves its input and cursor intact for the container's restart. Disabling the
+app stops its container: the worker gets SIGTERM and drains its current proof while
+the GPU server stays alive, and the server stops once the worker has exited. A worker
+still running after the entry's `stop_timeout_s` is killed; set it from the longest
+proof. Forced stops recover completed outputs from durable state. Sequential mode
+retries the unfinished block.
 
 Reporting acknowledges HTTP success, or a duplicate HTTP 409 only after an
 authenticated lookup matches the cluster, block, and exact downloaded proof

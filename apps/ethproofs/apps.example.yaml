@@ -1,21 +1,27 @@
 # Merge this entry into the selected machine's existing apps.yaml.
-# Replace the legacy EthProofs entry only after draining its SDK pipeline.
-# Keep GOAT's entry unchanged.
+# The image holds the GPU server and the worker (deploy/images/gpu-worker).
 apps:
-  - name: ethproofs-v2-gpu
-    kind: ziren-gpu
+  - name: ethproofs                    # the namespace app (fleetctl app add ethproofs --spec ...)
+    kind: app
     namespace: REPLACE_WITH_NAMESPACE_ID
-    app: ethproofs # the namespace app this server proves for (fleetctl app add ethproofs --spec ... --elf-id ...)
-    elf_id: REPLACE_WITH_GUEST_ELF_SHA256
-    proof_storage_root: /srv/zkm-fleet/apps/ethproofs
     machine: REPLACE_WITH_LOCAL_RAY_NODE_HOSTNAME_OR_IP
     replicas: 1
     disabled: true
     gpus: 4
     cpus: 48
     shm_gb: 64
-    image: ghcr.io/projectzkm/ziren-gpu@sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655
-    worker_command:
+    image: REPLACE_WITH_WORKER_IMAGE
+    runtime: {executor: shim, driver: docker}
+    port_base: 0                       # the shim picks the loopback port
+    container_port: 8080               # the entrypoint's health endpoint
+    health_path: /healthz
+    user: "1000:1000"                  # the account that owns the state directory
+    workdir: /srv/zkm-fleet/apps/ethproofs
+    stop_timeout_s: 120                # the worker's time to finish its proof on a stop
+    volumes:                           # mounted at the same path inside
+      - /srv/zkm-fleet/apps/ethproofs
+      - /etc/zkm-fleet/ethproofs-worker.env:ro
+    command:
       - /opt/zkm-fleet/apps/ethproofs/eth-proofs
       - --eth-proofs-cluster-id
       - "8"
@@ -25,10 +31,20 @@ apps:
       - "1"
       - --prepare-concurrency
       - "1"
-    worker_env_file: /etc/zkm-fleet/ethproofs-worker.env
-    worker_workdir: /srv/zkm-fleet/apps/ethproofs
-    worker_stop_timeout_s: 120
     env:
+      # The worker's: its private file, its threads and its identity.
+      WORKER_ENV_FILE: /etc/zkm-fleet/ethproofs-worker.env
+      WORKER_THREADS: "{cpu_count}"
+      FLEET_NODE_NAME: "{name}"
+      FLEET_WORKER_ROLE: app
+      FLEET_APP_NAMESPACE: "{namespace}"
+      FLEET_APP: "{app}"
+      FLEET_APP_ELF_ID: REPLACE_WITH_GUEST_ELF_SHA256
+      FLEET_APP_STORAGE_ROOT: /srv/zkm-fleet/apps/ethproofs
+      # The GPU server's.
+      CUDA_VISIBLE_DEVICES: "{gpus}"
+      ZKM_GPU_DEVICES: "{gpus}"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       RUST_LOG: "warn"
       RUST_BACKTRACE: "1"
       VERIFY_VK: "true"
