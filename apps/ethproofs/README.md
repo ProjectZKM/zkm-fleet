@@ -103,21 +103,13 @@ of the worker package.
 The node pool contains eight GPUs and 128 CPUs. Preparation concurrency remains one;
 GPU allocation and preparation concurrency are separate settings.
 This app does not use the external EthProofs client (reth-processor's `eth-proofs`);
-it calls its local GPU server directly. The scheduler no longer serves the SDK stage
-API that client used; an SDK client proves through an
+it calls its local GPU server directly. An SDK client proves through an
 [app-owned proof endpoint](../../docs/reference.md#app-owned-proof-endpoint).
 GOAT keeps its existing endpoint and configuration. App enable/disable state is
 an app-owner decision; inspect it with `fleetctl --namespace zkm app` using an
 owner token for namespace `zkm`.
 
-The earlier acceptance package (historical baseline) records worker source commit
-`85a0c17ea6a60f0cdad0920a653ae8ca9b4ad8f9` on
-`chore/ziren-v2-stateless`, with PR #23 based on `stateless`. The guest was built
-from `fd9589cd63c15c3671c643c1a34de7341a2201ff`; its SHA-256 is
-`334b45b88d6c60e3354e983a5b26ef39b18feee65da828f277a93e646c78c73b`.
-The checked-in submodule now pins the revision linked at the top. Revalidate
-any new package and record its guest, image digest and `source-revision`; the
-historical checks below do not validate a newly built image.
+Validate each new package and record its guest, image digest and `source-revision`.
 
 For example, request five GPUs while retaining the current CPU and replica settings:
 

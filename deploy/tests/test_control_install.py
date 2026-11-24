@@ -176,7 +176,7 @@ def release_server(tmp_path, version, install_body):
     package = releases / f"{top}.tar.gz"
     package.write_bytes(buffer.getvalue())
     (releases / f"{top}.tar.gz.sha256").write_text(
-        f"{hashlib.sha256(package.read_bytes()).hexdigest()}  dist/{top}.tar.gz\n")
+        f"{hashlib.sha256(package.read_bytes()).hexdigest()}  {top}.tar.gz\n")
     commands = tmp_path / "commands"
     executable(commands / "curl", f'''out=; url=
 while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; https://*) url=$1; shift;; *) shift;; esac; done

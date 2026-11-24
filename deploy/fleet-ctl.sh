@@ -40,7 +40,7 @@ cleanup_stage() { [ -z "$STAGE" ] || rm -rf "$STAGE"; return 0; }
 trap cleanup_stage EXIT
 stamp() { date -u +%Y%m%dT%H%M%SZ; }
 RELEASE_REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}
-RELEASE_VERSION=${FLEET_RELEASE_VERSION:-latest}
+RELEASE_VERSION=latest
 
 resolve_release_tag() {
   local requested=${1:-$RELEASE_VERSION}
@@ -60,12 +60,11 @@ PY
 }
 
 prepare_release() {
-  local requested=${1:-$RELEASE_VERSION} stage=${2:-}
+  local requested=${1:-$RELEASE_VERSION} stage=$2
   RELEASE_TAG=$(resolve_release_tag "$requested") || die "could not resolve release $requested"
   RELEASE_TAG=${RELEASE_TAG//$'\r'/}
   RELEASE_TAG=${RELEASE_TAG//$'\n'/}
   RELEASE_VERSION_NUMBER=${RELEASE_TAG#v}
-  if [ -z "$stage" ]; then stage=$(mktemp -d); fi
   STAGE=$stage
   RELEASE_PACKAGE="$stage/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz"
   RELEASE_CHECKSUM="$RELEASE_PACKAGE.sha256"
@@ -78,8 +77,7 @@ prepare_release() {
   fi
   curl -fsSL --retry 3 -o "$RELEASE_PACKAGE" "$base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz" || die "failed to download $RELEASE_TAG package"
   curl -fsSL --retry 3 -o "$RELEASE_CHECKSUM" "$base/zkm-fleet-${RELEASE_VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" || die "failed to download package checksum"
-  sed 's#  dist/#  #g' "$RELEASE_CHECKSUM" > "$RELEASE_CHECKSUM.normalized"
-  (cd "$stage" && sha256sum -c "$(basename "$RELEASE_CHECKSUM.normalized")") || die "package checksum mismatch"
+  (cd "$stage" && sha256sum -c "$(basename "$RELEASE_CHECKSUM")") || die "package checksum mismatch"
   mkdir -p "$stage/root"
   tar -xzf "$RELEASE_PACKAGE" -C "$stage/root" || die "invalid release package"
   RELEASE_ROOT=$(find "$stage/root" -mindepth 1 -maxdepth 1 -type d | head -1)
@@ -572,12 +570,7 @@ PY
 node_stage_runtime() { # FLEET_NODE DEPLOY_DIR
   local shim; shim=$(dirname "$1")/trusted-shim-runtime
   [ -n "$2" ] || return 0
-  if [ "$DRY" = 1 ]; then [ -f "$shim" ] || [ -n "${RELEASE_ROOT:-}" ] || return 0
-  else
-    [ -f "$shim" ] || return 0
-    grep -q -- --stage-only "$2/install-node-services.sh" \
-      || { echo "fleet-ctl: $2/install-node-services.sh cannot stage runtime binaries; none staged" >&2; return 0; }
-  fi
+  [ -f "$shim" ] || { [ "$DRY" = 1 ] && [ -n "${RELEASE_ROOT:-}" ]; } || return 0
   run bash "$2/install-node-services.sh" "$PREFIX" "" "" "$shim" --stage-only \
     || die "staging the runtime binaries failed; node was not stopped"
   [ "$DRY" = 1 ] || echo "staged the runtime binaries above; apps.yaml still selects the running shim"

@@ -24,15 +24,6 @@ deploy/fleet-ctl.sh -n scheduler upgrade v0.2.8  # -n prints every step and chan
 
 ### Control host
 
-For the runtime migration release (database schema 20), take a database backup
-and validate the upgrade from schema 16 (the 0.1 releases) against a copy before
-changing production.
-This migration retains router identities, tombstones and policy acknowledgments;
-it normalizes old JSON records so subsequent syncs can update them. Schema 19
-and older binaries cannot be used as rollback builds after migration. Keep a
-validated schema-20-compatible build available instead of resetting the database
-or restoring stale router authorization over live grants.
-
 Upgrade the independent data-router relay before publishing `workload: "*"`
 policies. Its next authenticated poll must advertise `workload-defaults-v1` in
 `GET /routers/ID`'s `capabilities`; publication otherwise returns 409. The updated
@@ -387,7 +378,7 @@ trust. Then the node's own traps:
 - **The Ray temp link** `/tmp/zkf-ray-<uid>` must resolve. A dead link, after a reboot
   or a stray `ray-start.sh` run against a cleaned-up temp workspace, aborts every
   agent restart with an opaque log-path error. The watchdog repairs it every minute
-  from v0.1.7 (every 30 seconds under `zkm-fleet-ray.service`); by hand,
+  (every 30 seconds under `zkm-fleet-ray.service`); by hand,
   `ln -sfn ~/app/fleet/work/ray /tmp/zkf-ray-$(id -u)`.
 - **A full disk** fails bridge writes, app starts and even the agent's log.
 
@@ -399,42 +390,14 @@ the app's log with `fleetctl app logs APP`, and the node's
 
 If the scheduler log repeats `job dispatch retained durable intents`, a scale is
 blocked, usually by a stale deployment of the same app on a node that no longer
-configures it. From v0.1.7 the blocked scale waits while the rest of the fleet keeps
-working, and stale starts are retired. On older releases, stop the scheduler, back up
-and remove the stale `data/workloads/deployments/<node>-<app>.json` and any undone
-command for it under `data/workloads/commands/`, then start it again.
+configures it. The blocked scale waits while the rest of the fleet keeps working, and
+stale starts are retired.
 
 A start whose node has no room moves to a node that has, unless its entry anchors it
 with `machine`; an anchored start waits on its node, preempting lower-priority batch
 jobs of its namespace when it can. Every integrated worker (an app whose node runs
 its prover as a Fleet worker, such as goat's proof builder) is anchored, since the
-bridge requires `machine` for one. Up to v0.1.9:
-
-- an anchored start moved too, and the move rewrote the entry's `machine` to the new
-  node's. Pin such an app again by restoring its node's entry; the bridge keeps the
-  old `apps.yaml` as `apps.yaml.removed-<UTC time>`.
-- the scheduler never freed a moved app's room on the node it left, so its quota
-  stayed held, and a start could be sent back to that node, leaving the app on no
-  node until `fleetctl app enable` placed it again.
-
-### Every node's heartbeat times out while jobs queue
-
-The nodes log `node heartbeat rejected; local execution continues ... Timeout
-expired` and the gateway logs heartbeat 499s. The nodes look idle while `fleetctl job`
-lists jobs `queued` (assigned, awaiting node acknowledgement), and the scheduler sits
-at a full core with sqlx `slow_acquire` warnings although Postgres is idle.
-
-- **Up to v0.1.7**, each dispatch pass scanned every job and command record ever kept,
-  once per waiting job, while holding the lock node reports wait for. With tens of
-  thousands of records and about a hundred jobs in flight, a pass outlasts the nodes'
-  10-second heartbeat timeout and no launch gets through. Keep fewer than about 50
-  jobs in flight. Later releases scan only what's in flight and let reports in between
-  jobs.
-- **Up to v0.1.8**, a bulk purge of a busy batch's history (`fleetctl job purge
-  --older-than DAYS`) does the same: it holds that lock while it writes a record and a
-  node command for every job, minutes for tens of thousands, and its node commands
-  then crowd out launches for as long again, at 16 per heartbeat. Later releases
-  purged in chunks; now there is no purge, and a batch's jobs go when it is deleted.
+bridge requires `machine` for one.
 
 ### Who changed what
 
@@ -481,49 +444,6 @@ Package the GOAT worker from its committed `third_party/bitvm-node` revision wit
 ## One-time migrations
 
 Each applies only to the versions it names.
-
-### OpenShell gateway in the default stack (before v0.2.4)
-
-These releases started `openshell-gateway` with the rest of the stack; from v0.2.4 it
-is the `openshell` profile, and upgrades leave an existing container as it is. On a
-host without `policy_gateway.openshell`, where that container keeps restarting, remove
-it with `docker rm -f zkm-fleet-openshell-gateway-1`; its volumes stay. On a host that
-uses the gateway, run `fleet-ctl.sh openshell up` once
-([installation](installation.md#openshell-gateway)), so `compose.env` lists the profile.
-
-### Owner-controlled runtime settings
-
-Releases that moved app execution settings, batch mount roots and runtime users to
-administrators don't rewrite existing configuration or cancel jobs an earlier
-scheduler accepted. Review existing apps' settings, batches' mount roots and runtime
-users, and queued jobs before giving untrusted owners access again.
-
-### Machine report version 2 to 3
-
-This changes the control host and every node at once. Let in-flight commands finish,
-stop the scheduler and every node, back up `data_dir`, Postgres and each node's
-`etc/`, and migrate their stored state before starting the new binaries:
-
-- The scheduler's per-node records move from `workloads/services` to
-  `workloads/deployments` (`service` becomes `spec`); stored commands and `service:`
-  reservations take the new names; each registered proof app needs its app record.
-- A node's `etc/services.yaml` becomes `etc/apps.yaml` (`services:` becomes `apps:`),
-  and its `node-start.sh` passes `--apps`.
-
-### The scheduler's SDK stage API (retired)
-
-The release that moved to the app model retired the scheduler's SDK stage API
-(`GenerateProof`/`GetStatus` on `stage_addr`): SDK clients prove through their
-[app-owned proof endpoint](reference.md#app-owned-proof-endpoint).
-
-1. Remove `stage_addr`, `tls`, `public_url`, `long_poll_ms` and `proof_output_dir`
-   from `fleet.yaml`; the scheduler refuses to start with them. A node ignores
-   `proof_output_dir` in `apps.yaml`.
-2. Let proofs submitted through the stage API finish: any still queued or running
-   fails when the new scheduler starts.
-3. Remove the gateway's `/stage.v1.StageService/` route, which has nothing behind it.
-4. Once rollback is no longer needed, delete the control host's `data_dir/elf`,
-   `data_dir/jobs` and `data_dir/proofs`, which held that API's payloads.
 
 ### Database schema 14 or 15 to 16
 

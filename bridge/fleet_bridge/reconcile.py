@@ -16,10 +16,9 @@ from ray.util.placement_group import PlacementGroup, placement_group, remove_pla
 from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after
+from .actors import GpuApp, ZirenCpuProver, ZirenGpuProver, clean_after, spec_hash
+from .jobs import NAMESPACE, is_job_actor
 from .model import ResourceRequest, ReplicaHealth, AppReplicaSpec, AppRuntime, AppsConfig, ExecutorKind
-
-NAMESPACE = "zkm-fleet"
 
 ACTORS: dict[AppRuntime, Any] = {AppRuntime.ZIREN_GPU: ZirenGpuProver, AppRuntime.ZIREN_CPU: ZirenCpuProver,
                                   AppRuntime.APP: GpuApp}
@@ -37,7 +36,6 @@ def replica_specs(file: AppsConfig) -> dict[str, AppReplicaSpec]:
     covers."""
     raw_apps = {a["name"]: a for a in file.raw.get("apps", [])}
     shared = {k: file.raw[k] for k in _SHARED_KEYS if k in file.raw}
-    from .jobs import is_job_actor
 
     out: dict[str, AppReplicaSpec] = {}
     for app in file.apps:
@@ -78,8 +76,6 @@ def bundle(spec: AppReplicaSpec) -> ResourceRequest:
 def running() -> dict[str, ActorHandle[Any]]:
     """The apps' actors: every named actor in the namespace except batch jobs'
     (those belong to their jobs, not to the apps file)."""
-    from .jobs import is_job_actor
-
     names = [a["name"] for a in ray.util.list_named_actors(all_namespaces=True)
              if a["namespace"] == NAMESPACE and not is_job_actor(a["name"])]
     out = {}
@@ -98,7 +94,6 @@ def health_of(actor: ActorHandle[Any], timeout_s: float = 30) -> ReplicaHealth:
 
 def matches(spec: AppReplicaSpec, health: ReplicaHealth) -> bool:
     """Compare the admitted deployment and its observed readiness."""
-    from .actors import spec_hash
     return (health.is_ready or (spec.app.native_access and health.allocation_reserved)) and health.spec == spec_hash(spec)
 
 
@@ -152,8 +147,6 @@ def start(spec: AppReplicaSpec, ready_timeout_s: float = 900) -> ActorHandle[Any
         try:
             if actor_submitted and not (spec.app.runtime and spec.app.runtime.executor is ExecutorKind.SHIM):
                 stop(spec.name)
-            # Shim allocations retain reservations until node-owned cleanup
-            # confirms the persisted execution is gone.
         except Exception:
             logging.getLogger(__name__).exception("cleanup after failed start of %s", spec.name)
         raise

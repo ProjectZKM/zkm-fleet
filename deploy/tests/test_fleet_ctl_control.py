@@ -115,7 +115,7 @@ case "$url" in */releases/download/*) exec cp "{self.releases}/${{url##*/}}" "$o
         package = self.releases / f"{top}.tar.gz"
         package.write_bytes(buffer.getvalue())
         digest = hashlib.sha256(package.read_bytes()).hexdigest()
-        (self.releases / f"{top}.tar.gz.sha256").write_text(f"{digest}  dist/{top}.tar.gz\n")
+        (self.releases / f"{top}.tar.gz.sha256").write_text(f"{digest}  {top}.tar.gz\n")
 
 
 @pytest.fixture
