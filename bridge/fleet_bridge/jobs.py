@@ -24,7 +24,7 @@ import yaml
 from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from . import shim
+from . import egress, shim
 from .rayapi import alive_nodes, node_ip
 from .model import (JobAttempt, ResourceRequest, GpuMemoryState, FailureCause, GpuProcess,
                     TaskPlacement, Batches, ControlPlaneConfig, JobSpec, JobState, JobStatus)
@@ -336,15 +336,22 @@ class _ShimRank(_Rank):
             environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
         if spec.cpus:
             environment.setdefault("OMP_NUM_THREADS", str(spec.cpus))
+        network: Any = job_network(spec)
         try:
+            if p.egress:
+                # The node's egress network, and the batch's list as the proxy's credentials.
+                if self.cluster.batch_egress is None:
+                    raise ValueError("this node gives batch jobs no egress")
+                environment.update(egress.environment(self.cluster.batch_egress, p.egress))
+                network = {"named": self.cluster.batch_egress.network}
             status = self.run.launch(self.cluster, spec.namespace or p.namespace, spec.batch, spec.id, image=p.image,
                 command=[spec.expand(a) for a in spec.command], environment=environment,
                 limits={"cpu_millicores": spec.cpus * 1000 if spec.cpus else None, "memory_bytes": None},
-                options={"network": job_network(spec), "gpus": self.gpus,
+                options={"network": network, "gpus": self.gpus,
                     "volumes": [m.docker() for m in spec.mounts] + [f"{spec.out}:{spec.out}"], "user": p.user,
                     "workdir": spec.expand(spec.workdir) if spec.workdir else None,
                     "stop_timeout_s": p.stop_timeout_s, "shm_bytes": p.shm_gb * 2**30})
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, ValueError, OSError) as error:
             return str(error)[:500]
         self.name = str(status.get("runtime_id") or self.name)
         return None

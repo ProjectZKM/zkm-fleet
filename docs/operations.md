@@ -161,6 +161,8 @@ fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
 fleetctl --namespace pi batch update gpu-test --allow /data/models --user 1000:1000
 # An administrator moves its jobs to the node's trusted-shim (new jobs; `legacy` moves back):
 fleetctl --namespace pi batch update gpu-test --runtime shim
+# On the shim, an administrator lists the hosts its jobs reach over HTTPS; without a list a job has no network:
+fleetctl --namespace pi batch update gpu-test --egress pypi.org --egress files.pythonhosted.org
 fleetctl --token-file pi-owner.token batch submit gpu-test --gpus 1 --cpus 2 \
   --mount /data/models:ro -- nvidia-smi
 fleetctl --token-file pi-owner.token batch gpu-test             # the batch and its newest jobs

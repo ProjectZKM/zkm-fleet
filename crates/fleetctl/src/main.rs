@@ -443,6 +443,12 @@ struct AddBatch {
     #[arg(long, value_parser = ["shim", "legacy"])]
     #[serde(skip)]
     runtime: Option<String>,
+    /// A host its jobs reach over HTTPS, through the node's egress proxy and nothing else
+    /// (pypi.org); repeat. Needs `--runtime shim` and a node that gives batch jobs egress;
+    /// requires administrator credentials. Without it a job has no network.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    egress: Vec<String>,
 }
 
 /// A batch's `runtime` setting for `--runtime shim|legacy`.
@@ -575,6 +581,11 @@ enum BatchCmd {
         /// batch jobs) or `legacy` (the node's own docker run); requires administrator
         /// credentials.
         #[arg(long, value_parser = ["shim", "legacy"])] runtime: Option<String>,
+        /// A host its jobs reach over HTTPS, through the node's egress proxy and nothing
+        /// else (pypi.org); repeat. Replaces the list; requires administrator credentials.
+        #[arg(long, conflicts_with = "no_egress")] egress: Vec<String>,
+        /// Its jobs have no network; requires administrator credentials.
+        #[arg(long)] no_egress: bool,
     },
     /// Delete a batch and everything of it, like app delete: its configuration on its nodes,
     /// and its jobs' records, logs and outputs on the control host and its nodes. Its mounts
@@ -1394,7 +1405,7 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(BatchCmd::Job(cmd)) => return batch_action(cmd, &p.conn, out),
         Some(BatchCmd::Add { add }) => return add_batch(add, &p.conn, out),
         Some(BatchCmd::List) => return batches(&p.conn, out),
-        Some(BatchCmd::Update { name, image, user, max_gpus, gpu_mem, shm_gb, allow, env, runtime }) => {
+        Some(BatchCmd::Update { name, image, user, max_gpus, gpu_mem, shm_gb, allow, env, runtime, egress, no_egress }) => {
             let mut set = json!({});
             if let Some(v) = image { set["image"] = json!(v); }
             if let Some(v) = user { set["user"] = json!(v); }
@@ -1404,6 +1415,7 @@ fn batch(p: &BatchArgs, out: &OutputWriter) -> anyhow::Result<()> {
             if !allow.is_empty() { set["allow"] = json!(allow); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
             if let Some(v) = runtime { set["runtime"] = batch_runtime(v); }
+            if !egress.is_empty() || *no_egress { set["egress"] = json!(egress); }
             if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
             let a = FleetClient::new(&p.conn)?;
             batch_named(&a, name)?;

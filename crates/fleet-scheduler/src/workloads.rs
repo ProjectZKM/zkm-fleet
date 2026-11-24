@@ -1813,8 +1813,12 @@ impl WorkloadController {
                     .collect::<Vec<_>>()
             };
             if allowed.is_empty() {
-                // Say why a job of a batch on the shim waits where no node's shim runs batch jobs.
-                let waiting = "waiting for a node whose shim runs batch jobs";
+                // Say why a job of a batch on the shim waits where no node runs it.
+                let waiting = if r.policy().egress().next().is_some() {
+                    "waiting for a node that gives batch jobs egress"
+                } else {
+                    "waiting for a node whose shim runs batch jobs"
+                };
                 if r.policy().runtime_capability().is_some() && r.status["detail"] != waiting {
                     r.set_detail(waiting);
                     self.save("jobs", &r.id, &r)?;
@@ -2128,6 +2132,21 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
     if !runtime.is_null() && runtime != &json!({"executor":"legacy"}) && runtime != &json!({"executor":"shim","driver":"docker"}) {
         return Err(fail(400, r#"runtime: {"executor":"shim","driver":"docker"}, {"executor":"legacy"} or null"#));
     }
+    // The hosts its jobs reach through a node's egress proxy; the shim puts a job on that network.
+    let hosts = match &spec["egress"] {
+        Value::Null => Vec::new(),
+        Value::Array(hosts) => hosts.iter().map(|h| h.as_str().filter(|h| fleet_proto::workload::is_egress_host(h))).collect(),
+        _ => vec![None],
+    };
+    if hosts.len() > fleet_proto::workload::MAX_EGRESS_HOSTS
+        || hosts.contains(&None)
+        || hosts.iter().collect::<HashSet<_>>().len() != hosts.len()
+    {
+        return Err(fail(400, format!("egress: at most {} distinct lowercase host names, such as pypi.org", fleet_proto::workload::MAX_EGRESS_HOSTS)));
+    }
+    if !hosts.is_empty() && runtime["executor"] != "shim" {
+        return Err(fail(400, "egress needs a batch on the shim: set its runtime to shim"));
+    }
     Ok(())
 }
 
@@ -2135,7 +2154,7 @@ fn check_batch_spec(spec: &Value) -> anyhow::Result<()> {
 const BATCH_IDENTITY: [&str; 4] = ["name", "namespace", "image", "user"];
 
 /// A new batch's settings that have a default, with it.
-fn batch_defaults() -> [(&'static str, Value); 11] {
+fn batch_defaults() -> [(&'static str, Value); 12] {
     [
         ("max_gpus", json!(8)),
         ("default_gpu_mem_gb", json!(0)),
@@ -2148,14 +2167,15 @@ fn batch_defaults() -> [(&'static str, Value); 11] {
         ("min_runtime_s", json!(300)),
         ("stop_timeout_s", json!(30)),
         ("runtime", Value::Null),
+        ("egress", json!([])),
     ]
 }
 
 /// Settings an update may change on a batch (its name, namespace, priority and enabled state
 /// have their own operations).
-const BATCH_SETTINGS: [&str; 11] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
-    "preemptible", "min_runtime_s", "stop_timeout_s", "runtime"];
-const BATCH_ADMIN_SETTINGS: [&str; 3] = ["user", "allow", "runtime"];
+const BATCH_SETTINGS: [&str; 12] = ["image", "user", "max_gpus", "default_gpu_mem_gb", "shm_gb", "allow", "env",
+    "preemptible", "min_runtime_s", "stop_timeout_s", "runtime", "egress"];
+const BATCH_ADMIN_SETTINGS: [&str; 4] = ["user", "allow", "runtime", "egress"];
 
 /// The apps and batches API. `crate::http::router` authorizes each request first.
 pub fn router(control: Arc<WorkloadController>) -> Router {
@@ -2306,8 +2326,10 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             }
         }
         check_batch_spec(&body)?;
-        if c.is_some() && (!Batch(&body).allow().is_empty() || Batch(&body).user().is_some() || !body["runtime"].is_null()) {
-            return Err(fail(403, "batch host mount roots, runtime user and runtime require administrator credentials"));
+        if c.is_some() && (!Batch(&body).allow().is_empty() || Batch(&body).user().is_some() || !body["runtime"].is_null()
+            || Batch(&body).egress().next().is_some())
+        {
+            return Err(fail(403, "batch host mount roots, runtime user, runtime and egress require administrator credentials"));
         }
         body["namespace"] = json!(namespace);
         body.as_object_mut().unwrap().remove("name");

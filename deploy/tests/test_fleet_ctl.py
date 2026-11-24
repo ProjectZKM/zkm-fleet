@@ -145,7 +145,8 @@ def node_fixture(tmp_path):
     executable(prefix / "venv/bin/python", "exit 0\n")
     for name, body in [("node-start.sh", "old node-start"), ("ray-start.sh", "old ray-start"),
                        ("fleet-watchdog.sh", "old watchdog"), ("shim-start.sh", "old shim"),
-                       ("ray-watch.sh", "old ray watch"), ("install-node-services.sh", "old install")]:
+                       ("ray-watch.sh", "old ray watch"), ("egress-start.sh", "old egress"),
+                       ("install-node-services.sh", "old install")]:
         (prefix / "deploy" / name).write_text(body + "\n")
     commands = tmp_path / "bin"
     executable(commands / "sudo", "exec \"$@\"\n")
@@ -163,7 +164,7 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     (newbridge / "fleet_bridge" / "__init__.py").write_text("")
     newscripts = tmp_path / "scripts"
     newscripts.mkdir()
-    for name in ["node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
+    for name in ["node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "egress-start.sh", "install-node-services.sh"]:
         (newscripts / name).write_text(f"new {name}\n")
     environment = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "FLEET_PREFIX": str(prefix),
                    "FLEET_CTL_ENV": str(tmp_path / "none.env"), "FLEET_CTL_ON_NODE": "1", "FLEET_NODE_SSH": ""}
@@ -171,7 +172,7 @@ def test_node_upgrade_replaces_the_launch_scripts_and_rollback_restores_them(tmp
     result = subprocess.run(args, env=environment, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert (prefix / "deploy/ray-start.sh").read_text() == "new ray-start.sh\n"
-    for name in ["shim-start.sh", "ray-watch.sh", "install-node-services.sh"]:
+    for name in ["shim-start.sh", "ray-watch.sh", "egress-start.sh", "install-node-services.sh"]:
         assert (prefix / "deploy" / name).read_text() == f"new {name}\n"
     assert (prefix / "bin/fleet-node").read_text() == "#!/bin/bash\necho new-node\n"
     backup = next((prefix / "backup").glob("node-*"))
@@ -320,7 +321,7 @@ def release_scripts(tmp_path):
     scripts = tmp_path / "release/deploy"
     scripts.mkdir(parents=True)
     for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh",
-                 "install-node-services.sh"):
+                 "egress-start.sh", "install-node-services.sh"):
         (scripts / name).write_text((ROOT / "deploy" / name).read_text())
     return scripts
 
@@ -523,7 +524,8 @@ def test_remote_upgrade_preserves_scripts_position_without_a_proof_app(tmp_path)
     (newbridge / "fleet_bridge").mkdir(parents=True)
     newscripts = tmp_path / "scripts"
     newscripts.mkdir()
-    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "install-node-services.sh"):
+    for name in ("node-start.sh", "ray-start.sh", "fleet-watchdog.sh", "shim-start.sh", "ray-watch.sh", "egress-start.sh",
+                 "install-node-services.sh"):
         (newscripts / name).write_text("#!/bin/bash\n")
     remote_command = tmp_path / "remote-command"
     executable(commands / "scp", "exit 0\n")

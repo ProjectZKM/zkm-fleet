@@ -324,8 +324,9 @@ refused.
 `fleetctl batch update NAME --image ...` (`PUT /batches/NAME/settings`) changes them,
 except `priority` and `disabled`, which have their own commands;
 accepted jobs keep the settings they were submitted with. Only administrators set
-`allow` (the host paths jobs may mount), `user` and `runtime`, so an owner's batch
-starts with no host mounts, the image's default user and the legacy executor.
+`allow` (the host paths jobs may mount), `user`, `runtime` and `egress`, so an owner's
+batch starts with no host mounts, the image's default user, the legacy executor and no
+network.
 
 **Runtime.** `runtime` says what runs a batch's jobs. With null or
 `{"executor":"legacy"}` the node's bridge runs each attempt with `docker run`. With
@@ -343,11 +344,33 @@ it with a long grace; until one does, the job waits with the detail `waiting for
 whose shim runs batch jobs`. A node refuses the launch of a job whose runtime its shim
 does not run.
 
+**Egress.** `egress` lists the hosts a batch's jobs reach, for a batch on the shim
+whose jobs download what they build from (`fleetctl batch add|update NAME --egress
+pypi.org --egress files.pythonhosted.org`; `--no-egress` empties the list). A host is
+a full lowercase DNS name: no address, pattern, port or path, and at most 32 of them.
+A job of such a batch is on the node's egress network in place of no network. That
+network is an internal Docker network whose bridge has no address on the node, so a
+job on it has no route to the node, to the node's other containers, to the LAN or to
+the internet. Its one other member is the node's egress proxy, and the job's
+`HTTPS_PROXY`, `HTTP_PROXY` and their lowercase forms name it, over whatever the batch
+or the job set. The proxy opens a TLS tunnel (`CONNECT`, port 443) to a host of the
+job's list that resolves to a public address, and answers anything else with a
+refusal: 403 for a host or port outside the list, 405 for plain HTTP, 407 without the
+job's credentials. The credentials are the list itself, signed by the bridge with the
+node's egress key, so the proxy keeps no state, and a job cannot widen its list or use
+another batch's. The proxy logs each tunnel it opens and each request it refuses with
+the job's address on the network (`journalctl -u zkm-fleet-egress`). The scheduler
+places such a job only on a node that reports `shim-batch-egress-v1`, which a node does
+when it has `batch_egress` settings and its shim both runs batch jobs and puts a
+container on a named network; until one does, the job waits with the detail `waiting
+for a node that gives batch jobs egress`. docs/maintenance.md, "Batch egress on a
+node", sets a node up.
+
 **Records.** A batch record (`type: batch`) has an app record's envelope. Its `state`
 is `enabled`, `disabled` or `deleted`, its `jobs` count the batch's job records, and
 its policy is under `batch`: `image`, `user`, `max_gpus`, `default_gpu_mem_gb`,
-`shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `runtime`
-and `workers`.
+`shm_gb`, `allow`, `env`, `preemptible`, `min_runtime_s`, `stop_timeout_s`, `runtime`,
+`egress` and `workers`.
 
 In the API, `POST /batches?namespace=alice` takes the batch JSON, or the namespace as
 its `namespace` field; a name or an ID is accepted, and the ID is stored. A batch or

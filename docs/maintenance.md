@@ -108,7 +108,7 @@ deploy/fleet-ctl.sh node upgrade target/release/fleet-node bridge \
 
 It installs the release's `fleet-node`, bridge, `fleet-proof-app` and launch scripts
 (`node-start.sh`, `ray-start.sh`, `fleet-watchdog.sh`, `shim-start.sh`,
-`ray-watch.sh`, `install-node-services.sh`) around a short stop and start
+`ray-watch.sh`, `egress-start.sh`, `install-node-services.sh`) around a short stop and start
 of the agent's unit, after checking that the new bridge imports in the node's venv
 and parses the node's `apps.yaml`, and waits until the scheduler reports the node
 READY with a heartbeat newer than the restart (a drained node never reports READY, so
@@ -355,6 +355,64 @@ report delivery in the logs. EthProofs must resume at its saved next block with 
 gaps; keep the state backup until it does. If something fails, disable the app,
 read its error and restore the previous configuration, keeping its current cursor
 and reports.
+
+## Batch egress on a node
+
+A batch that lists `egress` hosts runs its jobs only on a node set up for it. On the
+node, add the settings to the top of `apps.yaml`, with the node image of the node's
+release:
+
+```yaml
+batch_egress:
+  image: ghcr.io/projectzkm/zkm-fleet-node:VERSION   # holds the proxy
+  key_file: /opt/zkm-fleet/etc/egress.key            # made at the first start, mode 600
+  # network: fleet-egress        # the internal Docker network jobs join
+  # proxy: fleet-egress-proxy    # the proxy's container, and its name on the network
+  # port: 3128
+```
+
+and run `deploy/egress-start.sh` as a service of the node's user:
+
+```ini
+# /etc/systemd/system/zkm-fleet-egress.service
+[Unit]
+Description=Fleet batch egress proxy
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Environment=FLEET_ENV=/etc/zkm-fleet/watchdog.env
+ExecStart=/bin/bash /opt/zkm-fleet/deploy/egress-start.sh
+ExecStopPost=/usr/bin/docker rm --force fleet-egress-proxy
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now zkm-fleet-egress.service
+fleetctl node NODE --json | grep shim-batch-egress-v1   # reported with the node's next heartbeat
+```
+
+Each start of the service makes the network if the node lacks it (`docker network
+create --internal --opt com.docker.network.bridge.inhibit_ipv4=true fleet-egress`),
+makes the key if it is missing, and starts the proxy from the image, on Docker's
+default network for its way out and on the egress network for the jobs. It then runs
+`fleet-node egress-check` in a container on the egress network, as a job would be:
+the proxy must answer, and no address of the node may, neither the gateway of either
+network nor any address `hostname -I` lists. An address that refuses a connection
+counts as reached. When the check fails the service removes the proxy and fails with
+the address in its log, so a node whose Docker gives the network a way to the node
+serves no egress. A network of that name that is not an internal bridge network is
+refused; remove it and start the service again.
+
+The proxy needs the shim that advertises `runtime-named-network-v1`. A job whose
+node's proxy is stopped keeps its network and reaches nothing until the service runs
+again. Changing the key ends the credentials of the jobs that are running.
 
 ## Liveness
 

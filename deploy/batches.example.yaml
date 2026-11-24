@@ -33,3 +33,7 @@ batches:
     # What runs its jobs: the bridge's own `docker run` (the default), or the node's
     # trusted-shim, on a node that reports shim-batch-v1.
     # runtime: {executor: shim, driver: docker}
+    # The hosts its jobs reach, over HTTPS and through the node's egress proxy only, on a
+    # node that reports shim-batch-egress-v1 (docs/maintenance.md, "Batch egress on a
+    # node"). Without it a job has no network. Needs the shim runtime.
+    # egress: [pypi.org, files.pythonhosted.org]

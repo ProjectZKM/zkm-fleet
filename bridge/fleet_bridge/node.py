@@ -355,8 +355,11 @@ class NodeExecutor:
         cluster = None
         if policy.on_shim:
             cluster = shim.daemon_config(self.apps_file)
-            if shim.BATCH_CAPABILITY not in shim.capabilities(cluster):
+            supported = shim.capabilities(cluster)
+            if shim.BATCH_CAPABILITY not in supported:
                 raise ValueError("this node's shim does not run batch jobs")
+            if policy.egress and shim.EGRESS_CAPABILITY not in supported:
+                raise ValueError("this node gives batch jobs no egress")
         if policy.namespace != p["namespace"] or request.get("nodes", 1) != 1:
             raise ValueError("invalid local execution scope")
         directory.mkdir(parents=True, exist_ok=True)

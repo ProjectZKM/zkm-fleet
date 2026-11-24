@@ -12,6 +12,11 @@ gpu_port_range: [30100, 30199]     # GPU server, 127.0.0.1 only
 shim_binary: /opt/zkm-fleet/libexec/trusted-shim/SHA256/trusted-shim-runtime
 shim_state_dir: /opt/zkm-fleet/work/shim
 shim_daemon: true
+# The node's way out for batch jobs whose batch lists egress hosts: an internal Docker
+# network and its proxy, run by zkm-fleet-egress.service (docs/maintenance.md).
+# batch_egress:
+#   image: ghcr.io/projectzkm/zkm-fleet-node:VERSION
+#   key_file: /opt/zkm-fleet/etc/egress.key
 # Nodes initiate authenticated control RPCs; no inbound prover ports.
 apps:
   # Resources not reserved by enabled apps remain available to batch jobs.

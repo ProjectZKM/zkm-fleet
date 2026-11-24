@@ -1,4 +1,5 @@
 //! Outbound machine heartbeats. A slim Python child performs local Ray operations.
+mod egress;
 mod hardware;
 mod logs;
 mod runtime_delivery;
@@ -110,6 +111,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Some(done) = egress::command(&std::env::args().collect::<Vec<_>>()).await {
+        return done;
+    }
     let a = NodeAgentArgs::parse();
     anyhow::ensure!(
         fleet_proto::artifacts::is_safe_id(&a.name),

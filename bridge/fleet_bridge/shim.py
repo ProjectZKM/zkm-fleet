@@ -53,6 +53,9 @@ TEE_CPU_OVERCOMMIT_CAPABILITY = "shim-tee-cpu-overcommit-v1"
 BATCH_CAPABILITY = "shim-batch-v1"
 BATCH_FEATURES = ("runtime-run-to-completion-v1", "runtime-exit-status-v1", "runtime-logs-v1",
                   "runtime-network-v1", "runtime-long-stop-v1")
+# The node gives a batch's jobs a way out to the hosts the batch lists: its shim puts a
+# job on the node's egress network (`batch_egress`), whose proxy is the only way out.
+EGRESS_CAPABILITY = "shim-batch-egress-v1"
 
 
 def binding_hash(spec: AppReplicaSpec) -> str:
@@ -202,6 +205,8 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             (LIMITS_CAPABILITY, True),
             (CPU_SHARES_CAPABILITY, "runtime-cpu-shares-v1" in features),
             (BATCH_CAPABILITY, "docker" in value.get("drivers", []) and all(f in features for f in BATCH_FEATURES)),
+            (EGRESS_CAPABILITY, config.batch_egress is not None and "docker" in value.get("drivers", [])
+                and all(f in features for f in (*BATCH_FEATURES, "runtime-named-network-v1"))),
         ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         return []
@@ -960,7 +965,8 @@ def daemon_config(path: Path) -> ControlPlaneConfig:
     if not isinstance(data, dict):
         raise ValueError("apps.yaml must contain a mapping")
     return from_dict(ControlPlaneConfig, {key:data[key] for key in
-        ("shim_binary", "shim_state_dir", "shim_daemon", "shim_openshell", "shim_machine_labels", "shim_tee") if key in data})
+        ("shim_binary", "shim_state_dir", "shim_daemon", "shim_openshell", "shim_machine_labels", "shim_tee", "batch_egress")
+        if key in data})
 
 
 def daemon_options(config: ControlPlaneConfig) -> dict[str, Any]:

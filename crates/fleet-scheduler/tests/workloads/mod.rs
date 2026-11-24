@@ -2461,6 +2461,65 @@ async fn a_batch_on_the_shim_places_its_jobs_only_where_the_shim_runs_batch_jobs
 }
 
 #[tokio::test]
+async fn a_batch_that_lists_hosts_places_its_jobs_only_where_the_node_gives_them_egress() {
+    let (_dir,c,ns)=setup().await;
+    let on_shim=json!({"executor":"shim","driver":"docker"});
+    let mut batch=json!({"image":"t:1","namespace":ns,"priority":0,"user":null,"max_gpus":2,
+        "default_gpu_mem_gb":0,"shm_gb":16,"allow":[],"env":{},"disabled":false,"preemptible":true,
+        "min_runtime_s":0,"stop_timeout_s":30});
+    let mut report=inventory(&ns);
+    report.batches.insert("builder".into(),batch.clone().into());
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-batch-v1".into()];
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let path=format!("/batches/builder/settings?namespace={ns}");
+    let hosts=json!(["pypi.org","files.pythonhosted.org"]);
+    // A list is for a batch on the shim, whose runtime puts a job on the node's egress network.
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"egress":hosts})).await.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":on_shim})).await.status(),StatusCode::OK);
+    // Full lowercase names only: no address, pattern, port, path or repeat.
+    for bad in [json!("pypi.org"),json!(["PyPI.org"]),json!(["*.pypi.org"]),json!(["pypi.org:443"]),json!(["10.0.0.1"]),
+        json!(["localhost"]),json!(["pypi.org."]),json!(["pypi.org/simple"]),json!(["pypi.org","pypi.org"]),json!([1]),
+        json!((0..33).map(|i|format!("h{i}.example")).collect::<Vec<_>>())] {
+        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"egress":bad})).await.status(),StatusCode::BAD_REQUEST,"{bad}");
+    }
+    let owner=user_token(&c,&ns,0x7a,"scope=default",Some(vec!["builder".into()]),true).await;
+    for set in [json!({"egress":hosts}),json!({"egress":[]})] {
+        assert_eq!(scale_call(c.clone(),&owner,"PUT",&path,set).await.status(),StatusCode::FORBIDDEN);
+    }
+    let request=json!({"command":["true"],"gpus":0,"cpus":1});
+    let id=|job: Value| text(&job,"id").to_string();
+    let offline=id(c.submit("builder",request.clone(),None,&BTreeMap::new()).await.unwrap());
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"egress":hosts})).await.status(),StatusCode::OK);
+    let online=id(c.submit("builder",request.clone(),None,&BTreeMap::new()).await.unwrap());
+    let job=|id: &str| c.job(id,None,&BTreeMap::new()).unwrap();
+    // The node's shim runs batch jobs but the node gives them no egress: only the job without a list goes there.
+    c.dispatch().await.unwrap();
+    assert_eq!((job(&offline).worker.as_deref(),job(&online).worker.as_deref()),(Some("gpu"),None));
+    assert_eq!(job(&online).status["detail"],"waiting for a node that gives batch jobs egress");
+    batch["runtime"]=on_shim.clone();
+    batch["egress"]=hosts.clone();
+    report.batches.insert("builder".into(),batch.into());
+    report.runtime_capabilities.push("shim-batch-egress-v1".into());
+    c.report("gpu","session",report).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(job(&online).worker.as_deref(),Some("gpu"));
+    let launch=command_where(&c,|cmd|cmd.operation==NodeOperation::LaunchJob as i32&&cmd.parameters["id"]==online.as_str()).unwrap();
+    assert_eq!(launch.parameters["policy"]["egress"],hosts,"the node learns the list from the job's policy");
+    // The runtime stays the shim's while the batch lists hosts; an empty list takes the way out away.
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":{"executor":"legacy"}})).await.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"egress":[]})).await.status(),StatusCode::OK);
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":{"executor":"legacy"}})).await.status(),StatusCode::OK);
+    // A new batch takes a list too, from an administrator.
+    let create=format!("/batches?namespace={ns}");
+    let new=|name: &str| json!({"name":name,"image":"t:1","runtime":on_shim,"egress":hosts});
+    assert_eq!(scale_call(c.clone(),&owner,"POST",&create,new("builder")).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(),"admin","POST",&create,new("online")).await.status(),StatusCode::CREATED);
+    assert_eq!(c.inner.lock().apps["online"].spec["egress"],hosts);
+    assert_eq!(scale_call(c.clone(),"admin","POST",&create,json!({"name":"plain","image":"t:1"})).await.status(),StatusCode::CREATED);
+    assert_eq!(c.inner.lock().apps["plain"].spec["egress"],json!([]));
+}
+
+#[tokio::test]
 async fn a_registered_app_update_changes_its_server() {
     let (_dir,c,ns)=setup().await;
     let elf="a".repeat(64);

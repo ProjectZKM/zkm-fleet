@@ -261,6 +261,11 @@ class Mount(Record):
         return f"{self.path}:{self.path}" + (":ro" if self.mode is MountMode.RO else "")
 
 
+# A host a batch's jobs may reach: a full lowercase DNS name, never an address or a pattern.
+EGRESS_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+MAX_EGRESS_HOSTS = 32
+
+
 @dataclass(kw_only=True)
 class Batch(Record):
     """A batches.yaml batch: what a request may ask for, and the container it gets."""
@@ -286,12 +291,20 @@ class Batch(Record):
     # What runs the batch's jobs: the bridge's own `docker run` (None or legacy), or the
     # shim's Docker driver, as a run to completion.
     runtime: RuntimeSelection | None = None
+    # The hosts its jobs reach, over HTTPS and through the node's egress proxy only. Empty,
+    # a job has no network.
+    egress: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
         if self.on_shim and self.runtime.driver != "docker":
             raise ModelError("a batch runs on the legacy executor or on shim docker")
+        if self.egress and not self.on_shim:
+            raise ModelError("egress needs a batch on the shim")
+        if (len(self.egress) > MAX_EGRESS_HOSTS or len(set(self.egress)) != len(self.egress)
+                or not all(isinstance(h, str) and len(h) <= 253 and EGRESS_HOST.fullmatch(h) for h in self.egress)):
+            raise ModelError(f"egress lists at most {MAX_EGRESS_HOSTS} distinct lowercase host names")
 
     @property
     def on_shim(self) -> bool:
@@ -549,6 +562,7 @@ class ControlPlaneConfig(Record):
     shim_openshell: ShimOpenShellConfig | None = None
     shim_machine_labels: dict[str, str] = field(default_factory=dict)
     shim_tee: ShimTeeConfig | None = None
+    batch_egress: BatchEgressConfig | None = None
 
     def __post_init__(self) -> None:
         if (self.shim_machine_labels or self.shim_tee) and not self.shim_daemon:
@@ -560,6 +574,31 @@ class ControlPlaneConfig(Record):
                 raise ModelError("shim daemon requires absolute shim_binary and shim_state_dir")
             if len(os.fsencode(os.path.join(self.shim_state_dir, "control.sock"))) >= 108:
                 raise ModelError("shim daemon requires a Unix socket path under 108 bytes")
+
+
+@dataclass(kw_only=True)
+class BatchEgressConfig(Record):
+    """The node's way out for batch jobs: an internal Docker network whose only other
+    member is the egress proxy (`zkm-fleet-egress.service`)."""
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    # The node image of this release, which holds the proxy.
+    image: str
+    # The node's egress key; the bridge signs each job's host list with it.
+    key_file: str
+    network: str = "fleet-egress"
+    # The proxy's container, and its name on the network.
+    proxy: str = "fleet-egress-proxy"
+    port: int = 3128
+
+    def __post_init__(self) -> None:
+        name = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+        if (not all(isinstance(v, str) and name.fullmatch(v) for v in (self.network, self.proxy))
+                or self.network in ("none", "host", "bridge", "default") or self.network == self.proxy):
+            raise ModelError("batch egress needs a network and a proxy name: lowercase letters, digits and -")
+        if (not isinstance(self.image, str) or not self.image or self.image.startswith("-") or any(c.isspace() for c in self.image)
+                or not isinstance(self.key_file, str) or not os.path.isabs(self.key_file) or "\x00" in self.key_file
+                or type(self.port) is not int or not 1 <= self.port <= 65535):
+            raise ModelError("batch egress needs an image, an absolute key_file and a port")
 
 
 @dataclass(kw_only=True)

@@ -28,7 +28,7 @@ ENV_FILE=${FLEET_CTL_ENV:-$HOME/.config/zkm-fleet/ctl.env}
 PREFIX=${FLEET_PREFIX:-$(dirname "$(dirname "$SELF")")}
 NODE_SSH=${FLEET_NODE_SSH:-}; NODE_PREFIX=${FLEET_NODE_PREFIX:-\$HOME/app/fleet}
 NODE_UNIT=${FLEET_NODE_UNIT:-zkm-fleet-node.service}
-NODE_SCRIPTS=(node-start.sh ray-start.sh fleet-watchdog.sh shim-start.sh ray-watch.sh install-node-services.sh)
+NODE_SCRIPTS=(node-start.sh ray-start.sh fleet-watchdog.sh shim-start.sh ray-watch.sh egress-start.sh install-node-services.sh)
 [ -n "${FLEET_TOKEN_FILE:-}" ] || [ ! -f "$PREFIX/etc/admin.token" ] || export FLEET_TOKEN_FILE=$PREFIX/etc/admin.token
 DRY=0; [ "${1:-}" != -n ] || { DRY=1; shift; }
 die() { echo "fleet-ctl: $*" >&2; exit 1; }

@@ -275,6 +275,23 @@ pub const TEE_CPU_OVERCOMMIT_CAPABILITY: &str = "shim-tee-cpu-overcommit-v1";
 /// A node whose shim runs a batch job to completion, without a network, and reports how
 /// it ended and what it wrote.
 pub const BATCH_CAPABILITY: &str = "shim-batch-v1";
+/// A node that runs batch jobs on its shim and gives one a way out to the hosts its batch
+/// lists, through the node's egress proxy only.
+pub const BATCH_EGRESS_CAPABILITY: &str = "shim-batch-egress-v1";
+/// The most hosts a batch lists.
+pub const MAX_EGRESS_HOSTS: usize = 32;
+
+/// A host a batch's jobs may reach: a full lowercase DNS name, never an address or a pattern.
+pub fn is_egress_host(name: &str) -> bool {
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !l.starts_with('-') && !l.ends_with('-')
+    };
+    let labels = name.split('.').collect::<Vec<_>>();
+    name.len() <= 253 && labels.len() >= 2 && labels.iter().all(|l| label(l))
+        && labels.last().is_some_and(|l| l.as_bytes()[0].is_ascii_lowercase())
+}
 
 impl NodeReport {
     /// Native provisioning holds resources before there is an application route.
@@ -407,10 +424,19 @@ impl<'a> Batch<'a> {
     pub fn min_runtime_s(self) -> u64 {
         self.0["min_runtime_s"].as_u64().unwrap_or(300)
     }
+    /// The hosts its jobs reach, over HTTPS and through a node's egress proxy only.
+    pub fn egress(self) -> impl Iterator<Item = &'a str> {
+        self.0["egress"].as_array().into_iter().flatten().filter_map(Value::as_str)
+    }
     /// What a node must report to run its jobs: a batch on the shim runs only where the
-    /// shim runs batch jobs; any node runs one on the legacy executor.
+    /// shim runs batch jobs, and one that lists hosts only where the node also gives its
+    /// jobs that way out; any node runs one on the legacy executor.
     pub fn runtime_capability(self) -> Option<&'static str> {
-        (self.0["runtime"]["executor"] == "shim").then_some(BATCH_CAPABILITY)
+        if self.egress().next().is_some() {
+            Some(BATCH_EGRESS_CAPABILITY)
+        } else {
+            (self.0["runtime"]["executor"] == "shim").then_some(BATCH_CAPABILITY)
+        }
     }
 }
 
