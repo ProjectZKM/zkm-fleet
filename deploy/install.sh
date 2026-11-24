@@ -223,6 +223,7 @@ else
   fi
   mkdir -p "$PREFIX/bridge"
   cp "$SRC/bridge/pyproject.toml" "$PREFIX/bridge/"
+  rm -rf "$PREFIX/bridge/fleet_bridge"
   cp -r "$SRC/bridge/fleet_bridge" "$PREFIX/bridge/"
   if [ ! -x "$PREFIX/venv/bin/python" ]; then
     python3 -m venv "$PREFIX/venv"

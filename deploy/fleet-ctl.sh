@@ -410,7 +410,9 @@ node_upgrade() { # node_upgrade FLEET_NODE BRIDGE_DIR [FLEET_PROOF_APP] [DEPLOY_
   run install -m 755 "$bin" "$PREFIX/bin/fleet-node.new"
   run sudo systemctl stop "$NODE_UNIT"
   run mv "$PREFIX/bin/fleet-node.new" "$PREFIX/bin/fleet-node"
-  run cp -a "$bridge/fleet_bridge/." "$PREFIX/bridge/fleet_bridge/"
+  # The package as the release has it: a module the release dropped does not stay behind.
+  run rm -rf "$PREFIX/bridge/fleet_bridge"
+  run cp -a "$bridge/fleet_bridge" "$PREFIX/bridge/"
   if [ -n "$scripts" ]; then
     run mkdir -p "$PREFIX/deploy"
     local s; for s in "${NODE_SCRIPTS[@]}"; do
@@ -515,6 +517,7 @@ node_rollback() {
   node_runtime_check "$b/bridge"
   run sudo systemctl stop "$NODE_UNIT"
   run install -m 755 "$b/fleet-node" "$PREFIX/bin/fleet-node"
+  run rm -rf "$PREFIX/bridge/fleet_bridge"
   run cp -a "$b/bridge/." "$PREFIX/bridge/"
   if [ -d "$b/scripts" ]; then
     run mkdir -p "$PREFIX/deploy"
