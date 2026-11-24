@@ -420,7 +420,8 @@ priorities, other namespaces, active proofs and running apps are never preempted
 proof priority only orders queued proofs. Every priority defaults to 0, so preemption
 needs priorities set explicitly.
 
-A stop sends SIGTERM, then SIGKILL after `stop_timeout_s`. Reservations last until
+A stop sends SIGTERM, then SIGKILL after `stop_timeout_s`; disabling or deleting an
+app waits that long for its containers. Reservations last until
 every container is confirmed stopped or gone; an unreachable node keeps them, and the
 requeue survives a scheduler restart. A preempted job queues again with its ID,
 output and priority, without spending a retry.

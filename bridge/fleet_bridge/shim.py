@@ -271,7 +271,7 @@ def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *
     # Environment/credentials travel over private stdin, never shell text or argv.
     try:
         result = subprocess.run([binary, "--state-dir", state_dir, "--node-id", node_id],
-            input=json.dumps(to_dict(command)), capture_output=True, text=True, timeout=150, check=True)
+            input=json.dumps(to_dict(command)), capture_output=True, text=True, timeout=max(150, timeout or 0), check=True)
         return json.loads(result.stdout)
     except (OSError, ValueError, subprocess.SubprocessError):
         raise RuntimeError("shim operation failed; no legacy fallback") from None
@@ -290,6 +290,8 @@ class Allocation(Record):
     cleaned: bool = False
     # A record without one holds a revision 1 launch.
     launch_revision: int = 1
+    # The grace the app was launched with; its removal waits for it.
+    stop_timeout_s: int = 30
 
 
 class RuntimeBook:
@@ -347,7 +349,7 @@ class RuntimeBook:
         self.write(spec.name, Allocation(executor=ExecutorKind.SHIM, execution=execution,
             spec=binding_hash(spec), binary=spec.cluster.shim_binary, state_dir=spec.cluster.shim_state_dir,
             daemon=spec.cluster.shim_daemon, driver=spec.app.runtime.driver, access_policy_sha256=spec.app.access_policy_sha256,
-            launch_revision=LAUNCH_REVISION))
+            launch_revision=LAUNCH_REVISION, stop_timeout_s=spec.app.stop_timeout_s))
         return replace(spec, execution=execution, launch_revision=LAUNCH_REVISION)
 
     def cleanup(self, name: str) -> None:
@@ -359,7 +361,8 @@ class RuntimeBook:
             invoke(record.binary, record.state_dir, socket.gethostname(),
                 {"operation": "allocate", "execution": record.execution, "driver": record.driver}, daemon=record.daemon)
         result = invoke(record.binary, record.state_dir, socket.gethostname(),
-            {"operation": "delete", "execution": record.execution, **({"driver": record.driver} if record.driver != "docker" else {})}, daemon=record.daemon)
+            {"operation": "delete", "execution": record.execution, **({"driver": record.driver} if record.driver != "docker" else {})},
+            daemon=record.daemon, timeout=record.stop_timeout_s + 120)
         if result.get("cleaned") is not True:
             raise RuntimeError("shim cleanup is not confirmed")
         record.cleaned = True
