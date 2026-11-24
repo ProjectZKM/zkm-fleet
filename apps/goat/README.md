@@ -157,11 +157,12 @@ The script:
    [`worker.env.example`](worker.env.example) describes, readable only by the account in
    the entry's `user`. The worker reads it at startup. Do not set `ZKM_PROVER`, `ENDPOINT`,
    `FLEET_TOKEN_FILE` or `FLEET_EXIT_WITH_PARENT`.
-5. The worker's API listens on port 8080 in the container, which also answers the health
-   check (`GET /`); the shim publishes it on a loopback port of the node. The entrypoint's
-   own health responder takes `HEALTH_PORT` 8081, and metrics are on `127.0.0.1:9200` in
-   the container. Set `PROOF_SERVER_URL` on the Operator and Challenger nodes to where they
-   reach the API.
+5. The entry sets `network: host`, so the container runs on the node's network: the
+   worker's API listens on the node's port 8080, which also answers the health check
+   (`GET /`). The entrypoint's own health responder takes `HEALTH_PORT` 8081, metrics are
+   on `127.0.0.1:9200` and the GPU server on port 3000; keep those four ports free on the
+   node. Set `PROOF_SERVER_URL` on the Operator and Challenger nodes to the node's port
+   8080.
 
 The example follows the selected `ghcr.io/projectzkm/ziren-gpu:latest` image. Pull it on the
 GPU node before restarting this app and record its resolved digest for recovery. The tag

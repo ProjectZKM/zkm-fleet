@@ -757,7 +757,7 @@ class AppSpec(Record):
             raise ModelError("automatic host ports require shim and container_port")
         if self.kind is not AppRuntime.APP:
             if self.runtime.driver != "docker":
-                raise ModelError("packaged provers require shim Docker and an image-owned worker")
+                raise ModelError("packaged provers require shim Docker")
             if self.port_base is None or not self.container_port or not self.image:
                 raise ModelError("packaged provers require an image and health port")
             if self.services or self.ingress or self.service_protocol is not ServiceProtocol.HTTP1:

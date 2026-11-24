@@ -20,7 +20,8 @@ apps:
     image: ghcr.io/projectzkm/ziren-gpu:latest
     entrypoint: /srv/zkm-fleet/apps/goat/metadata/gpu-worker
     runtime: {executor: shim, driver: docker}
-    port_base: 0                       # the shim picks the loopback port
+    network: host                      # the container listens on the node's own ports
+    port_base: 0
     container_port: 8080               # the worker's API, which answers the health check too
     health_path: /
     user: "1000:1000"                  # the account that owns the storage root
