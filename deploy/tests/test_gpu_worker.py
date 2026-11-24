@@ -1,9 +1,11 @@
 """apps/gpu-worker.sh against a stand-in server and worker; no container runs."""
+import http.server
 import os
 from pathlib import Path
 import signal
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 
@@ -20,8 +22,8 @@ def script(path, body):
 
 @pytest.fixture
 def box(tmp_path):
-    """Stand-ins on PATH: a server that runs until told to stop and a readiness probe
-    that answers once `ready` exists; and the process, started on a free health port."""
+    """A stand-in server on PATH that runs until told to stop, its readiness endpoint,
+    which answers ready once `ready` exists, and the process on a free health port."""
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     script(bin_dir / 'zkm-gpu-server', f'''echo "server SHARD_SIZE=$SHARD_SIZE port=$ZIREN_SERVER_PORT" >> {tmp_path}/events
@@ -29,7 +31,6 @@ trap 'echo server-stopped >> {tmp_path}/events; exit 0' TERM
 while [ ! -e {tmp_path}/server-fails ]; do sleep 0.05; done
 exit 3
 ''')
-    script(bin_dir / 'curl', f"[ -e {tmp_path}/ready ] && printf '\\x08\\x01'\nexit 0\n")
     script(bin_dir / 'sleep', 'exec /bin/sleep 0.05\n')
     worker = script(tmp_path / 'worker', f'''env | sort > {tmp_path}/worker-env
 echo "worker-started $*" >> {tmp_path}/events
@@ -37,10 +38,24 @@ trap 'echo worker-stopped >> {tmp_path}/events; exit 0' TERM
 while [ ! -e {tmp_path}/worker-ends ]; do /bin/sleep 0.05; done
 exit 7
 ''')
+    class Ready(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            ready = self.path == '/twirp/api.ProverService/Ready' and (tmp_path / 'ready').exists()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/protobuf')
+            self.end_headers()
+            self.wfile.write(b'\x08\x01' if ready else b'')
+
+        def log_message(self, *args):
+            pass
+
+    gpu = http.server.HTTPServer(('127.0.0.1', 0), Ready)
+    threading.Thread(target=gpu.serve_forever, daemon=True).start()
     with socket.socket() as free:
         free.bind(('127.0.0.1', 0))
         port = free.getsockname()[1]
     env = {'PATH': f'{bin_dir}:{os.environ["PATH"]}', 'HOME': '/home/worker', 'SHARD_SIZE': '16777216',
+           'ZIREN_SERVER_PORT': str(gpu.server_port),
            'FLEET_APP': 'ethproofs', 'FLEET_APP_ELF_ID': 'a' * 64, 'WORKER_THREADS': '48', 'HEALTH_PORT': str(port)}
     process = subprocess.Popen([ENTRYPOINT, worker, '--block-interval', '1'], env=env, start_new_session=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -49,6 +64,7 @@ exit 7
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    gpu.shutdown()
 
 
 def until(condition, what):
@@ -75,7 +91,7 @@ def test_the_worker_starts_after_the_server_is_ready_with_its_own_environment(bo
     tmp_path, process, env = box
     until(lambda: events(tmp_path), 'the server starts')
     time.sleep(0.3)
-    assert events(tmp_path) == ['server SHARD_SIZE=16777216 port=3000']  # no worker before the server is ready
+    assert events(tmp_path) == [f'server SHARD_SIZE=16777216 port={env["ZIREN_SERVER_PORT"]}']  # no worker before the server is ready
     assert not healthy(env)
     (tmp_path / 'ready').touch()
     until(lambda: healthy(env), 'health answers')
@@ -84,7 +100,7 @@ def test_the_worker_starts_after_the_server_is_ready_with_its_own_environment(bo
     for name in ('PWD', 'SHLVL', '_'):  # the stand-in worker's own shell
         worker_env.pop(name, None)
     assert worker_env == {'PATH': env['PATH'], 'HOME': '/home/worker', 'FLEET_APP': 'ethproofs',
-                          'FLEET_APP_ELF_ID': 'a' * 64, 'FLEET_GPU_ENDPOINT': 'http://127.0.0.1:3000/twirp/',
+                          'FLEET_APP_ELF_ID': 'a' * 64, 'FLEET_GPU_ENDPOINT': f'http://127.0.0.1:{env["ZIREN_SERVER_PORT"]}/twirp/',
                           'RAYON_NUM_THREADS': '48'}
 
     process.send_signal(signal.SIGTERM)  # the worker is told first; the server outlives it
