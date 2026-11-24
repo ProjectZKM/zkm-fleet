@@ -483,7 +483,11 @@ class NodeExecutor:
                 if reconcile.matches(spec, health):
                     continue
                 if shim.selected(spec):
-                    raise ValueError("shim execution is unhealthy; retained until explicit cleanup")
+                    if health.spec == actors.spec_hash(spec):
+                        # The admitted replica is started. Making it ready is its runtime's
+                        # work, and what it runs stays until it is stopped.
+                        continue
+                    raise ValueError("shim execution differs from the admitted one; retained until explicit cleanup")
                 if spec.app.kind in ("ziren-cpu", "ziren-gpu") and not spec.app.worker_command:
                     # A changed configuration does not establish that a native
                     # actor is idle. Keep its process
