@@ -125,6 +125,9 @@ message RouterAuthorization {
   required uint64 revision = 1;
   repeated RouterAccessPolicy policies = 2;
   repeated RouterSubjectRevocation revoked_subjects = 3;
+  // The highest version of any removed policy; it never decreases. Every policy
+  // added later is above it, so a grant bound to a removed policy matches none.
+  optional uint64 retired_policy_version = 4;
 }
 message RouterAuthorizeRequest {
   required string namespace = 1;

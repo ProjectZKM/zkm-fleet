@@ -790,6 +790,21 @@ impl WorkloadController {
         running
     }
 
+    /// Whether `namespace` has an app or batch named `name`: one created here, a deleted one
+    /// its nodes are still removing, a registered proof app, or an entry a node configures.
+    pub(crate) fn has_workload(&self, namespace: &str, name: &str) -> bool {
+        let i = self.inner.lock();
+        i.apps.get(name).is_some_and(|a| a.namespace == namespace)
+            || i.deployments.values().map(AppDeployment::entry)
+                .any(|e| e.namespace() == namespace && (e.app() == name || e.name() == name))
+            || self.fleet.app_known(namespace, name)
+    }
+
+    /// Holds off creating apps and batches, for a caller acting on a name being unused.
+    pub(crate) async fn hold_creation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.ops.lock().await
+    }
+
     /// Refuses `name` while a deleted app or batch of that name is not gone yet.
     pub(super) fn ensure_name_free(&self, name: &str) -> anyhow::Result<()> {
         if self.inner.lock().apps.get(name).is_some_and(|a| a.removed) {

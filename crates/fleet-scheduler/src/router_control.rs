@@ -19,8 +19,10 @@ use fleet_proto::{
         valid_route_id, valid_router_id, MAX_ROUTER_REVOCATIONS, ROUTER_CAPABILITIES_HEADER,
         ROUTER_WORKLOAD_DEFAULTS, ROUTER_SCOPED_REVOCATIONS,
         ROUTER_REVOCATION_COMPACTION, ROUTER_REVOCATION_EXPIRY, DELEGATE_REVOCATION_RETENTION_SECS,
+        ROUTER_POLICY_RETIREMENT,
     },
 };
+use std::time::{Duration, Instant};
 
 pub fn router(state: HttpState) -> Router {
     Router::new()
@@ -199,6 +201,7 @@ async fn sync(
     capabilities.sort();
     capabilities.dedup();
     for _ in 0..16 {
+        let mut _creation = None;
         let previous = load_router(&s, &id).await?;
         if caller.id != previous.token_id
             || caller.namespace.as_deref() != Some(&previous.namespace)
@@ -233,6 +236,12 @@ async fn sync(
         let expiring_relay = next.capabilities.iter().any(|c| c == ROUTER_REVOCATION_EXPIRY);
         if next.authorization.as_ref().is_some_and(|a| a.revoked_subjects.iter().any(|r| r.expires_at.is_some()))
             && !expiring_relay {
+            return Err(StatusCode::CONFLICT);
+        }
+        // Nor below a retirement floor: it could not parse the snapshot.
+        let retiring_relay = next.capabilities.iter().any(|c| c == ROUTER_POLICY_RETIREMENT);
+        if next.authorization.as_ref().is_some_and(|a| a.retired_policy_version.is_some())
+            && !retiring_relay {
             return Err(StatusCode::CONFLICT);
         }
         next.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -270,6 +279,22 @@ async fn sync(
             }
             if expiring_relay && auth.drop_expired(now_ms() / 1000) {
                 auth.revision = auth.revision.checked_add(1).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+            }
+            // A relay receives only the latest snapshot and accepts the removal of a policy
+            // it last saw enabled. One that applied this very revision saw each as it is.
+            if retiring_relay && request.applied_authorization_revision == Some(auth.revision) {
+                let gone = orphaned(&s, &id, auth);
+                if !gone.is_empty() {
+                    // Until the removal is stored, no app or batch can take one of the names.
+                    _creation = Some(s.workloads.hold_creation().await);
+                    let unused = |p: &RouterAccessPolicy| {
+                        gone.iter().any(|(n, w)| *n == p.namespace && *w == p.workload)
+                            && !s.workloads.has_workload(&p.namespace, &p.workload)
+                    };
+                    if auth.retire(unused) {
+                        auth.revision = auth.revision.checked_add(1).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+                    }
+                }
             }
         }
         next.delivered_revision = revision;
@@ -312,6 +337,28 @@ async fn sync(
         }
     }
     Err(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// The workloads, each with its namespace, whose enabled policies on `router` have had no
+/// app or batch for the grace period: an app that is deleted leaves its policies behind.
+fn orphaned(s: &HttpState, router: &str, auth: &RouterAuthorization) -> Vec<(String, String)> {
+    let orphans: std::collections::HashSet<(&str, &str)> = auth
+        .policies
+        .iter()
+        .filter(|p| p.enabled && p.workload != "*" && !s.workloads.has_workload(&p.namespace, &p.workload))
+        .map(|p| (p.namespace.as_str(), p.workload.as_str()))
+        .collect();
+    let grace = Duration::from_secs(s.fleet.cfg.router_policy_grace_secs);
+    let mut since = s.fleet.router_orphans.lock();
+    since.retain(|(r, n, w), _| r != router || orphans.contains(&(n.as_str(), w.as_str())));
+    orphans
+        .into_iter()
+        .filter(|(n, w)| {
+            let key = (router.to_owned(), (*n).to_owned(), (*w).to_owned());
+            since.entry(key).or_insert_with(Instant::now).elapsed() >= grace
+        })
+        .map(|(n, w)| (n.to_owned(), w.to_owned()))
+        .collect()
 }
 
 fn namespace_active(s: &HttpState, namespace: &str) -> bool {
@@ -396,7 +443,9 @@ async fn set_policy(
             return Err(StatusCode::CONFLICT);
         }
         if let Some(old) = old {
-            if *old == policy {
+            // The same policy again changes nothing, whatever version it asks for: one
+            // added after a retirement is stored above the version its client requested.
+            if old.sha256 == policy.sha256 && old.enabled == policy.enabled && policy.version <= old.version {
                 return Ok(());
             }
             if delegated {
@@ -407,7 +456,8 @@ async fn set_policy(
             }
             *old = policy.clone();
         } else {
-            auth.policies.push(policy.clone());
+            let version = auth.new_policy_version(policy.version).ok_or(StatusCode::INSUFFICIENT_STORAGE)?;
+            auth.policies.push(RouterAccessPolicy { version, ..policy.clone() });
             auth.validate_namespace_capacity(&policy.namespace).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
         }
         auth.revision = auth

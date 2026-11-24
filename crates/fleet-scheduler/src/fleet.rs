@@ -115,6 +115,8 @@ pub struct Scheduler {
     pub submissions: tokio::sync::Mutex<()>,
     /// Serializes policy publication with namespace suspension/resumption.
     pub(crate) router_policy_ops: tokio::sync::Mutex<()>,
+    /// Since when each (router, namespace, workload) has had a policy but no app or batch.
+    pub(crate) router_orphans: Mutex<HashMap<(String, String, String), Instant>>,
     pub store: Arc<dyn Store>,
     pub proof_fetch: crate::proof_fetch::ProofFetcher,
     pub log_relay: crate::log_relay::LogRelay,
@@ -185,6 +187,7 @@ impl Scheduler {
         Arc::new(Self {
             submissions: tokio::sync::Mutex::new(()),
             router_policy_ops: tokio::sync::Mutex::new(()),
+            router_orphans: Mutex::default(),
             cfg,
             store,
             proof_fetch: crate::proof_fetch::ProofFetcher::default(),

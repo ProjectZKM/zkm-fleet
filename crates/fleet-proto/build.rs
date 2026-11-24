@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default)]");
     }
-    for path in ["RouterSubjectRevocation.application_only", "RouterSubjectRevocation.expires_at", "RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RuntimeInstance.native_observation_base64", "NodeReport.hardware"] {
+    for path in ["RouterSubjectRevocation.application_only", "RouterSubjectRevocation.expires_at", "RouterSyncRequest.applied_authorization_revision", "RouterSyncResponse.authorization", "RouterAuthorization.retired_policy_version", "RuntimeInstance.native_observation_base64", "NodeReport.hardware"] {
         build = build.field_attribute(format!(".fleet.model.v1.{path}"), "#[serde(default, skip_serializing_if = \"Option::is_none\")]" );
     }
     build = build.field_attribute(".fleet.model.v1.RuntimeInstance.gpu_ids", "#[serde(default, skip_serializing_if = \"Vec::is_empty\")]");

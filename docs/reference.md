@@ -1266,7 +1266,22 @@ Operator revocations stay permanent. Expiring denials do not count toward the
 router. Once a relay holds expiring denials, Fleet rejects its sync without the
 capability (409); never downgrade the relay.
 
-Changing an existing policy requires a higher version. New agents can inherit
+With `policy-retirement-v1` advertised, Fleet retires the enabled exact policies of
+a workload that has had no app or batch in its namespace for
+`router_policy_grace_secs` (600 by default), so they stop counting toward the
+64-record budget. Set a policy after creating its app, or within that time before.
+A retirement happens during a sync whose relay has applied the current
+authorization revision, and removes the policies as one new revision. It raises
+`retired_policy_version` to the highest version removed, and that floor never
+decreases. A policy added afterwards is stored above the floor, whatever version
+its request names, so a grant bound to a retired policy matches no later one of
+the same name. Disabled policies and `*` defaults are never retired. Upgrade the
+relay first; once a floor is stored, Fleet rejects its sync without the
+capability (409), so never downgrade the relay.
+
+Changing an existing policy requires a higher version. Repeating a policy with
+the same `sha256` and `enabled`, at its stored version or a lower one, changes
+nothing. New agents can inherit
 defaults without letting application backends write infrastructure policy. Defaults
 also apply to existing workloads without an exact entry; publish explicit disabled
 entries first for workloads that must remain denied.
