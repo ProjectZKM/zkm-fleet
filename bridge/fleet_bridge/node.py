@@ -244,6 +244,10 @@ class NodeExecutor:
         self.output_lock = threading.Lock()
         self.apps_lock = threading.Lock()
         self.runtimes = shim.RuntimeBook(self.jobs_dir / ".node" / "runtimes")
+        # Job directories with nothing left to report, by the modification time each had then.
+        self.settled: dict[str, int] = {}
+        # Set when a command finishes, so its result is reported without waiting.
+        self.finished = threading.Event()
 
     def resource_lock(self, key: str) -> threading.Lock:
         with self.lock:
@@ -312,6 +316,7 @@ class NodeExecutor:
             with self.lock:
                 write_json(self.journal / f"{command['id']}.json", {"command": command, "done": True, "result": result, "error": error})
                 self.running.discard(command["id"])
+            self.finished.set()
 
     def launch(self, p: dict[str, Any]) -> dict[str, Any]:
         if len(alive_nodes()) != 1:
@@ -720,14 +725,22 @@ class NodeExecutor:
                 app["ready"] &= healthy
             app["cleaned"] = not any(name in running for name in names) and all((not (record := self.runtimes.read(name)) or record.cleaned) for name in names) and all(container_gone(actors.gpu_container(name)) and container_gone(actors.app_container(name)) for name in names)
         job_reports = []
-        for entry in self.jobs_dir.iterdir():
-            if entry.name.startswith(".") or not entry.is_dir() or not (entry / "spec.json").is_file():
+        # A node keeps every job's directory, so only those that may still change are read.
+        settled, self.settled = self.settled, {}
+        for entry, modified in self._job_directories():
+            if settled.get(entry.name) == modified:
+                self.settled[entry.name] = modified
+                continue
+            if not (entry / "spec.json").is_file():
                 continue
             try:
                 job = jobs.JobDirectory(str(self.jobs_dir), entry.name)
                 spec, status = job.spec(), job.status()
                 lease = read_json(entry / ".fleet-lease.json", {"lease": "imported"})["lease"]
                 if (entry / f".fleet-reported-{lease}").exists() and (status.state.terminal or status.state is JobState.LOST):
+                    # A terminal job never runs again, and the scheduler has its last report.
+                    if status.state.terminal:
+                        self.settled[entry.name] = modified
                     continue
                 cleaned_file = entry / f".fleet-cleaned-{lease}"
                 cleaned = cleaned_file.exists()
@@ -755,15 +768,29 @@ class NodeExecutor:
             "batches": {k: v.dump() for k, v in config.batches.items()},
             "apps": apps, "jobs": job_reports, "results": results}
 
+    def _job_directories(self) -> list[tuple[Path, int]]:
+        """Each job directory with its modification time, which changes whenever a file
+        is added to it or removed from it, and when the directory is created again."""
+        found = []
+        with os.scandir(self.jobs_dir) as listing:
+            for entry in listing:
+                try:
+                    if not entry.name.startswith(".") and entry.is_dir():
+                        found.append((Path(entry.path), entry.stat().st_mtime_ns))
+                except OSError:
+                    pass  # deleted meanwhile
+        return found
+
     def publish(self) -> None:
         while True:
+            self.finished.clear()
             try:
                 report = self.report()
                 with self.output_lock:
                     print(json.dumps({"report": report}), flush=True)
             except BaseException:
                 log.exception("local Ray snapshot unavailable")
-            time.sleep(2)
+            self.finished.wait(2)
 
 
 def main() -> None:
