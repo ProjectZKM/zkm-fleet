@@ -471,6 +471,9 @@ same durable shim Docker lifecycle as other containers. The bridge advertises
 host-side `worker_command` are not supported for this packaged SDK worker path.
 It exposes only its private HTTP health port; SDK ingress and artifact retrieval
 continue through the existing proof-app endpoint and storage protocol.
+A prover's node entry can set `network: host`: its one replica then runs on the
+host's network and listens on `container_port` itself, with `port_base: 0`. The
+node advertises `shim-host-network-v1` for it. An app or a batch has no such setting.
 
 `deploy/build-proof-image.sh OUTPUT_IMAGE GPU_IMAGE@sha256:DIGEST` builds the locked
 SDK worker and puts it with the operator-validated GPU base in one image. The build
