@@ -7,14 +7,13 @@
 set -euo pipefail
 
 REPO=${FLEET_RELEASE_REPO:-ProjectZKM/zkm-fleet}
-VERSION=${FLEET_RELEASE_VERSION:-latest}
+VERSION=latest
 KEEP=0
 ARGS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) [ $# -ge 2 ] || { echo "setup.sh: --version needs a value" >&2; exit 2; }; VERSION=$2; shift 2;;
-    --repo) [ $# -ge 2 ] || { echo "setup.sh: --repo needs a value" >&2; exit 2; }; REPO=$2; shift 2;;
     --keep-package) KEEP=1; shift;;
     *) ARGS+=("$1"); shift;;
   esac
@@ -22,7 +21,7 @@ done
 
 ROLE=${ARGS[0]:-}
 case "$ROLE" in control|node) ;; *) cat >&2 <<'EOF'
-usage: setup.sh [--version vX.Y.Z|latest] [--repo OWNER/REPO] control|node [install.sh options]
+usage: setup.sh [--version vX.Y.Z|latest] control|node [install.sh options]
 EOF
   exit 2;; esac
 
@@ -58,8 +57,7 @@ BASE="https://github.com/$REPO/releases/download/$TAG"
 curl -fsSL --retry 3 "$BASE/zkm-fleet-${VERSION_NUMBER}-linux-x86_64.tar.gz" -o "$PACKAGE"
 curl -fsSL --retry 3 "$BASE/zkm-fleet-${VERSION_NUMBER}-linux-x86_64.tar.gz.sha256" -o "$CHECKSUM"
 
-sed 's#  dist/#  #g' "$CHECKSUM" > "$STAGE/package.sha256"
-(cd "$STAGE" && sha256sum -c package.sha256) || { echo "setup.sh: package checksum mismatch" >&2; exit 1; }
+(cd "$STAGE" && sha256sum -c "$(basename "$CHECKSUM")") || { echo "setup.sh: package checksum mismatch" >&2; exit 1; }
 
 mkdir -p "$STAGE/root"
 tar -xzf "$PACKAGE" -C "$STAGE/root"

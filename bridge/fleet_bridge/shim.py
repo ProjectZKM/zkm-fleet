@@ -134,10 +134,6 @@ def _helper_problem(path: str) -> str | None:
     return None
 
 
-def _operator_executable(path: str) -> bool:
-    """Shim's own helper check: a regular executable nobody else can modify."""
-    return _helper_problem(path) is None
-
 
 def capabilities(config: ControlPlaneConfig) -> list[str]:
     if not all(isinstance(p, str) and os.path.isabs(p) and "\x00" not in p
@@ -159,7 +155,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         # A configured tunnel helper gates only the network capabilities; runtimes
         # without services never use it.
         upstream = not config.shim_network or config.shim_network.tunnel_binary is None or (
-            "chisel-network-v1" in features and _operator_executable(config.shim_network.tunnel_binary))
+            "chisel-network-v1" in features and _helper_problem(config.shim_network.tunnel_binary) is None)
         modern = "data-plane-v1" in features
         management = "runtime-management-v1" in features
         network = bool(config.shim_network) and modern and upstream

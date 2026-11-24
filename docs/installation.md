@@ -261,9 +261,6 @@ Then start the gateway, on a new or an upgraded control host:
 "$FLEET_PREFIX/deploy/fleet-ctl.sh" openshell up
 ```
 
-A host installed before v0.2.4 has no copy of `fleet-ctl.sh` there; run the release's
-`deploy/fleet-ctl.sh` with `FLEET_PREFIX` set instead ([maintenance](maintenance.md#upgrading)).
-
 `openshell up` checks the files above and the `policy_gateway.openshell` block, pins the image
 digest, initializes the `openshell-run` and `openshell-data` volumes for
 `FLEET_UID:FLEET_GID`, recreates the scheduler and waits for its health check, starts

@@ -246,7 +246,6 @@ class NodeExecutor:
         self.running: set[str] = set()
         self.resource_locks: dict[str, threading.Lock] = {}
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-        self.output_lock = threading.Lock()
         self.apps_lock = threading.Lock()
         self.runtimes = shim.RuntimeBook(self.jobs_dir / ".node" / "runtimes")
         # Job directories with nothing left to report, by the modification time each had then.
@@ -804,7 +803,7 @@ class NodeExecutor:
         for app in apps:
             if private := private_environment(app):
                 app['env'] = {**app.get('env', {}), **private}
-        return {**({"runtime_capabilities": runtime_capabilities} if runtime_capabilities else {}),
+        return {"runtime_capabilities": runtime_capabilities,
             **({"runtime_instances": runtime_instances} if runtime_instances else {}),
             "version": 3, "machine": socket.gethostname(), "ready": ready,
             "total_gpus": total.get("GPU", 0), "total_cpus": total.get("CPU", 0),
@@ -830,8 +829,7 @@ class NodeExecutor:
             self.finished.clear()
             try:
                 report = self.report()
-                with self.output_lock:
-                    print(json.dumps({"report": report}), flush=True)
+                print(json.dumps({"report": report}), flush=True)
             except BaseException:
                 log.exception("local Ray snapshot unavailable")
             self.finished.wait(2)

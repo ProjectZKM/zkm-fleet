@@ -27,7 +27,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from . import shim
 from .rayapi import alive_nodes, node_ip
 from .model import (JobAttempt, ResourceRequest, GpuMemoryState, FailureCause, GpuProcess,
-                    TaskPlacement, Batches, ControlPlaneConfig, JobSpec, JobState, JobStatus)
+                    TaskPlacement, Batches, ControlPlaneConfig, JobSpec, JobState, JobStatus, merge)
 
 NAMESPACE = "zkm-fleet"
 GPU_OOM = re.compile(r"CUDA out of memory|OutOfMemoryError|CUBLAS_STATUS_ALLOC_FAILED|cudaErrorMemoryAllocation"
@@ -146,7 +146,7 @@ class JobDirectory:
                 changes.setdefault("preempt_requeue", False)
             if new_state is not None and new_state != st.state and not new_state.terminal:
                 changes.setdefault("quota_released", False)
-            st = st.merged(**changes)
+            st = merge(st, **changes)
             st.write(self.status_path)
             return st
 

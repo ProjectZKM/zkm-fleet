@@ -159,17 +159,15 @@ def merge(obj: D, **changes: Any) -> D:
 
 
 def to_env(obj: Any) -> dict[str, str]:
-    """Environment variables from a record whose fields carry `metadata={"env": NAMES}`
-    (one name or several, for a value that goes out under aliases); None is left out."""
+    """Environment variables from a record whose fields carry `metadata={"env": NAME}`;
+    None is left out."""
     out: dict[str, str] = {}
     for f in fields(obj):
-        names = f.metadata.get("env")
+        name = f.metadata.get("env")
         value = getattr(obj, f.name)
-        if not names or value is None:
+        if not name or value is None:
             continue
-        text = json.dumps(value) if isinstance(value, bool) else str(to_dict(value))  # true/false, as a parser expects
-        for name in ([names] if isinstance(names, str) else names):
-            out[name] = text
+        out[name] = json.dumps(value) if isinstance(value, bool) else str(to_dict(value))  # true/false, as a parser expects
     return out
 
 
@@ -197,9 +195,6 @@ class Record:
         with open(tmp, "w") as f:
             json.dump(self.dump(), f, indent=2)
         os.replace(tmp, path)
-
-    def merged(self: D, **changes: Any) -> D:
-        return merge(self, **changes)
 
 
 # ── batch jobs ────────────────────────────────────────────────────────────
@@ -573,7 +568,6 @@ class ShimOpenShellConfig(Record):
     supervisor_image: str | None = None
 
     def __post_init__(self) -> None:
-        from urllib.parse import urlsplit
         url = urlsplit(self.ledger_endpoint)
         if (url.scheme != "https" and not (url.scheme == "http" and url.hostname in ("127.0.0.1", "::1"))
                 or not url.hostname or url.username or url.password or url.query or url.fragment or url.path not in ("", "/")):
@@ -598,7 +592,6 @@ class ShimNetworkConfig(Record):
     tunnel_binary: str | None = field(default=None, metadata={"omit_none": True})
 
     def __post_init__(self) -> None:
-        from urllib.parse import urlsplit
         for value, secure, local in [(self.gateway_url,"https","http"),(self.relay_url,"wss","ws")]:
             url=urlsplit(value)
             if (url.scheme != secure and not (url.scheme == local and url.hostname in ("127.0.0.1","::1"))
@@ -927,10 +920,6 @@ class AppReplicaSpec(Record):
     def kind(self) -> AppRuntime:
         return self.app.kind
 
-    @property
-    def machine(self) -> str | None:
-        return self.app.machine
-
     def node_log_path(self) -> str:
         return os.path.join(self.cluster.log_dir, f"{self.name}.node.log")
 
@@ -999,11 +988,10 @@ class ReplicaHealth(Record):
     allocation_reserved: bool = False
     native_observation_base64: str | None = None
     stopping: bool = False
-    error: str | None = None
 
     @property
     def is_ready(self) -> bool:
-        if self.stopping or self.error or self.spec is None:
+        if self.stopping or self.spec is None:
             return False
         if self.ready is not None:
             return self.ready
