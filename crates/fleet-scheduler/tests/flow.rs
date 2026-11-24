@@ -1334,6 +1334,9 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
     };
     let mut worker = WorkerServiceClient::connect(format!("http://127.0.0.1:{}", h.control_port)).await.unwrap();
     let http = h.http.clone();
+    // The scheduler knows the agent from its first answered heartbeat on.
+    let (known, registered) = tokio::sync::oneshot::channel();
+    let mut known = Some(known);
     let task = tokio::spawn(async move {
         let client = reqwest::Client::new();
         loop {
@@ -1348,6 +1351,9 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
             });
             request.metadata_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
             let response = worker.heartbeat(request).await.unwrap().into_inner();
+            if let Some(known) = known.take() {
+                let _ = known.send(());
+            }
             for fetch in response.proof_fetches {
                 let result = fleet_ziren_node::fetch::read(&fetch, std::slice::from_ref(&root));
                 let mut post = client.post(format!("{http}/internal/proof-fetch/{}",fetch.ticket))
@@ -1359,7 +1365,7 @@ async fn start_fetch_agent(h: &Harness, root: std::path::PathBuf) -> tokio::task
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    registered.await.unwrap();
     task
 }
 
