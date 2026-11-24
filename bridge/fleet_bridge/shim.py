@@ -805,7 +805,7 @@ class _ShimApp:
             if time.monotonic() >= deadline or self.call({"operation": "inspect", "execution": spec.execution}).get(
                     "state") not in ("ready", "starting"):
                 raise RuntimeError("shim app did not become healthy; allocation retained for confirmed cleanup")
-            time.sleep(2)
+            time.sleep(0.5)
 
     def launch(self, request: dict[str, Any], *, pull: bool) -> dict[str, Any]:
         """Launches the allocation, or replays its launch, which finds the

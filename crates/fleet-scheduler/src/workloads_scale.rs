@@ -3,8 +3,8 @@ use super::*;
 
 use fleet_proto::model::v1::{ScalePhase as Phase, ScaleRequest, ScaleStatus};
 
-/// A change to one deployment: drain, stop, have the node write the target configuration
-/// (NODE_OPERATION_APP), start it again unless `disabled`.
+/// A change to one deployment: drain and stop it unless it is down, have the node write the
+/// target configuration (NODE_OPERATION_APP), start it unless `disabled`.
 pub(super) fn new_scale(target: impl Into<Value>, disabled: bool) -> ScaleStatus {
     ScaleStatus {
             id: uuid::Uuid::new_v4().to_string(),
@@ -358,6 +358,9 @@ impl WorkloadController {
                 return Err(fail(400, format!("{key}: invalid value")));
             }
         }
+        if let Some(template) = self.unplaced(namespace, app).filter(|_| node.is_none()) {
+            return self.update_unplaced(template, set, apply);
+        }
         let (key, mut intent) = self.deployment_to_change(namespace, app, node)?;
         if set.get("runtime").is_some_and(|r| r != &json!({"executor":"shim","driver":"docker"})) && intent.entry().is_prover() {
             return Err(fail(400, "packaged provers require shim Docker"));
@@ -392,6 +395,46 @@ impl WorkloadController {
             self.notify.notify_waiters();
         }
         Ok(self.scale_value(&intent))
+    }
+
+    /// The template of an app created and on no node yet: `deploy` has placed it nowhere.
+    pub(super) fn unplaced(&self, namespace: &str, app: &str) -> Option<WorkloadTemplate> {
+        let i = self.inner.lock();
+        i.apps.get(app)
+            .filter(|a| a.persistent && !a.removed && a.namespace == namespace && a.workers.is_empty())
+            .filter(|_| !i.deployments.values().any(|d| d.entry().app() == app && d.entry().namespace() == namespace))
+            .cloned()
+    }
+
+    /// Settings for an app on no node yet go into its template, which its first placement
+    /// carries: no node is told. They are checked like a placed app's, against the nodes
+    /// there are.
+    fn update_unplaced(&self, mut template: WorkloadTemplate, set: serde_json::Map<String, Value>, apply: bool) -> anyhow::Result<Value> {
+        if set.get("runtime").is_some_and(|r| r != &json!({"executor":"shim","driver":"docker"})) && template.entry().is_prover() {
+            return Err(fail(400, "packaged provers require shim Docker"));
+        }
+        let mut target = template.spec.0.clone();
+        for (k, v) in &set {
+            target[k.as_str()] = v.clone();
+        }
+        let settings = target.as_object().ok_or_else(|| fail(400, "invalid target"))?;
+        fleet_proto::model::v1::RegisterAppRequest::validate_transport(settings).map_err(|e| fail(400, e.to_string()))?;
+        if set.contains_key("memory_gb") || set.contains_key("runtime") {
+            fleet_proto::model::v1::RegisterAppRequest::validate_resources(settings).map_err(|e| fail(400, e.to_string()))?;
+        }
+        if !self.inner.lock().workers.values().any(|w| w.report.supports_runtime(Entry(&target))) {
+            return Err(fail(409, if set.contains_key("runtime") { "no node supports the selected runtime" }
+                else { "no node supports the selected runtime services" }));
+        }
+        let entry = Entry(&target);
+        let view = json!({"node": null, "entry": entry.name(), "namespace": entry.namespace(), "gpus": entry.gpus().unwrap_or(1.0),
+            "cpus": entry.cpus(), "replicas": entry.replicas(), "state": "configured", "disabled": true, "operation": null, "error": null});
+        if apply && target != template.spec.0 {
+            template.spec = target.into();
+            self.save("apps", &template.name, &template)?;
+            self.inner.lock().apps.insert(template.name.clone(), template);
+        }
+        Ok(view)
     }
 
     /// Sets an app's replica count, and its replicas' GPUs and CPUs: the app's settings, not any
@@ -656,6 +699,14 @@ impl WorkloadController {
         Ok(())
     }
 
+    /// Whether nothing of a disabled deployment is left on its node: the node, heard from
+    /// lately, reports its entry disabled and cleaned up.
+    fn down(&self, intent: &AppDeployment) -> bool {
+        intent.disabled && self.inner.lock().workers.get(&intent.worker).filter(|w| now() - w.seen < 30.0)
+            .and_then(|w| w.report.entry(intent.entry().name()))
+            .is_some_and(|e| e.disabled() && e.cleaned())
+    }
+
     pub(super) async fn advance_scales(&self) -> anyhow::Result<()> {
         let intents = self
             .inner
@@ -686,30 +737,28 @@ impl WorkloadController {
                     self.save("apps", &app.name, &app)?;
                     self.inner.lock().apps.insert(app.name.clone(), app);
                 }
-                if scale.stop.is_none() {
+                // A deployment that is down has nothing to stop; the choice holds once the
+                // node is told what to write.
+                if scale.stop.is_none() && scale.update.is_none() && !self.down(&intent) {
                     scale.stop =
                         Some(self.scale_command(&intent, &intent.spec, true, "stop")?);
                     self.save_scale(&key, scale.clone())?;
                 }
-                let command = self
-                    .inner
-                    .lock()
-                    .commands
-                    .get(scale.stop.as_ref().unwrap())
-                    .cloned()
-                    .unwrap();
-                if !command.done {
-                    return Ok(());
-                }
-                if command.error.is_some() || !command.cleaned() {
-                    scale.phase = Phase::Failed as i32;
-                    scale.error = Some(
-                        command
-                            .error
-                            .unwrap_or_else(|| "node did not confirm the app's cleanup".into()),
-                    );
-                    self.save_scale(&key, scale)?;
-                    return Ok(());
+                if let Some(stop) = &scale.stop {
+                    let command = self.inner.lock().commands.get(stop).cloned().unwrap();
+                    if !command.done {
+                        return Ok(());
+                    }
+                    if command.error.is_some() || !command.cleaned() {
+                        scale.phase = Phase::Failed as i32;
+                        scale.error = Some(
+                            command
+                                .error
+                                .unwrap_or_else(|| "node did not confirm the app's cleanup".into()),
+                        );
+                        self.save_scale(&key, scale)?;
+                        return Ok(());
+                    }
                 }
                 // The node writes the target configuration while the app is stopped.
                 {
@@ -748,21 +797,25 @@ impl WorkloadController {
                 scale.phase = Phase::Starting as i32;
                 self.save_scale(&key, scale.clone())?;
             }
-            if scale.start.is_none() {
+            // A target that stays down starts nothing: the stopped entry the node wrote is the
+            // deployment, and its report confirms it below.
+            if scale.disabled && scale.start.is_none() {
+                let mut down = self.inner.lock().deployments.get(&key).cloned().unwrap();
+                if !down.disabled || down.spec != scale.target {
+                    (down.spec, down.disabled, down.scale) = (scale.target.clone(), true, Some(scale.clone()));
+                    self.save("deployments", &key, &down)?;
+                    self.inner.lock().deployments.insert(key.clone(), down);
+                }
+            } else if scale.start.is_none() {
                 scale.start =
                     Some(self.scale_command(&intent, &scale.target, scale.disabled, "apply")?);
                 self.save_scale(&key, scale.clone())?;
             }
-            let command = self
-                .inner
-                .lock()
-                .commands
-                .get(scale.start.as_ref().unwrap())
-                .cloned()
-                .unwrap();
-            if !command.done {
+            let command = scale.start.as_ref().map(|start| self.inner.lock().commands.get(start).cloned().unwrap());
+            if command.as_ref().is_some_and(|c| !c.done) {
                 return Ok(());
             }
+            let failure = command.and_then(|c| c.error);
             let first_ack = scale.ready_since.is_none();
             let ready_since = *scale.ready_since.get_or_insert_with(now);
             let timeout = scale.target_entry().ready_timeout_s().clamp(1.0, 3600.0) + 30.0;
@@ -785,9 +838,9 @@ impl WorkloadController {
                     }),
                 )
             };
-            if command.error.is_some() || (!applied && connected && now() - ready_since > timeout) {
+            if failure.is_some() || (!applied && connected && now() - ready_since > timeout) {
                 scale.phase = Phase::Failed as i32;
-                scale.error=Some(command.error.clone().unwrap_or_else(||"node did not report the requested resources ready before the startup timeout".into()));
+                scale.error=Some(failure.unwrap_or_else(||"node did not report the requested resources ready before the startup timeout".into()));
                 let mut failed = self.inner.lock().deployments.get(&key).cloned().unwrap();
                 failed.disabled = true;
                 failed.scale = Some(scale);
