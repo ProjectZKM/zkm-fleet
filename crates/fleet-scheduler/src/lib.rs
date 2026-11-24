@@ -37,7 +37,7 @@ async fn terminated() {
 /// Starts every listener and the dispatcher; returns when one of them stops, or after a
 /// graceful stop on SIGTERM: listeners close, calls in flight (long polls included) finish.
 pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
-    let cluster_token = token::load(&cfg.cluster_token_file)?;
+    let cluster_token = fleet_proto::load_token(&cfg.cluster_token_file)?;
     let (store, _leader_lock): (Arc<dyn store::Store>, Option<store::PgLeaderLock>) =
         match &cfg.database_url {
             Some(url) => {

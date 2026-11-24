@@ -11,7 +11,7 @@ use fleet_proto::fleet::v1::ProofKind;
 use fleet_proto::stage::v1::Status as StageStatus;
 
 pub use fleet_proto::model::v1::{ProofJob, ProofJobState, Namespace, App, Token, RouterControl};
-pub use fleet_proto::models::{kind_name, status_name};
+use fleet_proto::models::{kind_name, status_name};
 
 #[derive(Debug)]
 pub struct RouterTokenInUse;
@@ -542,8 +542,8 @@ impl PgStore {
         })
     }
 
-    /// Initialize a fresh database or verify the current schema. Old development
-    /// databases require an explicit reset; startup never invents job identities.
+    /// Initialize a fresh database, migrate one from schema 14 on, or verify the
+    /// current schema. Startup never invents job identities.
     async fn initialize(pool: &PgPool) -> anyhow::Result<()> {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS fleet_schema (version INT PRIMARY KEY, applied_ms BIGINT NOT NULL);

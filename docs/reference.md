@@ -1093,7 +1093,7 @@ accepted work: an administrator stops jobs explicitly.
 | Preempt batch jobs | `admin` |
 | Namespaces, tokens, quotas, suspension, allocations, the preemption plan, nodes and status | `admin` |
 
-`/healthz` and `/{proof_id}/wrap/public_values.bin` need no token, `/access` takes any
+`/healthz` needs no token, `/access` takes any
 valid token, and `/internal/*` takes the cluster token.
 
 ### Administrator workflow

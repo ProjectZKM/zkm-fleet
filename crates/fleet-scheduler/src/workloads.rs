@@ -42,7 +42,7 @@ fn text<'a>(v: &'a Value, key: &str) -> &'a str {
 fn terminal(state: &str) -> bool {
     matches!(state, "succeeded" | "failed" | "cancelled" | "lost")
 }
-fn fail(code: u16, message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn fail(code: u16, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(crate::fleet::RequestRejection {
         status: code,
         message: message.into(),
@@ -702,7 +702,7 @@ impl WorkloadController {
             return Err(fail(403, "another namespace or tag cannot be selected"));
         }
         if let Some(t) = &tag {
-            crate::fleet::Scheduler::validate_tag(t).map_err(|e| fail(400, e.to_string()))?;
+            fleet_proto::models::validate_tag(t).map_err(|e| fail(400, e.to_string()))?;
         }
         Ok((n.id, tag))
     }
@@ -1025,7 +1025,7 @@ impl WorkloadController {
         }
         for spec in report.batches.values().chain(report.apps.iter()) {
             if let Some(tag) = Entry(spec).tag() {
-                crate::fleet::Scheduler::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
+                fleet_proto::models::validate_tag(tag).map_err(|e| fail(400, e.to_string()))?;
             }
         }
         let mut worker_streams = HashSet::new();

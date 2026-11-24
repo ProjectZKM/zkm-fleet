@@ -165,7 +165,7 @@ fn namespace_record(s: &HttpState, name: &str, tag: Option<&str>, c: Option<&Tok
             if let Some(tag) = tag {
                 let tag = (!tag.is_empty()).then_some(tag);
                 if let Some(tag) = tag {
-                    if let Err(e) = crate::fleet::Scheduler::validate_tag(tag) { return (StatusCode::BAD_REQUEST,e.to_string()).into_response(); }
+                    if let Err(e) = fleet_proto::models::validate_tag(tag) { return (StatusCode::BAD_REQUEST,e.to_string()).into_response(); }
                 }
                 v["tag"] = serde_json::json!(tag);
                 v["tag_quota"] = serde_json::json!(n.tag_quotas.get(tag.unwrap_or("")).cloned().unwrap_or_default());
@@ -213,7 +213,7 @@ async fn allocations(State(s): State<HttpState>, Path(name): Path<String>) -> Re
 async fn reserve_job(State(s): State<HttpState>, Path(name): Path<String>, Json(r): Json<AllocationRequest>,
 ) -> Response {
     if let Some(tag) = &r.tag {
-        if let Err(e) = crate::fleet::Scheduler::validate_tag(tag) { return (StatusCode::BAD_REQUEST, e.to_string()).into_response(); }
+        if let Err(e) = fleet_proto::models::validate_tag(tag) { return (StatusCode::BAD_REQUEST, e.to_string()).into_response(); }
     }
     match s.fleet.reserve_job(&name, r.tag.as_deref(), &r.id, r.gpus, r.cpus, r.restore).await {
         Ok(a) => Json(a).into_response(), Err(e) => app_outcome(Err(e)),
@@ -278,7 +278,7 @@ fn selected_tag(s: &HttpState, c: Option<&Token>, namespace: Option<&str>, selec
     } else if let Some(tag)=selected {
         let n=namespace.ok_or_else(|| (StatusCode::BAD_REQUEST,"tag requires namespace").into_response())?;
         if s.fleet.namespace(n).is_none() { return Err(StatusCode::NOT_FOUND.into_response()); }
-        crate::fleet::Scheduler::validate_tag(tag).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()).into_response())?;
+        fleet_proto::models::validate_tag(tag).map_err(|e|(StatusCode::BAD_REQUEST,e.to_string()).into_response())?;
         Ok(Some(tag.into()))
     } else { Ok(None) }
 }

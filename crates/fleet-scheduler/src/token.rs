@@ -116,9 +116,6 @@ impl tonic::service::Interceptor for BearerTokenInterceptor {
     }
 }
 
-/// Reads a token from a file (trimmed); refuses an empty one.
-pub use fleet_proto::load_token as load;
-
 /// The message the SDK's network prover signs (EIP-191 personal message):
 /// `proof_id&block_no&seg_size`, or `proof_id&seg_size` without a block number.
 pub fn signed_message(proof_id: &str, block_no: Option<u64>, seg_size: u32) -> String {

@@ -255,9 +255,6 @@ pub fn kind_name(k: ProofKind) -> String {
         .trim_start_matches("PROOF_KIND_")
         .to_ascii_lowercase()
 }
-pub fn default_jobs_limit() -> u64 {
-    20
-}
 
 impl ProofJobState {
     pub fn is_terminal(self) -> bool {
@@ -319,9 +316,6 @@ impl ScalePhase {
 impl ScaleStatus {
     pub fn pending(&self) -> bool {
         matches!(self.phase(), ScalePhase::Draining | ScalePhase::Starting)
-    }
-    pub fn target(&self) -> &Value {
-        &self.target
     }
     pub fn id(&self) -> &str {
         &self.id

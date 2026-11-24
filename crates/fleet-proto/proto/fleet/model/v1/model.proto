@@ -286,7 +286,6 @@ message NodeReport {
   // Exact durable shim allocations. Unready native reservations have no services;
   // service grants must never address a guessed host port.
   repeated RuntimeInstance runtime_instances = 14;
-  // Removed host-binary observations; runtime identity belongs to shim.
   reserved 15;
   reserved "native_provers";
   // The machine's processor and GPUs, detected once when the agent starts; absent on older agents.
@@ -476,13 +475,6 @@ message CreateTokenRequest {
   optional string namespace = 6;
   optional string tag = 7;
   repeated string permissions = 8;
-}
-
-message ProofJobsQuery {
-  optional string namespace = 1;
-  optional string tag = 2;
-  required bool active = 3;
-  required uint64 limit = 4;
 }
 
 message SubmitProofRequest {

@@ -11,16 +11,12 @@ use axum::{
 };
 use fleet_proto::artifacts::{self, is_safe_id};
 use fleet_proto::fleet::v1::ProofKind;
-pub use fleet_proto::sdk::{kind_for, SubmitProofRequest};
+use fleet_proto::sdk::{kind_for, SubmitProofRequest};
 use fleet_proto::stage::v1::Status as StageStatus;
 
 use crate::fleet::{now_ms, Scheduler};
 use crate::store::{normalize_address, App, ProofJob, ProofJobFilter, ProofJobState, Token};
-use crate::{token, workloads::WorkloadController};
-
-fn fail(status: u16, message: impl Into<String>) -> anyhow::Error {
-    crate::fleet::RequestRejection { status, message: message.into() }.into()
-}
+use crate::{token, workloads::{fail, WorkloadController}};
 
 /// `rest` is the path after `/apps/NAME/jobs`; the caller is granted `app`, in its namespace.
 #[allow(clippy::too_many_arguments)]
