@@ -2407,6 +2407,56 @@ async fn a_batch_update_is_checked_kept_by_the_scheduler_and_sent_to_its_nodes()
 }
 
 #[tokio::test]
+async fn a_batch_on_the_shim_places_its_jobs_only_where_the_shim_runs_batch_jobs() {
+    let (_dir,c,ns)=setup().await;
+    let mut batch=json!({"image":"t:1","namespace":ns,"priority":0,"user":null,"max_gpus":2,
+        "default_gpu_mem_gb":0,"shm_gb":16,"allow":[],"env":{},"disabled":false,"preemptible":true,
+        "min_runtime_s":0,"stop_timeout_s":30});
+    let mut report=inventory(&ns);
+    report.batches.insert("trainer".into(),batch.clone().into());
+    c.report("gpu","session",report.clone()).await.unwrap();
+    let path=format!("/batches/trainer/settings?namespace={ns}");
+    let on_shim=json!({"executor":"shim","driver":"docker"});
+    for bad in [json!("shim"),json!({"executor":"shim"}),json!({"executor":"shim","driver":"tee"}),json!({"executor":"legacy","driver":"docker"})] {
+        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":bad})).await.status(),StatusCode::BAD_REQUEST,"{bad}");
+    }
+    let owner=user_token(&c,&ns,0x7a,"scope=default",Some(vec!["trainer".into()]),true).await;
+    assert_eq!(scale_call(c.clone(),&owner,"PUT",&path,json!({"runtime":on_shim})).await.status(),StatusCode::FORBIDDEN);
+    let request=json!({"command":["true"],"gpus":0,"cpus":1});
+    let id=|job: Value| text(&job,"id").to_string();
+    let legacy=id(c.submit("trainer",request.clone(),None,&BTreeMap::new()).await.unwrap());
+    assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":on_shim})).await.status(),StatusCode::OK);
+    let shim=id(c.submit("trainer",request.clone(),None,&BTreeMap::new()).await.unwrap());
+    let job=|id: &str| c.job(id,None,&BTreeMap::new()).unwrap();
+    assert!(job(&legacy).policy["runtime"].is_null() && job(&shim).policy["runtime"]==on_shim,"a job keeps the runtime it was submitted with");
+    // The node's shim does not run batch jobs yet: only the job on the legacy executor goes there.
+    c.dispatch().await.unwrap();
+    assert_eq!((job(&legacy).worker.as_deref(),job(&shim).worker.as_deref()),(Some("gpu"),None));
+    assert_eq!(job(&shim).status["detail"],"waiting for a node whose shim runs batch jobs");
+    let written=fs::metadata(c.dir.join("jobs").join(format!("{shim}.json"))).unwrap().modified().unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(fs::metadata(c.dir.join("jobs").join(format!("{shim}.json"))).unwrap().modified().unwrap(),written,"a waiting job's record is written once");
+    batch["runtime"]=on_shim.clone();
+    report.batches.insert("trainer".into(),batch.into());
+    report.runtime_capabilities=vec!["shim-docker-v1".into(),"shim-batch-v1".into()];
+    c.report("gpu","session",report).await.unwrap();
+    c.dispatch().await.unwrap();
+    assert_eq!(job(&shim).worker.as_deref(),Some("gpu"));
+    let launch=command_where(&c,|cmd|cmd.operation==NodeOperation::LaunchJob as i32&&cmd.parameters["id"]==shim.as_str()).unwrap();
+    assert_eq!(launch.parameters["policy"]["runtime"],on_shim,"the node learns the runtime from the job's policy");
+    for back in [json!({"executor":"legacy"}),Value::Null] {
+        assert_eq!(scale_call(c.clone(),"admin","PUT",&path,json!({"runtime":back})).await.status(),StatusCode::OK);
+    }
+    assert!(c.inner.lock().apps["trainer"].spec["runtime"].is_null());
+    // A new batch takes it too, from an administrator.
+    let create=format!("/batches?namespace={ns}");
+    let new=|name: &str| json!({"name":name,"image":"t:1","runtime":on_shim});
+    assert_eq!(scale_call(c.clone(),&owner,"POST",&create,new("trainer")).await.status(),StatusCode::FORBIDDEN);
+    assert_eq!(scale_call(c.clone(),"admin","POST",&create,new("shimmed")).await.status(),StatusCode::CREATED);
+    assert_eq!(c.inner.lock().apps["shimmed"].spec["runtime"],on_shim);
+}
+
+#[tokio::test]
 async fn a_registered_app_update_changes_its_server() {
     let (_dir,c,ns)=setup().await;
     let elf="a".repeat(64);

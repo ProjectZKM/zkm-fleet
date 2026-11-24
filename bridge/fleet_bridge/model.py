@@ -283,10 +283,19 @@ class Batch(Record):
     min_runtime_s: int = 300
     # SIGTERM, then SIGKILL this much later: on cancel and on preemption (time to checkpoint).
     stop_timeout_s: int = 30
+    # What runs the batch's jobs: the bridge's own `docker run` (None or legacy), or the
+    # shim's Docker driver, as a run to completion.
+    runtime: RuntimeSelection | None = None
 
     def __post_init__(self) -> None:
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
+        if self.on_shim and self.runtime.driver != "docker":
+            raise ModelError("a batch runs on the legacy executor or on shim docker")
+
+    @property
+    def on_shim(self) -> bool:
+        return self.runtime is not None and self.runtime.executor is ExecutorKind.SHIM
 
 
 @dataclass(kw_only=True)

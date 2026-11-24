@@ -77,6 +77,11 @@ def container_gone(name: str) -> bool:
             or result.returncode != 0 and ("no such object" in result.stderr.lower() or "no such container" in result.stderr.lower()))
 
 
+def job_gone(jobs_dir: Path, ident: str) -> bool:
+    """Whether no container of a job runs, whichever executor ran it."""
+    return shim.JobRun(str(jobs_dir / ident)).gone() and container_gone(jobs.container_name(ident))
+
+
 def _entry(root: Any, section: str, name: str) -> Any:
     """The `apps` entry named `name`, or the `batches` value under key `name`."""
     node = next((v for k, v in root.value if k.value == section), None) if root else None
@@ -256,7 +261,7 @@ class NodeExecutor:
     def cleanup(self, job: jobs.JobDirectory) -> bool:
         # There is only one execution machine. A persisted old Ray IP must not
         # make local Docker cleanup depend on a vanished Ray node identity.
-        if jobs._going(job.id) or not container_gone(jobs.container_name(job.id)):
+        if jobs._going(job.id) or not job_gone(self.jobs_dir, job.id):
             return False
         jobs.discard_placement(job.id)
         return True
@@ -308,7 +313,7 @@ class NodeExecutor:
                     job = jobs.JobDirectory(str(self.jobs_dir), ident)
                     result = {"cleaned": self.cleanup(job)}
                 except (jobs.NotFound, FileNotFoundError):
-                    result = {"cleaned": not jobs._going(ident) and container_gone(jobs.container_name(ident))}
+                    result = {"cleaned": not jobs._going(ident) and job_gone(self.jobs_dir, ident)}
                 except BaseException:
                     pass
             log.exception("node command failed: %s", command["id"])
@@ -337,12 +342,17 @@ class NodeExecutor:
                 jobs.requeue_job(str(self.jobs_dir), ident)
             elif job.status().state.terminal or jobs._going(ident):
                 return {"id": ident, "lease": lease}
-            elif job.status().started_at is not None or not container_gone(jobs.container_name(ident)):
+            elif job.status().started_at is not None or not job_gone(self.jobs_dir, ident):
                 raise ValueError("execution is uncertain; refusing to relaunch")
         request = p["request"]
         if "code" in request:
             raise ValueError("job inputs must be prepared by the app owner in storage")
         policy = Batch.load(p["policy"])
+        cluster = None
+        if policy.on_shim:
+            cluster = shim.daemon_config(self.apps_file)
+            if shim.BATCH_CAPABILITY not in shim.capabilities(cluster):
+                raise ValueError("this node's shim does not run batch jobs")
         if policy.namespace != p["namespace"] or request.get("nodes", 1) != 1:
             raise ValueError("invalid local execution scope")
         directory.mkdir(parents=True, exist_ok=True)
@@ -384,7 +394,7 @@ class NodeExecutor:
             raise ValueError("local Ray capacity changed before launch")
         # Stable Ray actor name + get_if_exists makes heartbeat replay safe.
         try:
-            jobs.launch(spec, job.path)
+            jobs.launch(spec, job.path, cluster)
         except BaseException:
             if not jobs._going(ident):
                 job.update(state=JobState.FAILED, launch_pending=False, finished_at=time.time(), error="actor launch failed")
@@ -394,7 +404,7 @@ class NodeExecutor:
 
     def stop(self, p: dict[str, Any], preempt: bool) -> dict[str, Any]:
         if not (self.jobs_dir / p["id"]).exists():
-            if jobs._going(p["id"]) or not container_gone(jobs.container_name(p["id"])):
+            if jobs._going(p["id"]) or not job_gone(self.jobs_dir, p["id"]):
                 raise ValueError("execution exists without a local record")
             return {"cleaned": True, "state": "cancelled"}
         job = jobs.JobDirectory(str(self.jobs_dir), p["id"])
@@ -409,6 +419,7 @@ class NodeExecutor:
                 jobs.cancel(str(self.jobs_dir), p["id"])
         if not self.cleanup(job) and state.terminal:
             jobs._end_actors(job.id, job.status().nodes)
+            shim.JobRun(job.path).stop(job.spec().policy.stop_timeout_s)
             subprocess.run(["docker", "stop", "--time", str(job.spec().policy.stop_timeout_s), jobs.container_name(job.id)], capture_output=True, timeout=job.spec().policy.stop_timeout_s + 30)
         return {"cleaned": self.cleanup(job), "state": job.status().state.value}
 

@@ -159,6 +159,8 @@ fleetctl --token-file pi-owner.token --namespace pi batch add gpu-test \
   --image nvidia/cuda:12.8.0-base-ubuntu22.04 --priority 10
 # An administrator approves host storage and a runtime user before jobs mount it:
 fleetctl --namespace pi batch update gpu-test --allow /data/models --user 1000:1000
+# An administrator moves its jobs to the node's trusted-shim (new jobs; `legacy` moves back):
+fleetctl --namespace pi batch update gpu-test --runtime shim
 fleetctl --token-file pi-owner.token batch submit gpu-test --gpus 1 --cpus 2 \
   --mount /data/models:ro -- nvidia-smi
 fleetctl --token-file pi-owner.token batch gpu-test             # the batch and its newest jobs
