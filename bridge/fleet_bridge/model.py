@@ -683,6 +683,8 @@ class AppSpec(Record):
     service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
     ingress: dict[str, HttpIngress] = field(default_factory=dict)
     container_port: int | None = None
+    # A prover's own: `host` puts it on the host's network, listening on container_port itself.
+    network: str | None = None
     entrypoint: str | None = None
     namespace: str = "00000000000000000000000000000000"
     tag: str | None = None
@@ -805,6 +807,10 @@ class AppSpec(Record):
                 raise ModelError("packaged provers require an image and health port")
             if self.services or self.ingress or self.service_protocol is not ServiceProtocol.HTTP1:
                 raise ModelError("packaged SDK workers expose only a private HTTP health port")
+            if self.network not in (None, "host") or self.network and (self.port_base or self.replicas != 1):
+                raise ModelError("a prover's network is host: one replica, with port_base 0, listening on container_port itself")
+        elif self.network is not None:
+            raise ModelError("network is a setting of a prover on shim Docker")
         if type(self.priority) is not int or not -(2**31) <= self.priority < 2**31:
             raise ModelError("priority must be a signed 32-bit integer")
         if self.worker_command:

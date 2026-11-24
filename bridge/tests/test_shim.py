@@ -95,6 +95,25 @@ def test_packaged_prover_uses_shared_shim_lifecycle_and_explicit_manifest_inputs
             reconcile.load_apps(invalid)
 
 
+def test_a_prover_on_the_host_network_listens_on_its_own_port(tmp_path):
+    raw = config(tmp_path)
+    raw['apps'][0].update(kind="ziren-gpu", elf_id="a" * 64, proof_storage_root="/srv/proofs",
+        port_base=0, container_port=8080, network="host", command=["serve", "{port}"])
+    bound = shim.RuntimeBook(tmp_path / 'book').bind(
+        reconcile.replica_specs(reconcile.load_apps(raw))['web-0'], 'admitted-command')
+    request = shim.launch_request(bound, [])
+    options = request['driver_options']
+    # Nothing maps a port there, so the shim gets the one the prover listens on.
+    assert (options['network'], options['port'], 'container_port' in options) == ('host', 8080, False)
+    assert request['command'] == ['serve', '8080']
+    assert shim.HOST_NETWORK_CAPABILITY in shim.required_capabilities(bound)
+    for update in ({'network': 'none'}, {'port_base': 18080}, {'replicas': 2}, {'kind': 'app', 'elf_id': None}):
+        invalid = copy.deepcopy(raw)
+        invalid['apps'][0].update(update)
+        with pytest.raises(ValueError):
+            reconcile.load_apps(invalid)
+
+
 def test_tcp_service_uses_tcp_health_and_requires_new_capability(tmp_path, monkeypatch):
     from fleet_bridge.model import ServiceProtocol
     s = spec(tmp_path)

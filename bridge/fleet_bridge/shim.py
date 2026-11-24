@@ -48,6 +48,8 @@ LIMITS_CAPABILITY = "shim-limits-v1"
 CPU_SHARES_CAPABILITY = "shim-cpu-shares-v1"
 # A TEE node whose operator lets tenants that reserve no CPU share its VM.
 TEE_CPU_OVERCOMMIT_CAPABILITY = "shim-tee-cpu-overcommit-v1"
+# A node whose shim runs a container on the host's network.
+HOST_NETWORK_CAPABILITY = "shim-host-network-v1"
 # A node whose shim runs a batch job: a container without a network that ends with its
 # process, reports how it ended, keeps its output, and gets a batch's grace to stop.
 BATCH_CAPABILITY = "shim-batch-v1"
@@ -114,6 +116,7 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
             ("shim-single-use-ingress-v1", app.runtime.driver != "docker" and any(r.single_use for r in app.ingress.values())),
             (LIMITS_CAPABILITY, app.cpu_limit is not None or app.memory_limit_gb is not None),
             (CPU_SHARES_CAPABILITY, app.cpus == 0),
+            (HOST_NETWORK_CAPABILITY, app.network is not None),
             (TEE_CPU_OVERCOMMIT_CAPABILITY, app.cpus == 0 and app.runtime.driver in TEE_DRIVERS),
         ) if needed)
     return required
@@ -197,6 +200,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
             ("shim-management-v1", managed_network),
             (LIMITS_CAPABILITY, True),
             (CPU_SHARES_CAPABILITY, "runtime-cpu-shares-v1" in features),
+            (HOST_NETWORK_CAPABILITY, "docker" in value.get("drivers", []) and "runtime-network-v1" in features),
             (BATCH_CAPABILITY, "docker" in value.get("drivers", []) and all(f in features for f in BATCH_FEATURES)),
         ) if supported and local]
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
@@ -395,7 +399,9 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     app = spec.app
     if spec.execution is None or app.port_base is None or not app.image:
         raise ValueError("shim needs a persisted execution, image and port_base")
-    port = app.port_base + spec.index if app.port_base else 0
+    # On the host's network nothing maps a port: the container listens on its own.
+    host = app.network == "host"
+    port = app.container_port if host else app.port_base + spec.index if app.port_base else 0
     revision = spec.launch_revision
     # Explicit manifest substitution, shared by all containers. No credential
     # contents or worker-specific environment is injected into workloads.
@@ -435,7 +441,7 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
             "protocol": "http1" if name == "control" else app.service_protocol.value,
             "endpoint_ref": "control" if name == "control" else f"ingress:{name}" if name in app.ingress else "app"} for name in app.services],
         "driver_options": {"port": port,
-            **({"container_port": app.container_port} if app.container_port is not None else {}),
+            **({"network": "host"} if host else {"container_port": app.container_port} if app.container_port is not None else {}),
             **({"entrypoint": app.entrypoint} if app.entrypoint is not None else {}),
             **({"ingress": {name:{k:v for k,v in to_dict(rule).items() if k!="single_use" or v} for name,rule in app.ingress.items()}} if app.ingress else {}),
             "gpus": gpus, "volumes": volumes,
