@@ -146,7 +146,7 @@ message WorkerHeartbeatRequest {
   // A storage-only fleet-ziren-node handler is configured on this machine.
   bool proof_fetch_ready = 4;
   // Capacity, inventories, job leases/status and command acknowledgements only.
-  // Inputs, logs and outputs remain outside the heartbeat. Report version is 2.
+  // Inputs, logs and outputs remain outside the heartbeat. Report version is 3.
   fleet.model.v1.NodeReport report = 5;
   bool runtime_delivery_ready = 6;
 }

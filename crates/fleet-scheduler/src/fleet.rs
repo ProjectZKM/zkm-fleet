@@ -172,7 +172,7 @@ fn refuse(status: u16, message: String) -> anyhow::Error {
 }
 
 use fleet_proto::model::v1::AppAnchor;
-pub use fleet_proto::model::v1::{FleetStatus, NodeStatus};
+use fleet_proto::model::v1::{FleetStatus, NodeStatus};
 
 impl Scheduler {
     pub fn cluster_authorized(&self, header: Option<&str>) -> bool {
@@ -402,14 +402,11 @@ impl Scheduler {
         );
         tags.into_iter().collect()
     }
-    pub fn validate_tag(tag: &str) -> anyhow::Result<()> {
-        fleet_proto::models::validate_tag(tag)
-    }
     pub async fn set_tag_quota(&self, namespace: &str, tag: &str, quota: Quota,
     ) -> anyhow::Result<Namespace> {
         let _ops = self.quota_ops.lock().await;
         quota.validate()?;
-        if !tag.is_empty() { Self::validate_tag(tag)?; }
+        if !tag.is_empty() { fleet_proto::models::validate_tag(tag)?; }
         let mut n = self.namespace(namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
         self.store.set_tag_quota(&n.id,tag,&quota).await?;
         n.tag_quotas.insert(tag.into(),quota);
@@ -487,7 +484,7 @@ impl Scheduler {
             return Ok(crate::preemption::PreemptionPlan::impossible());
         }
         if let Some(tag) = request.tag.as_deref().filter(|tag| !tag.is_empty()) {
-            Self::validate_tag(tag).map_err(|e| refuse(400, e.to_string()))?;
+            fleet_proto::models::validate_tag(tag).map_err(|e| refuse(400, e.to_string()))?;
         }
         let tag_quota = namespace.tag_quotas.get(request.tag.as_deref().unwrap_or(""))
             .cloned().unwrap_or_default();
@@ -516,7 +513,7 @@ impl Scheduler {
     fn allocate(&self, a: Allocation, restore: bool) -> anyhow::Result<()> {
         a.validate().map_err(|e| refuse(400, e.to_string()))?;
         let n = self.namespace(&a.namespace).ok_or_else(|| refuse(404, "no such namespace".into()))?;
-        if let Some(tag) = &a.tag { Self::validate_tag(tag).map_err(|e|refuse(400,e.to_string()))?; }
+        if let Some(tag) = &a.tag { fleet_proto::models::validate_tag(tag).map_err(|e|refuse(400,e.to_string()))?; }
         let tag_quota = n.tag_quotas.get(a.tag.as_deref().unwrap_or("")).cloned().unwrap_or_default();
         let mut all = self.allocations.lock();
         if let Some(old) = all.get(&a.id) {
@@ -630,18 +627,13 @@ impl Scheduler {
         v
     }
 
-    pub fn token_for_id(&self, id: &str) -> Option<Token> {
-        self.tokens.lock().values().find(|t| t.id == id).cloned().filter(|t| self.token_active(t))
-    }
-
     pub fn token_for_token(&self, header: Option<&str>) -> Option<Token> {
         use sha2::Digest;
-        use subtle_eq::ConstantTimeEq;
         let token = header?.strip_prefix("Bearer ")?;
         if token.len() < 64 { return None; }
         let hash = hex::encode(sha2::Sha256::digest(token.as_bytes()));
         let c = self.tokens.lock().values()
-            .find(|c| c.token_hash.as_ref().is_some_and(|h| h.as_bytes().ct_eq(hash.as_bytes())))
+            .find(|c| c.token_hash.as_ref().is_some_and(|h| crate::token::equal(h.as_bytes(), hash.as_bytes())))
             .cloned()?;
         self.token_active(&c).then_some(c)
     }
@@ -700,7 +692,7 @@ impl Scheduler {
         };
         if let Some(tag) = &tag {
             anyhow::ensure!(namespace.is_some(), "tag requires namespace");
-            Self::validate_tag(tag)?;
+            fleet_proto::models::validate_tag(tag)?;
         }
         anyhow::ensure!(admin || namespace.is_some(), "a token needs a namespace, unless it is an administrator's");
         anyhow::ensure!(namespace.as_deref() != Some(crate::store::SYSTEM_NAMESPACE), "system namespace is reserved");
@@ -1494,13 +1486,13 @@ mod tests {
     fn new_tags_require_a_single_key_value_pair() {
         for tag in ["scope=default", "team=research", "network=Ethereum-mainnet", "build=1.2_3",
         ] {
-            assert!(Scheduler::validate_tag(tag).is_ok(), "{tag}");
+            assert!(fleet_proto::models::validate_tag(tag).is_ok(), "{tag}");
         }
         for tag in ["default", "", "=default", "scope=", "scope=a=b", "scope=a,b", "team=two words", "1key=value",
         ] {
-            assert!(Scheduler::validate_tag(tag).is_err(), "{tag}");
+            assert!(fleet_proto::models::validate_tag(tag).is_err(), "{tag}");
         }
-        assert!(Scheduler::validate_tag(&format!("key={}", "a".repeat(64))).is_err());
+        assert!(fleet_proto::models::validate_tag(&format!("key={}", "a".repeat(64))).is_err());
     }
 
     #[test]
@@ -1520,17 +1512,5 @@ mod tests {
         assert_eq!(c(tonic::Code::Unknown, "panicked"), ProofAttemptFailure::Prover);
         let gpu_gone = "Internal error: io error: CUDA RPC `prove_core_stateless` failed: error sending request for url (http://127.0.0.1:30101/twirp/api.ProverService/ProveCoreStateless)";
         assert_eq!(c(tonic::Code::Internal, gpu_gone), ProofAttemptFailure::NotStarted);
-    }
-}
-
-/// Constant-time comparison for keys and tokens.
-mod subtle_eq {
-    pub trait ConstantTimeEq {
-        fn ct_eq(&self, other: &Self) -> bool;
-    }
-    impl ConstantTimeEq for [u8] {
-        fn ct_eq(&self, other: &[u8]) -> bool {
-            self.len() == other.len() && self.iter().zip(other).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-        }
     }
 }

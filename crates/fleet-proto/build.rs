@@ -44,7 +44,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "AllocationRequest",
         "NamespaceSelector",
         "CreateTokenRequest",
-        "ProofJobsQuery",
         "RegisterAppRequest",
         "AppProof",
         "ScalePhase",
@@ -93,7 +92,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ScaleRequest",
         "CreateTokenRequest",
         "NamespaceSelector",
-        "ProofJobsQuery",
         "RegisterAppRequest",
         "AppProof",
         "SubmitProofRequest",
@@ -127,7 +125,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "CreateTokenRequest.permissions",
         "AppProof.backends",
         "Token.permissions",
-        "ProofJobsQuery.active",
         "ProofJobFilter.active",
         "PreemptionRequest.pins",
         "PreemptionRequest.free",
@@ -157,10 +154,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             ".fleet.model.v1.ScaleStatus.phase",
             "#[serde(with = \"crate::models::scale_phase\")]",
-        )
-        .field_attribute(
-            ".fleet.model.v1.ProofJobsQuery.limit",
-            "#[serde(default = \"crate::models::default_jobs_limit\")]",
         );
     build
         .type_attribute(".fleet.v1.ArtifactRef", "#[derive(serde::Serialize, serde::Deserialize)]",

@@ -1,8 +1,8 @@
 //! Wire types.
 //!
 //! `stage::v1` is a verbatim copy of the Ziren SDK's `stage.proto`, so the SDK's
-//! network prover (`ZKM_PROVER=network`) talks to the scheduler unchanged.
-//! `fleet::v1` is internal: scheduler <-> prover nodes.
+//! network prover (`ZKM_PROVER=network`) talks to an app's proof endpoint unchanged.
+//! `fleet::v1` is internal: scheduler <-> nodes.
 
 pub mod artifacts;
 pub mod json;
