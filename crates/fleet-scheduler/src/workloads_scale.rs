@@ -324,6 +324,20 @@ impl WorkloadController {
     }
 
     pub(super) async fn request_update(&self, namespace: &str, app: &str, node: Option<&str>, set: Value) -> anyhow::Result<Value> {
+        self.update(namespace, app, node, set, true).await
+    }
+
+    /// What `request_update` would answer or refuse, with nothing recorded and nothing sent
+    /// to a node: a way to learn whether an app's node takes new settings before the app
+    /// is drained for them.
+    pub(super) async fn check_update(&self, namespace: &str, app: &str, node: Option<&str>, set: Value) -> anyhow::Result<Value> {
+        let mut checked = self.update(namespace, app, node, set, false).await?;
+        checked["dry_run"] = json!(true);
+        checked["operation"] = Value::Null;
+        Ok(checked)
+    }
+
+    async fn update(&self, namespace: &str, app: &str, node: Option<&str>, set: Value, apply: bool) -> anyhow::Result<Value> {
         let _ops = self.ops.lock().await;
         let set = set.as_object().filter(|o| !o.is_empty()).cloned()
             .ok_or_else(|| fail(400, "set at least one setting"))?;
@@ -371,10 +385,12 @@ impl WorkloadController {
         let mut scale = new_scale(target, disabled);
         scale.set = Some(Value::Object(set).into());
         intent.scale = Some(scale);
-        // Persist the transition before changing admission or sending any command.
-        self.save("deployments", &key, &intent)?;
-        self.inner.lock().deployments.insert(key, intent.clone());
-        self.notify.notify_waiters();
+        if apply {
+            // Persist the transition before changing admission or sending any command.
+            self.save("deployments", &key, &intent)?;
+            self.inner.lock().deployments.insert(key, intent.clone());
+            self.notify.notify_waiters();
+        }
         Ok(self.scale_value(&intent))
     }
 

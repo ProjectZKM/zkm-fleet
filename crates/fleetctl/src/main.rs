@@ -136,6 +136,9 @@ enum AppCmd {
         #[arg(long)] shm_gb: Option<u32>,
         /// Select a machine agent when the app runs on several nodes.
         #[arg(long)] node: Option<String>,
+        /// Only check: say whether the scheduler and the app's node would take the settings,
+        /// and change nothing.
+        #[arg(long)] check: bool,
     },
     /// Show the last lines of an app's log, read from the node that runs it.
     Logs {
@@ -1118,12 +1121,17 @@ fn scale_app(name: &str, scale: Scale, node: Option<&str>, conn: &ConnectionOpti
 }
 
 /// Changes an app's settings; the scheduler drains and restarts it with them.
-fn update_app(name: &str, set: Value, node: Option<&str>, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
+fn update_app(name: &str, set: Value, node: Option<&str>, check: bool, conn: &ConnectionOptions, out: &OutputWriter) -> anyhow::Result<()> {
     if set.as_object().is_none_or(|o| o.is_empty()) { bail!("give at least one setting to change"); }
     let a = FleetClient::new(conn)?;
     let mut request = a.req(reqwest::Method::PUT, &format!("/apps/{name}/settings"));
     if let Some(node) = node { request = request.query(&[("node", node)]); }
+    if check { request = request.query(&[("dry_run", "true")]); }
     let v = a.send(request.json(&set))?;
+    if check {
+        out.done(&format!("{name}: {} takes these settings; nothing changed", v["node"].as_str().unwrap_or("?")), v);
+        return Ok(());
+    }
     out.done(&format!("{name}: {} — it drains and restarts with the new settings on {}",
         v["state"].as_str().unwrap_or("requested"), v["node"].as_str().unwrap_or("?")), v);
     Ok(())
@@ -1297,7 +1305,7 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Scale { name, gpus, cpus, replicas, node, cpu_limit, memory_limit_gb }) => return scale_app(name,
             Scale { gpus: *gpus, cpus: *cpus, replicas: *replicas, cpu_limit: *cpu_limit, memory_limit_gb: *memory_limit_gb },
             node.as_deref(), &p.conn, out),
-        Some(AppCmd::Update { name, settings, image, env, shm_gb, node }) => {
+        Some(AppCmd::Update { name, settings, image, env, shm_gb, node, check }) => {
             let mut set = match settings {
                 Some(path) => serde_json::from_slice(&std::fs::read(path)?)?,
                 None => json!({}),
@@ -1305,7 +1313,7 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
             if let Some(v) = image { set["image"] = json!(v); }
             if !env.is_empty() { set["env"] = env_map(env)?; }
             if let Some(v) = shm_gb { set["shm_gb"] = json!(v); }
-            return update_app(name, set, node.as_deref(), &p.conn, out);
+            return update_app(name, set, node.as_deref(), *check, &p.conn, out);
         }
         None => {}
     }
