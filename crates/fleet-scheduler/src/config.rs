@@ -23,6 +23,10 @@ pub struct SchedulerConfig {
     /// A node that has not sent a heartbeat for this long is dropped.
     #[serde(default = "default_node_stale_secs")]
     pub node_stale_secs: u64,
+    /// How long a router access policy outlives its app or batch before it is retired. It
+    /// leaves time to set a policy before creating the app it is for.
+    #[serde(default = "default_router_policy_grace_secs")]
+    pub router_policy_grace_secs: u64,
     /// Attempts per job, the first one included; a retry avoids the nodes that failed it.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
@@ -126,6 +130,9 @@ fn default_http_addr() -> String {
 }
 fn default_heartbeat_secs() -> u32 {
     5
+}
+fn default_router_policy_grace_secs() -> u64 {
+    600
 }
 fn default_node_stale_secs() -> u64 {
     20

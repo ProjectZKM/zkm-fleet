@@ -524,6 +524,66 @@ async fn delegate_logouts_expire_beyond_signed_grants_and_never_fill_the_permane
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn policies_of_workloads_that_no_longer_exist_are_retired_under_a_version_floor() {
+    use serde_json::{json, Value};
+    // Without the setting, a policy outlives its workload by ten minutes.
+    for (setting, retires) in [("router_policy_grace_secs: 0", true), ("", false)] {
+        let h = start_with(setting).await;
+        let ns: Value = h.client.get(format!("{}/namespaces/{PROOFS}", h.http))
+            .bearer_auth(&h.admin).send().await.unwrap().json().await.unwrap();
+        let ns = ns["id"].as_str().unwrap();
+        let sync_token = "ac".repeat(48);
+        h.client.post(format!("{}/tokens", h.http)).bearer_auth(&h.admin)
+            .json(&json!({"id":"ac".repeat(16),"address":"ac".repeat(20),"namespace":PROOFS,
+                "permissions":["router_sync"],"token_hash":hex::encode(sha2::Sha256::digest(sync_token.as_bytes()))}))
+            .send().await.unwrap().error_for_status().unwrap();
+        let base = format!("{}/routers/retiring", h.http);
+        h.client.put(&base).bearer_auth(&h.admin).json(&json!({"issuer":"gateway","token_id":"ac".repeat(16)}))
+            .send().await.unwrap().error_for_status().unwrap();
+        let older = "scoped-revocations-v1,revocation-compaction-v1,revocation-expiry-v1";
+        let all = format!("{older},policy-retirement-v1");
+        let poll = |capabilities: &str, epoch: &Value, applied: Value| h.client.post(format!("{base}/sync"))
+            .bearer_auth(&sync_token).header("x-fleet-router-capabilities", capabilities)
+            .json(&json!({"epoch":epoch,"after_revision":0,"applied_revision":null,"applied_authorization_revision":applied}));
+        let first: Value = poll(&all, &Value::Null, Value::Null).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let epoch = &first["epoch"];
+        let live = app_of(b"elf-one");
+        let policy = |workload: &str, version: u64, sha: &str, enabled: bool| json!({"namespace":ns,"workload":workload,
+            "service":"control","version":version,"sha256":sha.repeat(32),"enabled":enabled});
+        let put = |body: Value| h.client.put(format!("{base}/access-policy")).bearer_auth(&h.admin).json(&body);
+        for body in [policy(&live, 1, "ab", true), policy("gone-agent", 3, "ab", true), policy("denied-agent", 2, "ab", false)] {
+            put(body).send().await.unwrap().error_for_status().unwrap();
+        }
+        let workloads = |state: &Value| state["authorization"]["policies"].as_array().unwrap().iter()
+            .map(|p| p["workload"].as_str().unwrap().to_owned()).collect::<Vec<_>>();
+        // A relay that has not applied the current revision may have missed a change.
+        let delivered: Value = poll(&all, epoch, Value::Null).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!(workloads(&delivered).len(), 3);
+        let revision = delivered["authorization"]["revision"].as_u64().unwrap();
+        let caught_up: Value = poll(&all, epoch, json!(revision)).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        if !retires {
+            assert_eq!(workloads(&caught_up).len(), 3);
+            assert!(caught_up["authorization"]["retired_policy_version"].is_null());
+            continue;
+        }
+        // The app that exists keeps its policy, and so does the denial.
+        assert_eq!(workloads(&caught_up), [live.as_str(), "denied-agent"]);
+        assert_eq!(caught_up["authorization"]["retired_policy_version"], 3);
+        assert_eq!(caught_up["authorization"]["revision"], revision + 1);
+        // A policy for the name again is stored above the floor, whatever version is asked for.
+        let version = |auth: &Value| auth["policies"].as_array().unwrap().iter()
+            .find(|p| p["workload"] == "gone-agent").unwrap()["version"].as_u64().unwrap();
+        let again: Value = put(policy("gone-agent", 1, "ab", true)).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        let same: Value = put(policy("gone-agent", 1, "ab", true)).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+        assert_eq!((version(&again), version(&same), &same["revision"]), (4, 4, &again["revision"]));
+        assert_eq!(put(policy("gone-agent", 1, "cd", true)).send().await.unwrap().status(), 409);
+        // A relay that cannot parse a floor is never handed one.
+        assert_eq!(poll(older, epoch, Value::Null).send().await.unwrap().status(), 409);
+        poll(&all, epoch, Value::Null).send().await.unwrap().error_for_status().unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_control_scopes_snapshots_deltas_acknowledgment_and_rotation() {
     use serde_json::json;
     let h = start().await;

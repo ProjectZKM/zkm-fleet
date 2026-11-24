@@ -6,6 +6,7 @@ data_dir: /var/lib/zkm-fleet
 heartbeat_secs: 5
 node_stale_secs: 20
 max_attempts: 2
+# router_policy_grace_secs: 600   # how long a router access policy outlives its app or batch
 # Nodes' shared secret. Every other caller has a token from the database: the first
 # administrator's comes from `fleet-scheduler -c fleet.yaml issue-admin --label NAME --out FILE`.
 cluster_token_file: /etc/zkm-fleet/cluster.token

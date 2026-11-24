@@ -43,6 +43,8 @@ pub const ROUTER_NAMESPACE_RECORDS: usize = 64;
 /// A relay accepting delegate denials that expire once no grant signed before
 /// them can still be valid.
 pub const ROUTER_REVOCATION_EXPIRY: &str = "revocation-expiry-v1";
+/// A relay accepting the removal of an enabled policy that a retirement floor covers.
+pub const ROUTER_POLICY_RETIREMENT: &str = "policy-retirement-v1";
 /// The relay's longest grant lifetime plus clock margin between Fleet and relays.
 pub const DELEGATE_REVOCATION_RETENTION_SECS: u64 = 3600 + 900;
 /// Fleet drops an expired denial only this long after it expired, so a relay
@@ -114,6 +116,7 @@ impl RouterAuthorization {
         let expiring = self.revoked_subjects.iter().filter(|r| r.expires_at.is_some()).count();
         anyhow::ensure!(self.revision > 0 && self.policies.len() + self.revoked_subjects.len() - expiring <= MAX_ROUTER_AUTHORIZATION_RECORDS
             && expiring <= MAX_ROUTER_EXPIRING_REVOCATIONS, "authorization state capacity exceeded");
+        anyhow::ensure!(self.retired_policy_version != Some(0), "invalid retirement floor");
         let mut policies = std::collections::HashSet::new();
         for p in &self.policies {
             p.validate()?;
@@ -159,6 +162,32 @@ impl RouterAuthorization {
         anyhow::ensure!(expiring().filter(|r| r.namespace == changed).count() <= ROUTER_NAMESPACE_EXPIRING_REVOCATIONS
             && expiring().count() <= MAX_ROUTER_EXPIRING_REVOCATIONS, "namespace revocation capacity exceeded");
         Ok(())
+    }
+
+    /// Removes the enabled exact policies `gone` selects and raises the retirement floor
+    /// over their versions. The caller commits the result as a new revision. A disabled
+    /// policy stays: it is what keeps its namespace's default from applying to a workload.
+    pub fn retire(&mut self, gone: impl Fn(&RouterAccessPolicy) -> bool) -> bool {
+        let before = self.policies.len();
+        let mut floor = self.retired_policy_version;
+        self.policies.retain(|p| {
+            let retired = p.enabled && p.workload != "*" && gone(p);
+            if retired {
+                floor = floor.max(Some(p.version));
+            }
+            !retired
+        });
+        self.retired_policy_version = floor;
+        self.policies.len() != before
+    }
+
+    /// The version a policy added now gets: the requested one, raised above every retired
+    /// policy's. None when no version is left.
+    pub fn new_policy_version(&self, requested: u64) -> Option<u64> {
+        match self.retired_policy_version {
+            Some(floor) => floor.checked_add(1).map(|above| above.max(requested)),
+            None => Some(requested),
+        }
     }
 
     /// Drop delegate denials that expired at least the grace period ago. The
@@ -750,7 +779,7 @@ mod tests {
     #[test]
     fn namespace_capacity_and_scoped_revocations_preserve_operator_control() {
         let ns = "ab".repeat(16);
-        let mut auth = RouterAuthorization { revision:1, policies:vec![], revoked_subjects:vec![] };
+        let mut auth = RouterAuthorization { revision:1, ..Default::default() };
         for n in 0..ROUTER_NAMESPACE_RECORDS {
             auth.policies.push(RouterAccessPolicy {namespace:ns.clone(),workload:format!("app-{n}"),
                 service:"control".into(),version:1,sha256:"12".repeat(32),enabled:true});
@@ -768,6 +797,31 @@ mod tests {
         assert!(auth.authorize(&request).is_err());
         other.namespace = ns.clone(); other.workload = "overflow".into(); auth.policies.push(other);
         assert!(auth.validate_namespace_capacity(&ns).is_err());
+    }
+
+    #[test]
+    fn retiring_removes_enabled_exact_policies_and_later_ones_start_above_them() {
+        let policy = |workload: &str, version, enabled| RouterAccessPolicy {namespace:"ab".repeat(16),workload:workload.into(),
+            service:"chat".into(),version,sha256:"cd".repeat(32),enabled};
+        let mut auth = RouterAuthorization {revision:1,
+            policies:vec![policy("gone",3,true),policy("denied",7,false),policy("*",9,true),policy("kept",1,true)],..Default::default()};
+        auth.validate().unwrap();
+        assert!(serde_json::to_value(&auth).unwrap().get("retired_policy_version").is_none());
+        assert_eq!(auth.new_policy_version(1), Some(1));
+        assert!(!auth.retire(|p| p.workload == "nothing") && auth.retired_policy_version.is_none());
+        // A denial and a namespace default stay, whatever selects them.
+        assert!(auth.retire(|p| p.workload != "kept"));
+        assert_eq!(auth.policies.iter().map(|p| p.workload.as_str()).collect::<Vec<_>>(), ["denied","*","kept"]);
+        assert_eq!(auth.retired_policy_version, Some(3));
+        assert_eq!(serde_json::to_value(&auth).unwrap()["retired_policy_version"], 3);
+        assert_eq!((auth.new_policy_version(1), auth.new_policy_version(9)), (Some(4), Some(9)));
+        // The floor only rises.
+        auth.policies.push(policy("low",2,true));
+        assert!(auth.retire(|p| p.workload == "low"));
+        assert_eq!(auth.retired_policy_version, Some(3));
+        auth.validate().unwrap();
+        auth.retired_policy_version = Some(u64::MAX);
+        assert_eq!(auth.new_policy_version(1), None);
     }
 
     #[test]
@@ -789,7 +843,7 @@ mod tests {
     fn namespace_service_defaults_never_override_exact_denials_or_cross_namespaces() {
         let policy = RouterAccessPolicy { namespace:"ab".repeat(16),workload:"*".into(),service:"chat".into(),
             version:1,sha256:"cd".repeat(32),enabled:true };
-        let mut auth=RouterAuthorization {revision:1,policies:vec![policy.clone()],revoked_subjects:vec![]};
+        let mut auth=RouterAuthorization {revision:1,policies:vec![policy.clone()],..Default::default()};
         auth.validate().unwrap();
         let mut request=RouterAuthorizeRequest {namespace:policy.namespace.clone(),workload:"new-agent".into(),service:"chat".into(),
             principal:"12".repeat(32),session:"34".repeat(32)};
@@ -919,7 +973,7 @@ mod tests {
         assert!(operator.validate().is_err() && denial(1, Some(0)).validate().is_err());
         denial(1, Some(10)).validate().unwrap();
         // Dropped only a grace period after expiry; permanent denials stay.
-        let mut auth = RouterAuthorization {revision:1,policies:vec![],revoked_subjects:vec![denial(1, Some(100)), denial(2, None)]};
+        let mut auth = RouterAuthorization {revision:1,policies:vec![],revoked_subjects:vec![denial(1, Some(100)), denial(2, None)],..Default::default()};
         assert!(!auth.drop_expired(100 + REVOCATION_EXPIRY_GRACE_SECS - 1));
         assert!(auth.drop_expired(100 + REVOCATION_EXPIRY_GRACE_SECS));
         assert_eq!(auth.revoked_subjects, [denial(2, None)]);
