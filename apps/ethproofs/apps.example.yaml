@@ -1,5 +1,6 @@
 # Merge this entry into the selected machine's existing apps.yaml.
-# The image holds the GPU server and the worker (deploy/images/gpu-worker).
+# The GPU image runs the worker too: the package is mounted in, and its gpu-worker
+# script (apps/gpu-worker.sh) is the container's entrypoint.
 apps:
   - name: ethproofs                    # the namespace app (fleetctl app add ethproofs --spec ...)
     kind: app
@@ -10,17 +11,17 @@ apps:
     gpus: 4
     cpus: 48
     shm_gb: 64
-    image: REPLACE_WITH_WORKER_IMAGE
+    image: ghcr.io/projectzkm/ziren-gpu@sha256:d4b8ef78d59935d024c034f11f28c26718a1890181f42be2954f31b74e252655
+    entrypoint: /opt/zkm-fleet/apps/ethproofs/gpu-worker
     runtime: {executor: shim, driver: docker}
     port_base: 0                       # the shim picks the loopback port
     container_port: 8080               # the entrypoint's health endpoint
-    health_path: /healthz
     user: "1000:1000"                  # the account that owns the state directory
-    workdir: /srv/zkm-fleet/apps/ethproofs
+    workdir: /srv/zkm-fleet/apps/ethproofs   # the worker reads its private .env here
     stop_timeout_s: 120                # the worker's time to finish its proof on a stop
     volumes:                           # mounted at the same path inside
       - /srv/zkm-fleet/apps/ethproofs
-      - /etc/zkm-fleet/ethproofs-worker.env:ro
+      - /opt/zkm-fleet/apps/ethproofs:ro
     command:
       - /opt/zkm-fleet/apps/ethproofs/eth-proofs
       - --eth-proofs-cluster-id
@@ -32,8 +33,7 @@ apps:
       - --prepare-concurrency
       - "1"
     env:
-      # The worker's: its private file, its threads and its identity.
-      WORKER_ENV_FILE: /etc/zkm-fleet/ethproofs-worker.env
+      # The worker's: its threads and its identity.
       WORKER_THREADS: "{cpu_count}"
       FLEET_NODE_NAME: "{name}"
       FLEET_WORKER_ROLE: app
