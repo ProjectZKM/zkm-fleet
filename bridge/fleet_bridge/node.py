@@ -148,10 +148,15 @@ def _is_content(line: str) -> bool:
     return bool(line.strip()) and not line.lstrip().startswith("#")
 
 
+# How many removal backups a configuration file keeps beside it; each is the whole file.
+REMOVAL_BACKUPS = 5
+
+
 def remove_entry(path: Path, section: str, name: str) -> bool:
     """Removes one `apps` entry or `batches` key from a configuration file and keeps
     every other line as written, with the comment lines directly above the entry. The
-    previous file stays as <file>.removed-<UTC time>. False when there is no such entry."""
+    previous file stays as <file>.removed-<UTC time>, the newest REMOVAL_BACKUPS of them.
+    False when there is no such entry."""
     text = path.read_text()
     root = yaml.compose(text)
     node = next((v for k, v in root.value if k.value == section), None) if root else None
@@ -189,6 +194,9 @@ def remove_entry(path: Path, section: str, name: str) -> bool:
         remaining = remaining[:key.end_mark.index] + (": []" if isinstance(node, yaml.SequenceNode) else ": {}") + remaining[line_end:]
     shutil.copy2(path, path.with_name(f"{path.name}.removed-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"))
     _replace(path, remaining)
+    backup = re.compile(re.escape(path.name) + r"\.removed-\d{8}T\d{6}Z")
+    for old in sorted(p for p in path.parent.iterdir() if backup.fullmatch(p.name))[:-REMOVAL_BACKUPS]:
+        old.unlink(missing_ok=True)
     return True
 
 
