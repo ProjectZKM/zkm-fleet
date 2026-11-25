@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1420" viewBox="0 0 1600 1420" role="img" aria-labelledby="title desc">
 <title id="title">Fleet architecture: control host, data router and execution machines</title>
-<desc id="desc">Operators, SDK clients and automation reach the control host over authenticated HTTPS on port 8905. The control host is one Docker Compose project: an Envoy HTTPS gateway, the scheduler and workload controller with Postgres, and the optional MCP server, OpenShell gateway and Trustee Attestation Service as Compose profiles. The scheduler embeds optional Rail policy evaluation, whose proofs come from a remote proof network or guest. The OpenShell gateway talks to the scheduler over a private compute socket and serves mTLS on host port 17670, loopback by default. Trustee AS is reached only through the gateway's attestation route. The data router is a separate deployment with its own server and Compose project; clients reach apps' declared services through it. Each execution machine runs the fleet-node agent and its own local Ray with the bridge, supervised by systemd or the cron watchdog; every app replica and batch job runs in a container of the trusted-shim runtime, which runs as its own service beside an optional Chisel tunnel helper; app ports are published only on node loopback. Nodes connect outward only: HTTP/2 heartbeats to the control host on port 8905, and HTTPS or WSS to the data router. Workers read and write application-owned storage directly.</desc>
+<desc id="desc">Operators, SDK clients and automation reach the control host over authenticated HTTPS on port 8905. The control host is one Docker Compose project: an Envoy HTTPS gateway, the scheduler and workload controller with Postgres, and the optional MCP server, OpenShell gateway and Trustee Attestation Service as Compose profiles. The scheduler embeds optional Rail policy evaluation, whose proofs come from a remote proof network or guest. The OpenShell gateway talks to the scheduler over a private compute socket and serves mTLS on host port 17670, loopback by default. Trustee AS is reached only through the gateway's attestation route. The data router is a separate deployment with its own server and Compose project; clients reach apps' declared services through it. Each execution machine runs the fleet-node agent and its own local Ray with the bridge, supervised by systemd or the cron watchdog; the agent hands every app replica and batch job to the trusted-shim runtime, which runs it as a container on its Docker, OpenShell, TEE or TEE-simulation driver; the shim runs as its own service beside an optional Chisel tunnel helper, and app ports are published only on node loopback. Nodes connect outward only: HTTP/2 heartbeats to the control host on port 8905, and HTTPS or WSS to the data router. Workers read and write application-owned storage directly.</desc>
 <defs>
 <marker id="control" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#64748b"/></marker>
 <marker id="data" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#2563eb"/></marker>
@@ -113,38 +113,36 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="62" y="835" class="name">Execution machines</text>
 <text x="320" y="835" class="small">A … N: each runs these components with its own local Ray</text>
 
-<rect x="62" y="855" width="680" height="100" rx="10" class="box"/>
+<rect x="62" y="855" width="680" height="90" rx="10" class="box"/>
 <text x="82" y="887" class="name">fleet-node agent + local Ray + bridge</text>
-<text x="82" y="915" class="small">Apply commands · reserve resources · launch replicas and jobs · report availability</text>
-<text x="82" y="941" class="small">Supervised by systemd units (node, Ray) or the cron watchdog</text>
-<path d="M222 955V985 M582 955V985" class="data"/>
-<rect x="62" y="985" width="320" height="110" rx="10" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
-<text x="82" y="1018" class="name">Apps</text>
-<text x="82" y="1048" class="detail">Long-running replicas</text>
-<text x="82" y="1076" class="small">Shim containers · serving · proving</text>
-<rect x="422" y="985" width="320" height="110" rx="10" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.5"/>
-<text x="442" y="1018" class="name">Batch jobs</text>
-<text x="442" y="1048" class="detail">Finite commands · queued jobs</text>
-<text x="442" y="1076" class="small">Run to completion · release on cleanup</text>
+<text x="82" y="914" class="small">Applies commands · reserves Ray resources · reports availability</text>
+<text x="82" y="936" class="small">Supervised by systemd units (node, Ray) or the cron watchdog</text>
+<path d="M742 900H782" class="data"/>
+<rect x="782" y="855" width="420" height="90" rx="10" class="box"/>
+<text x="802" y="887" class="name">trusted-shim runtime</text>
+<text x="802" y="914" class="small">Own systemd service (zkm-fleet-shim)</text>
+<text x="802" y="936" class="small">Keeps running through agent upgrades</text>
+<rect x="1232" y="855" width="290" height="90" rx="10" class="opt"/>
+<text x="1252" y="887" class="name">Chisel tunnel helper</text>
+<text x="1252" y="914" class="small">Optional · beside the shim</text>
+<text x="1252" y="936" class="small">Carries router streams</text>
 
-<rect x="782" y="855" width="740" height="240" rx="12" fill="#f0fdfa" stroke="#2dd4bf" stroke-width="1.5"/>
-<text x="802" y="882" class="label">Trusted shim <tspan class="small" font-weight="400">· runs every app replica and batch job</tspan></text>
-<path d="M742 930H802" class="data"/>
-<rect x="802" y="897" width="380" height="88" rx="10" class="box"/>
-<text x="822" y="927" class="name">trusted-shim runtime</text>
-<text x="822" y="953" class="small">Own systemd service (zkm-fleet-shim)</text>
-<text x="822" y="976" class="small">Keeps running through agent upgrades</text>
-<rect x="1212" y="897" width="290" height="88" rx="10" class="opt"/>
-<text x="1232" y="927" class="name">Chisel tunnel helper</text>
-<text x="1232" y="953" class="small">Optional · beside the shim</text>
-<text x="1232" y="976" class="small">Carries router streams</text>
-<path d="M992 985V1010 M1357 985V1010" class="data"/>
-<rect x="802" y="1010" width="700" height="70" rx="10" fill="#ecfeff" stroke="#67e8f9" stroke-width="1.5"/>
-<text x="822" y="1040" class="name">App and job containers</text>
-<text x="822" y="1066" class="small">Docker, OpenShell or TEE driver · ports on node loopback · services via the data router</text>
+<!-- Every app replica and batch job is a container of the shim. -->
+<path d="M992 945V972" class="data"/>
+<path d="M1377 945V972" class="svc"/>
+<rect x="62" y="972" width="1460" height="131" rx="12" fill="#f0fdfa" stroke="#2dd4bf" stroke-width="1.5"/>
+<text x="82" y="995" class="label">Shim containers <tspan class="small" font-weight="400">· every app replica and batch job runs in one, on the Docker, OpenShell, TEE or TEE-simulation driver</tspan></text>
+<rect x="82" y="1005" width="700" height="88" rx="10" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
+<text x="102" y="1033" class="name">Apps</text>
+<text x="102" y="1059" class="detail">Long-running replicas · serving · proving</text>
+<text x="102" y="1083" class="small">Ports on node loopback · services reached through the data router</text>
+<rect x="812" y="1005" width="690" height="88" rx="10" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.5"/>
+<text x="832" y="1033" class="name">Batch jobs</text>
+<text x="832" y="1059" class="detail">Finite commands · queued jobs</text>
+<text x="832" y="1083" class="small">A fresh container per attempt · resources released on cleanup</text>
 
 <rect x="62" y="1115" width="1460" height="45" rx="10" class="box"/>
-<text x="82" y="1145" class="detail">Shared CPU / GPU pool · Ray reservations for every app replica and batch job</text>
+<text x="82" y="1145" class="detail">Shared CPU / GPU pool · Ray reserves CPUs, GPUs and memory for every app replica and batch job</text>
 
 <!-- Nodes connect outward only: heartbeats to the control host, service tunnels to the data router. -->
 <path d="M300 700V855" class="control"/>
@@ -160,5 +158,5 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="1080" y="1286" class="small">Workers read / write directly</text>
 <text x="40" y="1350" class="small">Apps expose application-specific endpoints or run their own pipelines. SDK proof requests may use the Fleet gateway.</text>
 <text x="40" y="1378" class="small">Dashed gray: node control + metadata. Blue: requests + commands. Orange: app service traffic. Green: worker data access.</text>
-<text x="40" y="1406" class="small">Dashed outline: optional. Each batch runs on one machine; machines use separate Ray runtimes.</text>
+<text x="40" y="1406" class="small">Dashed outline: optional. Each batch job runs on one machine; machines use separate Ray runtimes.</text>
 </svg>
