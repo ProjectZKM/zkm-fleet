@@ -23,6 +23,8 @@ deployments and controllers, without Kubernetes.
 
 ![Fleet architecture: control host, data router and execution machines](images/diagram.svg)
 
+The numbers in the diagram match these steps.
+
 1. **Clients** (`fleetctl`, the proof SDK, the HTTP API, optional MCP) call the control
    host over authenticated HTTPS on port 8905.
 2. **The scheduler** admits work against quotas and priority, picks a node with room and
@@ -79,19 +81,6 @@ Both run their worker beside a Ziren GPU server in the stock GPU image, with
   SNP and sample profiles use the optional Trustee AS
   ([TEE runtimes](docs/reference.md#node-configured-tee-runtimes)). Docker workloads are
   not attested.
-
-## Releases
-
-Each `vX.Y.Z` release publishes `zkm-fleet-X.Y.Z-linux-x86_64.tar.gz` with its SHA-256:
-the binaries, trusted-shim and its tunnel helper, the bridge and the deploy scripts.
-`deploy/fleet-ctl.sh` installs and upgrades from it; upgrade the scheduler first, then
-each node ([maintenance](docs/maintenance.md#upgrading)).
-
-GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}` with
-release versions and `sha-<full-commit>` tags. The OpenShell gateway image is
-`zkm-fleet-openshell:<upstream-revision>`, and `fleet-ctl.sh openshell up` pins its
-digest. A node still needs the release package, which carries the shim, the bridge and
-the scripts.
 
 ## Get started
 
