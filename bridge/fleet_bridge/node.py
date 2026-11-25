@@ -298,9 +298,10 @@ class NodeExecutor:
                     result = self.stop(params, preempt=operation == 3)
                 elif operation == 4:
                     with self.apps_lock:
-                        result, start = self.admit_app(params, command["id"])
-                    # A start waits until its replicas are ready; other apps' changes needn't.
-                    start()
+                        result, then = self.admit_app(params, command["id"])
+                    # A stop waits out its replicas' stop grace and a start until they are
+                    # ready; other apps' changes needn't wait for either.
+                    then()
                 elif operation == 7:
                     with self.apps_lock:
                         result, then = self.app(params)
@@ -434,8 +435,9 @@ class NodeExecutor:
 
     def admit_app(self, p: dict[str, Any], command_id: str | None = None) -> tuple[dict[str, Any], Any]:
         """`set_app` in two parts: what is checked and changed against the node's
-        configuration and its running replicas, and a function that starts the replicas
-        admitted here and returns once they are ready. A stop is done by the first part."""
+        configuration and its running replicas, and a function, run after the
+        configuration lock, that stops the replicas the change leaves (all of them for a
+        disable) and starts the ones admitted here, returning once they are gone and ready."""
         if len(alive_nodes()) != 1:
             raise ValueError("Ray must contain only this machine")
         app = p["app"]
@@ -453,8 +455,8 @@ class NodeExecutor:
         running = [n for n in reconcile.running()
                    if n.rpartition("-")[0] == configured.name and n.rpartition("-")[2].isdigit()]
         if p["disabled"]:
-            self._remove_replicas(sorted(set(running) | {f"{configured.name}-{i}" for i in range(configured.replicas)}))
-            return {"cleaned": True, "disabled": True}, lambda: None
+            stopped = sorted(set(running) | {f"{configured.name}-{i}" for i in range(configured.replicas)})
+            return {"cleaned": True, "disabled": True}, lambda: self._remove_replicas(stopped)
         if configured.disabled:
             raise ValueError(f"{configured.name} is disabled in apps.yaml")
         cfg.validate_launch(configured)
@@ -464,7 +466,7 @@ class NodeExecutor:
             if configured.cpu_limit > total + 1e-9:
                 raise ValueError(f"cpu_limit {configured.cpu_limit} exceeds this TEE node's {total} CPUs, its confidential VM's")
         replicas = [s for s in reconcile.replica_specs(cfg).values() if s.app.name == configured.name]
-        self._remove_replicas([n for n in running if n not in {s.name for s in replicas}])
+        beyond = [n for n in running if n not in {s.name for s in replicas}]
         existing = reconcile.running()
         capabilities = None
         admitted = []
@@ -482,6 +484,7 @@ class NodeExecutor:
             admitted.append(self.runtimes.bind(spec, command_id))
 
         def start() -> None:
+            self._remove_replicas(beyond)
             names = {spec.name for spec in admitted}
             with self.lock:
                 self.starting |= names
