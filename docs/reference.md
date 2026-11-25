@@ -795,6 +795,46 @@ stream; four execs per scheduler. Every call gets a fresh upstream `request_id`,
 so a transport retry never relaunches a command. A stream that ends without an
 exit status reports unavailable, not success.
 
+**An app's policy.** An app's owner can hand that whole flow to the scheduler:
+`PUT /apps/NAME/policy` (or `policy` in the app's `POST /apps`) stores what the
+scheduler launches each of the app's replicas with, and takes the owner's own
+namespace token:
+
+| Field | Meaning |
+| --- | --- |
+| `policy` | The Rail policy bundle, with its digest in `policy.sha256` |
+| `context` | The authoritative context object the policy is evaluated with |
+| `native_policy_base64` | The stock `SandboxPolicy` protobuf the sandbox runs under |
+| `principal` | Whom the owner starts the app for; it is the request's principal |
+| `cost` | What each start draws from the namespace's policy budget; at least 1 |
+| `state_root` | Optional 64-hex state root; all zeros when omitted |
+
+For every reservation a node reports for the app, and again for each new
+generation (a restart, a reschedule, a settings update), the scheduler activates
+the policy for that exact execution, prepares the launch from the entry Fleet
+admitted and the devices Ray granted, and submits the create to the stock gateway
+in the namespace's workspace. Steps 4 to 6 above then run as they do for a
+caller's own submission, with one proof per generation. An attempt that fails is
+tried again, after 2 s doubling to 60 s, for as long as the node reports the
+reservation.
+
+- The launches draw from the budget `namespace:<namespace ID>`. An administrator
+  sets its allowance with `PUT /policy/budgets`; until then the ledger takes no
+  activation and nothing is submitted.
+- It needs the scheduler's `gateway` settings, and an entry on the `openshell`
+  driver or one with `access_policy_sha256` on the `docker` driver. That hash
+  names the native rules the entry admits: `POST /apps` with a `policy` fills it
+  in from the policy's, and a policy with other native rules is refused. A TEE
+  driver's launch comes from a caller that knows the node's attestation profile.
+- A policy applies to the launches prepared after it is set. A replica that is
+  already launched keeps the one it started with until its next generation;
+  disable and enable the app to start one.
+- `GET /apps/NAME/policy` returns the policy's reference (not its modules, data
+  or context), the native rules' hash, `principal`, `cost`, the budget's name and
+  each reported replica's `phase` (`pending` before its first preparation) with
+  the last attempt's `error`. `DELETE /apps/NAME/policy` removes it, and deleting
+  the app does too. Responses are `no-store`.
+
 Native lifecycle stays with Fleet allocations: the compute extension refuses
 gateway stop/start, so "restart" is a replacement generation, and durable `mounts`
 carry state across it. Gateway sandbox logs are supervisor events only; the
@@ -1184,7 +1224,7 @@ listener behind the HTTPS gateway. Administrators select a namespace with
 
 | Workload | Routes |
 |---|---|
-| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs` |
+| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs`, `GET` / `PUT` / `DELETE /apps/NAME/policy` (a native OpenShell app's policy) |
 | Scaling | `PUT` / `GET /apps/NAME/scale` (the app's replicas over all its nodes; `GET ...?node=NODE` shows one node's part) |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
@@ -1366,7 +1406,8 @@ this SQLite file across active schedulers or restore an older ledger over live
 allocations. Disabling the section leaves legacy workloads unchanged.
 
 All `/policy/*` routes require a Fleet administrator token. Namespace owners,
-router delegates and execution credentials cannot call them.
+router delegates and execution credentials cannot call them; an owner sets its own
+app's policy with `PUT /apps/NAME/policy`.
 
 | Method and route | Input / result |
 | --- | --- |

@@ -377,6 +377,11 @@ impl WorkloadController {
             t.removed = true;
             self.save("apps", name, &t)?;
             self.inner.lock().apps.insert(name.into(), t);
+            // Its policy goes with it: an app created under the name later starts with none.
+            if self.policy.as_ref().is_some_and(|p| p.openshell.is_some()) {
+                crate::openshell::remove_app_policy(self, namespace, name)
+                    .map_err(|_| fail(503, "the app's policy could not be removed"))?;
+            }
         }
         // Its deployments go once their nodes report them no more, which needs them disabled.
         let enabled: Vec<(String, AppDeployment)> = self.inner.lock().deployments.iter()
@@ -2184,7 +2189,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         ));
     }
     let action = match parts.as_slice() {
-        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings") && !batch => Some(*action),
+        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings" | "policy") && !batch => Some(*action),
         _ => None,
     };
     if let Some(action) = action {
@@ -2226,9 +2231,17 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
     }
     if method == Method::POST && parts == ["apps"] {
         if !batch {
-            let body: fleet_proto::model::v1::RegisterAppRequest =
-                serde_json::from_slice(&to_bytes(request.into_body(), 1 << 20).await?)
+            let mut body: fleet_proto::model::v1::RegisterAppRequest =
+                serde_json::from_slice(&to_bytes(request.into_body(), 4 << 20).await?)
                     .map_err(|e| fail(400, format!("invalid app registration: {e}")))?;
+            // A policy selects the native path: on a driver other than OpenShell's own,
+            // the entry admits exactly the policy's native rules.
+            if let Some(policy) = &body.policy {
+                if body.spec["runtime"]["driver"] != "openshell" && body.spec["access_policy_sha256"].is_null() && body.spec.is_object() {
+                    body.spec.0["access_policy_sha256"] = json!(crate::openshell::native_rules_hash(policy)
+                        .map_err(|_| fail(400, "invalid policy: native_policy_base64 is not a SandboxPolicy"))?);
+                }
+            }
             body.validate().map_err(|e| fail(400, e.to_string()))?;
             return s.create_app(c, &q, body).await;
         }
@@ -2502,6 +2515,10 @@ impl WorkloadController {
             }
             return self.app_logs(c, namespace, app, q).await;
         }
+        if action == "policy" {
+            self.require_deployment_scope(c, namespace, app, None)?;
+            return self.app_policy_request(namespace, app, method, request).await;
+        }
         if action == "settings" {
             if method != Method::PUT {
                 return Err(fail(405, "PUT required"));
@@ -2527,6 +2544,45 @@ impl WorkloadController {
             return Ok((StatusCode::ACCEPTED, Json(self.request_scale(namespace, app, body).await?)).into_response());
         }
         Err(fail(405, "GET or PUT required"))
+    }
+
+    /// `/apps/NAME/policy`: a native OpenShell app's policy, which the scheduler launches
+    /// every replica generation with. Its owner sets, reads and removes it.
+    async fn app_policy_request(&self, namespace: &str, app: &str, method: &Method, request: Request,
+    ) -> anyhow::Result<Response> {
+        use trusted_shim::rail::Error;
+        let rejected = |e: Error| match e {
+            Error::Unavailable => fail(503, "this scheduler has no OpenShell compute extension with its gateway settings, or its storage failed"),
+            Error::Rejected => fail(400, "only a native OpenShell app takes a policy, and its access_policy_sha256, if set, must be the policy's native rules"),
+            _ => fail(400, "invalid policy: a Rail policy bundle with its digest, a context object, native_policy_base64, a principal and a positive cost"),
+        };
+        let result = match *method {
+            Method::GET => crate::openshell::app_policy(self, namespace, app)
+                .map_err(|e| if matches!(e, Error::Rejected) { fail(404, "the app has no policy") } else { rejected(e) })?,
+            Method::PUT => {
+                let policy: fleet_proto::model::v1::AppPolicy =
+                    serde_json::from_slice(&to_bytes(request.into_body(), 4 << 20).await?)
+                        .map_err(|e| fail(400, format!("invalid policy: {e}")))?;
+                // The settings each node runs the app with, or its template before it is placed.
+                let specs: Vec<Value> = match self.unplaced(namespace, app) {
+                    Some(template) => vec![template.spec.0],
+                    None => self.app_deployment_list(namespace, app, None).into_iter().map(|(_, d)| d.spec.0).collect(),
+                };
+                for (i, spec) in specs.iter().enumerate() {
+                    crate::openshell::set_app_policy(self, namespace, app, spec, policy.clone(), i + 1 == specs.len()).map_err(rejected)?;
+                }
+                if specs.is_empty() {
+                    return Err(fail(404, "the app runs on no node"));
+                }
+                crate::openshell::app_policy(self, namespace, app).map_err(rejected)?
+            }
+            Method::DELETE => {
+                crate::openshell::remove_app_policy(self, namespace, app).map_err(rejected)?;
+                json!({})
+            }
+            _ => return Err(fail(405, "GET, PUT or DELETE required")),
+        };
+        Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(result)).into_response())
     }
 
     /// A request for a registered proof app: `rest` is the path after `/apps/NAME`.

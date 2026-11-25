@@ -59,6 +59,29 @@ impl WorkloadController {
     }
 }
 
+impl WorkloadController {
+    /// Every native reservation a fresh node session reports, with its entry.
+    pub(crate) fn native_reservations(&self) -> Vec<crate::openshell::Reservation> {
+        let i = self.inner.read();
+        i.workers
+            .iter()
+            .filter(|(_, w)| !w.ended && now() - w.seen < self.fleet.cfg.node_stale_secs as f64)
+            .flat_map(|(id, w)| w.report.runtime_instances.iter().map(move |r| (id, r)))
+            .filter_map(|(id, r)| {
+                let spec = &i.deployments.get(&format!("{id}-{}", r.entry_name))?.spec;
+                fleet_proto::workload::Entry(spec).native_access().then(|| crate::openshell::Reservation {
+                    execution: crate::policy_gateway::identity(r.execution.clone()),
+                    spec: spec.0.clone(),
+                    gpus: r.gpu_ids.clone(),
+                })
+            })
+            .collect()
+    }
+    pub(crate) fn app_exists(&self, namespace: &str, app: &str) -> bool {
+        self.inner.read().apps.get(app).is_some_and(|a| !a.removed && a.namespace == namespace)
+    }
+}
+
 fn owner<'a>(
     i: &'a WorkloadState,
     e: &ExecutionIdentity,

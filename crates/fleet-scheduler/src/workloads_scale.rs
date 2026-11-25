@@ -87,7 +87,7 @@ impl WorkloadController {
 
     /// `app`'s deployments in `namespace` (on `node`, when given) but those being retired, in
     /// the order its replicas are kept in (`rank`).
-    fn app_deployment_list(&self, namespace: &str, app: &str, node: Option<&str>) -> Vec<(String, AppDeployment)> {
+    pub(super) fn app_deployment_list(&self, namespace: &str, app: &str, node: Option<&str>) -> Vec<(String, AppDeployment)> {
         let i = self.inner.lock();
         let mut list: Vec<(String, AppDeployment)> = i.deployments.iter()
             .filter(|(_, intent)| {
@@ -920,6 +920,11 @@ impl WorkloadController {
         for (key, value) in spec.into_iter().filter(|(_, v)| !v.is_null()) {
             entry[key.as_str()] = value;
         }
+        // Checked before the app exists, stored once it does.
+        let invalid_policy = |_| fail(400, "invalid policy: it needs a native OpenShell app, a Rail policy bundle with its digest, a context object, native_policy_base64, a principal and a positive cost, on a scheduler with the OpenShell compute extension");
+        if let Some(policy) = &request.policy {
+            crate::openshell::set_app_policy(self, &namespace, &name, &entry, policy.clone(), false).map_err(invalid_policy)?;
+        }
         let proof = match &request.proof {
             Some(proof) => Some(self.fleet.add_app(&namespace, &name, request.priority.unwrap_or(0), proof).await?),
             None => None,
@@ -937,7 +942,10 @@ impl WorkloadController {
             workers: Vec::new(),
         };
         self.save("apps", &name, &app)?;
-        self.inner.lock().apps.insert(name, app.clone());
+        self.inner.lock().apps.insert(name.clone(), app.clone());
+        if let Some(policy) = request.policy.clone() {
+            crate::openshell::set_app_policy(self, &app.namespace, &name, &app.spec, policy, true).map_err(invalid_policy)?;
+        }
         drop(_ops);
         let view = match &proof {
             Some(proof) => self.proof_app_value(proof, None, tag.as_deref()).await?,

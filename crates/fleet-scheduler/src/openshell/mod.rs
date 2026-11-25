@@ -46,10 +46,14 @@ use trusted_shim::{
 type Result<T> = trusted_shim::rail::Result<T>;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
 mod control;
+mod owner;
 mod readiness;
 pub(crate) use control::{ExecGateway, StockGateway};
 #[cfg(test)]
 pub(crate) use control::{stdin_frames, ExecOutput};
+#[cfg(test)]
+pub(crate) use owner::budget;
+pub(crate) use owner::{app_policy, launch_loop, native_rules_hash, remove_app_policy, set_app_policy, Reservation};
 pub(crate) use readiness::{services_ready, Observer};
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -116,9 +120,13 @@ pub(crate) struct Launches {
     /// The acknowledged node policy accepts GPU/volume `driver_config`.
     attachments: bool,
     readiness: readiness::Cache,
-    /// Administrative exec through the stock gateway, when it is configured.
+    /// Exec and create through the stock gateway, when it is configured.
     control: Option<Arc<dyn ExecGateway>>,
     control_slots: Semaphore,
+    /// Each native app's policy, by namespace and app.
+    selections: Mutex<BTreeMap<(String, String), owner::Selection>>,
+    /// The scheduler's own launch attempts, by launch name.
+    attempts: Mutex<BTreeMap<String, owner::Attempt>>,
 }
 impl Launches {
     pub(crate) fn open(dir: &Path, admission_policy: String) -> anyhow::Result<Self> {
@@ -176,11 +184,17 @@ impl Launches {
             readiness: Default::default(),
             control: None,
             control_slots: Semaphore::new(control::CONTROL_SLOTS),
+            selections: Mutex::new(owner::load(&dir.join("selections"))?),
+            attempts: Default::default(),
         })
     }
     pub(crate) fn with_control(mut self, gateway: Arc<dyn ExecGateway>) -> Self {
         self.control = Some(gateway);
         self
+    }
+    #[cfg(test)]
+    pub(crate) fn test_selected(&self, namespace: &str, app: &str) -> bool {
+        self.selections.lock().contains_key(&(namespace.to_owned(), app.to_owned()))
     }
     #[cfg(test)]
     pub(crate) fn test_phase(&self, name: &str, phase: &str) {
@@ -284,6 +298,15 @@ fn prepare_inner(
     c: &WorkloadController,
     preparation: OpenShellLaunchPreparation,
 ) -> Result<serde_json::Value> {
+    let (name, workspace, request) = prepare_record(c, preparation)?;
+    Ok(json!({"name":name, "workspace":workspace,
+        "create_request_base64":STANDARD.encode(request.encode_to_vec())}))
+}
+/// The launch's name, its workspace and the stock gateway's create request.
+fn prepare_record(
+    c: &WorkloadController,
+    preparation: OpenShellLaunchPreparation,
+) -> Result<(String, String, trusted_shim::openshell_gateway::protocol::CreateSandboxRequest)> {
     if preparation.native_policy_base64.len() > 1_398_104
         || preparation.principal.is_empty()
         || preparation.principal.len() > 256
@@ -366,10 +389,7 @@ fn prepare_inner(
             store.save(&record)?;
             records.insert(record.name.clone(), record.clone());
         }
-        Ok(
-            json!({"name":record.name, "workspace":workspace_name(&launch.execution.namespace),
-            "create_request_base64":STANDARD.encode(request.encode_to_vec())}),
-        )
+        Ok((record.name.clone(), workspace_name(&launch.execution.namespace), request))
     })
 }
 async fn launch_status(
