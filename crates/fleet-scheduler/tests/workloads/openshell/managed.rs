@@ -28,6 +28,9 @@ pub(super) fn permissive() -> String {
 pub(super) struct LateGateway(pub(super) std::sync::OnceLock<StockGateway>);
 #[async_trait::async_trait]
 impl ExecGateway for LateGateway {
+    async fn create(&self, _: &str, _: protocol::CreateSandboxRequest) -> trusted_shim::rail::Result<()> {
+        Err(trusted_shim::rail::Error::Unavailable)
+    }
     async fn exec(&self, start: protocol::ExecSandboxRequest, stdin: Vec<u8>) -> trusted_shim::rail::Result<ExecOutput> {
         self.0.get().ok_or(trusted_shim::rail::Error::Unavailable)?.exec(start, stdin).await
     }
