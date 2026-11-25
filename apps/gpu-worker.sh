@@ -27,6 +27,8 @@ server=$!
 ready() {  # the GPU image has perl, and no curl
   perl -MIO::Socket::INET -e '
     my $server = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$ARGV[0]", Timeout => 3) or exit 1;
+    # A server that takes the connection and does not answer is not ready yet.
+    $SIG{ALRM} = sub { exit 1 }; alarm 5;
     print $server "POST /twirp/api.ProverService/Ready HTTP/1.0\r\nHost: 127.0.0.1\r\n",
       "Content-Type: application/protobuf\r\nContent-Length: 0\r\n\r\n";
     local $/;
@@ -41,9 +43,10 @@ env -i "${worker_env[@]}" "$@" &
 worker=$!
 perl -MIO::Socket::INET -e '
   my $listener = IO::Socket::INET->new(LocalPort => $ARGV[0], Listen => 16, ReuseAddr => 1) or die "health port: $!\n";
+  $SIG{PIPE} = "IGNORE";  # a client that left before its answer
   while (my $client = $listener->accept) {
-    $client->timeout(5);
-    sysread $client, my $request, 4096;
+    # One client that sends nothing holds the next ones for two seconds at most.
+    eval { local $SIG{ALRM} = sub { die "silent\n" }; alarm 2; sysread $client, my $request, 4096; alarm 0 };
     print $client "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nok\n";
     close $client;
   }' "${HEALTH_PORT:-8080}" &

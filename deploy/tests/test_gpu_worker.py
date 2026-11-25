@@ -40,6 +40,8 @@ exit 7
 ''')
     class Ready(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
+            while (tmp_path / 'silent').exists():  # takes the request and does not answer
+                time.sleep(0.05)
             ready = self.path == '/twirp/api.ProverService/Ready' and (tmp_path / 'ready').exists()
             self.send_response(200)
             self.send_header('Content-Type', 'application/protobuf')
@@ -114,6 +116,26 @@ def test_a_server_that_ends_before_it_is_ready_starts_no_worker(box):
     assert process.wait(timeout=10) == 1
     assert 'ended before it was ready' in process.stdout.read()
     assert not (tmp_path / 'worker-env').exists()
+
+
+def test_a_server_that_takes_the_probe_and_never_answers_is_not_ready(box):
+    tmp_path, process, _ = box
+    (tmp_path / 'silent').touch()
+    try:
+        until(lambda: events(tmp_path), 'the server starts')
+        (tmp_path / 'server-fails').touch()
+        assert process.wait(timeout=15) == 1, 'the probe gave up, and the loop saw the server end'
+        assert 'ended before it was ready' in process.stdout.read()
+    finally:
+        (tmp_path / 'silent').unlink()
+
+
+def test_a_client_that_sends_nothing_does_not_hold_the_health_port(box):
+    tmp_path, _, env = box
+    (tmp_path / 'ready').touch()
+    until(lambda: healthy(env), 'health answers')
+    with socket.create_connection(('127.0.0.1', int(env['HEALTH_PORT']))):
+        until(lambda: healthy(env), 'health answers while a silent client is connected')
 
 
 def test_the_container_ends_with_the_worker_and_stops_the_server(box):
