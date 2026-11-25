@@ -135,6 +135,7 @@ fleetctl --token-file zkm-owner.token --namespace zkm app add model --spec model
 fleetctl --token-file zkm-owner.token --namespace zkm app add eth --spec prover.json \
   --elf /path/to/program.elf --class latency --anchor exclusive --backend cuda
 fleetctl --token-file zkm-owner.token --namespace zkm app enable model
+fleetctl --token-file zkm-owner.token --namespace zkm app restart model
 fleetctl --token-file zkm-owner.token --namespace zkm app disable model
 ```
 
@@ -144,7 +145,8 @@ they fit now, has that node add the entry to its `apps.yaml`, and starts it. Use
 don't choose the node, and app names are unique across the fleet.
 
 Disabling drains the replicas and releases their resources after cleanup; the app's
-durable data stays. An interrupted EthProofs block is retried from its saved cursor,
+durable data stays. `app restart` disables an enabled app and enables it again in
+one call, so every replica starts afresh. An interrupted EthProofs block is retried from its saved cursor,
 and its [shutdown rules](../apps/ethproofs/README.md#operate-and-recover) say how to
 finish an in-flight proof first. `node drain` stops new proof and batch placements,
 but not an app's own work, such as EthProofs' block stream.

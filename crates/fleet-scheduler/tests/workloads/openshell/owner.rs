@@ -10,11 +10,13 @@ use trusted_shim::rail::Error;
 struct Stock {
     controller: Mutex<Option<Arc<WorkloadController>>>,
     creates: Mutex<Vec<(String, String)>>,
+    execs: Mutex<Vec<(String, Vec<String>)>>,
 }
 #[async_trait::async_trait]
 impl ExecGateway for Stock {
-    async fn exec(&self, _: protocol::ExecSandboxRequest, _: Vec<u8>) -> trusted_shim::rail::Result<ExecOutput> {
-        Err(Error::Unavailable)
+    async fn exec(&self, start: protocol::ExecSandboxRequest, stdin: Vec<u8>) -> trusted_shim::rail::Result<ExecOutput> {
+        self.execs.lock().unwrap().push((start.sandbox, start.command));
+        Ok(ExecOutput { stdout: stdin, stderr: vec![], exit_code: 0 })
     }
     async fn create(&self, workspace: &str, request: protocol::CreateSandboxRequest) -> trusted_shim::rail::Result<()> {
         use compute_driver_server::ComputeDriver;
@@ -86,7 +88,11 @@ async fn owner_launches(driver: &str) {
     })
     .await;
     for module in policy.modules.values_mut() {
-        *module = module.replace("input.operation == \"read\"", "input.operation == \"runtime.create\"");
+        // It admits the launch, and of the owner's commands only `/bin/cat`.
+        *module = module.replace(
+            "{input.operation == \"read\"}",
+            "{input.operation == \"runtime.create\"}\ndecision := {\"decision\":\"allow\",\"reason_codes\":[]} if {\n\tinput.operation == \"exec\"\n\tinput.resource == \"model-0\"\n\tinput.principal == \"alice\"\n\tinput.parameters.command[0] == \"/bin/cat\"\n}",
+        );
     }
     policy.policy.sha256 = policy_digest(&policy).unwrap();
     let ns = request.execution.namespace.clone();
@@ -138,7 +144,7 @@ async fn owner_launches(driver: &str) {
     assert!(refused["launches"][0]["error"].as_str().unwrap().contains("policy budget"), "{refused}");
     assert_eq!(refused["launches"][0]["phase"], "pending");
     assert!(stock.creates.lock().unwrap().is_empty());
-    json_body(admin(&c, "PUT", "/policy/budgets", json!({"name": crate::openshell::budget(&ns), "allowance": 2})).await).await;
+    json_body(admin(&c, "PUT", "/policy/budgets", json!({"name": crate::openshell::budget(&ns), "allowance": 3})).await).await;
 
     let delivered = until(&c, &owner, &path, |v| v["launches"][0]["phase"] == "delivered").await;
     assert_eq!((delivered["launches"][0]["generation"].as_u64(), delivered["launches"][0]["allocation_id"].as_str()), (Some(1), Some("model-0")));
@@ -166,6 +172,26 @@ async fn owner_launches(driver: &str) {
     c.report("gpu", "session", report.clone()).await.unwrap();
     until(&c, &owner, &path, |v| v["launches"][0]["phase"] == "created" && v["launches"][0]["error"].is_null()).await;
 
+    // The owner's exec is the policy's decision on that command, and each allowed one draws on the budget.
+    let exec = format!("/apps/model/exec?namespace={ns}");
+    let command = |program: &str| json!({"command": [program, "-"], "stdin": STANDARD.encode("in"), "timeout_seconds": 5});
+    assert_eq!(call(&c, &exec, "cluster", "POST", command("/bin/cat")).await.status(), 401);
+    assert_eq!(call(&c, &exec, &other, "POST", command("/bin/cat")).await.status(), 404);
+    assert_eq!(call(&c, &exec, &owner, "GET", Value::Null).await.status(), 405);
+    assert_eq!(call(&c, &exec, &owner, "POST", json!({"command": [], "timeout_seconds": 5})).await.status(), 400);
+    assert_eq!(call(&c, &format!("{exec}&replica=model-1"), &owner, "POST", command("/bin/cat")).await.status(), 409);
+    let denied = call(&c, &exec, &owner, "POST", command("/bin/rm")).await;
+    assert_eq!(denied.status(), 403);
+    assert!(stock.execs.lock().unwrap().is_empty());
+    let ran = json_body(call(&c, &format!("{exec}&replica=model-0"), &owner, "POST", command("/bin/cat")).await).await;
+    assert_eq!((ran["stdout"].as_str(), ran["exit_code"].as_i64(), ran["decision"]["decision"].as_str()),
+        (Some(STANDARD.encode("in").as_str()), Some(0), Some("allow")), "{ran}");
+    assert_eq!(ran["decision"]["policy"], json!(policy.policy));
+    assert_eq!(*stock.execs.lock().unwrap(), vec![(name.clone(), vec!["/bin/cat".to_owned(), "-".to_owned()])]);
+    // Its grant is consumed, and its proof is queued under the decision's job.
+    let job = ran["decision"]["job_id"].as_str().unwrap();
+    assert_eq!(json_body(admin(&c, "GET", &format!("/policy/preflight/{job}"), json!({})).await).await["receipt_state"], "queued");
+
     // A restart is a new generation of the same replica: the same policy, a new activation and proof.
     report.runtime_instances[0].execution.generation = 2;
     report.runtime_instances[0].execution.lease_id = "lease-2".into();
@@ -178,6 +204,15 @@ async fn owner_launches(driver: &str) {
     let creates = stock.creates.lock().unwrap().clone();
     assert_eq!(creates.len(), 2);
     assert_ne!(creates[0].1, creates[1].1);
+    // The budget's 3 are spent on two launches and one exec: the next allow is refused, and nothing runs.
+    until(&c, &owner, &path, |v| v["launches"][0]["generation"] == 2 && v["launches"][0]["phase"] == "delivered").await;
+    report.runtime_instances[0].native_observation_base64 = Some(STANDARD.encode(DriverSandbox {
+        id: format!("id-{}", creates[1].1), name: creates[1].1.clone(), ..observed
+    }.encode_to_vec()));
+    c.report("gpu", "session", report.clone()).await.unwrap();
+    until(&c, &owner, &path, |v| v["launches"][0]["phase"] == "created").await;
+    assert_eq!(call(&c, &exec, &owner, "POST", command("/bin/cat")).await.status(), 409);
+    assert_eq!(stock.execs.lock().unwrap().len(), 1);
 
     assert_eq!(call(&c, &path, &owner, "DELETE", Value::Null).await.status(), 200);
     assert_eq!(call(&c, &path, &owner, "GET", Value::Null).await.status(), 404);

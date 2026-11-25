@@ -97,6 +97,8 @@ enum AppCmd {
     Priority { name: String, #[arg(allow_hyphen_values = true)] priority: i32 },
     /// The app takes jobs again.
     Enable { name: String },
+    /// Stop an enabled app's replicas and start them again.
+    Restart { name: String },
     /// App owners: change a proof or persistent app's resources within namespace quotas.
     /// Without resource flags, inspect its desired resources and scaling status.
     Scale {
@@ -1302,6 +1304,12 @@ fn app(p: &AppArgs, out: &OutputWriter) -> anyhow::Result<()> {
         Some(AppCmd::Delete { name, yes }) => return delete_app(name, *yes, &p.conn, out),
         Some(AppCmd::Disable { name }) => return set_app_disabled(name, true, &p.conn, out),
         Some(AppCmd::Enable { name }) => return set_app_disabled(name, false, &p.conn, out),
+        Some(AppCmd::Restart { name }) => {
+            let a = FleetClient::new(&p.conn)?;
+            let v = a.send(a.req(reqwest::Method::POST, &format!("/apps/{name}/restart")).timeout(Duration::from_secs(3600)))?;
+            out.done(&format!("{name} restarted: its replicas stopped and started again"), v);
+            return Ok(());
+        }
         Some(AppCmd::Add { add }) => return add_app(add, &p.conn, out),
         Some(AppCmd::Priority { name, priority }) => return set_app_priority(name, *priority, &p.conn, out),
         Some(AppCmd::Logs { name, lines, node }) => return app_logs(name, *lines, node.as_deref(), &p.conn, out),
