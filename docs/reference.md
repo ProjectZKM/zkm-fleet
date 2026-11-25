@@ -780,7 +780,7 @@ creation, not application readiness. Four creates may run concurrently. A callba
 with different private bytes is rejected. A disconnected RPC does not cancel an
 accepted create; inspect the same operation before retrying.
 
-**Administrative exec.** `POST /policy/openshell/launches/<name>/exec` takes the
+**Exec.** `POST /policy/openshell/launches/<name>/exec` takes the
 same body as shim's Docker `control` service, `{command, user, stdin,
 timeout_seconds}`, and returns `{stdout, stderr, exit_code}` (stdin/stdout/stderr
 base64). It needs the scheduler's `gateway` settings and runs through the stock
@@ -791,9 +791,21 @@ approved native process policy, so `user` may only repeat that policy's
 quota are current; losing any of them closes control at once. Bounds: at most 256
 arguments and 256 KiB assembled command, 1 to 600 seconds, 64 MiB stdin (sent in
 512 KiB frames, under the gateway's 1 MiB message limit) and 64 MiB per output
-stream; four execs per scheduler. Every call gets a fresh upstream `request_id`,
+stream; four execs per scheduler, an administrator's and owners' together. Every call gets a fresh upstream `request_id`,
 so a transport retry never relaunches a command. A stream that ends without an
 exit status reports unavailable, not success.
+
+An app's owner runs a command with `POST /apps/NAME/exec` and a namespace token
+with `manage`: the same body, bounds and conditions, in the app's one replica or
+the one `?replica=ALLOCATION` names (`GET /apps/NAME/policy` lists them). The
+replica's activated policy decides each call. Rail evaluates it at the ledger as
+operation `exec` on resource `ALLOCATION`, for the principal the replica was
+launched for, with `parameters` `{command, user, stdin_sha256, timeout_seconds}`.
+An `allow` draws 1 from the launch's budget, its grant is consumed, and then the
+command runs; the reply adds `decision` with the decision's `job_id`, `policy`
+and `reason_codes`, and the decision's proof follows under that job, as for
+`POST /policy/preflight`. Any other decision answers 403 with it and runs
+nothing; a spent budget answers 409.
 
 **An app's policy.** An app's owner can hand that whole flow to the scheduler:
 `PUT /apps/NAME/policy` (or `policy` in the app's `POST /apps`) stores what the
@@ -828,7 +840,7 @@ reservation.
   driver's launch comes from a caller that knows the node's attestation profile.
 - A policy applies to the launches prepared after it is set. A replica that is
   already launched keeps the one it started with until its next generation;
-  disable and enable the app to start one.
+  `POST /apps/NAME/restart` starts one.
 - `GET /apps/NAME/policy` returns the policy's reference (not its modules, data
   or context), the native rules' hash, `principal`, `cost`, the budget's name and
   each reported replica's `phase` (`pending` before its first preparation) with
@@ -1121,7 +1133,7 @@ accepted work: an administrator stops jobs explicitly.
 |---|---|
 | Read the own namespace, apps, batches, jobs, logs and scaling status | `read`, within the token's scope |
 | Submit proofs and batch jobs; cancel batch jobs | `submit`, within the token's scope |
-| Create, remove, enable, disable, prioritize, scale or update apps and batches | `manage`, with any app grants. Removing, enabling, disabling or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
+| Create, remove, enable, disable, restart, prioritize, scale or update apps and batches; set a native app's policy and run a command in it | `manage`, with any app grants. Removing, enabling, disabling, restarting or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
 | Batch `allow` and `user`; app `user`, `volumes` and `proof_storage_root`; changing an app's image, environment, command, user, workdir or volumes | `admin` |
 | Preempt batch jobs | `admin` |
 | Namespaces, tokens, quotas, suspension, allocations, the preemption plan, nodes and status | `admin` |
@@ -1224,7 +1236,7 @@ listener behind the HTTPS gateway. Administrators select a namespace with
 
 | Workload | Routes |
 |---|---|
-| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs`, `GET` / `PUT` / `DELETE /apps/NAME/policy` (a native OpenShell app's policy) |
+| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs`, `POST /apps/NAME/restart`, `GET` / `PUT` / `DELETE /apps/NAME/policy` and `POST /apps/NAME/exec` (a native OpenShell app's policy, and a command in one of its replicas) |
 | Scaling | `PUT` / `GET /apps/NAME/scale` (the app's replicas over all its nodes; `GET ...?node=NODE` shows one node's part) |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |

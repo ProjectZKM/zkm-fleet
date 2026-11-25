@@ -219,6 +219,7 @@ fn app_commands_address_every_app_by_its_name() {
         (vec!["disable", "ethproofs"], "PUT", "/disabled", serde_json::Value::Null,
             r#"{"name":"ethproofs","disabled":true,"resources":{"gpus":1},"proof":{"elf_id":"aaaa"}}"#),
         (vec!["enable", "comfyui"], "DELETE", "/disabled", serde_json::Value::Null, r#"{"name":"comfyui","disabled":false,"spec":{"image":"comfyui:1"}}"#),
+        (vec!["restart", "comfyui"], "POST", "/restart", serde_json::Value::Null, r#"{"name":"comfyui","disabled":false,"spec":{"image":"comfyui:1"}}"#),
         (vec!["scale", "ethproofs", "--replicas", "2"], "PUT", "/scale", serde_json::json!({"replicas":2}),
             r#"{"state":"draining","replicas":2,"gpus":2,"cpus":16,"nodes":["gpu-box"]}"#),
         (vec!["scale", "agent", "--cpus", "0", "--cpu-limit", "1.5", "--memory-limit-gb", "4"], "PUT", "/scale",
