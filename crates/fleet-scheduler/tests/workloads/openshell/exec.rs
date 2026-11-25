@@ -14,6 +14,9 @@ struct Gateway {
 }
 #[async_trait::async_trait]
 impl ExecGateway for Gateway {
+    async fn create(&self, _: &str, _: protocol::CreateSandboxRequest) -> trusted_shim::rail::Result<()> {
+        Err(trusted_shim::rail::Error::Unavailable)
+    }
     async fn exec(&self, start: protocol::ExecSandboxRequest, stdin: Vec<u8>) -> trusted_shim::rail::Result<ExecOutput> {
         self.starts.lock().unwrap().push(start);
         self.stdin.lock().unwrap().push(stdin.clone());

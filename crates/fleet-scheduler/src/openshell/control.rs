@@ -38,11 +38,16 @@ pub(crate) struct ExecOutput {
     pub exit_code: i32,
 }
 
-/// One bounded non-TTY exec. Implementations must deliver all of `stdin` then
-/// end it, and fail rather than truncate output beyond `MAX_STREAM`.
+/// The stock gateway's public API, as the scheduler uses it.
 #[async_trait::async_trait]
 pub(crate) trait ExecGateway: Send + Sync {
+    /// One bounded non-TTY exec. Implementations must deliver all of `stdin` then
+    /// end it, and fail rather than truncate output beyond `MAX_STREAM`.
     async fn exec(&self, start: protocol::ExecSandboxRequest, stdin: Vec<u8>) -> Result<ExecOutput>;
+    /// Creates `workspace` if it is missing, then the sandbox, returning once the
+    /// gateway's create has: its compute callback proves and delivers the launch
+    /// meanwhile. A sandbox the gateway already holds is that same create.
+    async fn create(&self, workspace: &str, request: protocol::CreateSandboxRequest) -> Result<()>;
 }
 
 pub(crate) struct StockGateway(OpenShellClient<tonic_native::transport::Channel>);
@@ -54,6 +59,21 @@ impl StockGateway {
 
 #[async_trait::async_trait]
 impl ExecGateway for StockGateway {
+    async fn create(&self, workspace: &str, request: protocol::CreateSandboxRequest) -> Result<()> {
+        use tonic_native::Code::AlreadyExists;
+        let mut client = self.0.clone();
+        let made = client
+            .create_workspace(protocol::CreateWorkspaceRequest { name: workspace.into(), ..Default::default() })
+            .await;
+        if made.is_err_and(|status| status.code() != AlreadyExists) {
+            return Err(Error::Unavailable);
+        }
+        match client.create_sandbox(request).await {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == AlreadyExists => Ok(()),
+            Err(_) => Err(Error::Unavailable),
+        }
+    }
     async fn exec(&self, start: protocol::ExecSandboxRequest, stdin: Vec<u8>) -> Result<ExecOutput> {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let first = protocol::ExecSandboxInput {

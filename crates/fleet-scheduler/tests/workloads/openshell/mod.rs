@@ -277,6 +277,8 @@ mod docker;
 
 mod gateway;
 
+mod owner;
+
 async fn startup(forged: bool, stock: bool, driver: &str) {
     let native_policy = SandboxPolicy {
         version: 1,

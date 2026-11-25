@@ -142,6 +142,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         if let Some(policy) = policy { policy.receipt_loop().await; }
         std::future::pending::<()>().await;
     };
+    let launch_loop = openshell::launch_loop(workloads.clone());
     let dispatch_loop = tokio::spawn(workloads.dispatch_loop());
     let f = fleet.clone();
     tokio::spawn(async move {
@@ -163,6 +164,7 @@ pub async fn serve(cfg: config::SchedulerConfig) -> anyhow::Result<()> {
         r = dispatcher => r?,
         r = dispatch_loop => r??,
         _ = receipt_loop => anyhow::bail!("policy receipt worker stopped"),
+        _ = launch_loop => anyhow::bail!("OpenShell launch worker stopped"),
         _ = readiness_loop => anyhow::bail!("OpenShell readiness observer stopped"),
         r = compute_loop => { r?; anyhow::bail!("OpenShell compute extension stopped"); },
     }

@@ -225,6 +225,22 @@ message RegisterAppRequest {
   optional int32 priority = 3;
   required Json spec = 4;
   optional AppProof proof = 5;
+  // A native OpenShell app's policy; PUT /apps/NAME/policy sets the same thing later.
+  optional AppPolicy policy = 6;
+}
+
+// What the scheduler launches each replica of a native OpenShell app with, for every
+// generation: the Rail policy and context it activates for the replica's execution, and
+// the stock `SandboxPolicy` protobuf the sandbox runs under. `principal` is whom the
+// app's owner starts it for and `cost` what each start draws from the namespace's
+// policy budget.
+message AppPolicy {
+  required Json policy = 1;
+  required Json context = 2;
+  required string native_policy_base64 = 3;
+  required string principal = 4;
+  required uint64 cost = 5;
+  optional string state_root = 6;
 }
 
 message WorkloadTemplate {
