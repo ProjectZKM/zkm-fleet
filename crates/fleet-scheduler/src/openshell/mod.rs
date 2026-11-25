@@ -48,12 +48,14 @@ const MAX_RECORD: usize = 4 * 1024 * 1024;
 mod control;
 mod owner;
 mod readiness;
-pub(crate) use control::{app_exec, ExecGateway, ExecInput, Refusal, StockGateway};
+pub(crate) use control::{app_exec, Caller, ExecGateway, ExecInput, Refusal, StockGateway};
 #[cfg(test)]
 pub(crate) use control::{stdin_frames, ExecOutput};
 #[cfg(test)]
 pub(crate) use owner::budget;
-pub(crate) use owner::{app_policy, launch_loop, native_rules_hash, remove_app_policy, set_app_policy, Reservation};
+pub(crate) use owner::{
+    app_approvals, app_policy, decide_approval, launch_loop, native_rules_hash, remove_app_policy, set_app_policy, Reservation,
+};
 pub(crate) use readiness::{services_ready, Observer};
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -127,6 +129,8 @@ pub(crate) struct Launches {
     selections: Mutex<BTreeMap<(String, String), owner::Selection>>,
     /// The scheduler's own launch attempts, by launch name.
     attempts: Mutex<BTreeMap<String, owner::Attempt>>,
+    /// Requests to approve an exec a policy answered `approval_required`, by policy job.
+    approvals: Mutex<BTreeMap<String, owner::Approval>>,
 }
 impl Launches {
     pub(crate) fn open(dir: &Path, admission_policy: String) -> anyhow::Result<Self> {
@@ -184,8 +188,9 @@ impl Launches {
             readiness: Default::default(),
             control: None,
             control_slots: Semaphore::new(control::CONTROL_SLOTS),
-            selections: Mutex::new(owner::load(&dir.join("selections"))?),
+            selections: Mutex::new(owner::load(&dir.join("selections"), owner::Selection::record)?),
             attempts: Default::default(),
+            approvals: Mutex::new(owner::load(&dir.join("approvals"), owner::Approval::file)?),
         })
     }
     pub(crate) fn with_control(mut self, gateway: Arc<dyn ExecGateway>) -> Self {

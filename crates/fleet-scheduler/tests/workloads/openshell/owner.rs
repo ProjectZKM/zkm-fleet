@@ -56,6 +56,12 @@ async fn call(c: &Arc<WorkloadController>, path: &str, token: &str, method: &str
     scale_call(c.clone(), token, method, path, body).await
 }
 
+/// A refusal's JSON answer.
+async fn answer(r: Response) -> Value {
+    assert_eq!(r.status(), 403);
+    serde_json::from_slice(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+}
+
 /// The owner's view of the app's policy, once `done` holds.
 async fn until(c: &Arc<WorkloadController>, token: &str, path: &str, done: impl Fn(&Value) -> bool) -> Value {
     let mut last = Value::Null;
@@ -88,10 +94,28 @@ async fn owner_launches(driver: &str) {
     })
     .await;
     for module in policy.modules.values_mut() {
-        // It admits the launch, and of the owner's commands only `/bin/cat`.
+        // It admits the launch, and of the owner's commands `/bin/cat`, and `/bin/sh` once bob
+        // approved it with another credential than the sender's.
         *module = module.replace(
             "{input.operation == \"read\"}",
-            "{input.operation == \"runtime.create\"}\ndecision := {\"decision\":\"allow\",\"reason_codes\":[]} if {\n\tinput.operation == \"exec\"\n\tinput.resource == \"model-0\"\n\tinput.principal == \"alice\"\n\tinput.parameters.command[0] == \"/bin/cat\"\n}",
+            r#"{input.operation == "runtime.create"}
+decision := {"decision":"allow","reason_codes":[]} if {
+	input.operation == "exec"
+	input.resource == "model-0"
+	input.principal == "alice"
+	input.parameters.command[0] == "/bin/cat"
+}
+decision := {"decision":"approval_required","reason_codes":["needs_approval"]} if {
+	input.operation == "exec"
+	input.parameters.command[0] == "/bin/sh"
+	not input.parameters.approval
+}
+decision := {"decision":"allow","reason_codes":[]} if {
+	input.operation == "exec"
+	input.parameters.command[0] == "/bin/sh"
+	input.parameters.approval.approver == "bob"
+	input.parameters.approval.independent
+}"#,
         );
     }
     policy.policy.sha256 = policy_digest(&policy).unwrap();
@@ -144,7 +168,7 @@ async fn owner_launches(driver: &str) {
     assert!(refused["launches"][0]["error"].as_str().unwrap().contains("policy budget"), "{refused}");
     assert_eq!(refused["launches"][0]["phase"], "pending");
     assert!(stock.creates.lock().unwrap().is_empty());
-    json_body(admin(&c, "PUT", "/policy/budgets", json!({"name": crate::openshell::budget(&ns), "allowance": 3})).await).await;
+    json_body(admin(&c, "PUT", "/policy/budgets", json!({"name": crate::openshell::budget(&ns), "allowance": 4})).await).await;
 
     let delivered = until(&c, &owner, &path, |v| v["launches"][0]["phase"] == "delivered").await;
     assert_eq!((delivered["launches"][0]["generation"].as_u64(), delivered["launches"][0]["allocation_id"].as_str()), (Some(1), Some("model-0")));
@@ -192,6 +216,59 @@ async fn owner_launches(driver: &str) {
     let job = ran["decision"]["job_id"].as_str().unwrap();
     assert_eq!(json_body(admin(&c, "GET", &format!("/policy/preflight/{job}"), json!({})).await).await["receipt_state"], "queued");
 
+    // `/bin/sh` needs an approval: the policy's answer opens a request, and nothing runs.
+    let ask = || async { answer(call(&c, &exec, &owner, "POST", command("/bin/sh")).await).await };
+    let asked = ask().await;
+    assert_eq!((asked["decision"]["decision"].as_str(), &asked["decision"]["reason_codes"]),
+        (Some("approval_required"), &json!(["needs_approval"])), "{asked}");
+    assert_eq!(asked["approval"]["id"], asked["decision"]["job_id"]);
+    let paths = |asked: &Value| {
+        let id = asked["approval"]["id"].as_str().unwrap();
+        (format!("/apps/model/approvals/{id}?namespace={ns}"), format!("{exec}&approval={id}"))
+    };
+    let (approval, unused) = paths(&asked);
+    let approvals = format!("/apps/model/approvals?namespace={ns}");
+    let listed = json_body(call(&c, &approvals, &owner, "GET", Value::Null).await).await;
+    assert_eq!(listed["approvals"].as_array().unwrap().len(), 1);
+    assert_eq!((&listed["approvals"][0]["id"], listed["approvals"][0]["state"].as_str(), &listed["approvals"][0]["parameters"]["command"]),
+        (&asked["approval"]["id"], Some("pending"), &json!(["/bin/sh", "-"])));
+    assert_eq!(call(&c, &approvals, &other, "GET", Value::Null).await.status(), 404);
+    let approve = |approve: bool| json!({"approver": "bob", "approve": approve});
+    assert_eq!(call(&c, &approval, "cluster", "POST", approve(true)).await.status(), 401);
+    assert_eq!(call(&c, &approval, &other, "POST", approve(true)).await.status(), 404);
+    assert_eq!(call(&c, &approval, &owner, "POST", json!({"approver": "", "approve": true})).await.status(), 400);
+    assert_eq!(call(&c, &format!("/apps/model/approvals/exec-none?namespace={ns}"), &owner, "POST", approve(true)).await.status(), 404);
+    // Unapproved, it admits nothing.
+    assert_eq!(call(&c, &unused, &owner, "POST", command("/bin/sh")).await.status(), 409);
+    // The sender's own approval is recorded as such, and this policy does not take it.
+    let own = json_body(call(&c, &approval, &owner, "POST", approve(true)).await).await;
+    assert_eq!((own["state"].as_str(), own["independent"].as_bool(), own["approver"].as_str()), (Some("approved"), Some(false), Some("bob")));
+    assert_eq!(call(&c, &approval, &owner, "POST", approve(false)).await.status(), 409);
+    let own = answer(call(&c, &unused, &owner, "POST", command("/bin/sh")).await).await;
+    assert_eq!((own["decision"]["decision"].as_str(), own["approval"].is_null()), (Some("deny"), true), "{own}");
+    // Another credential's approval admits exactly that exec, once: the policy decides it afresh.
+    let (approval, approved) = paths(&ask().await);
+    let other_credential = json_body(call(&c, &approval, "admin", "POST", approve(true)).await).await;
+    assert_eq!((other_credential["state"].as_str(), other_credential["independent"].as_bool()), (Some("approved"), Some(true)));
+    let another = json!({"command": ["/bin/sh", "-c"], "stdin": STANDARD.encode("in"), "timeout_seconds": 5});
+    assert_eq!(call(&c, &approved, &owner, "POST", another).await.status(), 409);
+    assert_eq!(stock.execs.lock().unwrap().len(), 1);
+    let ran = json_body(call(&c, &approved, &owner, "POST", command("/bin/sh")).await).await;
+    assert_eq!(ran["decision"]["decision"], "allow", "{ran}");
+    assert_eq!(stock.execs.lock().unwrap().last().unwrap().1, vec!["/bin/sh".to_owned(), "-".to_owned()]);
+    assert_eq!(call(&c, &approved, &owner, "POST", command("/bin/sh")).await.status(), 409);
+    // A refused request admits nothing.
+    let (approval, refusal) = paths(&ask().await);
+    assert_eq!(json_body(call(&c, &approval, "admin", "POST", approve(false)).await).await["state"], "refused");
+    assert_eq!(call(&c, &refusal, &owner, "POST", command("/bin/sh")).await.status(), 409);
+    assert_eq!(stock.execs.lock().unwrap().len(), 2);
+    let listed = json_body(call(&c, &approvals, &owner, "GET", Value::Null).await).await;
+    let mut states: Vec<_> = listed["approvals"].as_array().unwrap().iter().map(|a| a["state"].as_str().unwrap()).collect();
+    states.sort();
+    assert_eq!(states, ["approved", "refused", "used"]);
+    // They are stored: a scheduler that starts again has them.
+    assert_eq!(std::fs::read_dir(dir.path().join("launches/approvals")).unwrap().count(), 3);
+
     // A restart is a new generation of the same replica: the same policy, a new activation and proof.
     report.runtime_instances[0].execution.generation = 2;
     report.runtime_instances[0].execution.lease_id = "lease-2".into();
@@ -204,7 +281,9 @@ async fn owner_launches(driver: &str) {
     let creates = stock.creates.lock().unwrap().clone();
     assert_eq!(creates.len(), 2);
     assert_ne!(creates[0].1, creates[1].1);
-    // The budget's 3 are spent on two launches and one exec: the next allow is refused, and nothing runs.
+    // An approval is for its generation.
+    assert_eq!(call(&c, &unused, &owner, "POST", command("/bin/sh")).await.status(), 409);
+    // The budget's 4 are spent on two launches and two execs: the next allow is refused, and nothing runs.
     until(&c, &owner, &path, |v| v["launches"][0]["generation"] == 2 && v["launches"][0]["phase"] == "delivered").await;
     report.runtime_instances[0].native_observation_base64 = Some(STANDARD.encode(DriverSandbox {
         id: format!("id-{}", creates[1].1), name: creates[1].1.clone(), ..observed
@@ -212,7 +291,7 @@ async fn owner_launches(driver: &str) {
     c.report("gpu", "session", report.clone()).await.unwrap();
     until(&c, &owner, &path, |v| v["launches"][0]["phase"] == "created").await;
     assert_eq!(call(&c, &exec, &owner, "POST", command("/bin/cat")).await.status(), 409);
-    assert_eq!(stock.execs.lock().unwrap().len(), 1);
+    assert_eq!(stock.execs.lock().unwrap().len(), 2);
 
     assert_eq!(call(&c, &path, &owner, "DELETE", Value::Null).await.status(), 200);
     assert_eq!(call(&c, &path, &owner, "GET", Value::Null).await.status(), 404);
