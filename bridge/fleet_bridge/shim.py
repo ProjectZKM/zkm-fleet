@@ -118,6 +118,8 @@ def required_capabilities(spec: AppReplicaSpec) -> set[str]:
         required.add("shim-openshell-ingress-v1")
     if app.runtime.driver == "docker":
         required.add(CAPABILITY)
+    if app.mandates is not None:
+        required.add("shim-mandates-v1")
     if app.access_policy_sha256 is not None:
         required.add("shim-openshell-access-v1")
         if app.runtime.driver in ("tee", "tee-simulation"):
@@ -203,6 +205,7 @@ def capabilities(config: ControlPlaneConfig) -> list[str]:
         return native + [name for name, supported in (
             ("shim-chisel-network-v1", network and config.shim_network.tunnel_binary is not None),
             ("shim-cleanup-v1", True),
+            ("shim-mandates-v1", "runtime-mandates-v1" in features),
             ("shim-resume-v1", config.shim_daemon and "runtime-resume-v1" in features and "docker" in value.get("drivers", [])),
             # A TEE restart is admitted afresh: new evidence and a proof each time.
             ("shim-resume-tee-v1", config.shim_daemon and "runtime-resume-tee-v1" in features and config.shim_tee is not None
@@ -445,6 +448,8 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
         environment.setdefault("NVIDIA_DRIVER_CAPABILITIES", "all")
     return {"execution": spec.execution, "driver": driver, "image": app.image,
         **({"access_policy_sha256": app.access_policy_sha256} if app.access_policy_sha256 is not None else {}),
+        # Carried to the shim with the launch, never into the container (env/labels/files); the shim enforces it.
+        **({"mandates": to_dict(app.mandates)} if app.mandates is not None else {}),
         "command": [v.format(**fill) for v in app.command],
         "environment": environment,
         "limits": launch_limits(spec),

@@ -1693,6 +1693,30 @@ actors use a separate Ray worker environment so updated adapter code loads
 without restarting Ray or existing detached apps. Stop/delete requires the shim
 to drain live streams before releasing the port and Ray reservation.
 
+**Mandates.** An app's spec may carry a `mandates` object — `{issuer, owner, agent,
+names: [...]}` — that the shim enforces outside the sandbox (attestx/trusted-shim#33):
+before each request the shim decides against the named mandates and lets only an
+allowed one through. Fleet carries it to the shim but never interprets it: it
+checks only the shape (non-empty bounded strings, 1–64 names) and size, never the
+names' meaning, and never calls the Mandate service.
+
+- **Administrator-owned.** `mandates` is set with the rest of an app's launch
+  (`POST /apps`, `PUT /apps/NAME/settings`), like `user` and `runtime`; a
+  namespace owner's token and `POST /apps/NAME/exec` cannot set or change it.
+  Changing it is a settings change that drains and restarts the replicas, like a
+  policy change.
+- **Never in the sandbox.** It travels to the shim with the launch over the
+  node's private channel, never in the container's environment, labels, files or
+  anything else the sandbox can read.
+- **Delivered only where enforced.** A mandates-bearing app requires the node
+  capability `shim-mandates-v1`, which the node reports when its shim advertises
+  `runtime-mandates-v1`; so it is placed only where the shim carries and enforces
+  it. ClawUp sends the field only when a node reports that capability.
+- **Shown read-only.** It appears in the app's spec and report so an owner's
+  health check can compare it with its own record.
+- **Absent means none.** An app without `mandates` runs as before; the shim
+  treats it as "no mandates".
+
 ### Shim management and ingress
 
 The explicit Docker shim executor can declare the reserved `control` service for node-local administration. It maps to the shim's control endpoint; the central connection gateway requires Fleet administrator permission to issue that service's access grant. Application ingress is an administrator-only `ingress` map in the existing app spec, keyed by a declared service name (excluding `control`), with exact `paths`, allowed `methods`, and optional `bearer_env`. The shim injects that container environment credential locally after verifying the execution grant. A normal service with no ingress rule still maps directly to the app's port.

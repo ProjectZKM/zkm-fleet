@@ -639,12 +639,35 @@ MIN_MEMORY_LIMIT_BYTES = 6 * 1024**2
 
 
 @dataclass(kw_only=True)
+class MandateBinding(Record):
+    """The mandates a hosted agent is under, which the node's shim enforces
+    (attestx/trusted-shim#33). Fleet carries this verbatim to the shim and never
+    interprets it: the node checks only its shape, never the names' meaning, and
+    never calls the Mandate service."""
+
+    STRICT_FIELDS: typing.ClassVar[bool] = True
+    issuer: str
+    owner: str
+    agent: str
+    names: list[str]
+
+    def __post_init__(self) -> None:
+        def ok(s: str) -> bool:
+            return bool(s) and len(s) <= 256 and not any(ord(c) < 32 or ord(c) == 127 for c in s)
+        if (not all(ok(s) for s in (self.issuer, self.owner, self.agent))
+                or not 1 <= len(self.names) <= 64 or not all(ok(n) for n in self.names)):
+            raise ModelError("invalid mandates: {issuer, owner, agent, names:[...]} of non-empty bounded strings")
+
+
+@dataclass(kw_only=True)
 class AppSpec(Record):
     """One entry of `apps:`."""
 
     name: str
     runtime: RuntimeSelection | None = None
     access_policy_sha256: str | None = None
+    # Carried to the shim, kept out of the sandbox; absent means none. Admin-set only.
+    mandates: MandateBinding | None = None
     services: list[str] = field(default_factory=list)
     service_protocol: ServiceProtocol = ServiceProtocol.HTTP1
     ingress: dict[str, HttpIngress] = field(default_factory=dict)

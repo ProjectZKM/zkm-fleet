@@ -485,7 +485,18 @@ impl RegisterAppRequest {
     pub const SPEC_SETTINGS: [&'static str; 13] = ["kind", "image", "replicas", "gpus", "cpus", "shm_gb",
         "memory_gb", "env", "volumes", "ready_timeout_s", "stop_timeout_s", "cpu_limit", "memory_limit_gb"];
     /// Settings only a container app's spec (`kind: app`) may give.
-    pub const CONTAINER_SETTINGS: [&'static str; 14] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner", "mounts"];
+    pub const CONTAINER_SETTINGS: [&'static str; 15] = ["command", "port_base", "health_path", "workdir", "user", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "access_policy_sha256", "health_tcp_banner", "mounts", "mandates"];
+
+    /// A mandate binding the shim enforces (attestx/trusted-shim#33), which Fleet carries to
+    /// the node but never interprets: `{issuer, owner, agent, names:[...]}`. Only its shape and
+    /// size are checked here, so the node delivers exactly what the launcher set.
+    pub fn valid_mandates(v: &Value) -> bool {
+        let Some(m) = v.as_object() else { return false };
+        let str_ok = |s: &Value, max: usize| s.as_str().is_some_and(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control));
+        m.keys().all(|k| ["issuer", "owner", "agent", "names"].contains(&k.as_str()))
+            && ["issuer", "owner", "agent"].iter().all(|k| m.get(*k).is_some_and(|s| str_ok(s, 256)))
+            && m.get("names").is_some_and(|n| n.as_array().is_some_and(|a| !a.is_empty() && a.len() <= 64 && a.iter().all(|s| str_ok(s, 256))))
+    }
     /// At most this many GPUs or durable mounts per native replica, as in shim.
     pub const MAX_NATIVE_ATTACHMENTS: usize = 16;
 
@@ -600,6 +611,9 @@ impl RegisterAppRequest {
         }
         if let Some(entrypoint) = spec.get("entrypoint") {
             anyhow::ensure!(entrypoint.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')), "invalid entrypoint");
+        }
+        if let Some(mandates) = spec.get("mandates") {
+            anyhow::ensure!(Self::valid_mandates(mandates), "invalid mandates: {{issuer, owner, agent, names:[...]}} of non-empty bounded strings");
         }
         Ok(())
     }
@@ -1069,6 +1083,24 @@ mod tests {
             report.runtime_capabilities.remove(0);
             assert!(!report.supports_runtime(entry));
         }
+    }
+
+    #[test]
+    fn mandates_are_validated_by_shape_only_and_are_a_container_setting() {
+        let base = json!({"kind":"app","image":"agent:1","runtime":{"executor":"shim","driver":"docker"},
+            "cpus":1,"gpus":0,"port_base":0,"container_port":8080,"services":["http"],"memory_gb":0.125});
+        let with = |m: Value| { let mut s = base.clone(); s["mandates"] = m; s };
+        let ok = json!({"issuer":"clawup","owner":"u1","agent":"a1","names":["cloud-buyer","no-withdrawals"]});
+        RegisterAppRequest { name:"agent".into(), spec:with(ok).into(), ..Default::default() }.validate().unwrap();
+        for bad in [json!({"issuer":"clawup"}), json!({"issuer":"c","owner":"u","agent":"a","names":[]}),
+            json!({"issuer":"c","owner":"u","agent":"a","names":["n"],"extra":1}),
+            json!({"issuer":"","owner":"u","agent":"a","names":["n"]}), json!("not-an-object")] {
+            assert!(RegisterAppRequest { name:"agent".into(), spec:with(bad.clone()).into(), ..Default::default() }.validate().is_err(), "{bad}");
+        }
+        // It is a container setting; a prover may not carry it.
+        let mut prover = with(json!({"issuer":"c","owner":"u","agent":"a","names":["n"]}));
+        prover["kind"] = json!("ziren-gpu"); prover["elf_id"] = json!("a".repeat(64));
+        assert!(RegisterAppRequest { name:"p".into(), spec:prover.into(), ..Default::default() }.validate().is_err());
     }
 
     #[test]
