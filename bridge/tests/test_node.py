@@ -76,6 +76,31 @@ def test_stop_removes_every_replica_and_writes_nothing(executor,monkeypatch):
     assert executor.apps_file.read_bytes()==before
 
 
+def test_a_stop_in_progress_holds_no_other_app_change(executor,monkeypatch):
+    import threading
+    app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
+    monkeypatch.setattr(reconcile,"running",lambda:{})
+    begun,gone=threading.Event(),threading.Event()
+    def stop(name,**kwargs):
+        begun.set()
+        assert gone.wait(10)  # a replica's stop grace
+    monkeypatch.setattr(reconcile,"stop",stop)
+    command={"id":"stop","operation":4,"parameters":{"app":app,"disabled":True}}
+    node.write_json(executor.journal/"stop.json",{"command":command,"done":False})
+    stopping=threading.Thread(target=executor.execute,args=(command,))
+    stopping.start()
+    try:
+        assert begun.wait(10)
+        assert executor.apps_lock.acquire(timeout=1),"another app's create or start takes the configuration at once"
+        executor.apps_lock.release()
+        assert not node.read_json(executor.journal/"stop.json")["done"],"the disable is done once its replicas are"
+    finally:
+        gone.set()
+        stopping.join(10)
+    done=node.read_json(executor.journal/"stop.json")
+    assert done["error"] is None and done["result"]["cleaned"]
+
+
 def test_stop_failure_does_not_confirm_cleanup(executor,monkeypatch):
     app=yaml.safe_load(executor.apps_file.read_text())["apps"][0]
     monkeypatch.setattr(reconcile,"stop",Mock(side_effect=RuntimeError("shim cleanup is not confirmed")))
