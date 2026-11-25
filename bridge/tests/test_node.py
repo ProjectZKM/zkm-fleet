@@ -383,6 +383,18 @@ def test_remove_entry_keeps_every_other_line(tmp_path):
     assert not node.remove_entry(p,"apps","goat")
 
 
+def test_remove_entry_keeps_the_newest_backups(tmp_path):
+    p=tmp_path/"apps.yaml";p.write_text(APPS)
+    old=[tmp_path/f"apps.yaml.removed-2026010{i}T000000Z" for i in range(1,8)]
+    for f in old+[tmp_path/"apps.yaml.removed-by-hand", tmp_path/"batches.yaml.removed-20260101T000000Z"]:
+        f.write_text("old")
+    assert node.remove_entry(p,"apps","eth")
+    kept=sorted(f.name for f in tmp_path.glob("apps.yaml.removed-2*"))
+    assert len(kept)==node.REMOVAL_BACKUPS and kept[-1]>old[-1].name, kept
+    assert (tmp_path/"apps.yaml.removed-by-hand").exists(), "a file Fleet did not write stays"
+    assert (tmp_path/"batches.yaml.removed-20260101T000000Z").exists(), "another file's backups stay"
+
+
 def test_remove_entry_drops_one_batch(tmp_path):
     p=tmp_path/"batches.yaml"
     p.write_text("batches:\n  trainer:\n    image: a\n  # retired\n  old:\n    image: b\n    allow: [/srv]\n  last: {image: c}\n")
