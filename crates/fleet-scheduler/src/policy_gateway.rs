@@ -35,7 +35,7 @@ pub struct PolicyGateway {
     program_vkey: String,
     elf: Vec<u8>,
     permits: Arc<Semaphore>,
-    preflight: Option<Arc<PreflightWorker>>,
+    pub(crate) preflight: Option<Arc<PreflightWorker>>,
     pub(crate) network: Option<Arc<dyn trusted_shim::proof::ProofNetwork>>,
     pub(crate) openshell: Option<Arc<crate::openshell::Launches>>,
 }

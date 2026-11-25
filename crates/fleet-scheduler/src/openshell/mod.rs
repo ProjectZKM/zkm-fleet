@@ -48,7 +48,7 @@ const MAX_RECORD: usize = 4 * 1024 * 1024;
 mod control;
 mod owner;
 mod readiness;
-pub(crate) use control::{ExecGateway, StockGateway};
+pub(crate) use control::{app_exec, ExecGateway, ExecInput, Refusal, StockGateway};
 #[cfg(test)]
 pub(crate) use control::{stdin_frames, ExecOutput};
 #[cfg(test)]

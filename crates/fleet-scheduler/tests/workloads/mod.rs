@@ -1219,11 +1219,13 @@ async fn app_owners_manage_apps_and_scale_without_widening_grants_or_tags() {
         let other_signer = user_token(&c, &ns, 5, "scope=default", Some(vec!["model".into()]), false).await;
         let scale = if proof { format!("/apps/{PROOF}/scale") } else { "/apps/model/scale".into() };
         let disabled = if proof { format!("/apps/{PROOF}/disabled") } else { "/apps/model/disabled".into() };
+        let restart = disabled.replace("/disabled", "/restart");
         for token in [&consumer, &restricted, &foreign_tag] {
             for (method, path, body) in [
                 ("PUT", scale.as_str(), json!({"replicas":1})),
                 ("PUT", disabled.as_str(), Value::Null),
                 ("DELETE", disabled.as_str(), Value::Null),
+                ("POST", restart.as_str(), Value::Null),
             ] {
                 let status = scale_call(c.clone(), token, method, path, body).await.status();
                 assert!(matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), "{method} {path}: {status}");
@@ -1257,7 +1259,20 @@ async fn app_owners_manage_apps_and_scale_without_widening_grants_or_tags() {
             }).await.unwrap();
             node_completes_changes(&c, &ns, proof).await;
             assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+            if disabled_state {
+                // A disabled app is enabled, not restarted.
+                assert_eq!(scale_call(c.clone(), &owner, "POST", &restart, Value::Null).await.status(), StatusCode::CONFLICT);
+            }
         }
+        // A restart is both in one call: the node stops the app's replicas, then starts them.
+        let (control, token, path) = (c.clone(), owner.clone(), restart.clone());
+        let request = tokio::spawn(async move { scale_call(control, &token, "POST", &path, Value::Null).await });
+        for disabled_state in [true, false] {
+            change_pending(&c, disabled_state).await;
+            node_completes_changes(&c, &ns, proof).await;
+        }
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        assert!(c.inner.lock().deployments.values().all(|d| !d.disabled && d.scale.as_ref().is_none_or(|s| !s.pending())));
         assert_eq!(scale_call(c.clone(), &owner, "PUT", &scale, json!({"replicas":1})).await.status(), StatusCode::ACCEPTED);
         assert_eq!(scale_call(c, &owner, "PUT", &disabled, Value::Null).await.status(), StatusCode::CONFLICT);
     }

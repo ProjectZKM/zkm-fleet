@@ -2189,7 +2189,7 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         ));
     }
     let action = match parts.as_slice() {
-        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings" | "policy") && !batch => Some(*action),
+        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings" | "policy" | "exec") && !batch => Some(*action),
         _ => None,
     };
     if let Some(action) = action {
@@ -2199,6 +2199,9 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         if !app.persistent { return Err(fail(400, "batch job resources are selected with batch submit --gpus and --cpus",
             )); }
         WorkloadController::require_grant(c, &app.name)?;
+        if action == "exec" {
+            return app_exec(&s, c, &q, &namespace, &app.name, &method, request).await;
+        }
         return s.app_action(c, &q, &namespace, &app.name, action, &method, request).await;
     }
     if method == Method::GET && parts == ["apps"] {
@@ -2365,37 +2368,43 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
             s.inner.lock().apps.insert(name.into(), app.clone());
             return Ok(Json(view(&s, &app)).into_response());
         }
-        if parts.len() == 3
-            && parts[2] == "disabled"
-            && matches!(method, Method::PUT | Method::DELETE)
+        // A restart is a disable, then an enable: every replica comes back as a new generation.
+        let restart = parts.len() == 3 && parts[2] == "restart" && method == Method::POST && app.persistent;
+        if restart && app.disabled() {
+            return Err(fail(409, "the app is disabled; enable it instead"));
+        }
+        if restart
+            || parts.len() == 3 && parts[2] == "disabled" && matches!(method, Method::PUT | Method::DELETE)
         {
-            let disabled = method == Method::PUT;
-            if app.persistent && !disabled {
-                s.deploy(&app.namespace, name).await?;
-            }
-            let ids = {
-                let _ops = s.ops.lock().await;
-                app = s
-                    .inner
-                    .lock()
-                    .apps
-                    .get(name)
-                    .filter(|a| !a.removed && a.persistent != batch)
-                    .cloned()
-                    .ok_or_else(|| fail(404, "unknown app"))?;
-                app.set_disabled(disabled);
-                s.save("apps", name, &app)?;
-                s.inner.lock().apps.insert(name.into(), app.clone());
-                if app.persistent {
-                    // Every deployment changes; an offline node's waits until it reconnects.
-                    let keys = s.app_deployments(&app.namespace, name);
-                    s.begin_toggle(&keys, disabled)?;
-                    s.online(&keys)
-                } else {
-                    vec![]
+            let steps: &[bool] = if restart { &[true, false] } else if method == Method::PUT { &[true] } else { &[false] };
+            for &disabled in steps {
+                if app.persistent && !disabled {
+                    s.deploy(&app.namespace, name).await?;
                 }
-            };
-            s.wait_scales(&ids).await?;
+                let ids = {
+                    let _ops = s.ops.lock().await;
+                    app = s
+                        .inner
+                        .lock()
+                        .apps
+                        .get(name)
+                        .filter(|a| !a.removed && a.persistent != batch)
+                        .cloned()
+                        .ok_or_else(|| fail(404, "unknown app"))?;
+                    app.set_disabled(disabled);
+                    s.save("apps", name, &app)?;
+                    s.inner.lock().apps.insert(name.into(), app.clone());
+                    if app.persistent {
+                        // Every deployment changes; an offline node's waits until it reconnects.
+                        let keys = s.app_deployments(&app.namespace, name);
+                        s.begin_toggle(&keys, disabled)?;
+                        s.online(&keys)
+                    } else {
+                        vec![]
+                    }
+                };
+                s.wait_scales(&ids).await?;
+            }
             app = s.inner.lock().apps.get(name).cloned().unwrap_or(app);
             return Ok(Json(view(&s, &app)).into_response());
         }
@@ -2628,21 +2637,29 @@ impl WorkloadController {
                 let p = priority_of(request).await?;
                 Ok(Json(self.fleet.set_app_priority(&namespace, &name, p).await?).into_response())
             }
-            (&Method::PUT | &Method::DELETE, ["disabled"]) => {
-                let disabled = method == Method::PUT;
-                if !disabled {
-                    self.deploy(&namespace, &name).await?;
+            (&Method::PUT | &Method::DELETE, ["disabled"]) | (&Method::POST, ["restart"]) => {
+                // A restart is a disable, then an enable: every replica comes back as a new generation.
+                let steps: &[bool] = match *method {
+                    Method::POST if app.disabled => return Err(fail(409, "the app is disabled; enable it instead")),
+                    Method::POST => &[true, false],
+                    Method::PUT => &[true],
+                    _ => &[false],
+                };
+                for &disabled in steps {
+                    if !disabled {
+                        self.deploy(&namespace, &name).await?;
+                    }
+                    // Every deployment changes; an offline node's waits until it reconnects.
+                    let keys = self.app_deployments(&namespace, &name);
+                    {
+                        let _ops = self.ops.lock().await;
+                        // Refused while another change is under way, before anything changes.
+                        self.begin_toggle(&keys, disabled)?;
+                        // Its jobs are refused until its prover is up again, which re-enables it.
+                        self.fleet.set_app_disabled(&namespace, &name, disabled || !keys.is_empty()).await?;
+                    }
+                    self.wait_scales(&self.online(&keys)).await?;
                 }
-                // Every deployment changes; an offline node's waits until it reconnects.
-                let keys = self.app_deployments(&namespace, &name);
-                {
-                    let _ops = self.ops.lock().await;
-                    // Refused while another change is under way, before anything changes.
-                    self.begin_toggle(&keys, disabled)?;
-                    // Its jobs are refused until its prover is up again, which re-enables it.
-                    self.fleet.set_app_disabled(&namespace, &name, disabled || !keys.is_empty()).await?;
-                }
-                self.wait_scales(&self.online(&keys)).await?;
                 Ok(Json(self.stored_proof_app(&namespace, &name, tag.as_deref()).await?).into_response())
             }
             (_, [action]) if matches!(*action, "scale" | "logs" | "settings") => {
@@ -2655,6 +2672,29 @@ impl WorkloadController {
         }
     }
 }
+/// `POST /apps/NAME/exec[?replica=ALLOCATION]`: the owner runs a command in one replica of
+/// its native OpenShell app. The replica's activated policy decides each call.
+async fn app_exec(s: &Arc<WorkloadController>, c: Option<&Token>, q: &BTreeMap<String, String>, namespace: &str, app: &str,
+    method: &Method, request: Request,
+) -> anyhow::Result<Response> {
+    use trusted_shim::rail::Error;
+    if method != Method::POST {
+        return Err(fail(405, "POST required"));
+    }
+    s.require_deployment_scope(c, namespace, app, None)?;
+    let input: crate::openshell::ExecInput = serde_json::from_slice(&to_bytes(request.into_body(), 90 << 20).await?)
+        .map_err(|e| fail(400, format!("invalid exec: {e}")))?;
+    let replica = q.get("replica").map(String::as_str);
+    let output = crate::openshell::app_exec(s, namespace, app, replica, input).await.map_err(|refusal| match refusal {
+        crate::openshell::Refusal(_, Some(decision)) => fail(403, format!("the app's policy does not allow this exec: {decision}")),
+        crate::openshell::Refusal(Error::InvalidInput, _) => fail(400, "invalid exec: 1 to 256 arguments, base64 stdin and timeout_seconds of 1 to 600"),
+        crate::openshell::Refusal(Error::Conflict, _) => fail(409, "select one replica of the app with ?replica=ALLOCATION; GET /apps/NAME/policy lists them"),
+        crate::openshell::Refusal(Error::Unavailable, _) => fail(503, "exec is unavailable: it needs the scheduler's gateway settings, a free exec slot and the gateway's answer"),
+        crate::openshell::Refusal(..) => fail(409, "the replica takes no exec: its launch must be created and current, its policy active with budget left, and user its policy's run_as_user"),
+    })?;
+    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(output)).into_response())
+}
+
 async fn log_response(
     s: &WorkloadController,
     r: &Job,
