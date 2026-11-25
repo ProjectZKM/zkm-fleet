@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1420" viewBox="0 0 1600 1420" role="img" aria-labelledby="title desc">
 <title id="title">Fleet architecture: control host, data router and execution machines</title>
-<desc id="desc">Operators, SDK clients and automation reach the control host over authenticated HTTPS on port 8905. The control host is one Docker Compose project: an Envoy HTTPS gateway, the scheduler and workload controller with Postgres, and the optional MCP server, OpenShell gateway and Trustee Attestation Service as Compose profiles. The scheduler embeds optional Rail policy evaluation, whose proofs come from a remote proof network or guest. The OpenShell gateway talks to the scheduler over a private compute socket and serves mTLS on host port 17670, loopback by default. Trustee AS is reached only through the gateway's attestation route. The data router is a separate deployment with its own server and Compose project; clients reach shim apps' declared services through it. Each execution machine runs the fleet-node agent and its own local Ray with the bridge, supervised by systemd or the cron watchdog; apps and batch jobs run through the existing executor. An opt-in trusted-shim runtime runs as its own service with shim app containers published only on node loopback, beside an optional Chisel tunnel helper. Nodes connect outward only: HTTP/2 heartbeats to the control host on port 8905, and HTTPS or WSS to the data router. Workers read and write application-owned storage directly.</desc>
+<desc id="desc">Operators, SDK clients and automation reach the control host over authenticated HTTPS on port 8905. The control host is one Docker Compose project: an Envoy HTTPS gateway, the scheduler and workload controller with Postgres, and the optional MCP server, OpenShell gateway and Trustee Attestation Service as Compose profiles. The scheduler embeds optional Rail policy evaluation, whose proofs come from a remote proof network or guest. The OpenShell gateway talks to the scheduler over a private compute socket and serves mTLS on host port 17670, loopback by default. Trustee AS is reached only through the gateway's attestation route. The data router is a separate deployment with its own server and Compose project; clients reach apps' declared services through it. Each execution machine runs the fleet-node agent and its own local Ray with the bridge, supervised by systemd or the cron watchdog; every app replica and batch job runs in a container of the trusted-shim runtime, which runs as its own service beside an optional Chisel tunnel helper; app ports are published only on node loopback. Nodes connect outward only: HTTP/2 heartbeats to the control host on port 8905, and HTTPS or WSS to the data router. Workers read and write application-owned storage directly.</desc>
 <defs>
 <marker id="control" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#64748b"/></marker>
 <marker id="data" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#2563eb"/></marker>
@@ -29,7 +29,7 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="1120" y="151" class="small">Submit · configure · observe</text>
 <text x="270" y="202" class="small">Authenticated HTTPS · port 8905</text>
 <path d="M1375 175V215" class="svc"/>
-<text x="1360" y="202" class="small" text-anchor="end">Shim apps' declared services · HTTPS / WSS</text>
+<text x="1360" y="202" class="small" text-anchor="end">Apps' declared services · HTTPS / WSS</text>
 
 <!-- Policy and durable workload metadata live on the control host; optional services are Compose profiles. -->
 <rect x="40" y="215" width="1110" height="510" rx="14" fill="#eff6ff" stroke="#93c5fd" stroke-width="1.5"/>
@@ -89,7 +89,7 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="1212" y="340" class="small">not on the control host</text>
 <rect x="1212" y="370" width="326" height="95" rx="10" class="box"/>
 <text x="1232" y="400" class="label">Client side</text>
-<text x="1232" y="426" class="small">Clients reach shim apps'</text>
+<text x="1232" y="426" class="small">Clients reach apps'</text>
 <text x="1232" y="450" class="small">declared services here</text>
 <rect x="1212" y="485" width="326" height="95" rx="10" class="box"/>
 <text x="1232" y="515" class="label">Node side</text>
@@ -115,20 +115,20 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 
 <rect x="62" y="855" width="680" height="100" rx="10" class="box"/>
 <text x="82" y="887" class="name">fleet-node agent + local Ray + bridge</text>
-<text x="82" y="915" class="small">Apply commands · reserve resources · launch workers · report availability</text>
+<text x="82" y="915" class="small">Apply commands · reserve resources · launch replicas and jobs · report availability</text>
 <text x="82" y="941" class="small">Supervised by systemd units (node, Ray) or the cron watchdog</text>
 <path d="M222 955V985 M582 955V985" class="data"/>
 <rect x="62" y="985" width="320" height="110" rx="10" fill="#f0fdf4" stroke="#86efac" stroke-width="1.5"/>
 <text x="82" y="1018" class="name">Apps</text>
-<text x="82" y="1048" class="detail">Long-running replicas / workers</text>
-<text x="82" y="1076" class="small">Existing executor · serving · proving</text>
+<text x="82" y="1048" class="detail">Long-running replicas</text>
+<text x="82" y="1076" class="small">Shim containers · serving · proving</text>
 <rect x="422" y="985" width="320" height="110" rx="10" fill="#faf5ff" stroke="#d8b4fe" stroke-width="1.5"/>
 <text x="442" y="1018" class="name">Batch jobs</text>
 <text x="442" y="1048" class="detail">Finite commands · queued jobs</text>
-<text x="442" y="1076" class="small">Existing executor · release on cleanup</text>
+<text x="442" y="1076" class="small">Run to completion · release on cleanup</text>
 
-<rect x="782" y="855" width="740" height="240" rx="12" fill="#f0fdfa" stroke="#2dd4bf" stroke-width="1.5" stroke-dasharray="7 5"/>
-<text x="802" y="882" class="label">Trusted shim path <tspan class="small" font-weight="400">· opt-in per node (install --with-shim)</tspan></text>
+<rect x="782" y="855" width="740" height="240" rx="12" fill="#f0fdfa" stroke="#2dd4bf" stroke-width="1.5"/>
+<text x="802" y="882" class="label">Trusted shim <tspan class="small" font-weight="400">· runs every app replica and batch job</tspan></text>
 <path d="M742 930H802" class="data"/>
 <rect x="802" y="897" width="380" height="88" rx="10" class="box"/>
 <text x="822" y="927" class="name">trusted-shim runtime</text>
@@ -140,11 +140,11 @@ text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}
 <text x="1232" y="976" class="small">Carries router streams</text>
 <path d="M992 985V1010 M1357 985V1010" class="data"/>
 <rect x="802" y="1010" width="700" height="70" rx="10" fill="#ecfeff" stroke="#67e8f9" stroke-width="1.5"/>
-<text x="822" y="1040" class="name">Shim app containers</text>
-<text x="822" y="1066" class="small">Opt-in apps · published only on node loopback · services reached via the data router</text>
+<text x="822" y="1040" class="name">App and job containers</text>
+<text x="822" y="1066" class="small">Docker, OpenShell or TEE driver · ports on node loopback · services via the data router</text>
 
 <rect x="62" y="1115" width="1460" height="45" rx="10" class="box"/>
-<text x="82" y="1145" class="detail">Shared CPU / GPU pool · Ray reservations for apps, batches and shim containers</text>
+<text x="82" y="1145" class="detail">Shared CPU / GPU pool · Ray reservations for every app replica and batch job</text>
 
 <!-- Nodes connect outward only: heartbeats to the control host, service tunnels to the data router. -->
 <path d="M300 700V855" class="control"/>
