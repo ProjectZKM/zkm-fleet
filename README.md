@@ -2,86 +2,106 @@
 
 [![CI](https://github.com/ProjectZKM/zkm-fleet/actions/workflows/ci.yml/badge.svg)](https://github.com/ProjectZKM/zkm-fleet/actions/workflows/ci.yml)
 
-Fleet schedules apps and batch jobs on shared GPU and CPU machines.
+Fleet runs apps and batch jobs on a shared pool of GPU and CPU machines. A control host
+decides what runs where; each machine runs it in containers through
+[trusted-shim](#how-it-works).
 
-- **Apps** keep containers running: a model server, or a Ziren prover with its program.
-- **Batches** run finite commands and release resources when cleanup finishes.
+## What it runs
 
-## Architecture
+- **Apps** keep replicas running: a model server, a web service, or a Ziren prover
+  (`kind: ziren-gpu` or `ziren-cpu`) with its program.
+- **Batches** queue finite jobs. Each job runs once on one machine and frees its
+  resources when its cleanup is confirmed.
 
-![Fleet architecture: apps and batches share machine resources](images/diagram.svg)
+Work belongs to a **namespace**. Its owners create apps and batches and set their
+priority, enabled state and scale, within the quotas of their namespace and tag.
+Administrators manage namespaces, quotas, access, host storage and each app's execution
+settings. The [code model](docs/reference.md#code-names) follows Kubernetes' jobs,
+deployments and controllers, without Kubernetes.
 
-The control host runs the Rust scheduler, Postgres, an HTTPS gateway and, optionally,
-MCP, the OpenShell gateway and Trustee AS. Each execution machine runs `fleet-node`
-and its own local Ray, and connects outward to register. Fleet handles admission,
-quotas, placement and lifecycle; apps own their data and pipelines. The [code model](docs/reference.md#code-names) follows
-Kubernetes' jobs, deployments and controllers, without needing Kubernetes.
+## How it works
 
-Namespace owners create apps and batches and manage their priority, enabled state and
-scaling, within their namespace's and tag's quotas; the scheduler picks each app's
-node, and moves an app's start to a node with room when its own has none. Fleet copies
-nothing an app keeps on a node's disks, so an app that keeps data there, or runs from
-it, is anchored to that node with `machine` in its entry in the node's `apps.yaml`.
-Administrators manage namespaces, quotas, access, host storage for batches and apps'
-execution settings.
+![Fleet architecture: control host, data router and execution machines](images/diagram.svg)
 
-Two app workers prove on the GPU server in their own container:
+1. **Clients** (`fleetctl`, the proof SDK, the HTTP API, optional MCP) call the control
+   host over authenticated HTTPS on port 8905.
+2. **The scheduler** admits work against quotas and priority, picks a node with room and
+   keeps the records. It drains an app before it changes or stops it.
+3. **Each node** runs `fleet-node`, its own local Ray and the bridge. The agent sends
+   heartbeats out to the control host, and the replies carry its commands. Nothing
+   connects in to a node, and adding one needs only the control-plane URL and the
+   cluster token.
+4. **On the node**, the bridge reserves CPUs, GPUs and memory in Ray and runs every app
+   replica and batch job in a container of trusted-shim, on its Docker, OpenShell, TEE or
+   TEE-simulation driver. The shim runs as its own service, so a node upgrade leaves
+   running containers alone.
+5. **App traffic** reaches an app only through the
+   [data router](https://github.com/attestx/trusted-data-router/tree/main/deploy), a
+   separate deployment: an app's ports are published on node loopback, and the router
+   carries its declared services over the node's outbound tunnel. A prover's node entry
+   can instead set `network: host` to listen on the node's own port.
+6. **Data** stays with the app. Fleet copies nothing an app keeps on a node's disks, so an
+   app that keeps data on a node is anchored there with `machine` in that node's
+   `apps.yaml`.
 
-- **EthProofs** prepares witnesses, proves and reports every block in sequence,
-  resuming from its saved cursor.
-- **The GOAT proof builder** serves Bitcoin node proof requests, proves its five
-  circuits and keeps its task database and proofs in app storage.
+| Where | Component | Role |
+|---|---|---|
+| Control host (one Compose project) | `fleet-scheduler` + Postgres | Admission, quotas, placement, lifecycle and records |
+| | HTTPS gateway | TLS for clients and nodes on port 8905 |
+| | `fleet-mcp`, OpenShell gateway, Trustee AS | Optional Compose profiles |
+| Every node | `fleet-node`, local Ray, `bridge/fleet_bridge` | Heartbeats, resource grants, launches and confirmed cleanup |
+| | `trusted-shim-runtime` (+ Chisel tunnel helper) | Runs the containers; carries the data router's streams |
+| | `fleet-proof-app`, `fleet-ziren-node` | Optional: a proof app's SDK endpoint, and fetching its stored proofs |
+| Elsewhere | Data router | Routes clients to apps' declared services |
 
-## Runtime deployment (0.2)
+[Reference: architecture](docs/reference.md#architecture) describes each part in detail.
 
-Opt-in shim workloads use an independently supervised `trusted-shim-runtime`;
-node-agent upgrades leave that process and existing containers running.
-OpenShell is the shared access layer for Docker and TEE drivers; without user
-rules it adds no restrictions beyond driver limits. Its gateway is the optional
-`openshell` Compose profile, started by `fleet-ctl.sh openshell up` once the
-scheduler's `policy_gateway.openshell` is configured
-([installation](docs/installation.md#openshell-gateway)). Trustee AS is an optional
-`trustee` Compose profile for legacy attestation/prechecks; its appraisal RPC uses the existing
-HTTPS ingress with node client certificates. TDX DCAP admission verifies original
-evidence in a Ziren guest and does not require AS. Rail is embedded policy evaluation plus a remote proof guest.
-The [Data Router](https://github.com/attestx/trusted-data-router/tree/main/deploy)
-has its own server and Compose project; runtime nodes need only outbound HTTPS/WSS.
+## Apps in this repository
 
-GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}`
-with `sha-<full-commit>` tags and release versions. The unchanged native gateway
-uses `zkm-fleet-openshell:<upstream-revision>`, built once per revision, and
-`fleet-ctl.sh openshell up` pins its digest. The manual proof-image workflow
-publishes `zkm-fleet-ziren-node:sha-<full-commit>` from an operator-validated
-Ziren 2.0 GPU image digest; building it does not run a prover. The node image holds
-only Fleet's binaries: installing a node still needs the release package, which also
-carries the shim, its tunnel helper, the bridge and the scripts. The image does not
-replace local Ray/bridge supervision or combine the shim lifecycle with the node process.
+| App | What it does |
+|---|---|
+| [EthProofs](apps/ethproofs/README.md) | Prepares witnesses, proves and reports every Ethereum block in sequence, resuming from its saved cursor |
+| [GOAT proof builder](apps/goat/README.md) | Serves the Bitcoin node proof API, proves its five circuits and keeps its task database and proofs in app storage |
 
-Existing workloads are not automatically migrated. Schema 20 requires a
-[backup and compatible rollback plan](docs/maintenance.md); preserve application
-data, cursors and identities before the initial upgrade. Policy-enabled deployments
-must also coordinate Rail's v2 evaluator with the new guest, approved program key
-and policy revisions; see [policy upgrades](docs/maintenance.md#policy-evaluator).
+Both run their worker beside a Ziren GPU server in the stock GPU image, with
+[`apps/gpu-worker.sh`](apps/gpu-worker.sh) as the container's entrypoint.
+
+## Access, policy and TEEs
+
+- **OpenShell** is the access layer for the Docker and TEE drivers; without user rules
+  it adds no limits beyond the driver's. Its gateway is the `openshell` Compose profile
+  ([installation](docs/installation.md#openshell-gateway)).
+- **Policy**: the scheduler can embed Rail's policy evaluation, with proofs from a remote
+  proof guest ([central policy ledger](docs/reference.md#central-policy-ledger),
+  [upgrades](docs/maintenance.md#policy-evaluator)).
+- **TEE nodes** check CoCo evidence and a remote attestation receipt in the shim. TDX
+  DCAP admission verifies the original evidence in a Ziren guest (Automata DCAP);
+  SNP and sample profiles use the optional Trustee AS
+  ([TEE runtimes](docs/reference.md#node-configured-tee-runtimes)). Docker workloads are
+  not attested.
+
+## Releases
+
+Each `vX.Y.Z` release publishes `zkm-fleet-X.Y.Z-linux-x86_64.tar.gz` with its SHA-256:
+the binaries, trusted-shim and its tunnel helper, the bridge and the deploy scripts.
+`deploy/fleet-ctl.sh` installs and upgrades from it; upgrade the scheduler first, then
+each node ([maintenance](docs/maintenance.md#upgrading)).
+
+GHCR publishes `ghcr.io/projectzkm/zkm-fleet-{scheduler,ctl,mcp,node,proof-app}` with
+release versions and `sha-<full-commit>` tags. The OpenShell gateway image is
+`zkm-fleet-openshell:<upstream-revision>`, and `fleet-ctl.sh openshell up` pins its
+digest. A node still needs the release package, which carries the shim, the bridge and
+the scripts.
 
 ## Get started
 
 1. [Install the control host and add a node](docs/installation.md).
-2. [Inspect resources, scale apps and run batches](docs/operations.md).
-3. [Adjust machine capacity, update and recover](docs/maintenance.md).
-
-## Documentation
+2. [Create namespaces, scale apps and run batches](docs/operations.md).
+3. [Upgrade, change capacity and recover](docs/maintenance.md).
 
 | Guide | Covers |
 |---|---|
-| [Installation](docs/installation.md) | Dependencies, binaries, control host, execution nodes and registration |
-| [Operations](docs/operations.md) | Namespace commands, tags, node capacity, app scaling, batches and logs |
-| [Maintenance](docs/maintenance.md) | Upgrades, Ray capacity changes, self-built programs, liveness and troubleshooting |
-| [Reference](docs/reference.md) | Architecture, workloads, proofs, access, quotas, APIs, storage and ports |
-| [EthProofs](apps/ethproofs/README.md) | Pinned source, worker build, sequential proving and durable recovery |
-| [GOAT](apps/goat/README.md) | Pinned source, program bundle identity, packaging, cutover and recovery |
-
-Node-configured TEE profiles use CoCo evidence and a synchronous remote RA receipt
-gate in shim. The TDX guest reuses Automata DCAP; SNP/sample retain their separate
-guest contracts and optional-to-the-stack Trustee adapter. Hardware and simulation are separate
-capabilities; existing Docker workloads remain unattested. See the [configuration
-and remaining hardware guest requirements](docs/reference.md#node-configured-tee-runtimes).
+| [Installation](docs/installation.md) | Dependencies, the control host, execution nodes and their shim service, registration |
+| [Operations](docs/operations.md) | Daily commands, namespaces and tags, node capacity, apps, batches and logs |
+| [Maintenance](docs/maintenance.md) | Upgrades and rollback, capacity changes, self-built programs, liveness and troubleshooting |
+| [Reference](docs/reference.md) | Architecture, workloads, proofs, access, quotas, APIs, data, ports and TLS |
