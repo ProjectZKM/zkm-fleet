@@ -8,7 +8,7 @@
 use super::*;
 use crate::config::OpenShellGatewayConfig;
 use sha2::{Digest, Sha256};
-use trusted_shim::{contracts::ExecutionIdentity, ledger_transport::ExecutionAuthority, AuthorizationLedger};
+use trusted_shim::{contracts::ExecutionIdentity, ledger_transport::ExecutionAuthority, rail::Decision, AuthorizationLedger};
 use trusted_shim::openshell_gateway::protocol::{
     self, exec_sandbox_event, exec_sandbox_input, open_shell_client::OpenShellClient,
 };
@@ -152,15 +152,33 @@ pub(super) async fn exec(
     ApiPath(name): ApiPath<String>,
     Json(input): Json<ExecInput>,
 ) -> HttpResponse {
-    private(exec_inner(&c, &name, input, false).await.map_err(|e| e.0))
+    private(exec_inner(&c, &name, input, None).await.map_err(|refusal| match refusal {
+        Refusal::Rail(e) => e,
+        _ => Error::Rejected,
+    }))
 }
 
-/// What refused an exec, and the policy's own answer when that was it.
-pub(crate) struct Refusal(pub Error, pub Option<serde_json::Value>);
+/// What refused an exec.
+pub(crate) enum Refusal {
+    Rail(Error),
+    /// The policy's own answer, with the approval request it opened, if any.
+    Policy(serde_json::Value),
+    /// The app has no such replica, or several and none was named.
+    Replica,
+    /// The named approval is not approved, is spent or expired, or is another exec's.
+    Approval,
+}
 impl From<Error> for Refusal {
     fn from(e: Error) -> Self {
-        Self(e, None)
+        Self::Rail(e)
     }
+}
+
+/// Who sends an owner's exec, and the approval it names.
+pub(crate) struct Caller {
+    /// The token's ID; none for an administrator's.
+    pub token: Option<String>,
+    pub approval: Option<String>,
 }
 
 /// `POST /apps/NAME/exec`: the owner's exec in one replica of its native app.
@@ -169,6 +187,7 @@ pub(crate) async fn app_exec(
     namespace: &str,
     app: &str,
     replica: Option<&str>,
+    caller: Caller,
     input: ExecInput,
 ) -> std::result::Result<serde_json::Value, Refusal> {
     let mut replicas = c.native_reservations().into_iter().filter(|r| {
@@ -178,27 +197,42 @@ pub(crate) async fn app_exec(
     });
     // One replica runs the command; an app with several names which.
     let (Some(r), None) = (replicas.next(), replicas.next()) else {
-        return Err(Error::Conflict.into());
+        return Err(Refusal::Replica);
     };
     let name = GatewayLaunch::execution_name(&r.execution).map_err(|_| Error::InvalidInput)?;
-    exec_inner(c, &name, input, true).await
+    exec_inner(c, &name, input, Some(caller)).await
 }
 
 /// Rail's decision on one exec under the launch's activated policy, as operation
 /// `exec` on the replica. The ledger evaluates it, draws 1 from the launch's
 /// budget for an allow and queues the decision's proof; the grant is consumed
 /// here, so a decision runs one command.
+///
+/// `approval_required` opens an approval request for this exec. Sent again
+/// with that request approved, the exec is evaluated afresh with the approval
+/// as `parameters.approval`; the policy decides what an approval is worth, and
+/// an allow spends it.
 async fn decide(
     c: &Arc<WorkloadController>,
     record: &Record,
     e: &ExecutionIdentity,
     input: &ExecInput,
     stdin: &[u8],
+    caller: Caller,
 ) -> std::result::Result<serde_json::Value, Refusal> {
     let policy = c.policy.clone().filter(|p| p.preflight.is_some()).ok_or(Error::Unavailable)?;
+    let store = launches(c)?;
     let job_id = format!("exec-{}", uuid::Uuid::new_v4().simple());
-    let parameters = json!({"command": input.command, "user": input.user,
+    let asked = json!({"command": input.command, "user": input.user,
         "stdin_sha256": hex::encode(Sha256::digest(stdin)), "timeout_seconds": input.timeout_seconds});
+    let approved = match &caller.approval {
+        Some(id) => Some(store.approved(id, e, &asked).ok_or(Refusal::Approval)?),
+        None => None,
+    };
+    let mut parameters = asked.clone();
+    if let Some(approval) = &approved {
+        parameters["approval"] = approval.fact();
+    }
     let (controller, ledger, e, principal, id) =
         (c.clone(), policy.ledger.clone(), e.clone(), record.preparation.principal.clone(), job_id.clone());
     let (e, result) = tokio::task::spawn_blocking(move || {
@@ -223,8 +257,18 @@ async fn decide(
     let decision = json!({"job_id": job_id, "decision": result.decision.decision,
         "reason_codes": result.decision.reason_codes, "policy": result.decision.policy});
     let Some(grant) = result.grant else {
-        return Err(Refusal(Error::Rejected, Some(decision)));
+        let mut refusal = json!({"decision": decision});
+        if result.decision.decision == Decision::ApprovalRequired && approved.is_none() {
+            // Without a free request slot the answer stands, with nothing to approve.
+            refusal["approval"] = store
+                .request_approval(&job_id, &e, asked, &record.preparation.principal, result.decision.reason_codes, caller.token)
+                .unwrap_or_default();
+        }
+        return Err(Refusal::Policy(refusal));
     };
+    if let Some(approval) = &approved {
+        store.spend(&approval.id).map_err(|_| Refusal::Approval)?;
+    }
     policy.ledger.consume(&grant, &e, &grant.request_sha256).await?;
     Ok(decision)
 }
@@ -233,7 +277,7 @@ async fn exec_inner(
     c: &Arc<WorkloadController>,
     name: &str,
     input: ExecInput,
-    decided: bool,
+    owner: Option<Caller>,
 ) -> std::result::Result<serde_json::Value, Refusal> {
     if input.command.is_empty()
         || input.command.len() > MAX_ARGS
@@ -265,9 +309,9 @@ async fn exec_inner(
     // Current owning node session, generation, deployment intent and quota.
     c.with_runtime_delivery(&launch.execution, None, Some(&launch), |_| Ok(()))?;
     let _slot = store.control_slots.try_acquire().map_err(|_| Error::Unavailable)?;
-    let decision = match decided {
-        true => Some(decide(c, &record, &launch.execution, &input, &stdin).await?),
-        false => None,
+    let decision = match owner {
+        Some(caller) => Some(decide(c, &record, &launch.execution, &input, &stdin, caller).await?),
+        None => None,
     };
     let mut start = protocol::ExecSandboxRequest {
         workspace_scope,

@@ -16,6 +16,10 @@ const ZERO_ROOT: &str = "0000000000000000000000000000000000000000000000000000000
 const MAX_CONTEXT: usize = 256 * 1024;
 /// Launch attempts in flight; each one waits for its create's proof and delivery.
 const MAX_ATTEMPTS: usize = 16;
+/// How long an approval request can be approved and then used.
+const APPROVAL_SECS: u64 = 24 * 3600;
+/// An app's approval requests that are pending or approved and not yet used.
+const MAX_OPEN_APPROVALS: usize = 32;
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const LAST_RETRY: Duration = Duration::from_secs(60);
 
@@ -39,6 +43,9 @@ impl Selection {
         hash.update([0]);
         hash.update(app.as_bytes());
         format!("{}.json", hex::encode(hash.finalize()))
+    }
+    pub(super) fn record(&self) -> ((String, String), String) {
+        ((self.namespace.clone(), self.app.clone()), Self::file(&self.namespace, &self.app))
     }
     fn bundle(&self) -> Result<PolicyBundle> {
         serde_json::from_value(self.policy.policy.0.clone()).map_err(|_| Error::InvalidInput)
@@ -75,6 +82,49 @@ impl Selection {
     }
 }
 
+/// A request to approve one exec that the replica's policy answered
+/// `approval_required`. Approving it changes no decision: the same exec, sent
+/// again with it, is evaluated afresh with the approval among its parameters,
+/// and runs once if the policy then allows it.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Approval {
+    /// The policy job of the decision that asked for it.
+    pub(super) id: String,
+    execution: ExecutionIdentity,
+    /// The exec as the policy saw it: command, user, stdin hash and timeout.
+    parameters: serde_json::Value,
+    principal: String,
+    reason_codes: Vec<String>,
+    /// The token that sent the exec; none for an administrator's.
+    requester: Option<String>,
+    requested_at: u64,
+    expires_at: u64,
+    /// `pending`, `approved`, `refused` or `used`.
+    state: String,
+    approver: Option<String>,
+    /// Approved with another credential than the one that sent the exec.
+    independent: bool,
+    decided_at: Option<u64>,
+}
+impl Approval {
+    pub(super) fn file(&self) -> (String, String) {
+        (self.id.clone(), format!("{}.json", self.id))
+    }
+    /// What the policy reads as `input.parameters.approval`.
+    pub(super) fn fact(&self) -> serde_json::Value {
+        json!({"id": self.id, "approver": self.approver, "approved_at": self.decided_at, "independent": self.independent})
+    }
+    fn view(&self) -> serde_json::Value {
+        let state = if self.expires_at <= now() && self.state != "used" { "expired" } else { self.state.as_str() };
+        json!({"id": self.id, "operation": "exec", "allocation_id": self.execution.allocation_id,
+            "generation": self.execution.generation, "parameters": self.parameters, "principal": self.principal,
+            "reason_codes": self.reason_codes, "state": state, "requested_at": self.requested_at,
+            "expires_at": self.expires_at, "approver": self.approver, "independent": self.independent,
+            "decided_at": self.decided_at})
+    }
+}
+
 /// One execution's launch attempts: at most one runs, and a failed one waits longer each time.
 pub(super) struct Attempt {
     running: bool,
@@ -90,10 +140,14 @@ pub(crate) struct Reservation {
     pub gpus: Vec<String>,
 }
 
-pub(super) fn load(dir: &Path) -> anyhow::Result<BTreeMap<(String, String), Selection>> {
-    let mut selections = BTreeMap::new();
+/// The private records of `dir`, each under the key and file name `name` gives it.
+pub(super) fn load<K: Ord, T: serde::de::DeserializeOwned>(
+    dir: &Path,
+    name: impl Fn(&T) -> (K, String),
+) -> anyhow::Result<BTreeMap<K, T>> {
+    let mut records = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(selections);
+        return Ok(records);
     };
     for entry in entries {
         let path = entry?.path();
@@ -103,16 +157,17 @@ pub(super) fn load(dir: &Path) -> anyhow::Result<BTreeMap<(String, String), Sele
         let m = std::fs::symlink_metadata(&path)?;
         anyhow::ensure!(
             m.is_file() && m.permissions().mode() & 0o077 == 0 && m.len() <= MAX_RECORD as u64,
-            "invalid app policy record"
+            "invalid app policy or approval record"
         );
-        let s: Selection = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let record: T = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let (key, file) = name(&record);
         anyhow::ensure!(
-            path.file_name().and_then(|n| n.to_str()) == Some(&Selection::file(&s.namespace, &s.app)),
-            "invalid app policy record name"
+            path.file_name().and_then(|n| n.to_str()) == Some(&file),
+            "invalid app policy or approval record name"
         );
-        selections.insert((s.namespace.clone(), s.app.clone()), s);
+        records.insert(key, record);
     }
-    Ok(selections)
+    Ok(records)
 }
 
 impl Launches {
@@ -150,6 +205,67 @@ impl Launches {
         }
         selections.remove(&(namespace.to_owned(), app.to_owned()));
         Ok(())
+    }
+    fn write_approval(&self, approvals: &mut BTreeMap<String, Approval>, approval: Approval) -> Result<()> {
+        let bytes = serde_json::to_vec(&approval).map_err(|_| Error::InvalidInput)?;
+        if bytes.len() > MAX_RECORD {
+            return Err(Error::InvalidInput);
+        }
+        atomic(&self.dir.join("approvals").join(approval.file().1), &bytes).map_err(|_| Error::Unavailable)?;
+        approvals.insert(approval.id.clone(), approval);
+        Ok(())
+    }
+    /// Records that the exec `parameters` in `execution` waits for an approval,
+    /// under the policy job `id` of the decision that asked for one.
+    pub(super) fn request_approval(
+        &self,
+        id: &str,
+        execution: &ExecutionIdentity,
+        parameters: serde_json::Value,
+        principal: &str,
+        reason_codes: Vec<String>,
+        requester: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let mut approvals = self.approvals.lock();
+        let open = approvals.values().filter(|a| {
+            a.execution.namespace == execution.namespace
+                && a.execution.workload == execution.workload
+                && a.expires_at > now()
+                && matches!(a.state.as_str(), "pending" | "approved")
+        });
+        if open.count() >= MAX_OPEN_APPROVALS {
+            return Err(Error::Unavailable);
+        }
+        let approval = Approval {
+            id: id.to_owned(),
+            execution: execution.clone(),
+            parameters,
+            principal: principal.to_owned(),
+            reason_codes,
+            requester,
+            requested_at: now(),
+            expires_at: now() + APPROVAL_SECS,
+            state: "pending".into(),
+            approver: None,
+            independent: false,
+            decided_at: None,
+        };
+        let reply = json!({"id": approval.id, "expires_at": approval.expires_at});
+        self.write_approval(&mut approvals, approval)?;
+        Ok(reply)
+    }
+    /// The approval `id`, when it stands for exactly this exec in this execution.
+    pub(super) fn approved(&self, id: &str, execution: &ExecutionIdentity, parameters: &serde_json::Value) -> Option<Approval> {
+        self.approvals.lock().get(id).filter(|a| {
+            a.state == "approved" && a.expires_at > now() && a.execution == *execution && a.parameters == *parameters
+        }).cloned()
+    }
+    /// An approval runs one command: a second use finds it spent.
+    pub(super) fn spend(&self, id: &str) -> Result<()> {
+        let mut approvals = self.approvals.lock();
+        let mut approval = approvals.get(id).filter(|a| a.state == "approved" && a.expires_at > now()).cloned().ok_or(Error::Conflict)?;
+        approval.state = "used".into();
+        self.write_approval(&mut approvals, approval)
     }
     /// Claims `name`'s next attempt when none runs and its wait is over.
     fn begin(&self, name: &str) -> bool {
@@ -352,6 +468,14 @@ pub(crate) async fn launch_loop(c: Arc<WorkloadController>) {
         for (namespace, app) in stale {
             let _ = store.deselect(&namespace, &app);
         }
+        // An approval request goes when it expires, and with its app.
+        store.approvals.lock().retain(|_, a| {
+            let keep = a.expires_at > now() && c.app_exists(&a.execution.namespace, &a.execution.workload);
+            if !keep {
+                let _ = std::fs::remove_file(store.dir.join("approvals").join(a.file().1));
+            }
+            keep
+        });
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -414,4 +538,51 @@ pub(crate) fn app_policy(c: &WorkloadController, namespace: &str, app: &str) -> 
         "native_policy_sha256": native_rules_hash(&selection.policy)?,
         "principal": selection.policy.principal, "cost": selection.policy.cost,
         "state_root": selection.root(), "budget": budget(namespace), "launches": launches}))
+}
+
+/// `GET /apps/NAME/approvals`: the app's approval requests, newest first.
+pub(crate) fn app_approvals(c: &WorkloadController, namespace: &str, app: &str) -> Result<serde_json::Value> {
+    let store = launches(c)?;
+    let mut approvals: Vec<_> = store
+        .approvals
+        .lock()
+        .values()
+        .filter(|a| a.execution.namespace == namespace && a.execution.workload == app)
+        .cloned()
+        .collect();
+    approvals.sort_by_key(|a| std::cmp::Reverse(a.requested_at));
+    Ok(json!({"approvals": approvals.iter().map(Approval::view).collect::<Vec<_>>()}))
+}
+
+/// `POST /apps/NAME/approvals/ID`: approves or refuses one pending request, once.
+/// `token` is the deciding credential's ID, none for an administrator's.
+pub(crate) fn decide_approval(
+    c: &WorkloadController,
+    namespace: &str,
+    app: &str,
+    id: &str,
+    approver: &str,
+    approve: bool,
+    token: Option<&str>,
+) -> Result<serde_json::Value> {
+    if approver.is_empty() || approver.len() > 256 || approver.chars().any(char::is_control) {
+        return Err(Error::InvalidInput);
+    }
+    let store = launches(c)?;
+    let mut approvals = store.approvals.lock();
+    let mut approval = approvals
+        .get(id)
+        .filter(|a| a.execution.namespace == namespace && a.execution.workload == app)
+        .cloned()
+        .ok_or(Error::Rejected)?;
+    if approval.state != "pending" || approval.expires_at <= now() {
+        return Err(Error::Conflict);
+    }
+    approval.state = if approve { "approved" } else { "refused" }.into();
+    approval.approver = Some(approver.to_owned());
+    approval.independent = approval.requester.as_deref() != token;
+    approval.decided_at = Some(now());
+    let view = approval.view();
+    store.write_approval(&mut approvals, approval)?;
+    Ok(view)
 }

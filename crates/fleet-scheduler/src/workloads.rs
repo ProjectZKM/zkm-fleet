@@ -704,6 +704,22 @@ impl WorkloadController {
         }
         Ok(())
     }
+    /// A token's tag must cover the app's template, or every deployment once it is placed.
+    fn require_app_scope(&self, c: Option<&Token>, namespace: &str, app: &str) -> anyhow::Result<()> {
+        let Some(c) = c else { return Ok(()) };
+        let tags: Vec<Option<String>> = match self.unplaced(namespace, app) {
+            Some(template) => vec![template.entry().tag().map(str::to_owned)],
+            None => self.app_deployment_list(namespace, app, None).into_iter()
+                .map(|(_, d)| d.entry().tag().map(str::to_owned)).collect(),
+        };
+        if tags.is_empty() {
+            return Err(fail(404, "the app runs on no node (enable it to place it)"));
+        }
+        if tags.iter().flatten().any(|tag| c.tag.as_deref() != Some(tag.as_str())) {
+            return Err(fail(403, "another tag cannot be selected"));
+        }
+        Ok(())
+    }
     fn job(
         &self,
         id: &str,
@@ -2189,7 +2205,8 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         ));
     }
     let action = match parts.as_slice() {
-        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings" | "policy" | "exec") && !batch => Some(*action),
+        ["apps", _, action] if matches!(*action, "scale" | "logs" | "settings" | "policy" | "exec" | "approvals") && !batch => Some(*action),
+        ["apps", _, "approvals", _] if !batch => Some("approvals"),
         _ => None,
     };
     if let Some(action) = action {
@@ -2201,6 +2218,9 @@ async fn handle_result(s: Arc<WorkloadController>, request: Request) -> anyhow::
         WorkloadController::require_grant(c, &app.name)?;
         if action == "exec" {
             return app_exec(&s, c, &q, &namespace, &app.name, &method, request).await;
+        }
+        if action == "approvals" {
+            return app_approvals(&s, c, &namespace, &app.name, parts.get(3).copied(), &method, request).await;
         }
         return s.app_action(c, &q, &namespace, &app.name, action, &method, request).await;
     }
@@ -2525,7 +2545,7 @@ impl WorkloadController {
             return self.app_logs(c, namespace, app, q).await;
         }
         if action == "policy" {
-            self.require_deployment_scope(c, namespace, app, None)?;
+            self.require_app_scope(c, namespace, app)?;
             return self.app_policy_request(namespace, app, method, request).await;
         }
         if action == "settings" {
@@ -2681,18 +2701,59 @@ async fn app_exec(s: &Arc<WorkloadController>, c: Option<&Token>, q: &BTreeMap<S
     if method != Method::POST {
         return Err(fail(405, "POST required"));
     }
-    s.require_deployment_scope(c, namespace, app, None)?;
+    use crate::openshell::Refusal;
+    s.require_app_scope(c, namespace, app)?;
     let input: crate::openshell::ExecInput = serde_json::from_slice(&to_bytes(request.into_body(), 90 << 20).await?)
         .map_err(|e| fail(400, format!("invalid exec: {e}")))?;
     let replica = q.get("replica").map(String::as_str);
-    let output = crate::openshell::app_exec(s, namespace, app, replica, input).await.map_err(|refusal| match refusal {
-        crate::openshell::Refusal(_, Some(decision)) => fail(403, format!("the app's policy does not allow this exec: {decision}")),
-        crate::openshell::Refusal(Error::InvalidInput, _) => fail(400, "invalid exec: 1 to 256 arguments, base64 stdin and timeout_seconds of 1 to 600"),
-        crate::openshell::Refusal(Error::Conflict, _) => fail(409, "select one replica of the app with ?replica=ALLOCATION; GET /apps/NAME/policy lists them"),
-        crate::openshell::Refusal(Error::Unavailable, _) => fail(503, "exec is unavailable: it needs the scheduler's gateway settings, a free exec slot and the gateway's answer"),
-        crate::openshell::Refusal(..) => fail(409, "the replica takes no exec: its launch must be created and current, its policy active with budget left, and user its policy's run_as_user"),
+    let caller = crate::openshell::Caller { token: c.map(|c| c.id.clone()), approval: q.get("approval").cloned() };
+    let private = [(axum::http::header::CACHE_CONTROL, "no-store")];
+    let output = match crate::openshell::app_exec(s, namespace, app, replica, caller, input).await {
+        Ok(output) => output,
+        // The policy's answer, and the approval request to approve when it asked for one.
+        Err(Refusal::Policy(mut answer)) => {
+            answer["error"] = json!(if answer["approval"].is_object() {
+                "the app's policy requires an approval for this exec: POST /apps/NAME/approvals/ID, then send it again with ?approval=ID"
+            } else {
+                "the app's policy does not allow this exec"
+            });
+            return Ok((StatusCode::FORBIDDEN, private, Json(answer)).into_response());
+        }
+        Err(Refusal::Replica) => return Err(fail(409, "select one replica of the app with ?replica=ALLOCATION; GET /apps/NAME/policy lists them")),
+        Err(Refusal::Approval) => return Err(fail(409, "the approval is not approved, is used or expired, or is for another exec or generation")),
+        Err(Refusal::Rail(Error::InvalidInput)) => return Err(fail(400, "invalid exec: 1 to 256 arguments, base64 stdin and timeout_seconds of 1 to 600")),
+        Err(Refusal::Rail(Error::Unavailable)) => return Err(fail(503, "exec is unavailable: it needs the scheduler's gateway settings, a free exec slot and the gateway's answer")),
+        Err(Refusal::Rail(_)) => return Err(fail(409, "the replica takes no exec: its launch must be created and current, its policy active with budget left, and user its policy's run_as_user")),
+    };
+    Ok((private, Json(output)).into_response())
+}
+
+/// `GET /apps/NAME/approvals` and `POST /apps/NAME/approvals/ID`: the requests to approve an
+/// exec the app's policy answered `approval_required`, and the decision on one.
+async fn app_approvals(s: &Arc<WorkloadController>, c: Option<&Token>, namespace: &str, app: &str, id: Option<&str>,
+    method: &Method, request: Request,
+) -> anyhow::Result<Response> {
+    use trusted_shim::rail::Error;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Decision { approver: String, approve: bool }
+    s.require_app_scope(c, namespace, app)?;
+    let result = match (method, id) {
+        (&Method::GET, None) => crate::openshell::app_approvals(s, namespace, app),
+        (&Method::POST, Some(id)) => {
+            let d: Decision = serde_json::from_slice(&to_bytes(request.into_body(), 4096).await?)
+                .map_err(|e| fail(400, format!("invalid approval: {e}")))?;
+            crate::openshell::decide_approval(s, namespace, app, id, &d.approver, d.approve, c.map(|c| c.id.as_str()))
+        }
+        _ => return Err(fail(405, "GET /apps/NAME/approvals, or POST /apps/NAME/approvals/ID")),
+    };
+    let value = result.map_err(|e| match e {
+        Error::InvalidInput => fail(400, "approver: 1 to 256 characters"),
+        Error::Rejected => fail(404, "the app has no such approval request"),
+        Error::Conflict => fail(409, "the approval request is decided already, or expired"),
+        _ => fail(503, "this scheduler has no OpenShell compute extension, or its storage failed"),
     })?;
-    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(output)).into_response())
+    Ok(([(axum::http::header::CACHE_CONTROL, "no-store")], Json(value)).into_response())
 }
 
 async fn log_response(

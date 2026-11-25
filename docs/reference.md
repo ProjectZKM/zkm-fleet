@@ -804,8 +804,32 @@ launched for, with `parameters` `{command, user, stdin_sha256, timeout_seconds}`
 An `allow` draws 1 from the launch's budget, its grant is consumed, and then the
 command runs; the reply adds `decision` with the decision's `job_id`, `policy`
 and `reason_codes`, and the decision's proof follows under that job, as for
-`POST /policy/preflight`. Any other decision answers 403 with it and runs
-nothing; a spent budget answers 409.
+`POST /policy/preflight`. Any other decision answers 403 with `decision` and
+runs nothing; a spent budget answers 409.
+
+**Approvals.** When the policy answers `approval_required`, the 403 also carries
+`approval` `{id, expires_at}`: a request to approve that exact exec in that
+replica generation, open for 24 hours. An app holds at most 32 open requests;
+beyond them the answer carries no `approval`.
+
+- `GET /apps/NAME/approvals` lists the app's requests with their `parameters`
+  (the command, user, stdin hash and timeout), `principal`, `reason_codes` and
+  `state`: `pending`, `approved`, `refused`, `used` or `expired`.
+- `POST /apps/NAME/approvals/ID` with `{"approver": "NAME", "approve": true}`
+  decides a pending request, once; `false` refuses it. It takes a token with
+  `manage` on the app, or an administrator's.
+- `POST /apps/NAME/exec?approval=ID` with the same body sends the exec again.
+
+An approval changes no decision. The policy evaluates the exec afresh, with
+`parameters.approval` `{id, approver, approved_at, independent}`, and decides
+what the approval is worth; `independent` is true when the approval came with
+another credential than the one that sent the exec. An allow spends the approval
+and runs the command; a policy that still does not allow answers 403 as before.
+`approver` is the name the approving caller gives, as `principal` is the name the
+owner gives.
+
+Approvals cover execs. A launch starts only on an `allow` for `runtime.create`,
+and no approval request is opened for any other answer.
 
 **An app's policy.** An app's owner can hand that whole flow to the scheduler:
 `PUT /apps/NAME/policy` (or `policy` in the app's `POST /apps`) stores what the
@@ -1133,7 +1157,7 @@ accepted work: an administrator stops jobs explicitly.
 |---|---|
 | Read the own namespace, apps, batches, jobs, logs and scaling status | `read`, within the token's scope |
 | Submit proofs and batch jobs; cancel batch jobs | `submit`, within the token's scope |
-| Create, remove, enable, disable, restart, prioritize, scale or update apps and batches; set a native app's policy and run a command in it | `manage`, with any app grants. Removing, enabling, disabling, restarting or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
+| Create, remove, enable, disable, restart, prioritize, scale or update apps and batches; set a native app's policy, run a command in it and approve one | `manage`, with any app grants. Removing, enabling, disabling, restarting or prioritizing a proof app also needs the tag it was created for and the tag of every node entry running it; scaling and updating it need the tag of the entry they change. |
 | Batch `allow` and `user`; app `user`, `volumes` and `proof_storage_root`; changing an app's image, environment, command, user, workdir or volumes | `admin` |
 | Preempt batch jobs | `admin` |
 | Namespaces, tokens, quotas, suspension, allocations, the preemption plan, nodes and status | `admin` |
@@ -1236,7 +1260,7 @@ listener behind the HTTPS gateway. Administrators select a namespace with
 
 | Workload | Routes |
 |---|---|
-| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs`, `POST /apps/NAME/restart`, `GET` / `PUT` / `DELETE /apps/NAME/policy` and `POST /apps/NAME/exec` (a native OpenShell app's policy, and a command in one of its replicas) |
+| Apps | `GET` / `POST /apps`, `GET` / `DELETE /apps/NAME`, `PUT /apps/NAME/priority` with `{"priority":N}`, `PUT` / `DELETE /apps/NAME/disabled`, `PUT /apps/NAME/settings`, `GET /apps/NAME/logs`, `POST /apps/NAME/restart`, `GET` / `PUT` / `DELETE /apps/NAME/policy`, `POST /apps/NAME/exec`, `GET /apps/NAME/approvals` and `POST /apps/NAME/approvals/ID` (a native OpenShell app's policy, a command in one of its replicas, and the approvals its policy asks for) |
 | Scaling | `PUT` / `GET /apps/NAME/scale` (the app's replicas over all its nodes; `GET ...?node=NODE` shows one node's part) |
 | Proof app jobs | `GET /apps/NAME/jobs?limit=N&active=true`, `POST /apps/NAME/jobs` (app-storage references), `GET /apps/NAME/jobs/ID`, `GET /apps/NAME/jobs/ID/output/proof.json` and `.../output/public_values.bin` |
 | Batches | `GET` / `POST /batches`, `GET` / `DELETE /batches/NAME`, `PUT /batches/NAME/priority`, `PUT /batches/NAME/settings`, `PUT` / `DELETE /batches/NAME/disabled` |
