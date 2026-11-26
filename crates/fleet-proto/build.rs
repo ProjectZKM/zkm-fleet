@@ -119,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NodeReport.results",
         "NodeReport.runtime_capabilities",
         "NodeReport.runtime_instances",
+        "NodeReport.proof_storage_roots",
         "NodeHardware.gpus",
         "RouterControl.capabilities",
         "CreateNamespaceRequest.quota",

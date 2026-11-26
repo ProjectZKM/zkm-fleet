@@ -306,6 +306,10 @@ message NodeReport {
   reserved "native_provers";
   // The machine's processor and GPUs, detected once when the agent starts; absent on older agents.
   optional NodeHardware hardware = 16;
+  // The app-storage roots the node's proof-fetch handler is approved to serve
+  // (`--proof-storage-root`); empty on an agent that reports none. A prover is placed only
+  // on a node that covers its `proof_storage_root`.
+  repeated string proof_storage_roots = 17;
 }
 
 // What a node runs on, for operators choosing where work can go.
