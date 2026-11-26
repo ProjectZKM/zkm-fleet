@@ -1,6 +1,8 @@
 import copy
 import re
 import socket
+import os
+import struct
 from dataclasses import replace
 from unittest.mock import Mock
 
@@ -1879,3 +1881,55 @@ def test_shim_mandates_capability_is_gated_on_the_shim_feature(tmp_path, monkeyp
     monkeypatch.setattr(shim.subprocess, "run",
         lambda *a, **k: Mock(stdout=shim.json.dumps({**base, "features": base["features"] + ["runtime-mandates-v1"]})))
     assert "shim-mandates-v1" in shim.capabilities(spec(tmp_path).cluster)
+
+
+def test_a_volume_template_that_expands_to_nothing_adds_no_mount(tmp_path):
+    # An unset scheduler_ca_file (publicly trusted; no private CA) must not become a bare ":ro".
+    raw = config(tmp_path)
+    raw["apps"][0].update(container_port=8080,
+        volumes=["{scheduler_ca_file}:ro", "/srv/data", "{cluster_token_file}:ro"],
+        env={"FLEET_SCHEDULER_CA_FILE": "{scheduler_ca_file}"})
+    assert "scheduler_ca_file" not in raw and "cluster_token_file" not in raw
+    bound = shim.RuntimeBook(tmp_path / "book").bind(
+        reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
+    request = shim.launch_request(bound, [])
+    # Only the real mount survives; no ":ro" from an empty expansion.
+    assert request["driver_options"]["volumes"] == ["/srv/data:/srv/data"]
+    assert not any(v.startswith(":") for v in request["driver_options"]["volumes"])
+    # With the CA set, the mount is present as before.
+    raw["scheduler_ca_file"] = "/etc/zkm-fleet/ca.pem"
+    bound = shim.RuntimeBook(tmp_path / "book2").bind(
+        reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
+    assert "/etc/zkm-fleet/ca.pem:/etc/zkm-fleet/ca.pem:ro" in shim.launch_request(bound, [])["driver_options"]["volumes"]
+
+
+def test_a_shim_executable_refusal_carries_its_reason(tmp_path, monkeypatch):
+    err = shim.subprocess.CalledProcessError(1, "shim", output="", stderr="invalid mount spec: \":ro\"")
+    monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=err))
+    with pytest.raises(RuntimeError, match=r"invalid mount spec"):
+        shim.invoke("/bin/shim", str(tmp_path), socket.gethostname(), {"operation": "launch"})
+
+
+def test_a_shim_daemon_refusal_carries_its_reason(tmp_path, monkeypatch):
+    sock = tmp_path / "control.sock"
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(sock)); os.chmod(sock, 0o700)
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def settimeout(self, t): pass
+        def connect(self, p): pass
+        def getsockopt(self, *a): return struct.pack("3i", 0, os.geteuid(), 0)
+        def sendall(self, d): pass
+        def shutdown(self, h): pass
+        def recv(self, n):
+            if getattr(self, "done", False): return b""
+            self.done = True
+            return shim.json.dumps({"protocol": 1, "error": {"reason": "invalid mount spec"}}).encode()
+    monkeypatch.setattr(shim.socket, "socket", lambda *a, **k: FakeConn())
+    try:
+        with pytest.raises(shim.ShimRejected, match=r"invalid mount spec"):
+            shim.daemon_call(str(tmp_path), socket.gethostname(), {"operation": "launch"})
+    finally:
+        srv.close()

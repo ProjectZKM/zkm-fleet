@@ -233,6 +233,15 @@ class ShimPending(RuntimeError):
     timeout. It runs daemon operations to completion, so this one continues."""
 
 
+class ShimRejected(RuntimeError):
+    """The shim refused the operation and said why (e.g. an invalid mount or an
+    unknown field). Its reason is carried to the caller so a refusal is not lost."""
+
+    def __init__(self, reason: Any) -> None:
+        text = reason if isinstance(reason, str) else json.dumps(reason, sort_keys=True)
+        super().__init__(f"shim refused the operation: {text[:500]}")
+
+
 def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
     """No TCP listener or credentials in argv. Never fall back to direct Docker."""
     path = Path(state_dir) / "control.sock"
@@ -259,7 +268,12 @@ def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: 
                 if len(data) > 1024 * 1024:
                     raise ValueError("oversize response")
         response = json.loads(data)
-        if not isinstance(response, dict) or response.get("protocol") != 1 or not isinstance(response.get("result"), dict) or "error" in response:
+        if not isinstance(response, dict) or response.get("protocol") != 1:
+            raise ValueError("shim rejected operation")
+        if response.get("error") is not None:
+            # The shim refused and gave a reason; carry it, don't flatten it to "unavailable".
+            raise ShimRejected(response["error"])
+        if not isinstance(response.get("result"), dict):
             raise ValueError("shim rejected operation")
         return response["result"]
     except TimeoutError:
@@ -298,6 +312,9 @@ def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *
         result = subprocess.run([binary, "--state-dir", state_dir, "--node-id", node_id],
             input=json.dumps(to_dict(command)), capture_output=True, text=True, timeout=max(150, timeout or 0), check=True)
         return json.loads(result.stdout)
+    except subprocess.CalledProcessError as error:
+        detail = ((error.stderr or "") + (error.stdout or "")).strip()[-500:]
+        raise RuntimeError(f"shim operation failed: {detail or f'exited {error.returncode}'}") from None
     except (OSError, ValueError, subprocess.SubprocessError):
         raise RuntimeError("shim operation failed") from None
 
@@ -434,6 +451,10 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     volumes = []
     for volume in app.volumes:
         path, _, options = volume.format(**fill).partition(":")
+        # An optional template that expands to nothing (e.g. an unset scheduler_ca_file,
+        # trusted without a private CA) contributes no mount, never a bare ":ro".
+        if not path:
+            continue
         volumes.append(f"{path}:{path}" + (f":{options}" if options else ""))
     driver = app.runtime.driver
     trust = {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"}
