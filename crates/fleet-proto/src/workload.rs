@@ -282,6 +282,8 @@ impl NodeReport {
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
         if !entry.runtime_capability().is_none_or(has) { return false; }
+        // A mandates-bearing app is placed only where the shim carries and enforces them.
+        if entry.0["mandates"].is_object() && !has("shim-mandates-v1") { return false; }
         if entry.native_access() && (entry.gpus().is_some_and(|g| g > 0.0) || !entry.durable_mounts().is_empty())
             && !has("shim-openshell-attachments-v1") {
             return false;

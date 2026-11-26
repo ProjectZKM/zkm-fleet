@@ -255,14 +255,14 @@ impl WorkloadController {
 
     /// Settings an update may change on an app. The rest is identity, placement or the
     /// node's own configuration, or has its own operation (scale, enable/disable, priority).
-    pub(super) const APP_SETTINGS: [&'static str; 18] = ["image", "env", "command", "user", "workdir", "volumes", "port_base",
-        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
+    pub(super) const APP_SETTINGS: [&'static str; 19] = ["image", "env", "command", "user", "workdir", "volumes", "port_base",
+        "shm_gb", "memory_gb", "health_path", "stop_timeout_s", "ready_timeout_s", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "mandates"];
     // Apps can access host networking, storage and prover credentials. Changing
     // their executable or environment is as privileged as changing their mounts.
-    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 13] = ["image", "env", "command", "user", "workdir", "volumes", "port_base", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol"];
+    pub(super) const ADMIN_APP_SETTINGS: [&'static str; 14] = ["image", "env", "command", "user", "workdir", "volumes", "port_base", "runtime", "services", "container_port", "entrypoint", "ingress", "service_protocol", "mandates"];
     // A namespace's owner creates its own apps, as it does its batches: the host's
     // filesystem and user ids stay administrator settings.
-    const ADMIN_CREATE_SETTINGS: [&'static str; 8] = ["user", "volumes", "proof_storage_root", "runtime", "services", "container_port", "entrypoint", "ingress"];
+    const ADMIN_CREATE_SETTINGS: [&'static str; 9] = ["user", "volumes", "proof_storage_root", "runtime", "services", "container_port", "entrypoint", "ingress", "mandates"];
 
     /// Starts enabling or disabling these deployments of `app` the way a scale changes them:
     /// drain, stop, the node writes the enabled state, start again unless disabled. The caller
@@ -347,6 +347,7 @@ impl WorkloadController {
                 "image" => value.as_str().is_some_and(|v| !v.is_empty() && !v.starts_with('-')),
                 "env" => value.as_object().is_some_and(|o| o.values().all(Value::is_string)),
                 "ingress" => value.is_object(),
+                "mandates" => fleet_proto::model::v1::RegisterAppRequest::valid_mandates(value),
                 "command" | "volumes" | "services" => value.as_array().is_some_and(|a| a.iter().all(Value::is_string)),
                 "user" | "workdir" | "health_path" | "entrypoint" | "service_protocol" => value.is_string(),
                 "port_base" => value.as_u64().is_some_and(|v| v <= u16::MAX as u64),

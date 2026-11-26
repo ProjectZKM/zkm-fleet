@@ -1844,3 +1844,38 @@ def test_no_follower_without_the_shims_own_container_name(tmp_path, monkeypatch,
     bound = bound_spec(tmp_path)
     start_actor(monkeypatch, bound, {"launch": [status]})
     assert shim._ShimApp(bound).logs is None
+
+
+def test_mandates_are_delivered_to_the_shim_and_kept_out_of_the_sandbox(tmp_path):
+    raw = config(tmp_path)
+    raw["apps"][0].update(container_port=8080, env={"SECRET": "keep"},
+        mandates={"issuer": "clawup", "owner": "u1", "agent": "a1", "names": ["cloud-buyer", "no-withdrawals"]})
+    bound = shim.RuntimeBook(tmp_path / "book").bind(
+        reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "admitted-command")
+    request = shim.launch_request(bound, [])
+    # Delivered to the shim, verbatim, as a top-level launch field.
+    assert request["mandates"] == {"issuer": "clawup", "owner": "u1", "agent": "a1", "names": ["cloud-buyer", "no-withdrawals"]}
+    # Never where the sandbox can read it: not in env, nor in the driver options the container gets.
+    assert "mandates" not in request["environment"]
+    import json as _json
+    assert "cloud-buyer" not in _json.dumps(request["environment"]) and "cloud-buyer" not in _json.dumps(request["driver_options"])
+    # A mandates-bearing app may run only where the shim supports it.
+    assert "shim-mandates-v1" in shim.required_capabilities(bound)
+    # Changing the mandates is a new binding (restart), like any settings change.
+    other = copy.deepcopy(raw)
+    other["apps"][0]["mandates"]["names"] = ["cloud-buyer"]
+    assert shim.spec_hash(bound) != shim.spec_hash(reconcile.replica_specs(reconcile.load_apps(other))["web-0"])
+    # Absent means none: nothing is delivered and no capability is required.
+    plain = config(tmp_path)
+    plain["apps"][0]["container_port"] = 8080
+    bare = shim.RuntimeBook(tmp_path / "book2").bind(reconcile.replica_specs(reconcile.load_apps(plain))["web-0"], "cmd")
+    assert "mandates" not in shim.launch_request(bare, []) and "shim-mandates-v1" not in shim.required_capabilities(bare)
+
+
+def test_shim_mandates_capability_is_gated_on_the_shim_feature(tmp_path, monkeypatch):
+    base = {"protocol": 1, "drivers": ["docker"], "features": ["data-plane-v1", "runtime-management-v1"]}
+    monkeypatch.setattr(shim.subprocess, "run", lambda *a, **k: Mock(stdout=shim.json.dumps(base)))
+    assert "shim-mandates-v1" not in shim.capabilities(spec(tmp_path).cluster)
+    monkeypatch.setattr(shim.subprocess, "run",
+        lambda *a, **k: Mock(stdout=shim.json.dumps({**base, "features": base["features"] + ["runtime-mandates-v1"]})))
+    assert "shim-mandates-v1" in shim.capabilities(spec(tmp_path).cluster)

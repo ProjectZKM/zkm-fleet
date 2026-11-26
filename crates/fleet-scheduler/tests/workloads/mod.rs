@@ -1075,6 +1075,8 @@ async fn scoped_managers_cannot_change_app_execution_or_batch_host_access() {
             json!({"env":{"LD_PRELOAD":"/data/owner.so"}}), json!({"user":"0:0"}),
             json!({"workdir":"/etc/zkm-fleet"}), json!({"volumes":["/var/run/docker.sock","/etc/zkm-fleet:ro"]}),
             json!({"stop_timeout_s":10,"command":["sh"]}),
+            // The shim's own rules are the launcher's, never the app owner's.
+            json!({"mandates":{"issuer":"clawup","owner":"u","agent":"a","names":["cloud-buyer"]}}),
         ] {
             assert_eq!(scale_call(c.clone(), &owner, "PUT", &path, set.clone()).await.status(), StatusCode::FORBIDDEN, "{set}");
             assert_eq!(c.inner.lock().deployments["gpu-model"], before, "a refused update must not create a transition");
@@ -1108,6 +1110,27 @@ async fn scoped_managers_cannot_change_app_execution_or_batch_host_access() {
     assert_eq!(scale_call(c.clone(), &owner, "PUT", path, json!({"image":"test:2","env":{"A":"1"}})).await.status(), StatusCode::OK);
     assert_eq!(c.inner.lock().apps["safe"].spec["allow"], json!(["/srv/app"]));
     assert_eq!(c.inner.lock().apps["safe"].spec["user"], "1000:1000");
+}
+
+#[tokio::test]
+async fn mandates_are_an_admin_set_field_kept_on_the_spec_and_shown_read_only() {
+    let (_dir, c, ns) = setup().await;
+    c.report("gpu", "session", scale_inventory(&ns, false, true)).await.unwrap();
+    let owner = user_token(&c, &ns, 1, "scope=default", None, true).await;
+    let m = json!({"issuer":"clawup","owner":"u1","agent":"a1","names":["cloud-buyer","no-withdrawals"]});
+    let body = |name: &str| json!({"name":name,"spec":{"kind":"app","image":"agent:1","runtime":{"executor":"shim","driver":"docker"},
+        "cpus":1,"gpus":0,"port_base":0,"container_port":8080,"services":["http"],"memory_gb":0.125,"mandates":m}});
+    // The launcher sets it: an owner's own token cannot (it is an admin create setting).
+    assert_eq!(scale_call(c.clone(), &owner, "POST", "/apps", body("owned")).await.status(), StatusCode::FORBIDDEN);
+    assert!(!c.inner.lock().apps.contains_key("owned"));
+    // An administrator can, and it is kept on the app's spec.
+    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/apps?namespace={ns}"), body("agent")).await.status(), StatusCode::CREATED);
+    // Shown read-only to the owner, for ClawUp's health check to compare.
+    let view = json_of(scale_call(c.clone(), &owner, "GET", &format!("/apps/agent?namespace={ns}"), Value::Null).await).await;
+    assert_eq!(view["spec"]["mandates"], m, "{view}");
+    // A malformed binding is refused.
+    let mut bad = body("bad"); bad["spec"]["mandates"] = json!({"issuer":"clawup"});
+    assert_eq!(scale_call(c.clone(), "admin", "POST", &format!("/apps?namespace={ns}"), bad).await.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
