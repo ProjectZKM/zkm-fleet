@@ -495,7 +495,9 @@ impl RegisterAppRequest {
         let str_ok = |s: &Value, max: usize| s.as_str().is_some_and(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control));
         m.keys().all(|k| ["issuer", "owner", "agent", "names"].contains(&k.as_str()))
             && ["issuer", "owner", "agent"].iter().all(|k| m.get(*k).is_some_and(|s| str_ok(s, 256)))
-            && m.get("names").is_some_and(|n| n.as_array().is_some_and(|a| !a.is_empty() && a.len() <= 64 && a.iter().all(|s| str_ok(s, 256))))
+            && m.get("names").is_some_and(|n| n.as_array().is_some_and(|a| !a.is_empty() && a.len() <= 64
+                && a.iter().all(|s| str_ok(s, 256))
+                && a.iter().filter_map(Value::as_str).collect::<std::collections::HashSet<_>>().len() == a.len()))
     }
     /// At most this many GPUs or durable mounts per native replica, as in shim.
     pub const MAX_NATIVE_ATTACHMENTS: usize = 16;
@@ -613,7 +615,8 @@ impl RegisterAppRequest {
             anyhow::ensure!(entrypoint.as_str().is_some_and(|s| !s.is_empty() && !s.contains('\0')), "invalid entrypoint");
         }
         if let Some(mandates) = spec.get("mandates") {
-            anyhow::ensure!(Self::valid_mandates(mandates), "invalid mandates: {{issuer, owner, agent, names:[...]}} of non-empty bounded strings");
+            anyhow::ensure!(spec.get("kind").and_then(Value::as_str).unwrap_or("app") == "app", "mandates apply only to a kind: app");
+            anyhow::ensure!(Self::valid_mandates(mandates), "invalid mandates: {{issuer, owner, agent, names:[...]}} of non-empty distinct bounded strings");
         }
         Ok(())
     }
@@ -1091,16 +1094,30 @@ mod tests {
             "cpus":1,"gpus":0,"port_base":0,"container_port":8080,"services":["http"],"memory_gb":0.125});
         let with = |m: Value| { let mut s = base.clone(); s["mandates"] = m; s };
         let ok = json!({"issuer":"clawup","owner":"u1","agent":"a1","names":["cloud-buyer","no-withdrawals"]});
-        RegisterAppRequest { name:"agent".into(), spec:with(ok).into(), ..Default::default() }.validate().unwrap();
+        RegisterAppRequest { name:"agent".into(), spec:with(ok.clone()).into(), ..Default::default() }.validate().unwrap();
+        // Placement: only a node advertising shim-mandates-v1 supports a mandates app, so one set
+        // before any shim supports it waits for a capable node instead of failing on one.
+        let spec = with(ok);
+        let mut report = NodeReport { runtime_capabilities: vec!["shim-docker-v1".into(), "shim-network-v1".into(),
+            "shim-automatic-port-v1".into(), "shim-runtime-v2".into()], ..Default::default() };
+        assert!(!report.supports_runtime(crate::workload::Entry(&spec)));
+        report.runtime_capabilities.push("shim-mandates-v1".into());
+        assert!(report.supports_runtime(crate::workload::Entry(&spec)));
         for bad in [json!({"issuer":"clawup"}), json!({"issuer":"c","owner":"u","agent":"a","names":[]}),
             json!({"issuer":"c","owner":"u","agent":"a","names":["n"],"extra":1}),
             json!({"issuer":"","owner":"u","agent":"a","names":["n"]}), json!("not-an-object")] {
             assert!(RegisterAppRequest { name:"agent".into(), spec:with(bad.clone()).into(), ..Default::default() }.validate().is_err(), "{bad}");
         }
-        // It is a container setting; a prover may not carry it.
-        let mut prover = with(json!({"issuer":"c","owner":"u","agent":"a","names":["n"]}));
-        prover["kind"] = json!("ziren-gpu"); prover["elf_id"] = json!("a".repeat(64));
-        assert!(RegisterAppRequest { name:"p".into(), spec:prover.into(), ..Default::default() }.validate().is_err());
+        // Duplicate names are refused.
+        assert!(RegisterAppRequest { name:"agent".into(), spec:with(json!({"issuer":"c","owner":"u","agent":"a","names":["n","n"]})).into(), ..Default::default() }.validate().is_err());
+        // It applies only to kind: app. `validate_transport` refuses it on a prover for that reason
+        // alone: the same prover spec validates once its mandates are removed.
+        let mut prover = json!({"kind":"ziren-gpu","image":"p:1","runtime":{"executor":"shim","driver":"docker"},
+            "cpus":1,"gpus":1,"port_base":0,"container_port":8080,"memory_gb":0.125,
+            "mandates":{"issuer":"c","owner":"u","agent":"a","names":["n"]}});
+        assert!(RegisterAppRequest::validate_transport(prover.as_object().unwrap()).is_err());
+        prover.as_object_mut().unwrap().remove("mandates");
+        RegisterAppRequest::validate_transport(prover.as_object().unwrap()).unwrap();
     }
 
     #[test]

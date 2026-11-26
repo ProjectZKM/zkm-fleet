@@ -655,8 +655,9 @@ class MandateBinding(Record):
         def ok(s: str) -> bool:
             return bool(s) and len(s) <= 256 and not any(ord(c) < 32 or ord(c) == 127 for c in s)
         if (not all(ok(s) for s in (self.issuer, self.owner, self.agent))
-                or not 1 <= len(self.names) <= 64 or not all(ok(n) for n in self.names)):
-            raise ModelError("invalid mandates: {issuer, owner, agent, names:[...]} of non-empty bounded strings")
+                or not 1 <= len(self.names) <= 64 or not all(ok(n) for n in self.names)
+                or len(set(self.names)) != len(self.names)):
+            raise ModelError("invalid mandates: {issuer, owner, agent, names:[...]} of non-empty distinct bounded strings")
 
 
 @dataclass(kw_only=True)

@@ -1710,8 +1710,12 @@ names' meaning, and never calls the Mandate service.
   anything else the sandbox can read.
 - **Delivered only where enforced.** A mandates-bearing app requires the node
   capability `shim-mandates-v1`, which the node reports when its shim advertises
-  `runtime-mandates-v1`; so it is placed only where the shim carries and enforces
-  it. ClawUp sends the field only when a node reports that capability.
+  `runtime-mandates-v1`; the scheduler places such an app only on a node that has
+  it, so an app set before any shim supports it waits for a capable node instead
+  of failing on one.
+- **Container apps only.** `mandates` is refused on a prover (`ziren-*`).
+- **Clearing it takes recreating the app.** A settings update cannot remove the
+  field (there is no empty value for it); recreate the app to return it to none.
 - **Shown read-only.** It appears in the app's spec and report so an owner's
   health check can compare it with its own record.
 - **Absent means none.** An app without `mandates` runs as before; the shim
