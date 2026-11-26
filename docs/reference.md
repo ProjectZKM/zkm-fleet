@@ -1055,7 +1055,10 @@ set `FLEET_PROOF_STORAGE_ROOTS_FILE` to an administrator-owned file with one abs
 root per line; `deploy/install.sh node --proof-storage-roots FILE` installs it.
 `fleet-ziren-node` isn't in the release package; build it from source
 ([self-built programs](maintenance.md#self-built-node-programs)). Keep
-the roots configured while GPU actors are stopped. The agent runs storage-only
+the roots configured while GPU actors are stopped. The agent reports its approved
+roots, and the scheduler places a prover only on a node that serves its
+`proof_storage_root` (that root or a parent of it); a node reporting no roots (an
+older agent) is not filtered on this. The agent runs storage-only
 fetches apart from its heartbeats and Ray work.
 
 ### Fetching proofs

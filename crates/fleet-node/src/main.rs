@@ -72,7 +72,7 @@ async fn stopped() {
 const AGENT_VERSION: Option<&str> = option_env!("FLEET_VERSION");
 /// The snapshot the agent sends: the bridge's report, marked not ready when it is stale,
 /// named with the agent's release when it has one, and with the machine's hardware.
-fn outbound(mut report: Value, stale: bool, version: Option<&str>, hardware: &Value) -> Value {
+fn outbound(mut report: Value, stale: bool, version: Option<&str>, hardware: &Value, proof_roots: &[PathBuf]) -> Value {
     if stale {
         report["ready"] = json!(false);
     }
@@ -80,6 +80,9 @@ fn outbound(mut report: Value, stale: bool, version: Option<&str>, hardware: &Va
         report["agent_version"] = json!(version);
     }
     report["hardware"] = hardware.clone();
+    // What the proof-fetch handler is approved to serve, so the scheduler places a prover
+    // only on a node that covers its proof storage.
+    report["proof_storage_roots"] = json!(proof_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
     report
 }
 /// Tells the control plane this agent's session is over, so the agent that replaces it (a
@@ -231,6 +234,7 @@ async fn main() -> Result<()> {
                         s.seen.elapsed() > Duration::from_secs(20),
                         AGENT_VERSION,
                         &hardware,
+                        &a.proof_storage_root,
                     )
                 })
             };
@@ -586,12 +590,13 @@ mod tests {
     #[test]
     fn outbound_keeps_the_report_and_stamps_staleness_and_release() {
         let hardware = json!({"cpu_arch":"x86_64","gpus":[{"index":0,"name":"NVIDIA GeForce RTX 5090","architecture":"Blackwell"}]});
-        let outbound = |r, stale, v| outbound(r, stale, v, &hardware);
+        let outbound = |r, stale, v| outbound(r, stale, v, &hardware, &[std::path::PathBuf::from("/srv/proofs")]);
         let fresh = outbound(json!({"version":3,"machine":"m","ready":true}), false, Some("0.1.5"));
         assert_eq!(fresh["version"], 3);
         assert_eq!(fresh["machine"], "m");
         assert_eq!(fresh["ready"], true);
         assert_eq!(fresh["agent_version"], "0.1.5");
+        assert_eq!(fresh["proof_storage_roots"], json!(["/srv/proofs"]));
         let stale = outbound(json!({"version":3,"machine":"m","ready":true}), true, Some("0.1.5"));
         assert_eq!(stale["ready"], false);
         assert_eq!(stale["agent_version"], "0.1.5");

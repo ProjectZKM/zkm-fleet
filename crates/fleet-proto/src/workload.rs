@@ -282,6 +282,17 @@ impl NodeReport {
     pub fn supports_runtime(&self, entry: Entry<'_>) -> bool {
         let has = |cap: &str| self.runtime_capabilities.iter().any(|v| v == cap);
         if !entry.runtime_capability().is_none_or(has) { return false; }
+        // A prover's proof storage must be one the node's fetch handler is approved to serve:
+        // its `proof_storage_root`, or a path under one of the node's `--proof-storage-root`s.
+        // A node that reports none (an older agent) is not gated, so placement is unchanged
+        // until nodes report their roots.
+        if let Some(root) = entry.0["proof_storage_root"].as_str() {
+            let covered = self.proof_storage_roots.iter().any(|r| {
+                let r = r.trim_end_matches('/');
+                root == r || root.strip_prefix(r).is_some_and(|rest| rest.starts_with('/'))
+            });
+            if !self.proof_storage_roots.is_empty() && !covered { return false; }
+        }
         // A mandates-bearing app is placed only where the shim carries and enforces them.
         if entry.0["mandates"].is_object() && !has("shim-mandates-v1") { return false; }
         if entry.native_access() && (entry.gpus().is_some_and(|g| g > 0.0) || !entry.durable_mounts().is_empty())

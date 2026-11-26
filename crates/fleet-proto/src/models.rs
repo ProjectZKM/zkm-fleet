@@ -780,6 +780,15 @@ mod tests {
         assert!(!report.supports_runtime(entry));
         report.runtime_capabilities.push("shim-prover-v1".into());
         assert!(report.supports_runtime(entry));
+        // Proof storage: a node reporting roots must cover the prover's `/srv/proofs`.
+        report.proof_storage_roots = vec!["/mnt/other".into()];
+        assert!(!report.supports_runtime(entry), "a node that serves other roots is not chosen");
+        report.proof_storage_roots = vec!["/srv".into()];
+        assert!(report.supports_runtime(entry), "an approved parent root covers the prover's");
+        report.proof_storage_roots = vec!["/srv/proofs".into()];
+        assert!(report.supports_runtime(entry), "the exact approved root covers it");
+        report.proof_storage_roots.clear();
+        assert!(report.supports_runtime(entry), "a node reporting no roots (older agent) is not gated");
         for key in ["port_base", "container_port"] {
             let mut bad = source.clone();
             bad["spec"][key] = Value::Null;

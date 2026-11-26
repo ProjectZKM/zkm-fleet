@@ -141,8 +141,10 @@ fleetctl --token-file zkm-owner.token --namespace zkm app disable model
 
 An app starts disabled and on no node. Its first `app enable` places it: the
 scheduler picks a ready node big enough for all its replicas, preferring one where
-they fit now, has that node add the entry to its `apps.yaml`, and starts it. Users
-don't choose the node, and app names are unique across the fleet.
+they fit now, has that node add the entry to its `apps.yaml`, and starts it. A
+prover is placed only on a node whose approved `--proof-storage-root`s serve its
+`proof_storage_root`. Users don't choose the node, and app names are unique across
+the fleet.
 
 Disabling drains the replicas and releases their resources after cleanup; the app's
 durable data stays. `app restart` disables an enabled app and enables it again in
