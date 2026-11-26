@@ -1883,34 +1883,39 @@ def test_shim_mandates_capability_is_gated_on_the_shim_feature(tmp_path, monkeyp
     assert "shim-mandates-v1" in shim.capabilities(spec(tmp_path).cluster)
 
 
-def test_a_volume_template_that_expands_to_nothing_adds_no_mount(tmp_path):
-    # An unset scheduler_ca_file (publicly trusted; no private CA) must not become a bare ":ro".
+def test_an_optional_volume_template_is_dropped_but_a_required_one_is_refused(tmp_path):
+    # An unset scheduler_ca_file (publicly trusted, no private CA) adds no mount, never a ":ro".
     raw = config(tmp_path)
-    raw["apps"][0].update(container_port=8080,
-        volumes=["{scheduler_ca_file}:ro", "/srv/data", "{cluster_token_file}:ro"],
+    raw["apps"][0].update(container_port=8080, volumes=["{scheduler_ca_file}:ro", "/srv/data"],
         env={"FLEET_SCHEDULER_CA_FILE": "{scheduler_ca_file}"})
-    assert "scheduler_ca_file" not in raw and "cluster_token_file" not in raw
-    bound = shim.RuntimeBook(tmp_path / "book").bind(
-        reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
-    request = shim.launch_request(bound, [])
-    # Only the real mount survives; no ":ro" from an empty expansion.
-    assert request["driver_options"]["volumes"] == ["/srv/data:/srv/data"]
-    assert not any(v.startswith(":") for v in request["driver_options"]["volumes"])
-    # With the CA set, the mount is present as before.
+    bound = shim.RuntimeBook(tmp_path / "book").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
+    volumes = shim.launch_request(bound, [])["driver_options"]["volumes"]
+    assert volumes == ["/srv/data:/srv/data"] and not any(v.startswith(":") for v in volumes)
+    # A different template that expands to nothing is a misconfiguration, refused at once
+    # rather than starting the prover without the token it needs.
+    other = config(tmp_path)
+    other["apps"][0].update(container_port=8080, volumes=["{cluster_token_file}:ro"])
+    bound2 = shim.RuntimeBook(tmp_path / "book2").bind(reconcile.replica_specs(reconcile.load_apps(other))["web-0"], "cmd")
+    with pytest.raises(ValueError, match="empty source path"):
+        shim.launch_request(bound2, [])
+    # With the CA set, it mounts as before.
     raw["scheduler_ca_file"] = "/etc/zkm-fleet/ca.pem"
-    bound = shim.RuntimeBook(tmp_path / "book2").bind(
-        reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
-    assert "/etc/zkm-fleet/ca.pem:/etc/zkm-fleet/ca.pem:ro" in shim.launch_request(bound, [])["driver_options"]["volumes"]
+    bound3 = shim.RuntimeBook(tmp_path / "book3").bind(reconcile.replica_specs(reconcile.load_apps(raw))["web-0"], "cmd")
+    assert "/etc/zkm-fleet/ca.pem:/etc/zkm-fleet/ca.pem:ro" in shim.launch_request(bound3, [])["driver_options"]["volumes"]
 
 
-def test_a_shim_executable_refusal_carries_its_reason(tmp_path, monkeypatch):
-    err = shim.subprocess.CalledProcessError(1, "shim", output="", stderr="invalid mount spec: \":ro\"")
+def test_a_shim_executable_refusal_keeps_its_output_in_the_node_log(tmp_path, monkeypatch, caplog):
+    err = shim.subprocess.CalledProcessError(1, "shim", output="", stderr='invalid mount spec: ":ro"')
     monkeypatch.setattr(shim.subprocess, "run", Mock(side_effect=err))
-    with pytest.raises(RuntimeError, match=r"invalid mount spec"):
-        shim.invoke("/bin/shim", str(tmp_path), socket.gethostname(), {"operation": "launch"})
+    with caplog.at_level("WARNING"):
+        # The untrusted process output must not reach the tenant-readable error, only the node log.
+        with pytest.raises(RuntimeError, match=r"^shim operation failed$"):
+            shim.invoke("/bin/shim", str(tmp_path), socket.gethostname(), {"operation": "launch"})
+    assert "invalid mount spec" in caplog.text
 
 
-def test_a_shim_daemon_refusal_carries_its_reason(tmp_path, monkeypatch):
+def test_a_shim_daemon_refusal_carries_its_bounded_reason(tmp_path, monkeypatch):
+    # The ownership guard reads a real socket file; the connection itself is faked.
     sock = tmp_path / "control.sock"
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(str(sock)); os.chmod(sock, 0o700)

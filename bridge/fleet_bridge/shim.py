@@ -233,13 +233,19 @@ class ShimPending(RuntimeError):
     timeout. It runs daemon operations to completion, so this one continues."""
 
 
+# Volume templates that may expand to nothing without being an error.
+OPTIONAL_VOLUME_TEMPLATES = ("scheduler_ca_file",)
+
+
 class ShimRejected(RuntimeError):
     """The shim refused the operation and said why (e.g. an invalid mount or an
-    unknown field). Its reason is carried to the caller so a refusal is not lost."""
+    unknown field). The shim's own, bounded reason is carried to the caller so a
+    refusal is not lost; the full value is also logged at the node."""
 
     def __init__(self, reason: Any) -> None:
         text = reason if isinstance(reason, str) else json.dumps(reason, sort_keys=True)
-        super().__init__(f"shim refused the operation: {text[:500]}")
+        logging.getLogger(__name__).warning("shim refused the operation: %s", text[:2000])
+        super().__init__(f"shim refused the operation: {text[:200]}")
 
 
 def daemon_call(state_dir: str, node_id: str, command: dict[str, Any], timeout: float = 150) -> dict[str, Any]:
@@ -313,8 +319,12 @@ def invoke(binary: str, state_dir: str, node_id: str, command: dict[str, Any], *
             input=json.dumps(to_dict(command)), capture_output=True, text=True, timeout=max(150, timeout or 0), check=True)
         return json.loads(result.stdout)
     except subprocess.CalledProcessError as error:
-        detail = ((error.stderr or "") + (error.stdout or "")).strip()[-500:]
-        raise RuntimeError(f"shim operation failed: {detail or f'exited {error.returncode}'}") from None
+        # The process's output is untrusted and may echo mount sources or environment; keep it in
+        # the node log, send only a generic failure upward (it reaches the tenant-readable report).
+        detail = ((error.stderr or "") + (error.stdout or "")).strip()
+        if detail:
+            logging.getLogger(__name__).warning("shim exited %s: %s", error.returncode, detail[-2000:])
+        raise RuntimeError("shim operation failed") from None
     except (OSError, ValueError, subprocess.SubprocessError):
         raise RuntimeError("shim operation failed") from None
 
@@ -451,10 +461,13 @@ def launch_request(spec: AppReplicaSpec, gpus: list[str]) -> dict[str, Any]:
     volumes = []
     for volume in app.volumes:
         path, _, options = volume.format(**fill).partition(":")
-        # An optional template that expands to nothing (e.g. an unset scheduler_ca_file,
-        # trusted without a private CA) contributes no mount, never a bare ":ro".
         if not path:
-            continue
+            # Only an unset optional template adds no mount: a publicly-trusted scheduler needs
+            # no private CA. Any other empty expansion is a misconfiguration; refuse it here
+            # rather than start the container without a mount it needs and fail later.
+            if any("{%s}" % name in volume.partition(":")[0] for name in OPTIONAL_VOLUME_TEMPLATES):
+                continue
+            raise ValueError(f"volume {volume!r} expands to an empty source path")
         volumes.append(f"{path}:{path}" + (f":{options}" if options else ""))
     driver = app.runtime.driver
     trust = {"attestation": {"mode": "skip_non_tee"}, "policy_proof": "not_required", "attestation_proof": "not_required"}
@@ -872,6 +885,7 @@ class _ShimApp:
             raise self.launch_failed(error) from None
 
     def launch_failed(self, error: Exception) -> RuntimeError:
+        logging.getLogger(__name__).warning("shim did not launch %s: %s", self.spec.name, error)
         return RuntimeError(f"shim did not launch {self.spec.name} ({error}); if its allocation was stopped or "
                             "deleted, it needs explicit cleanup and a new generation")
 
